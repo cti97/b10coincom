@@ -1205,7 +1205,7 @@ git commit -m "feat: add transfer transaction type with signing and canonical en
   - `type Block struct { Header Header; Txs []Tx }`
   - `(*Header) Encode() []byte`, `(*Block) ID() [32]byte`, `(*Block) Encode() []byte`, `DecodeBlock([]byte) (*Block, error)`, `ComputeTxRoot([]Tx) [32]byte`, `(*Block) ValidateStructure() error`
   - Constants: `MaxTxsPerBlock = 10_000`, `MaxBlockBytes = 1 << 20`
-  - Errors: `ErrBadProposer`, `ErrTxRootMismatch`, `ErrDuplicateTx`, `ErrBlockTooLarge`, `ErrNoTransactions`
+  - Errors: `ErrBadProposer`, `ErrTxRootMismatch`, `ErrDuplicateTx`, `ErrBlockTooLarge`, `ErrBadTimestamp`. There is deliberately NO `ErrNoTransactions`: an empty block is valid, and `TestValidateStructureAcceptsWellFormedBlock` requires it (`validateStructure` therefore never errors on `len(Txs) == 0`)
 
 - [ ] **Step 1: Write the failing tests**
 
