@@ -111,6 +111,27 @@ func TestAppendRejectsUnsignedOrForgedHeader(t *testing.T) {
 	}
 }
 
+// A block whose header was altered after signing must be rejected by the
+// signature check ITSELF. This is the only test that reaches crypto.Verify in
+// Append: TestAppendRejectsUnsignedOrForgedHeader only clears Sig, which the
+// nil check catches first, so deleting the verification call left the whole
+// suite green.
+func TestAppendRejectsForgedSignature(t *testing.T) {
+	c, priv := devChain(t)
+	b, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate a signed header field WITHOUT re-signing. The timestamp stays
+	// positive so ValidateStructure still passes, and parent, height and
+	// validator membership are unaffected, so only the signature check can
+	// reject this.
+	b.Header.Timestamp = 1_700_000_101
+	if err := c.Append(b); !errors.Is(err, ErrBadProposerSig) {
+		t.Fatalf("expected ErrBadProposerSig, got %v", err)
+	}
+}
+
 func TestAppendRejectsNonValidatorProposer(t *testing.T) {
 	c, _ := devChain(t)
 	_, otherPriv, err := crypto.GenerateKey()
@@ -147,18 +168,49 @@ func TestChainWithoutValidatorsCannotAdvance(t *testing.T) {
 
 // Replay is the core durability guarantee: reopen from disk and confirm the
 // recomputed state root matches the stored header.
+//
+// The blocks carry REAL signed transfers, so replay must re-derive
+// transaction effects rather than re-load empty blocks: the final state root
+// must differ from the genesis root (value actually moved), yet still equal
+// the stored head header's root (replay recomputed exactly what was stored).
+// Fixed timestamps and deterministic keys keep the whole sequence
+// reproducible.
 func TestReplayRebuildsIdenticalState(t *testing.T) {
 	dir := t.TempDir()
 	g := genesis.Devnet()
 	_, priv := devKey()
 
+	fromPub := g.DevAccounts[0].PubKey
+	toPub := g.DevAccounts[1].PubKey
+	from := types.AddressFromPub(fromPub)
+	to := types.AddressFromPub(toPub)
+	// The devnet validator key is not the dev account key, so txs are
+	// signed with the dev account's deterministic key.
+	devPriv := devPrivateKey(t)
+
 	c, err := Open(g, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	genesisRoot := c.State().Root()
+
 	var roots [][32]byte
 	for h := 1; h <= 5; h++ {
-		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		// Block h pays h b10 from dev account 0 to dev account 1. The
+		// nonce is the account's current replay counter, so each block's
+		// transfer chains onto the previous one's effect.
+		tx := &types.Tx{
+			Type:   types.TxTransfer,
+			From:   from,
+			PubKey: fromPub,
+			Nonce:  c.State().Get(from).Nonce,
+			To:     to,
+			Amount: uint64(h) * genesis.SparksPerB10,
+		}
+		sigHash := tx.SigningHash()
+		tx.Sig = crypto.Sign(devPriv, sigHash[:])
+
+		b, err := c.Build(priv, []types.Tx{*tx}, int64(1_700_000_000+h))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -184,6 +236,12 @@ func TestReplayRebuildsIdenticalState(t *testing.T) {
 	}
 	if c2.State().Root() != roots[len(roots)-1] {
 		t.Fatal("replayed state root differs from the stored header")
+	}
+	// Without this the test could pass with blocks that carry no txs at
+	// all: the root-differs assertion is what proves replay re-derived
+	// transaction effects from the stored blocks.
+	if c2.State().Root() == genesisRoot {
+		t.Fatal("replayed state root equals the genesis root after five real transfers; replay did not re-derive transaction effects")
 	}
 }
 

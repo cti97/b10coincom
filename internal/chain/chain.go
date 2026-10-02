@@ -72,10 +72,21 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Close the store on every failure path after this point: returning an
+	// open handle with the chain unset would leak the handle. owned records
+	// that the handle was successfully handed to a returned Chain; until
+	// then the deferred close owns it. Error values are unchanged.
+	owned := false
+	defer func() {
+		if !owned {
+			_ = s.Close()
+		}
+	}()
 	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st)}
 
 	height, ok := s.Height()
 	if !ok {
+		owned = true
 		return c, nil
 	}
 	for h := uint64(1); h <= height; h++ {
@@ -95,13 +106,20 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 			return nil, fmt.Errorf("%w at height %d", ErrGenesisReplay, h)
 		}
 	}
+	owned = true
 	return c, nil
 }
 
 func (c *Chain) Genesis() *genesis.Genesis { return c.gen }
 func (c *Chain) Height() uint64            { return c.head.Header.Height }
-func (c *Chain) Head() *types.Block        { return c.head }
-func (c *Chain) State() *state.State       { return c.state }
+
+// Head returns the current head block. Append retains the caller's
+// *types.Block as the head and this method hands that same pointer back, so
+// a caller must not mutate a block after appending it: doing so silently
+// changes Height()/Head().ID() without any store write. Returned blocks are
+// therefore immutable by contract.
+func (c *Chain) Head() *types.Block  { return c.head }
+func (c *Chain) State() *state.State { return c.state }
 
 // isValidator reports whether pub is in the genesis validator set.
 func (c *Chain) isValidator(pub []byte) bool {
@@ -157,6 +175,12 @@ func (c *Chain) applyValidated(b *types.Block) error {
 // Append validates a block against the current head and state, then stores
 // it. Validation happens before any mutation, so a rejected block leaves the
 // chain untouched.
+//
+// Aliasing contract: on success Append retains the caller's *types.Block as
+// the chain's head (no defensive copy), and Head() later hands that same
+// pointer back. A caller must not mutate a block after appending it:
+// mutating the retained block silently changes Height()/Head().ID() with no
+// store write, leaving the stored bytes behind the chain's in-memory view.
 func (c *Chain) Append(b *types.Block) error {
 	if b.Header.ParentHash != c.head.ID() {
 		return ErrBadParent
