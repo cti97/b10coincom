@@ -4650,7 +4650,7 @@ git commit -m "feat: add mempool, HTTP RPC and single-node block production"
 **Interfaces:**
 - Consumes: everything above
 - Produces:
-  - `devnet.Options struct { Dir string; Blocks uint64; Verbose bool }`
+  - `devnet.Options struct { Dir string; Blocks uint64 }`
   - `devnet.Run(Options) (Summary, error)`, `devnet.Summary struct { Height uint64; StateRoot [32]byte; TxsIncluded int }`
   - CLI: `b10coin devnet --blocks N [--dir D]`, `b10coin node --dir D --block-time 2s`
 
@@ -4768,9 +4768,8 @@ var ErrNoBlocks = errors.New("devnet: Blocks must be greater than zero")
 
 // Options configures a devnet run.
 type Options struct {
-	Dir     string
-	Blocks  uint64
-	Verbose bool
+	Dir    string
+	Blocks uint64
 }
 
 // Summary reports what a run produced.
@@ -4933,7 +4932,6 @@ func cmdDevnet(args []string) error {
 	fs := flag.NewFlagSet("devnet", flag.ExitOnError)
 	blocks := fs.Uint64("blocks", 100, "number of blocks to produce")
 	dir := fs.String("dir", "", "data directory (default: a fresh temporary directory)")
-	verbose := fs.Bool("verbose", false, "print per-run detail")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -4946,7 +4944,7 @@ func cmdDevnet(args []string) error {
 		*dir = d
 	}
 
-	summary, err := devnet.Run(devnet.Options{Dir: *dir, Blocks: *blocks, Verbose: *verbose})
+	summary, err := devnet.Run(devnet.Options{Dir: *dir, Blocks: *blocks})
 	if err != nil {
 		return err
 	}
