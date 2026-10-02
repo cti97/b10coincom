@@ -17,9 +17,10 @@ var (
 	ErrUnsupportedTxType = errors.New("state: unsupported transaction type")
 )
 
-// ApplyTx applies one transaction, mutating the receiver. On error the
-// receiver may be partially modified, so callers that need atomicity must
-// use ApplyBlock.
+// ApplyTx applies one transaction, mutating the receiver. Every validation
+// runs before the first write, so on error the receiver is left unchanged.
+// ApplyBlock still clones, so that one transaction's success is not persisted
+// when a later transaction in the same block fails.
 func (s *State) ApplyTx(tx *types.Tx) error {
 	if err := tx.VerifySignature(); err != nil {
 		return err
