@@ -219,4 +219,29 @@ func (c *Chain) Append(b *types.Block) error {
 	return nil
 }
 
+// BlockAt returns the block stored at height. Only the head is cached, so
+// historical reads go to disk. Height 0 is the genesis block, which the
+// store deliberately never holds (store heights start at 1): it is
+// re-synthesised from the genesis configuration exactly as Open built it.
+func (c *Chain) BlockAt(height uint64) (*types.Block, error) {
+	if height > c.Height() {
+		return nil, fmt.Errorf("%w: %d", store.ErrNotFound, height)
+	}
+	if height == c.Height() {
+		return c.head, nil
+	}
+	if height == 0 {
+		st, err := genesisState(c.gen)
+		if err != nil {
+			return nil, err
+		}
+		return genesisBlock(c.gen, st), nil
+	}
+	raw, err := c.store.Read(height)
+	if err != nil {
+		return nil, err
+	}
+	return types.DecodeBlock(raw)
+}
+
 func (c *Chain) Close() error { return c.store.Close() }

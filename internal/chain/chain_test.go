@@ -329,6 +329,31 @@ func TestTotalSupplyIsConserved(t *testing.T) {
 	}
 }
 
+func TestBlockAtReadsHistoricalBlocks(t *testing.T) {
+	c, priv := devChain(t)
+	for h := 1; h <= 3; h++ {
+		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for h := uint64(0); h <= 3; h++ {
+		b, err := c.BlockAt(h)
+		if err != nil {
+			t.Fatalf("BlockAt(%d): %v", h, err)
+		}
+		if b.Header.Height != h {
+			t.Fatalf("BlockAt(%d) returned height %d", h, b.Header.Height)
+		}
+	}
+	if _, err := c.BlockAt(4); err == nil {
+		t.Fatal("BlockAt beyond head must fail")
+	}
+}
+
 func devKey() (ed25519.PublicKey, ed25519.PrivateKey) { return genesis.DevValidatorKey() }
 
 func devPrivateKey(t *testing.T) ed25519.PrivateKey {
