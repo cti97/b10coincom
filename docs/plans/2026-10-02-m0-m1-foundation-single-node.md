@@ -3910,6 +3910,22 @@ git commit -m "feat: add chain build, validation, append and replay"
 
 ### Task 11: Mempool, HTTP RPC, and node loop
 
+> **As-built corrections (controller, after review).** The reference is now
+> `internal/mempool`, `internal/rpc` and `internal/node` themselves. Corrections
+> applied after review:
+> 1. `Mempool` and `Chain` carry mutexes. The RPC server reads the chain while
+>    the node loop appends to it; `-race` flagged this as a genuine data race
+>    (`Append` vs `Head`), and `cmdNode` runs both concurrently.
+> 2. `RunOnce` filters the batch it took against a state clone. `Take` has
+>    already drained the mempool, so without the filter one state-invalid
+>    transaction discards every valid transaction beside it and no block is
+>    produced — the node wedges (probe: `mempool=2 -> 0, height=0`). Valid
+>    transactions are re-added if `Build` or `Append` fails.
+> 3. `TestTxEndpointAcceptsValidTx` asserts the transaction reached the mempool
+>    via `/status`, not merely that the response was 200.
+> 4. `BlockAt(0)` re-synthesises the genesis block: genesis is never on disk.
+> 5. `RunOnce`'s doc comment does not claim it returns nil when idle.
+
 **Files:**
 - Create: `internal/mempool/mempool.go`, `internal/mempool/mempool_test.go`, `internal/rpc/server.go`, `internal/rpc/server_test.go`, `internal/node/node.go`, `internal/node/node_test.go`
 
