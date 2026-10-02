@@ -14,8 +14,8 @@
 
 - **Module path:** `github.com/cti97/b10coincom`
 - **Go floor:** `go 1.23`
-- **Toolchain caveat (verified 2026-10-02):** this machine has **go1.21.4** installed. With `GOTOOLCHAIN=auto`, Go will try to download the 1.23 toolchain on the first build; that download needs network plus a writable module cache. If it is unavailable, either install a current Go (`brew install go`, a system-level change) or lower this floor to `go 1.21` — nothing in this plan uses a language feature newer than 1.21.
-- **Dependencies:** exactly one external module, `lukechampine.com/blake3`. No others. Do not add a CLI framework, a logging framework, a test framework, or a database.
+- **Toolchain (verified 2026-10-02):** `brew install go` upgraded this machine from go1.21.4 to **go1.27.1**, which satisfies this floor. No toolchain download or floor change is needed.
+- **Dependencies:** exactly one *direct* external module, `lukechampine.com/blake3` (v1.4.1). It pulls one transitive requirement, `github.com/klauspost/cpuid/v2`, recorded `// indirect` in `go.mod` — that is unavoidable and is not a second chosen dependency. Do not add a CLI framework, a logging framework, a test framework, a database, or any other direct dependency.
 - **Base unit is `spark`**; `1 b10 = 10^8 sparks`. All monetary values are `uint64` sparks. Never use floats for money.
 - **Canonical encoding only.** Every consensus structure is encoded with the helpers from Task 2. Never `encoding/gob`, never JSON for anything that gets hashed or signed, never iterate a Go `map` when producing bytes.
 - **No premine on testnet.** The testnet genesis must have zero funded accounts. Task 8 includes a test that enforces this.
@@ -550,7 +550,10 @@ func TestMerkleRootHandlesOddLeafCounts(t *testing.T) {
 		if got == ([32]byte{}) {
 			t.Fatalf("n=%d produced the empty root", n)
 		}
-		if !bytes.Equal(got[:], MerkleRoot(leaves)[:]) {
+		// MerkleRoot's result is an unaddressable array and cannot be sliced
+		// in place, so bind it before comparing.
+		again := MerkleRoot(leaves)
+		if !bytes.Equal(got[:], again[:]) {
 			t.Fatalf("n=%d is not deterministic", n)
 		}
 	}
@@ -643,7 +646,7 @@ func MerkleRoot(leaves [][32]byte) [32]byte {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `go test ./internal/crypto/ -v`
-Expected: PASS for all six tests.
+Expected: PASS for all seven tests.
 
 - [ ] **Step 5: Commit**
 
@@ -897,7 +900,7 @@ git commit -m "feat: add Ed25519 signing and checksummed base32 addresses"
   - `(*Tx) SigningHash() [32]byte`, `(*Tx) ID() [32]byte`, `(*Tx) Encode() []byte`, `(*Tx) VerifySignature() error`, `DecodeTx([]byte) (*Tx, error)`
   - `ErrUnsupportedTxType`, `ErrBadSignature`, `ErrAddressMismatch`
 
-**Note:** M1 implements `TxTransfer` end to end. The remaining type constants are reserved so the wire format does not need to change later; `Encode`/`DecodeTx` return `ErrUnsupportedTxType` for them, and `state` rejects them. M2 adds `TxFaucetClaim`; M5 adds the staking types.
+**Note:** M1 implements `TxTransfer` end to end. The remaining type constants are reserved so the wire format does not need to change later; `DecodeTx` returns `ErrUnsupportedTxType` for them, and `state` rejects them. (`Tx.Encode` has no error return, so it can only ever produce the transfer shape.) M2 adds `TxFaucetClaim`; M5 adds the staking types.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -932,7 +935,8 @@ func signedTransfer(t *testing.T, nonce, amount uint64) *Tx {
 		To:     AddressFromPub(otherPub),
 		Amount: amount,
 	}
-	tx.Sig = crypto.Sign(priv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return tx
 }
 
@@ -1110,7 +1114,8 @@ func (tx *Tx) VerifySignature() error {
 	if AddressFromPub(tx.PubKey) != tx.From {
 		return ErrAddressMismatch
 	}
-	if !crypto.Verify(tx.PubKey, tx.SigningHash()[:], tx.Sig) {
+	sigHash := tx.SigningHash()
+	if !crypto.Verify(tx.PubKey, sigHash[:], tx.Sig) {
 		return ErrBadSignature
 	}
 	return nil
@@ -1200,7 +1205,7 @@ git commit -m "feat: add transfer transaction type with signing and canonical en
   - `type Block struct { Header Header; Txs []Tx }`
   - `(*Header) Encode() []byte`, `(*Block) ID() [32]byte`, `(*Block) Encode() []byte`, `DecodeBlock([]byte) (*Block, error)`, `ComputeTxRoot([]Tx) [32]byte`, `(*Block) ValidateStructure() error`
   - Constants: `MaxTxsPerBlock = 10_000`, `MaxBlockBytes = 1 << 20`
-  - Errors: `ErrBadProposer`, `ErrTxRootMismatch`, `ErrDuplicateTx`, `ErrBlockTooLarge`, `ErrNoTransactions`
+  - Errors: `ErrBadProposer`, `ErrTxRootMismatch`, `ErrDuplicateTx`, `ErrBlockTooLarge`, `ErrBadTimestamp`. There is deliberately NO `ErrNoTransactions`: an empty block is valid, and `TestValidateStructureAcceptsWellFormedBlock` requires it (`validateStructure` therefore never errors on `len(Txs) == 0`)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1411,7 +1416,10 @@ func (b *Block) Encode() []byte {
 	e.Raw(b.Header.Encode())
 	e.Len(len(b.Txs))
 	for i := range b.Txs {
-		e.Raw(b.Txs[i].Encode())
+		// VarBytes, not Raw: DecodeBlock frames each transaction with
+		// d.VarBytes(), so the encoder MUST write the matching length
+		// prefix. Raw here produced blocks that could not be decoded.
+		e.VarBytes(b.Txs[i].Encode())
 	}
 	return e.Bytes()
 }
@@ -1569,7 +1577,8 @@ func transfer(t *testing.T, fromPub, fromPriv []byte, from types.Address, nonce,
 		To:     to,
 		Amount: amount,
 	}
-	tx.Sig = crypto.Sign(fromPriv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 	return tx
 }
 
@@ -1727,26 +1736,106 @@ func TestApplyBlockReturnsNewStateOnSuccess(t *testing.T) {
 }
 
 func TestRootIsOrderIndependentAndSensitive(t *testing.T) {
-	a, _, _ := keypair(t)
-	b, _, _ := keypair(t)
+	// 32 accounts inserted in opposite orders. With this many entries the
+	// chance that two independent map iterations agree is negligible, so an
+	// unsorted Root() cannot pass by luck on any Go runtime.
+	const n = 32
+	addrs := make([]types.Address, n)
+	for i := range addrs {
+		pub, _, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		addrs[i] = types.AddressFromPub(pub)
+	}
 
-	s1 := New()
-	s1.Set(a, Account{Balance: 1})
-	s1.Set(b, Account{Balance: 2})
-
-	s2 := New()
-	s2.Set(b, Account{Balance: 2})
-	s2.Set(a, Account{Balance: 1})
-
-	if s1.Root() != s2.Root() {
+	forward := New()
+	backward := New()
+	for i := 0; i < n; i++ {
+		forward.Set(addrs[i], Account{Balance: uint64(i + 1)})
+		backward.Set(addrs[n-1-i], Account{Balance: uint64(n - i)})
+	}
+	if forward.Root() != backward.Root() {
 		t.Fatal("state root depends on insertion order")
 	}
 
-	s3 := New()
-	s3.Set(a, Account{Balance: 1})
-	s3.Set(b, Account{Balance: 3})
-	if s1.Root() == s3.Root() {
+	// Sensitivity: a single balance change must move the root.
+	altered := New()
+	for i := 0; i < n; i++ {
+		altered.Set(addrs[i], Account{Balance: uint64(i + 1)})
+	}
+	altered.Set(addrs[0], Account{Balance: 999})
+	if forward.Root() == altered.Root() {
 		t.Fatal("state root ignored a balance change")
+	}
+}
+
+// TestRootGoldenVector freezes the exact root for a fixed state. It is the
+// only test that pins the leaf encoding (balance then nonce), the Merkle
+// construction and the "b10coin-account" domain label: change any of them and
+// this value changes, which is precisely the point.
+//
+// The vector is frozen. It was captured once from the implementation and then
+// proven load-bearing by changing the "b10coin-account" domain label in
+// state.go (the test fails) and reverting. Never re-capture it from a fresh
+// run: that would enshrine whatever the code currently produces, regression
+// included, and destroy the test's value.
+func TestRootGoldenVector(t *testing.T) {
+	s := New()
+	s.Set(types.Address{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}, Account{Balance: 1000, Nonce: 7})
+	s.Set(types.Address{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}, Account{Balance: 0, Nonce: 3})
+	s.Set(types.Address{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, Account{Balance: 18446744073709551615, Nonce: 0})
+
+	// Frozen and verified load-bearing: changing the "b10coin-account" domain
+	// label makes this test fail. Do NOT re-capture this value from a fresh run -
+	// re-capturing would enshrine whatever the code happens to produce, including a
+	// regression. If it fails, the root construction changed and that is the point.
+	want := [32]byte{
+		0x69, 0x38, 0x3e, 0xe3, 0xc1, 0xb9, 0x2d, 0xa5, 0x0c, 0x46, 0xbc, 0xa8, 0x97, 0x47, 0x6d, 0xc1,
+		0xde, 0xde, 0xd1, 0xec, 0x5b, 0x47, 0x08, 0x6d, 0xee, 0xc2, 0xa0, 0x9e, 0x7d, 0x37, 0x29, 0x5e,
+	}
+	if got := s.Root(); got != want {
+		t.Fatalf("golden root changed:\n got %x\nwant %x", got, want)
+	}
+}
+
+// An unsupported transaction type must be rejected. The signature is valid, so
+// execution reaches the type switch rather than failing the signature check
+// first.
+func TestApplyTxRejectsUnsupportedType(t *testing.T) {
+	from, pub, priv := keypair(t)
+	to, _, _ := keypair(t)
+
+	s := New()
+	s.Set(from, Account{Balance: 100})
+
+	tx := transfer(t, pub, priv, from, 0, 10, to)
+	tx.Type = types.TxType(99)
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+
+	if err := s.ApplyTx(tx); !errors.Is(err, ErrUnsupportedTxType) {
+		t.Fatalf("expected ErrUnsupportedTxType, got %v", err)
+	}
+}
+
+// TotalBalance is required API surface: the supply-invariant check consumes it.
+func TestTotalBalance(t *testing.T) {
+	a, _, _ := keypair(t)
+	b, _, _ := keypair(t)
+
+	if got := New().TotalBalance(); got != 0 {
+		t.Fatalf("empty state TotalBalance = %d, want 0", got)
+	}
+
+	s := New()
+	s.Set(a, Account{Balance: 400})
+	s.Set(b, Account{Balance: 600})
+	if got := s.TotalBalance(); got != 1000 {
+		t.Fatalf("TotalBalance = %d, want 1000", got)
 	}
 }
 
@@ -1890,9 +1979,10 @@ var (
 	ErrUnsupportedTxType = errors.New("state: unsupported transaction type")
 )
 
-// ApplyTx applies one transaction, mutating the receiver. On error the
-// receiver may be partially modified, so callers that need atomicity must
-// use ApplyBlock.
+// ApplyTx applies one transaction, mutating the receiver. Every validation
+// runs before the first write, so on error the receiver is left unchanged.
+// ApplyBlock still clones, so that one transaction's success is not persisted
+// when a later transaction in the same block fails.
 func (s *State) ApplyTx(tx *types.Tx) error {
 	if err := tx.VerifySignature(); err != nil {
 		return err
@@ -1988,6 +2078,7 @@ Create `internal/genesis/genesis_test.go`:
 package genesis
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -2016,8 +2107,25 @@ func TestFaucetAddressIsDeterministicAndKeyless(t *testing.T) {
 	if f1 != f2 {
 		t.Fatal("faucet address is not deterministic")
 	}
-	// The faucet address must not be derivable as address-of-a-pubkey for
-	// any key we hold, and it must differ from every validator address.
+
+	// Independently recompute the specified construction. This is the assertion
+	// that actually guards the domain label and the derivation: without it,
+	// replacing the body with `AddressFromPub(gh[:])` makes the faucet spendable
+	// by anyone holding ed25519.NewKeyFromSeed(genesisHash) and every other
+	// assertion below still passes.
+	gh := g.Hash()
+	want := crypto.HashParts([]byte("b10coin-faucet"), gh[:])
+	var expected types.Address
+	copy(expected[:], want[:types.AddressSize])
+	if f1 != expected {
+		t.Fatalf("faucet derivation changed:\n got %v\nwant %v", f1, expected)
+	}
+
+	// Negative: the faucet must not be the address of any public key we can
+	// name, including the genesis hash reinterpreted as one.
+	if f1 == types.AddressFromPub(gh[:]) {
+		t.Fatal("faucet address is key-derived and therefore spendable")
+	}
 	for _, v := range g.Validators {
 		if types.AddressFromPub(v.PubKey) == f1 {
 			t.Fatal("faucet address collided with a validator address")
@@ -2025,6 +2133,23 @@ func TestFaucetAddressIsDeterministicAndKeyless(t *testing.T) {
 	}
 	if f1 == types.AddressFromPub([]byte("any")) {
 		t.Fatal("faucet address looks like a normal key-derived address")
+	}
+}
+
+// TestSupplyCapIsPinned pins the ABSOLUTE monetary values. The emission test
+// only checks the identity R0 * interval * 2 == supply, which any proportional
+// mutation satisfies - halving both the supply and the reward would pass it
+// while changing monetary policy. This test is what stops that.
+func TestSupplyCapIsPinned(t *testing.T) {
+	if SparksPerB10 != 100_000_000 {
+		t.Fatalf("SparksPerB10 = %d, want 100000000", SparksPerB10)
+	}
+	const wantCapSparks = 21_000_000 * SparksPerB10
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		if g.Params.TotalSupplySparks != wantCapSparks {
+			t.Fatalf("%s: TotalSupplySparks = %d, want %d",
+				g.Params.ChainID, g.Params.TotalSupplySparks, wantCapSparks)
+		}
 	}
 }
 
@@ -2058,6 +2183,14 @@ func TestValidateRejectsBadGenesis(t *testing.T) {
 	g.Validators[0].PubKey = []byte{1, 2, 3}
 	if err := g.Validate(); err == nil {
 		t.Fatal("expected an error for a malformed validator key")
+	}
+}
+
+func TestValidateRejectsChainIDMismatch(t *testing.T) {
+	g := Devnet()
+	g.Params.ChainID = "some-other-chain"
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis, got %v", err)
 	}
 }
 
@@ -2202,7 +2335,8 @@ func (g *Genesis) Hash() [32]byte {
 // ever be produced for it. Coins can only leave this account through the
 // protocol's claim rule.
 func (g *Genesis) FaucetAddress() types.Address {
-	h := crypto.HashParts([]byte("b10coin-faucet"), g.Hash()[:])
+	gh := g.Hash()
+	h := crypto.HashParts([]byte("b10coin-faucet"), gh[:])
 	var a types.Address
 	copy(a[:], h[:types.AddressSize])
 	return a
@@ -2212,6 +2346,12 @@ func (g *Genesis) FaucetAddress() types.Address {
 func (g *Genesis) Validate() error {
 	if g.ChainID == "" {
 		return fmt.Errorf("%w: empty chain ID", ErrBadGenesis)
+	}
+	// ChainID is duplicated on Genesis and Params; a mismatch would let a
+	// genesis describe two different chains at once.
+	if g.Params.ChainID != g.ChainID {
+		return fmt.Errorf("%w: Params.ChainID %q does not match ChainID %q",
+			ErrBadGenesis, g.Params.ChainID, g.ChainID)
 	}
 	// An empty validator set is legal: the testnet genesis is defined before
 	// any operator keys exist. Such a chain simply cannot advance, because
@@ -2437,7 +2577,7 @@ truth; these exist for review):
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `go test ./internal/genesis/ -v`
-Expected: PASS for all eleven tests.
+Expected: PASS for all fourteen tests.
 
 - [ ] **Step 7: Commit**
 
@@ -2454,7 +2594,7 @@ git commit -m "feat: add genesis parameters, keyless faucet address, and no-prem
 - Create: `internal/store/store.go`, `internal/store/store_test.go`
 
 **Interfaces:**
-- Consumes: `types.NewEncoder`, `types.Decoder`
+- Consumes: nothing from other b10coin packages — the store deals in opaque `[]byte` and imports the standard library only
 - Produces:
   - `const BlocksPerSegment = 1000`
   - `type Store struct{}` with `Open(dir string) (*Store, error)`, `(*Store) Append(height uint64, payload []byte) error`, `(*Store) Read(height uint64) ([]byte, error)`, `(*Store) Height() (uint64, bool)`, `(*Store) Close() error`
@@ -2571,6 +2711,10 @@ func TestTruncatedTailIsDiscardedOnOpen(t *testing.T) {
 	s.Close()
 
 	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	good, err := os.Stat(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f, err := os.OpenFile(seg, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -2594,6 +2738,15 @@ func TestTruncatedTailIsDiscardedOnOpen(t *testing.T) {
 	if _, err := s2.Read(3); err != nil {
 		t.Fatalf("good records must survive: %v", err)
 	}
+	// The partial record must be cut out of the file itself, not merely
+	// skipped by the index; otherwise the next segment write lands after it.
+	dropped, err := os.Stat(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped.Size() != good.Size() {
+		t.Fatalf("Open left the partial tail in place: size = %d, want %d", dropped.Size(), good.Size())
+	}
 }
 
 // A corrupted payload must be detected by the checksum.
@@ -2610,7 +2763,7 @@ func TestCorruptPayloadIsDetected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[len(raw)-3] ^= 0xFF // flip a payload byte, leaving it intact in length
+	raw[2] ^= 0xFF // flip a payload byte; the length stays intact, so only the checksum can catch this
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2643,6 +2796,171 @@ func TestSegmentRolloverAtBlocksPerSegment(t *testing.T) {
 		t.Fatalf("expected a second segment file, got %d files", len(entries))
 	}
 }
+
+// Beyond the brief's eight tests: binding constraint check. A damaged record
+// in a NON-final segment is genuine corruption — earlier segments are closed,
+// so no crash could have cut a record there — and must fail Open instead of
+// being truncated away like a crashed tail.
+func TestCorruptRecordInEarlierSegmentFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(1); h <= BlocksPerSegment+2; h++ {
+		if err := s.Append(h, []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Heights 1..999 live in segment 0, which is non-final here because
+	// segment 1 already holds heights 1000..1002.
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[1] ^= 0xFF // corrupt the first record's payload byte, keeping the length valid
+	if err := os.WriteFile(seg, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("corruption in a non-final segment must fail Open with ErrCorruptRecord, got %v", err)
+	}
+}
+
+// A complete record with a bad checksum followed by a partial trailing record
+// is the layout that exposed a height-renumbering bug in recovery: the corrupt
+// record's bytes must NOT survive while the in-memory height is rewound. The
+// repair must keep the corrupt record at its own height, so that appending on
+// top and reopening yields the same heights.
+func TestCorruptCompleteRecordThenPartialTailKeepsHeights(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(1, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(2, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record 1 occupies bytes 0..7 (varint len + payload + crc32), so record 2
+	// starts at 8 and its payload begins at 9.
+	raw[9] ^= 0xFF
+	// Append a truncated trailing record: a length prefix claiming 64 bytes
+	// with only 3 following.
+	raw = append(raw, 64, 1, 2, 3)
+	if err := os.WriteFile(seg, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open after repair must succeed: %v", err)
+	}
+	h, _ := s2.Height()
+	if h != 2 {
+		t.Fatalf("repaired Height() = %d, want 2 - the corrupt complete record keeps its own height", h)
+	}
+	if _, err := s2.Read(2); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("Read(2) = %v, want ErrCorruptRecord", err)
+	}
+	if err := s2.Append(3, []byte("three")); err != nil {
+		t.Fatal(err)
+	}
+	s2.Close()
+
+	s3, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	if h3, _ := s3.Height(); h3 != 3 {
+		t.Fatalf("reopened Height() = %d, want 3 - heights were renumbered", h3)
+	}
+	if b, err := s3.Read(3); err != nil || string(b) != "three" {
+		t.Fatalf("Read(3) = %q, %v; want \"three\", nil", b, err)
+	}
+}
+
+// Read must return a copy: mutating the returned slice must not corrupt the
+// store's view of the recorded bytes.
+func TestReadReturnsACopy(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Append(1, []byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got[0] = 'Z'
+	again, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != "abcdef" {
+		t.Fatalf("mutation of a returned slice changed the store: got %q", again)
+	}
+}
+
+// The layout admits a zero-length payload (a 5-byte record): an empty payload
+// must round-trip, and Read must hand back a non-nil, zero-length slice.
+func TestZeroLengthPayloadRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(1, []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(2, []byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Read(1); err != nil {
+		t.Fatal(err)
+	} else if got == nil || len(got) != 0 {
+		t.Fatalf("fresh Read(1) = %#v (len %d), want non-nil zero-length slice", got, len(got))
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if got, err := s2.Read(1); err != nil {
+		t.Fatal(err)
+	} else if got == nil || len(got) != 0 {
+		t.Fatalf("reopened Read(1) = %#v (len %d), want non-nil zero-length slice", got, len(got))
+	}
+	if h, ok := s2.Height(); !ok || h != 2 {
+		t.Fatalf("reopened Height() = %d, %v; want 2, true", h, ok)
+	}
+	if b, err := s2.Read(2); err != nil || string(b) != "after" {
+		t.Fatalf("Read(2) = %q, %v; want \"after\", nil", b, err)
+	}
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2659,11 +2977,15 @@ Create `internal/store/store.go`:
 //
 // Record layout:
 //
-//	varint(len(payload)) || payload || uint32be(crc32c(payload))
+//	uvarint(len(payload)) || payload || uint32be(crc32c(payload))
 //
-// Open scans the final segment and truncates a partial or corrupt trailing
-// record. That is what makes a crash mid-write survivable: the node restarts,
-// re-syncs from the last good block, and loses nothing already committed.
+// Open scans the final segment and truncates any partial trailing record:
+// that is what makes a crash mid-write survivable. The node restarts,
+// re-syncs from the last good block, and loses nothing already committed. A
+// structurally complete record whose checksum fails is indexed but never
+// trusted: Read reports it as ErrCorruptRecord instead of silently dropping
+// committed heights. A damaged record in any non-final segment is genuine
+// corruption and fails Open.
 package store
 
 import (
@@ -2688,15 +3010,19 @@ var (
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
-// Store is an append-only block log.
+// Store is an append-only block log over opaque payloads.
 type Store struct {
 	dir   string
-	file  *os.File
-	last  uint64
+	file  *os.File // append handle on the segment receiving writes
+	last  uint64   // highest height present, corrupt ones included
 	have  bool
-	index map[uint64]int64 // height -> offset within its segment
+	index map[uint64]int64 // height -> record offset within its segment
 }
 
+// segmentName maps a height to the segment file holding it. Names are
+// zero-padded, so lexical order is height order — but only while segment
+// indices fit in 8 digits (height < 10^11): wider indices print unpadded and
+// no longer sort lexicographically.
 func segmentName(height uint64) string {
 	return fmt.Sprintf("%08d.seg", height/BlocksPerSegment)
 }
@@ -2726,7 +3052,7 @@ func (s *Store) segmentPath() string {
 	return filepath.Join(s.dir, segmentName(0))
 }
 
-// scan rebuilds the index from disk and truncates any damaged tail.
+// scan rebuilds the index from disk and repairs the final segment's tail.
 func (s *Store) scan() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -2738,54 +3064,69 @@ func (s *Store) scan() error {
 			segs = append(segs, e.Name())
 		}
 	}
-	// File names are zero-padded, so lexical order is height order.
 	slices.Sort(segs)
 
 	for si, name := range segs {
-		path := filepath.Join(s.dir, name)
-		raw, err := os.ReadFile(path)
-		if err != nil {
+		if err := s.scanSegment(name, si == len(segs)-1); err != nil {
 			return err
-		}
-		off := int64(0)
-		i := 0
-		lastSegment := si == len(segs)-1
-		for i < len(raw) {
-			n, m := binary.Uvarint(raw[i:])
-			if m <= 0 {
-				if lastSegment {
-					return s.truncate(path, off)
-				}
-				return fmt.Errorf("%w: bad length in %s", ErrCorruptRecord, name)
-			}
-			total := int64(m) + int64(n) + 4
-			if off+total > int64(len(raw)) {
-				if lastSegment {
-					return s.truncate(path, off)
-				}
-				return fmt.Errorf("%w: truncated record in %s", ErrCorruptRecord, name)
-			}
-			payloadStart := i + m
-			payload := raw[payloadStart : payloadStart+int(n)]
-			want := binary.BigEndian.Uint32(raw[payloadStart+int(n) : payloadStart+int(n)+4])
-			if crc32.Checksum(payload, crcTable) != want {
-				if lastSegment {
-					return s.truncate(path, off)
-				}
-				return fmt.Errorf("%w: in %s", ErrCorruptRecord, name)
-			}
-			height := s.last + 1
-			s.index[height] = off
-			s.last = height
-			s.have = true
-			off += total
-			i += int(total)
 		}
 	}
 	return nil
 }
 
-func (s *Store) truncate(path string, size int64) error {
+// scanSegment walks one segment record by record. Earlier segments are
+// closed, so a damaged record there is real corruption and fails Open; the
+// final segment is the only place a crash could have cut a record, so its
+// tail is repaired instead: a partial trailing record is truncated away, and
+// a complete record with a bad checksum keeps its index slot for Read to
+// reject.
+func (s *Store) scanSegment(name string, final bool) error {
+	path := filepath.Join(s.dir, name)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	off := int64(0)
+	for off < int64(len(raw)) {
+		n, m := binary.Uvarint(raw[off:])
+		// A length prefix beyond the file cannot be a valid record and
+		// would overflow the arithmetic below.
+		if m <= 0 || n > uint64(len(raw)) {
+			if final {
+				return s.truncateTail(path, off)
+			}
+			return fmt.Errorf("%w: bad length prefix in %s at offset %d", ErrCorruptRecord, name, off)
+		}
+		recEnd := off + int64(m) + int64(n) + 4
+		if recEnd > int64(len(raw)) {
+			if final {
+				return s.truncateTail(path, off)
+			}
+			return fmt.Errorf("%w: truncated record in %s at offset %d", ErrCorruptRecord, name, off)
+		}
+		payStart := off + int64(m)
+		payload := raw[payStart : payStart+int64(n) : payStart+int64(n)]
+		want := binary.BigEndian.Uint32(raw[payStart+int64(n) : recEnd])
+		corrupt := crc32.Checksum(payload, crcTable) != want
+		if corrupt && !final {
+			return fmt.Errorf("%w: checksum mismatch in %s at offset %d", ErrCorruptRecord, name, off)
+		}
+		h := s.last + 1
+		s.index[h] = off
+		s.last = h
+		s.have = true
+		off = recEnd
+	}
+	return nil
+}
+
+// truncateTail cuts a partial trailing record off the file. It deliberately
+// does NOT rewind s.last or drop index slots: every indexed record starts
+// BEFORE size (the partial record was never indexed), so a complete-but-corrupt
+// record keeps its height and Read reports ErrCorruptRecord for it. Rewinding
+// here would leave that record's bytes on disk while claiming a lower height,
+// and the next reopen would re-read them and renumber every height after.
+func (s *Store) truncateTail(path string, size int64) error {
 	return os.Truncate(path, size)
 }
 
@@ -2799,21 +3140,20 @@ func (s *Store) Append(height uint64, payload []byte) error {
 		return fmt.Errorf("%w: got %d, want %d", ErrBadHeight, height, want)
 	}
 
-	// Roll to a new segment before writing across a boundary.
+	// Roll to a new segment before writing across a boundary. Open the new
+	// segment before closing the old handle, and swap only on success, so a
+	// failed rollover leaves s.file on an open handle rather than a closed one.
 	if s.have && segmentName(height) != segmentName(s.last) {
-		if err := s.file.Close(); err != nil {
-			return err
-		}
 		f, err := os.OpenFile(filepath.Join(s.dir, segmentName(height)),
 			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
 		}
+		if err := s.file.Close(); err != nil {
+			f.Close()
+			return err
+		}
 		s.file = f
-		s.last = height
-		s.have = true
-		s.index[height] = 0
-		return writeRecord(s.file, payload)
 	}
 
 	off, err := s.file.Seek(0, io.SeekEnd)
@@ -2821,6 +3161,9 @@ func (s *Store) Append(height uint64, payload []byte) error {
 		return err
 	}
 	if err := writeRecord(s.file, payload); err != nil {
+		// Cut a partial record back off so later appends start clean; the
+		// next Open also self-heals if this truncate fails.
+		_ = s.file.Truncate(off)
 		return err
 	}
 	s.index[height] = off
@@ -2846,7 +3189,7 @@ func writeRecord(f *os.File, payload []byte) error {
 	return f.Sync()
 }
 
-// Read returns the payload stored at height.
+// Read returns a copy of the payload stored at height.
 func (s *Store) Read(height uint64) ([]byte, error) {
 	off, ok := s.index[height]
 	if !ok {
@@ -2890,7 +3233,7 @@ func (s *Store) Close() error {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `go test ./internal/store/ -v`
-Expected: PASS for all eight tests.
+Expected: PASS for all twelve tests.
 
 - [ ] **Step 5: Commit**
 
@@ -2902,6 +3245,22 @@ git commit -m "feat: add crash-tolerant append-only block store"
 ---
 
 ### Task 10: Chain — build, validate, append, replay
+
+> **As-built corrections (controller, after review).** This task's fragments
+> were superseded during implementation. The reference is now
+> `internal/chain/chain.go` and `internal/chain/chain_test.go` themselves.
+> Corrections applied after review, all reflected in the code:
+> 1. `TestAppendRejectsTamperedStateRoot` must RE-SIGN the tampered header —
+>    otherwise the signature check rejects first and the state-root guard is
+>    never reached.
+> 2. `TestAppendRejectsForgedSignature` was added: the pre-existing test only
+>    cleared `Sig`, so `crypto.Verify` could be deleted with the whole suite
+>    still green (controller-verified with a compiling mutant).
+> 3. `TestReplayRebuildsIdenticalState` now includes a real signed transfer;
+>    with only empty blocks every stored root equalled the genesis root, so
+>    the durability guarantee never compared re-derived transaction effects.
+> 4. `Open` closes the store on its replay-failure paths, and `Append`/`Head`
+>    document that a caller must not mutate a block after appending it.
 
 **Files:**
 - Create: `internal/chain/chain.go`, `internal/chain/chain_test.go`
@@ -2933,10 +3292,8 @@ import (
 func devChain(t *testing.T) (*Chain, ed25519.PrivateKey) {
 	t.Helper()
 	g := genesis.Devnet()
-	_, priv, err := devKey()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// devKey never errors: it returns a deterministic devnet key.
+	_, priv := devKey()
 	c, err := Open(g, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -3008,7 +3365,13 @@ func TestAppendRejectsWrongHeight(t *testing.T) {
 func TestAppendRejectsTamperedStateRoot(t *testing.T) {
 	c, priv := devChain(t)
 	b, _ := c.Build(priv, nil, 1_700_000_100)
+	// Tamper the root and RE-SIGN it, modelling a validator that signs a state
+	// root it did not compute. Without the re-signature the signature check
+	// rejects the block first and this test passes for the wrong reason,
+	// never reaching the state-root guard it names.
 	b.Header.StateRoot = crypto.HashParts([]byte("fabricated"))
+	headerHash := b.Header.SigningHash()
+	b.Sig = crypto.Sign(priv, headerHash[:])
 	if err := c.Append(b); !errors.Is(err, ErrBadStateRoot) {
 		t.Fatalf("expected ErrBadStateRoot, got %v", err)
 	}
@@ -3018,6 +3381,26 @@ func TestAppendRejectsUnsignedOrForgedHeader(t *testing.T) {
 	c, priv := devChain(t)
 	b, _ := c.Build(priv, nil, 1_700_000_100)
 	b.Sig = nil
+	if err := c.Append(b); !errors.Is(err, ErrBadProposerSig) {
+		t.Fatalf("expected ErrBadProposerSig, got %v", err)
+	}
+}
+
+// A block whose header was altered after signing must be rejected by the
+// signature check ITSELF. This is the only test that reaches crypto.Verify in
+// Append: the test above only clears Sig, which the nil check catches first,
+// so deleting the verification call left the whole suite green.
+func TestAppendRejectsForgedSignature(t *testing.T) {
+	c, priv := devChain(t)
+	b, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate a signed header field WITHOUT re-signing. The timestamp stays
+	// positive so ValidateStructure still passes, and parent, height and
+	// validator membership are unaffected, so only the signature check can
+	// reject this.
+	b.Header.Timestamp = 1_700_000_101
 	if err := c.Append(b); !errors.Is(err, ErrBadProposerSig) {
 		t.Fatalf("expected ErrBadProposerSig, got %v", err)
 	}
@@ -3062,18 +3445,39 @@ func TestChainWithoutValidatorsCannotAdvance(t *testing.T) {
 func TestReplayRebuildsIdenticalState(t *testing.T) {
 	dir := t.TempDir()
 	g := genesis.Devnet()
-	_, priv, err := devKey()
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, priv := devKey()
+
+	fromPub := g.DevAccounts[0].PubKey
+	toPub := g.DevAccounts[1].PubKey
+	from := types.AddressFromPub(fromPub)
+	to := types.AddressFromPub(toPub)
+	// The devnet validator key is not the dev account key, so txs are
+	// signed with the dev account's deterministic key.
+	devPriv := devPrivateKey(t)
 
 	c, err := Open(g, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	genesisRoot := c.State().Root()
+
 	var roots [][32]byte
 	for h := 1; h <= 5; h++ {
-		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		// Block h pays h b10 from dev account 0 to dev account 1. The
+		// nonce is the account's current replay counter, so each block's
+		// transfer chains onto the previous one's effect.
+		tx := &types.Tx{
+			Type:   types.TxTransfer,
+			From:   from,
+			PubKey: fromPub,
+			Nonce:  c.State().Get(from).Nonce,
+			To:     to,
+			Amount: uint64(h) * genesis.SparksPerB10,
+		}
+		sigHash := tx.SigningHash()
+		tx.Sig = crypto.Sign(devPriv, sigHash[:])
+
+		b, err := c.Build(priv, []types.Tx{*tx}, int64(1_700_000_000+h))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3099,6 +3503,12 @@ func TestReplayRebuildsIdenticalState(t *testing.T) {
 	}
 	if c2.State().Root() != roots[len(roots)-1] {
 		t.Fatal("replayed state root differs from the stored header")
+	}
+	// Without this the test could pass with blocks that carry no txs at
+	// all: the root-differs assertion is what proves replay re-derived
+	// transaction effects from the stored blocks.
+	if c2.State().Root() == genesisRoot {
+		t.Fatal("replayed state root equals the genesis root after five real transfers; replay did not re-derive transaction effects")
 	}
 }
 
@@ -3126,7 +3536,8 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 		To:     to,
 		Amount: 250 * genesis.SparksPerB10,
 	}
-	tx.Sig = crypto.Sign(devPriv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(devPriv, sigHash[:])
 
 	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
 	if err != nil {
@@ -3145,20 +3556,43 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 }
 
 // Total supply must be conserved by transfers.
+// Total supply must be conserved BY A REAL TRANSFER: value moves between
+// accounts and none is created. The original version of this test built a
+// block with the dev ACCOUNT key, discarded it, and asserted supply was
+// unchanged - and since Build never mutates state, it could not fail for the
+// reason it named.
 func TestTotalSupplyIsConserved(t *testing.T) {
-	c, _ := devChain(t)
+	c, priv := devChain(t)
 	before := c.State().TotalBalance()
 	if before == 0 {
 		t.Fatal("devnet should start with funds")
 	}
-	// Apply an empty block; supply must be unchanged.
-	b, err := c.Build(devPrivateKey(t), nil, 1_700_000_100)
+
+	g := c.Genesis()
+	fromPub := g.DevAccounts[0].PubKey
+	toPub := g.DevAccounts[1].PubKey
+	from := types.AddressFromPub(fromPub)
+
+	tx := &types.Tx{
+		Type:   types.TxTransfer,
+		From:   from,
+		PubKey: fromPub,
+		Nonce:  c.State().Get(from).Nonce,
+		To:     types.AddressFromPub(toPub),
+		Amount: 123 * genesis.SparksPerB10,
+	}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(devPrivateKey(t), sigHash[:])
+
+	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = b
-	if c.State().TotalBalance() != before {
-		t.Fatal("supply changed without transactions")
+	if err := c.Append(b); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.State().TotalBalance(); got != before {
+		t.Fatalf("supply changed across a transfer: %d -> %d", before, got)
 	}
 }
 ```
@@ -3379,7 +3813,11 @@ func (c *Chain) Append(b *types.Block) error {
 	if !c.isValidator(b.Header.Proposer) {
 		return ErrNotValidator
 	}
-	if b.Sig == nil || !crypto.Verify(b.Header.Proposer, b.Header.SigningHash()[:], b.Sig) {
+	if b.Sig == nil {
+		return ErrBadProposerSig
+	}
+	headerHash := b.Header.SigningHash()
+	if !crypto.Verify(b.Header.Proposer, headerHash[:], b.Sig) {
 		return ErrBadProposerSig
 	}
 
@@ -3387,9 +3825,9 @@ func (c *Chain) Append(b *types.Block) error {
 	if err != nil {
 		return err
 	}
-	if next.Root() != b.Header.StateRoot {
+	if computed := next.Root(); computed != b.Header.StateRoot {
 		return fmt.Errorf("%w: computed %x, header claims %x",
-			ErrBadStateRoot, next.Root()[:8], b.Header.StateRoot[:8])
+			ErrBadStateRoot, computed[:8], b.Header.StateRoot[:8])
 	}
 
 	if err := c.store.Append(b.Header.Height, b.Encode()); err != nil {
@@ -3439,7 +3877,8 @@ extend `DecodeBlock` to read it back:
 before the `return b, nil`:
 
 ```go
-	b.Sig = crypto.Sign(proposer, b.Header.SigningHash()[:])
+	headerHash := b.Header.SigningHash()
+	b.Sig = crypto.Sign(proposer, headerHash[:])
 ```
 
 Also add this test to guard that the signature is over the header only:
@@ -3470,6 +3909,22 @@ git commit -m "feat: add chain build, validation, append and replay"
 ---
 
 ### Task 11: Mempool, HTTP RPC, and node loop
+
+> **As-built corrections (controller, after review).** The reference is now
+> `internal/mempool`, `internal/rpc` and `internal/node` themselves. Corrections
+> applied after review:
+> 1. `Mempool` and `Chain` carry mutexes. The RPC server reads the chain while
+>    the node loop appends to it; `-race` flagged this as a genuine data race
+>    (`Append` vs `Head`), and `cmdNode` runs both concurrently.
+> 2. `RunOnce` filters the batch it took against a state clone. `Take` has
+>    already drained the mempool, so without the filter one state-invalid
+>    transaction discards every valid transaction beside it and no block is
+>    produced — the node wedges (probe: `mempool=2 -> 0, height=0`). Valid
+>    transactions are re-added if `Build` or `Append` fails.
+> 3. `TestTxEndpointAcceptsValidTx` asserts the transaction reached the mempool
+>    via `/status`, not merely that the response was 200.
+> 4. `BlockAt(0)` re-synthesises the genesis block: genesis is never on disk.
+> 5. `RunOnce`'s doc comment does not claim it returns nil when idle.
 
 **Files:**
 - Create: `internal/mempool/mempool.go`, `internal/mempool/mempool_test.go`, `internal/rpc/server.go`, `internal/rpc/server_test.go`, `internal/node/node.go`, `internal/node/node_test.go`
@@ -3513,7 +3968,8 @@ func mkTx(t *testing.T, nonce uint64) types.Tx {
 		To:     types.AddressFromPub(otherPub),
 		Amount: 1,
 	}
-	tx.Sig = crypto.Sign(priv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return *tx
 }
 
@@ -3682,8 +4138,10 @@ import (
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/chain"
+	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/mempool"
+	"github.com/cti97/b10coincom/internal/types"
 )
 
 func testServer(t *testing.T) (*Server, *httptest.Server) {
@@ -3762,6 +4220,32 @@ func TestTxEndpointRejectsGarbage(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
+}
+
+// buildSignedTx returns a valid transfer signed by a fresh key. The RPC
+// endpoint only decodes a transaction and verifies its signature - it never
+// checks balances - so an unfunded key is sufficient here.
+func buildSignedTx(t *testing.T) *types.Tx {
+	t.Helper()
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherPub, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &types.Tx{
+		Type:   types.TxTransfer,
+		From:   types.AddressFromPub(pub),
+		PubKey: pub,
+		Nonce:  0,
+		To:     types.AddressFromPub(otherPub),
+		Amount: 1,
+	}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+	return tx
 }
 
 func TestTxEndpointAcceptsValidTx(t *testing.T) {
@@ -4114,7 +4598,8 @@ func TestRunOnceIncludesMempoolTransactions(t *testing.T) {
 		To:     types.AddressFromPub(toPub),
 		Amount: 10 * genesis.SparksPerB10,
 	}
-	tx.Sig = crypto.Sign(fromPriv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 
 	mp := mempool.New(100)
 	if err := mp.Add([]types.Tx{*tx})[0]; err != nil {
@@ -4165,7 +4650,7 @@ git commit -m "feat: add mempool, HTTP RPC and single-node block production"
 **Interfaces:**
 - Consumes: everything above
 - Produces:
-  - `devnet.Options struct { Dir string; Blocks uint64; Verbose bool }`
+  - `devnet.Options struct { Dir string; Blocks uint64 }`
   - `devnet.Run(Options) (Summary, error)`, `devnet.Summary struct { Height uint64; StateRoot [32]byte; TxsIncluded int }`
   - CLI: `b10coin devnet --blocks N [--dir D]`, `b10coin node --dir D --block-time 2s`
 
@@ -4283,9 +4768,8 @@ var ErrNoBlocks = errors.New("devnet: Blocks must be greater than zero")
 
 // Options configures a devnet run.
 type Options struct {
-	Dir     string
-	Blocks  uint64
-	Verbose bool
+	Dir    string
+	Blocks uint64
 }
 
 // Summary reports what a run produced.
@@ -4367,7 +4851,8 @@ func devTransfer(c *chain.Chain, amount uint64) (*types.Tx, error) {
 		To:     types.AddressFromPub(toPub),
 		Amount: amount,
 	}
-	tx.Sig = crypto.Sign(fromPriv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 	return tx, nil
 }
 
@@ -4447,7 +4932,6 @@ func cmdDevnet(args []string) error {
 	fs := flag.NewFlagSet("devnet", flag.ExitOnError)
 	blocks := fs.Uint64("blocks", 100, "number of blocks to produce")
 	dir := fs.String("dir", "", "data directory (default: a fresh temporary directory)")
-	verbose := fs.Bool("verbose", false, "print per-run detail")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -4460,7 +4944,7 @@ func cmdDevnet(args []string) error {
 		*dir = d
 	}
 
-	summary, err := devnet.Run(devnet.Options{Dir: *dir, Blocks: *blocks, Verbose: *verbose})
+	summary, err := devnet.Run(devnet.Options{Dir: *dir, Blocks: *blocks})
 	if err != nil {
 		return err
 	}

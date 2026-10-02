@@ -299,7 +299,7 @@ exotic dependencies**.
 | Signatures | Ed25519 |
 | Hashing / Merkle tree | BLAKE3 |
 | Faucet puzzle | Argon2id (memory-hard) |
-| Addresses | `prefix + base32(BLAKE3(pubkey)[0..20])` with a checksum |
+| Addresses | `"b10" + base32(payload ‖ checksum)`, where `payload = BLAKE3("b10coin-address" ‖ pubkey)[0..20]` and `checksum = BLAKE3("b10coin-checksum" ‖ payload)[0..4]`, base32 is RFC4648 lowercase unpadded, and `‖` denotes domain-separated framing via `HashParts` (each part length-prefixed), NOT bare concatenation |
 | Node identity | same keypair as the validator key |
 
 ### 6.8 Storage

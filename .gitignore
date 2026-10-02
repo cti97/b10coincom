@@ -29,3 +29,9 @@ coverage.out
 .DS_Store
 .idea/
 .vscode/
+
+# SDD controller scratch: ledger, task briefs, reports and build caches.
+.superpowers/
+
+# Node data directory created by `b10coin node` (regenerable).
+/b10coin-data/

@@ -1,0 +1,17 @@
+{
+  "chain_id": "b10coin-devnet-1",
+  "note": "DEVNET TEST FIXTURE. The dev_accounts below are for exercising transfers before the M2 faucet exists. Never replicate this in testnet.",
+  "validators": 1,
+  "dev_accounts": 2,
+  "params": {
+    "block_time_ms": 2000,
+    "total_supply_sparks": 2100000000000000,
+    "initial_reward_sparks": 50000000,
+    "halving_interval_blocks": 21000000,
+    "claim_amount_sparks": 10000000000,
+    "min_stake_sparks": 100000000000,
+    "epoch_blocks": 10000,
+    "unbonding_epochs": 2,
+    "committee_size": 1
+  }
+}
