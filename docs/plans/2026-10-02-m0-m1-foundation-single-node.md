@@ -2185,6 +2185,14 @@ func TestValidateRejectsBadGenesis(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsChainIDMismatch(t *testing.T) {
+	g := Devnet()
+	g.Params.ChainID = "some-other-chain"
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis, got %v", err)
+	}
+}
+
 func TestEmissionMathReachesExactlyTheSupplyCap(t *testing.T) {
 	for _, g := range []*Genesis{Devnet(), Testnet()} {
 		p := g.Params
