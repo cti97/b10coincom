@@ -2078,6 +2078,7 @@ Create `internal/genesis/genesis_test.go`:
 package genesis
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -2576,7 +2577,7 @@ truth; these exist for review):
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `go test ./internal/genesis/ -v`
-Expected: PASS for all twelve tests.
+Expected: PASS for all fourteen tests.
 
 - [ ] **Step 7: Commit**
 
