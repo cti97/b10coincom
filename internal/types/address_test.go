@@ -53,13 +53,23 @@ func TestAddressDiffersForDifferentKeys(t *testing.T) {
 
 func TestParseAddressRejectsTamperedChecksum(t *testing.T) {
 	s := AddressFromPub(randomPub(t)).String()
-	// Flip the final character to a different valid base32 symbol.
-	last := s[len(s)-1]
+
+	// Tamper the FIRST body character, not the last. A 24-byte payload
+	// encodes to 39 base32 characters and only the final character carries
+	// padding bits (2 data bits + 3 zero padding bits): flipping its low
+	// padding bit, as the original version of this test did, produces a
+	// string that decodes to the byte-identical payload, the checksum
+	// legitimately matches, and for addresses whose last character happens
+	// to be 'a' the test failed spuriously. Every other character in the
+	// body carries five data bits, so replacing the first body character
+	// with any different base32 symbol always changes the decoded payload
+	// and the stored checksum can no longer match.
+	first := s[len(AddressPrefix)]
 	repl := byte('a')
-	if last == 'a' {
+	if first == 'a' {
 		repl = 'b'
 	}
-	tampered := s[:len(s)-1] + string(repl)
+	tampered := s[:len(AddressPrefix)] + string(repl) + s[len(AddressPrefix)+1:]
 
 	if _, err := ParseAddress(tampered); !errors.Is(err, ErrBadAddress) {
 		t.Fatalf("expected ErrBadAddress for tampered checksum, got %v", err)
@@ -67,7 +77,11 @@ func TestParseAddressRejectsTamperedChecksum(t *testing.T) {
 }
 
 func TestParseAddressRejectsBadInput(t *testing.T) {
-	for _, in := range []string{"", "xyz", "b10", "b10!!!!", strings.ToUpper(AddressFromPub(randomPub(t)).String())} {
+	// A 20-byte body is valid base32 and decodes cleanly, so this is the one
+	// current input that reaches the decoded-length check; every other input
+	// below is rejected earlier, at the prefix check or the base32 decode.
+	wrongLength := AddressPrefix + strings.ToLower(b32.EncodeToString(make([]byte, 20)))
+	for _, in := range []string{"", "xyz", "b10", "b10!!!!", strings.ToUpper(AddressFromPub(randomPub(t)).String()), wrongLength} {
 		if _, err := ParseAddress(in); !errors.Is(err, ErrBadAddress) {
 			t.Fatalf("ParseAddress(%q): expected ErrBadAddress, got %v", in, err)
 		}
