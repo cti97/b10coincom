@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/genesis"
@@ -25,8 +26,18 @@ var (
 	ErrUnknownProposer = errors.New("chain: cannot determine proposer key")
 )
 
-// Chain is a validated, durably-stored block sequence.
+// Chain is a validated, durably-stored block sequence. It is safe for
+// concurrent use: mu guards state and head, because one process may serve
+// the RPC server (reading Height/Head/State/Genesis/BlockAt) while the node
+// loop appends. No exported method may be called while its own lock is
+// already held — every mutator works on unexported fields directly.
+//
+// Returning *types.Block and *state.State under a read lock is sound: an
+// appended block is never mutated again (see Head), and state.ApplyBlock
+// returns a NEW State without touching its receiver, so published states are
+// immutable after Open.
 type Chain struct {
+	mu    sync.RWMutex
 	gen   *genesis.Genesis
 	store *store.Store
 	state *state.State
@@ -110,16 +121,34 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 	return c, nil
 }
 
-func (c *Chain) Genesis() *genesis.Genesis { return c.gen }
-func (c *Chain) Height() uint64            { return c.head.Header.Height }
+func (c *Chain) Genesis() *genesis.Genesis {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gen
+}
+
+func (c *Chain) Height() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.head.Header.Height
+}
 
 // Head returns the current head block. Append retains the caller's
 // *types.Block as the head and this method hands that same pointer back, so
 // a caller must not mutate a block after appending it: doing so silently
 // changes Height()/Head().ID() without any store write. Returned blocks are
 // therefore immutable by contract.
-func (c *Chain) Head() *types.Block  { return c.head }
-func (c *Chain) State() *state.State { return c.state }
+func (c *Chain) Head() *types.Block {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.head
+}
+
+func (c *Chain) State() *state.State {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.state
+}
 
 // isValidator reports whether pub is in the genesis validator set.
 func (c *Chain) isValidator(pub []byte) bool {
@@ -134,6 +163,8 @@ func (c *Chain) isValidator(pub []byte) bool {
 // Build constructs and signs a candidate block. It does not mutate the
 // chain: the caller decides whether to Append.
 func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int64) (*types.Block, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	pub, ok := proposer.Public().(ed25519.PublicKey)
 	if !ok {
 		return nil, ErrUnknownProposer
@@ -144,7 +175,7 @@ func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int
 	}
 	b := &types.Block{
 		Header: types.Header{
-			Height:     c.Height() + 1,
+			Height:     c.head.Header.Height + 1,
 			ParentHash: c.head.ID(),
 			StateRoot:  next.Root(),
 			TxRoot:     types.ComputeTxRoot(txs),
@@ -162,7 +193,15 @@ func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int
 }
 
 // applyValidated applies a block whose structure is already trusted.
+// Write-locked; the unlocked body lives in applyValidatedLocked so Append can
+// reuse it while holding the lock.
 func (c *Chain) applyValidated(b *types.Block) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.applyValidatedLocked(b)
+}
+
+func (c *Chain) applyValidatedLocked(b *types.Block) error {
 	next, err := c.state.ApplyBlock(b.Txs)
 	if err != nil {
 		return err
@@ -182,11 +221,13 @@ func (c *Chain) applyValidated(b *types.Block) error {
 // mutating the retained block silently changes Height()/Head().ID() with no
 // store write, leaving the stored bytes behind the chain's in-memory view.
 func (c *Chain) Append(b *types.Block) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if b.Header.ParentHash != c.head.ID() {
 		return ErrBadParent
 	}
-	if b.Header.Height != c.Height()+1 {
-		return fmt.Errorf("%w: got %d, want %d", ErrBadHeight, b.Header.Height, c.Height()+1)
+	if b.Header.Height != c.head.Header.Height+1 {
+		return fmt.Errorf("%w: got %d, want %d", ErrBadHeight, b.Header.Height, c.head.Header.Height+1)
 	}
 	if err := b.ValidateStructure(); err != nil {
 		return err
@@ -224,10 +265,13 @@ func (c *Chain) Append(b *types.Block) error {
 // store deliberately never holds (store heights start at 1): it is
 // re-synthesised from the genesis configuration exactly as Open built it.
 func (c *Chain) BlockAt(height uint64) (*types.Block, error) {
-	if height > c.Height() {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	headHeight := c.head.Header.Height
+	if height > headHeight {
 		return nil, fmt.Errorf("%w: %d", store.ErrNotFound, height)
 	}
-	if height == c.Height() {
+	if height == headHeight {
 		return c.head, nil
 	}
 	if height == 0 {
@@ -244,4 +288,8 @@ func (c *Chain) BlockAt(height uint64) (*types.Block, error) {
 	return types.DecodeBlock(raw)
 }
 
-func (c *Chain) Close() error { return c.store.Close() }
+func (c *Chain) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.Close()
+}

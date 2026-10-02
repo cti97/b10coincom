@@ -4,6 +4,7 @@ package mempool
 
 import (
 	"errors"
+	"sync"
 
 	"github.com/cti97/b10coincom/internal/types"
 )
@@ -13,9 +14,13 @@ var (
 	ErrFull      = errors.New("mempool: at capacity")
 )
 
-// Mempool is a bounded, deduplicated set of pending transactions.
+// Mempool is a bounded, deduplicated set of pending transactions. It is
+// safe for concurrent use: mu guards every field, because one process may
+// serve the RPC server (Add via POST /tx, Len via GET /status) while the
+// node loop runs Take.
 type Mempool struct {
 	max  int
+	mu   sync.RWMutex
 	txs  []types.Tx
 	seen map[[32]byte]struct{}
 }
@@ -27,6 +32,8 @@ func New(max int) *Mempool {
 // Add validates signatures and inserts transactions, returning one error per
 // input in the same order. Insertion of one transaction never blocks another.
 func (m *Mempool) Add(txs []types.Tx) []error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	errs := make([]error, len(txs))
 	for i := range txs {
 		tx := txs[i]
@@ -51,6 +58,8 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 
 // Take removes and returns up to max transactions.
 func (m *Mempool) Take(max int) []types.Tx {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if max > len(m.txs) {
 		max = len(m.txs)
 	}
@@ -65,6 +74,8 @@ func (m *Mempool) Take(max int) []types.Tx {
 
 // Remove drops a transaction by ID, used when a block includes it.
 func (m *Mempool) Remove(id [32]byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, ok := m.seen[id]; !ok {
 		return
 	}
@@ -77,4 +88,8 @@ func (m *Mempool) Remove(id [32]byte) {
 	}
 }
 
-func (m *Mempool) Len() int { return len(m.txs) }
+func (m *Mempool) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.txs)
+}

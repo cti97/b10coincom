@@ -132,4 +132,53 @@ func TestTxEndpointAcceptsValidTx(t *testing.T) {
 		n, _ := resp.Body.Read(buf)
 		t.Fatalf("status = %d, body = %s", resp.StatusCode, buf[:n])
 	}
+	// A 200 must mean the transaction was actually stored, not merely decoded.
+	// A handler that returned 200 without mempool.Add would pass the status
+	// check alone.
+	status, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer status.Body.Close()
+	var body statusResponse
+	if err := json.NewDecoder(status.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Mempool != 1 {
+		t.Fatalf("mempool holds %d transactions after a 200 POST, want 1", body.Mempool)
+	}
+}
+
+// The RPC server reads the chain while the node loop appends to it. Run the
+// suite with -race and this fails loudly if the guards are ever removed.
+func TestRPCReadsAreSafeDuringAppends(t *testing.T) {
+	c, err := chain.Open(genesis.Devnet(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ts := httptest.NewServer(NewServer(c, mempool.New(100)).Handler())
+	defer ts.Close()
+	_, priv := genesis.DevValidatorKey()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 80; i++ {
+			resp, err := http.Get(ts.URL + "/status")
+			if err == nil {
+				resp.Body.Close()
+			}
+		}
+	}()
+	for i := 0; i < 80; i++ {
+		b, err := c.Build(priv, nil, int64(1_700_000_000+i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-done
 }

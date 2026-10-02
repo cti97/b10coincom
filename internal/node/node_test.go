@@ -79,3 +79,59 @@ func TestRunOnceIncludesMempoolTransactions(t *testing.T) {
 		t.Fatalf("mempool should be drained, length = %d", mp.Len())
 	}
 }
+
+func mkTransfer(t *testing.T, nonce uint64) types.Tx {
+	t.Helper()
+	fromPub, fromPriv := genesis.DevAccountKey(0)
+	toPub, _ := genesis.DevAccountKey(1)
+	tx := &types.Tx{
+		Type:   types.TxTransfer,
+		From:   types.AddressFromPub(fromPub),
+		PubKey: fromPub,
+		Nonce:  nonce,
+		To:     types.AddressFromPub(toPub),
+		Amount: 1,
+	}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
+	return *tx
+}
+
+// One state-invalid transaction must not discard the valid ones in its batch
+// or wedge the node. Take has already drained the mempool, so a transaction
+// dropped here is gone forever.
+func TestRunOnceEvictsOnlyInvalidTransactions(t *testing.T) {
+	c, err := chain.Open(genesis.Devnet(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, priv := genesis.DevValidatorKey()
+	mp := mempool.New(100)
+
+	good := mkTransfer(t, 0)
+	bad := mkTransfer(t, 99) // valid signature, impossible nonce
+	for i, e := range mp.Add([]types.Tx{good, bad}) {
+		if e != nil {
+			t.Fatalf("mempool.Add[%d]: %v", i, e)
+		}
+	}
+
+	n := New(c, priv, mp)
+	b, err := n.RunOnce(1_700_000_100)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(b.Txs) != 1 {
+		t.Fatalf("block contains %d transactions, want 1 (the valid one)", len(b.Txs))
+	}
+	if b.Txs[0].ID() != good.ID() {
+		t.Fatal("the wrong transaction was included")
+	}
+	if mp.Len() != 0 {
+		t.Fatalf("mempool length = %d, want 0 (the invalid transaction was evicted)", mp.Len())
+	}
+	if c.Height() != 1 {
+		t.Fatalf("chain height = %d, want 1", c.Height())
+	}
+}
