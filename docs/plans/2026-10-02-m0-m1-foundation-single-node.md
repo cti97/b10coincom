@@ -2528,7 +2528,7 @@ truth; these exist for review):
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `go test ./internal/genesis/ -v`
-Expected: PASS for all eleven tests.
+Expected: PASS for all twelve tests.
 
 - [ ] **Step 7: Commit**
 
