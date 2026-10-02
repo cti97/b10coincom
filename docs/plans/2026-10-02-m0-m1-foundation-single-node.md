@@ -646,7 +646,7 @@ func MerkleRoot(leaves [][32]byte) [32]byte {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `go test ./internal/crypto/ -v`
-Expected: PASS for all six tests.
+Expected: PASS for all seven tests.
 
 - [ ] **Step 5: Commit**
 
