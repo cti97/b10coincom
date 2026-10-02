@@ -3276,10 +3276,8 @@ import (
 func devChain(t *testing.T) (*Chain, ed25519.PrivateKey) {
 	t.Helper()
 	g := genesis.Devnet()
-	_, priv, err := devKey()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// devKey never errors: it returns a deterministic devnet key.
+	_, priv := devKey()
 	c, err := Open(g, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -3405,10 +3403,7 @@ func TestChainWithoutValidatorsCannotAdvance(t *testing.T) {
 func TestReplayRebuildsIdenticalState(t *testing.T) {
 	dir := t.TempDir()
 	g := genesis.Devnet()
-	_, priv, err := devKey()
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, priv := devKey()
 
 	c, err := Open(g, dir)
 	if err != nil {
@@ -3489,20 +3484,43 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 }
 
 // Total supply must be conserved by transfers.
+// Total supply must be conserved BY A REAL TRANSFER: value moves between
+// accounts and none is created. The original version of this test built a
+// block with the dev ACCOUNT key, discarded it, and asserted supply was
+// unchanged - and since Build never mutates state, it could not fail for the
+// reason it named.
 func TestTotalSupplyIsConserved(t *testing.T) {
-	c, _ := devChain(t)
+	c, priv := devChain(t)
 	before := c.State().TotalBalance()
 	if before == 0 {
 		t.Fatal("devnet should start with funds")
 	}
-	// Apply an empty block; supply must be unchanged.
-	b, err := c.Build(devPrivateKey(t), nil, 1_700_000_100)
+
+	g := c.Genesis()
+	fromPub := g.DevAccounts[0].PubKey
+	toPub := g.DevAccounts[1].PubKey
+	from := types.AddressFromPub(fromPub)
+
+	tx := &types.Tx{
+		Type:   types.TxTransfer,
+		From:   from,
+		PubKey: fromPub,
+		Nonce:  c.State().Get(from).Nonce,
+		To:     types.AddressFromPub(toPub),
+		Amount: 123 * genesis.SparksPerB10,
+	}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(devPrivateKey(t), sigHash[:])
+
+	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = b
-	if c.State().TotalBalance() != before {
-		t.Fatal("supply changed without transactions")
+	if err := c.Append(b); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.State().TotalBalance(); got != before {
+		t.Fatalf("supply changed across a transfer: %d -> %d", before, got)
 	}
 }
 ```
