@@ -108,6 +108,12 @@ func (g *Genesis) Validate() error {
 	if g.ChainID == "" {
 		return fmt.Errorf("%w: empty chain ID", ErrBadGenesis)
 	}
+	// ChainID is duplicated on Genesis and Params; a mismatch would let a
+	// genesis describe two different chains at once.
+	if g.Params.ChainID != g.ChainID {
+		return fmt.Errorf("%w: Params.ChainID %q does not match ChainID %q",
+			ErrBadGenesis, g.Params.ChainID, g.ChainID)
+	}
 	// An empty validator set is legal: the testnet genesis is defined before
 	// any operator keys exist. Such a chain simply cannot advance, because
 	// chain.Append rejects every proposer (ErrNotValidator).

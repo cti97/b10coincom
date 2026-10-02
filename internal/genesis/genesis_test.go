@@ -1,6 +1,7 @@
 package genesis
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -29,8 +30,25 @@ func TestFaucetAddressIsDeterministicAndKeyless(t *testing.T) {
 	if f1 != f2 {
 		t.Fatal("faucet address is not deterministic")
 	}
-	// The faucet address must not be derivable as address-of-a-pubkey for
-	// any key we hold, and it must differ from every validator address.
+
+	// Independently recompute the specified construction. This is the assertion
+	// that actually guards the domain label and the derivation: without it,
+	// replacing the body with `AddressFromPub(gh[:])` makes the faucet spendable
+	// by anyone holding ed25519.NewKeyFromSeed(genesisHash) and every other
+	// assertion below still passes.
+	gh := g.Hash()
+	want := crypto.HashParts([]byte("b10coin-faucet"), gh[:])
+	var expected types.Address
+	copy(expected[:], want[:types.AddressSize])
+	if f1 != expected {
+		t.Fatalf("faucet derivation changed:\n got %v\nwant %v", f1, expected)
+	}
+
+	// Negative: the faucet must not be the address of any public key we can
+	// name, including the genesis hash reinterpreted as one.
+	if f1 == types.AddressFromPub(gh[:]) {
+		t.Fatal("faucet address is key-derived and therefore spendable")
+	}
 	for _, v := range g.Validators {
 		if types.AddressFromPub(v.PubKey) == f1 {
 			t.Fatal("faucet address collided with a validator address")
@@ -74,6 +92,14 @@ func TestValidateRejectsBadGenesis(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsChainIDMismatch(t *testing.T) {
+	g := Devnet()
+	g.Params.ChainID = "some-other-chain"
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis, got %v", err)
+	}
+}
+
 func TestEmissionMathReachesExactlyTheSupplyCap(t *testing.T) {
 	for _, g := range []*Genesis{Devnet(), Testnet()} {
 		p := g.Params
@@ -82,6 +108,23 @@ func TestEmissionMathReachesExactlyTheSupplyCap(t *testing.T) {
 		if total != p.TotalSupplySparks {
 			t.Fatalf("%s: emission sums to %d sparks, cap is %d",
 				p.ChainID, total, p.TotalSupplySparks)
+		}
+	}
+}
+
+// TestSupplyCapIsPinned pins the ABSOLUTE monetary values. The emission test
+// only checks the identity R0 * interval * 2 == supply, which any proportional
+// mutation satisfies - halving both the supply and the reward would pass it
+// while changing monetary policy. This test is what stops that.
+func TestSupplyCapIsPinned(t *testing.T) {
+	if SparksPerB10 != 100_000_000 {
+		t.Fatalf("SparksPerB10 = %d, want 100000000", SparksPerB10)
+	}
+	const wantCapSparks = 21_000_000 * SparksPerB10
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		if g.Params.TotalSupplySparks != wantCapSparks {
+			t.Fatalf("%s: TotalSupplySparks = %d, want %d",
+				g.Params.ChainID, g.Params.TotalSupplySparks, wantCapSparks)
 		}
 	}
 }
