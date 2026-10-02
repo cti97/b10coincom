@@ -3373,6 +3373,26 @@ func TestAppendRejectsUnsignedOrForgedHeader(t *testing.T) {
 	}
 }
 
+// A block whose header was altered after signing must be rejected by the
+// signature check ITSELF. This is the only test that reaches crypto.Verify in
+// Append: the test above only clears Sig, which the nil check catches first,
+// so deleting the verification call left the whole suite green.
+func TestAppendRejectsForgedSignature(t *testing.T) {
+	c, priv := devChain(t)
+	b, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate a signed header field WITHOUT re-signing. The timestamp stays
+	// positive so ValidateStructure still passes, and parent, height and
+	// validator membership are unaffected, so only the signature check can
+	// reject this.
+	b.Header.Timestamp = 1_700_000_101
+	if err := c.Append(b); !errors.Is(err, ErrBadProposerSig) {
+		t.Fatalf("expected ErrBadProposerSig, got %v", err)
+	}
+}
+
 func TestAppendRejectsNonValidatorProposer(t *testing.T) {
 	c, _ := devChain(t)
 	_, otherPriv, err := crypto.GenerateKey()
