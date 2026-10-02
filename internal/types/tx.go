@@ -2,11 +2,15 @@ package types
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 
 	"github.com/cti97/b10coincom/internal/crypto"
 )
+
+// ed25519PublicKeySize is the expected length of a proposer or signer key.
+const ed25519PublicKeySize = ed25519.PublicKeySize
 
 var (
 	ErrUnsupportedTxType = errors.New("types: unsupported transaction type")
