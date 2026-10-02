@@ -225,3 +225,132 @@ func TestCorruptRecordInEarlierSegmentFailsOpen(t *testing.T) {
 		t.Fatalf("corruption in a non-final segment must fail Open with ErrCorruptRecord, got %v", err)
 	}
 }
+
+// A complete record with a bad checksum followed by a partial trailing record
+// is the layout that exposed a height-renumbering bug in recovery: the corrupt
+// record's bytes must NOT survive while the in-memory height is rewound. The
+// repair must keep the corrupt record at its own height, so that appending on
+// top and reopening yields the same heights.
+func TestCorruptCompleteRecordThenPartialTailKeepsHeights(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(1, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(2, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Record 1 occupies bytes 0..7 (varint len + payload + crc32), so record 2
+	// starts at 8 and its payload begins at 9.
+	raw[9] ^= 0xFF
+	// Append a truncated trailing record: a length prefix claiming 64 bytes
+	// with only 3 following.
+	raw = append(raw, 64, 1, 2, 3)
+	if err := os.WriteFile(seg, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open after repair must succeed: %v", err)
+	}
+	h, _ := s2.Height()
+	if h != 2 {
+		t.Fatalf("repaired Height() = %d, want 2 - the corrupt complete record keeps its own height", h)
+	}
+	if _, err := s2.Read(2); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("Read(2) = %v, want ErrCorruptRecord", err)
+	}
+	if err := s2.Append(3, []byte("three")); err != nil {
+		t.Fatal(err)
+	}
+	s2.Close()
+
+	s3, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	if h3, _ := s3.Height(); h3 != 3 {
+		t.Fatalf("reopened Height() = %d, want 3 - heights were renumbered", h3)
+	}
+	if b, err := s3.Read(3); err != nil || string(b) != "three" {
+		t.Fatalf("Read(3) = %q, %v; want \"three\", nil", b, err)
+	}
+}
+
+// Read must return a copy: mutating the returned slice must not corrupt the
+// store's view of the recorded bytes.
+func TestReadReturnsACopy(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Append(1, []byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got[0] = 'Z'
+	again, err := s.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != "abcdef" {
+		t.Fatalf("mutation of a returned slice changed the store: got %q", again)
+	}
+}
+
+// The layout admits a zero-length payload (a 5-byte record): an empty payload
+// must round-trip, and Read must hand back a non-nil, zero-length slice.
+func TestZeroLengthPayloadRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(1, []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(2, []byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Read(1); err != nil {
+		t.Fatal(err)
+	} else if got == nil || len(got) != 0 {
+		t.Fatalf("fresh Read(1) = %#v (len %d), want non-nil zero-length slice", got, len(got))
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if got, err := s2.Read(1); err != nil {
+		t.Fatal(err)
+	} else if got == nil || len(got) != 0 {
+		t.Fatalf("reopened Read(1) = %#v (len %d), want non-nil zero-length slice", got, len(got))
+	}
+	if h, ok := s2.Height(); !ok || h != 2 {
+		t.Fatalf("reopened Height() = %d, %v; want 2, true", h, ok)
+	}
+	if b, err := s2.Read(2); err != nil || string(b) != "after" {
+		t.Fatalf("Read(2) = %q, %v; want \"after\", nil", b, err)
+	}
+}

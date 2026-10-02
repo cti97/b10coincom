@@ -45,7 +45,9 @@ type Store struct {
 }
 
 // segmentName maps a height to the segment file holding it. Names are
-// zero-padded, so lexical order is height order.
+// zero-padded, so lexical order is height order — but only while segment
+// indices fit in 8 digits (height < 10^11): wider indices print unpadded and
+// no longer sort lexicographically.
 func segmentName(height uint64) string {
 	return fmt.Sprintf("%08d.seg", height/BlocksPerSegment)
 }
@@ -109,7 +111,6 @@ func (s *Store) scanSegment(name string, final bool) error {
 	if err != nil {
 		return err
 	}
-	goodHeight := s.last // height of the last checksum-verified record here
 	off := int64(0)
 	for off < int64(len(raw)) {
 		n, m := binary.Uvarint(raw[off:])
@@ -117,14 +118,14 @@ func (s *Store) scanSegment(name string, final bool) error {
 		// would overflow the arithmetic below.
 		if m <= 0 || n > uint64(len(raw)) {
 			if final {
-				return s.truncateTail(path, goodHeight, off)
+				return s.truncateTail(path, off)
 			}
 			return fmt.Errorf("%w: bad length prefix in %s at offset %d", ErrCorruptRecord, name, off)
 		}
 		recEnd := off + int64(m) + int64(n) + 4
 		if recEnd > int64(len(raw)) {
 			if final {
-				return s.truncateTail(path, goodHeight, off)
+				return s.truncateTail(path, off)
 			}
 			return fmt.Errorf("%w: truncated record in %s at offset %d", ErrCorruptRecord, name, off)
 		}
@@ -139,23 +140,18 @@ func (s *Store) scanSegment(name string, final bool) error {
 		s.index[h] = off
 		s.last = h
 		s.have = true
-		if !corrupt {
-			goodHeight = h
-		}
 		off = recEnd
 	}
 	return nil
 }
 
-// truncateTail cuts path back to size and forgets every index slot past
-// goodHeight. Only the last checksum-verified record survives a crash
-// mid-write.
-func (s *Store) truncateTail(path string, goodHeight uint64, size int64) error {
-	for h := s.last; h > goodHeight; h-- {
-		delete(s.index, h)
-	}
-	s.last = goodHeight
-	s.have = goodHeight > 0
+// truncateTail cuts a partial trailing record off the file. It deliberately
+// does NOT rewind s.last or drop index slots: every indexed record starts
+// BEFORE size (the partial record was never indexed), so a complete-but-corrupt
+// record keeps its height and Read reports ErrCorruptRecord for it. Rewinding
+// here would leave that record's bytes on disk while claiming a lower height,
+// and the next reopen would re-read them and renumber every height after.
+func (s *Store) truncateTail(path string, size int64) error {
 	return os.Truncate(path, size)
 }
 
@@ -169,14 +165,17 @@ func (s *Store) Append(height uint64, payload []byte) error {
 		return fmt.Errorf("%w: got %d, want %d", ErrBadHeight, height, want)
 	}
 
-	// Roll to a new segment before writing across a boundary.
+	// Roll to a new segment before writing across a boundary. Open the new
+	// segment before closing the old handle, and swap only on success, so a
+	// failed rollover leaves s.file on an open handle rather than a closed one.
 	if s.have && segmentName(height) != segmentName(s.last) {
-		if err := s.file.Close(); err != nil {
-			return err
-		}
 		f, err := os.OpenFile(filepath.Join(s.dir, segmentName(height)),
 			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
+			return err
+		}
+		if err := s.file.Close(); err != nil {
+			f.Close()
 			return err
 		}
 		s.file = f
