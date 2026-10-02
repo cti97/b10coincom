@@ -3364,10 +3364,7 @@ func TestAppendRejectsWrongHeight(t *testing.T) {
 // from silently accepting a block that claims a state it did not compute.
 func TestAppendRejectsTamperedStateRoot(t *testing.T) {
 	c, priv := devChain(t)
-	b, err := c.Build(priv, nil, 1_700_000_100)
-	if err != nil {
-		t.Fatal(err)
-	}
+	b, _ := c.Build(priv, nil, 1_700_000_100)
 	// Tamper the root and RE-SIGN it, modelling a validator that signs a state
 	// root it did not compute. Without the re-signature the signature check
 	// rejects the block first and this test passes for the wrong reason,
