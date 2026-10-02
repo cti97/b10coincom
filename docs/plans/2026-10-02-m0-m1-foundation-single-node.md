@@ -3399,9 +3399,9 @@ func (c *Chain) Append(b *types.Block) error {
 	if err != nil {
 		return err
 	}
-	if next.Root() != b.Header.StateRoot {
+	if computed := next.Root(); computed != b.Header.StateRoot {
 		return fmt.Errorf("%w: computed %x, header claims %x",
-			ErrBadStateRoot, next.Root()[:8], b.Header.StateRoot[:8])
+			ErrBadStateRoot, computed[:8], b.Header.StateRoot[:8])
 	}
 
 	if err := c.store.Append(b.Header.Height, b.Encode()); err != nil {
