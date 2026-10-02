@@ -34,10 +34,13 @@ type Header struct {
 	Proposer   []byte // Ed25519 public key
 }
 
-// Block is a header plus its transactions.
+// Block is a header plus its transactions. Sig is the proposer's Ed25519
+// signature over Header.SigningHash(); it is deliberately outside the header
+// so that signing does not change the block's identity.
 type Block struct {
 	Header Header
 	Txs    []Tx
+	Sig    []byte
 }
 
 // ComputeTxRoot commits to the ordered list of transaction IDs.
@@ -79,6 +82,7 @@ func (b *Block) Encode() []byte {
 		// varint length, so a tx must not be written bare.
 		e.VarBytes(b.Txs[i].Encode())
 	}
+	e.VarBytes(b.Sig)
 	return e.Bytes()
 }
 
@@ -149,6 +153,9 @@ func DecodeBlock(b []byte) (*Block, error) {
 			return nil, err
 		}
 		out.Txs = append(out.Txs, *tx)
+	}
+	if out.Sig, err = d.VarBytes(); err != nil {
+		return nil, err
 	}
 	if err := d.Done(); err != nil {
 		return nil, err

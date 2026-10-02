@@ -261,6 +261,21 @@ func Testnet() *Genesis {
 	}
 }
 
+// DevValidatorKey returns the devnet validator keypair. It is deterministic
+// and PUBLIC: it exists so tests and the devnet CLI can sign blocks. It must
+// never be used on any network holding value.
+func DevValidatorKey() (ed25519.PublicKey, ed25519.PrivateKey) {
+	pub, priv, _ := deterministicKey("b10coin-devnet-validator-1")
+	return pub, priv
+}
+
+// DevAccountKey returns the keypair for devnet dev account i (0 or 1).
+func DevAccountKey(i int) (ed25519.PublicKey, ed25519.PrivateKey) {
+	seeds := []string{"b10coin-devnet-faucet-tester", "b10coin-devnet-recipient"}
+	pub, priv, _ := deterministicKey(seeds[i])
+	return pub, priv
+}
+
 // deterministicKey derives a stable keypair from a seed string so devnet
 // fixtures are reproducible across machines and runs. It is NOT secret and
 // must never be used outside devnet.

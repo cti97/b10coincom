@@ -64,6 +64,17 @@ func TestBlockIDChangesWithHeader(t *testing.T) {
 	}
 }
 
+// The signature must not change the block ID: signing does not mutate the
+// header, so a block keeps its identity when the proposer signs it.
+func TestBlockSigDoesNotAffectBlockID(t *testing.T) {
+	b := testBlock(t)
+	before := b.ID()
+	b.Sig = []byte("a-signature")
+	if b.ID() != before {
+		t.Fatal("signature must not change the block ID")
+	}
+}
+
 func TestValidateStructureAcceptsWellFormedBlock(t *testing.T) {
 	if err := testBlock(t, *signedTransfer(t, 1, 5)).ValidateStructure(); err != nil {
 		t.Fatalf("valid block rejected: %v", err)
