@@ -1775,10 +1775,11 @@ func TestRootIsOrderIndependentAndSensitive(t *testing.T) {
 // construction and the "b10coin-account" domain label: change any of them and
 // this value changes, which is precisely the point.
 //
-// To produce the expected value: write this test with a zero `want`, run it,
-// and paste the 32 bytes the failure reports. Then confirm the vector is
-// load-bearing by temporarily changing the domain label in state.go and
-// watching this test fail, before reverting that change.
+// The vector is frozen. It was captured once from the implementation and then
+// proven load-bearing by changing the "b10coin-account" domain label in
+// state.go (the test fails) and reverting. Never re-capture it from a fresh
+// run: that would enshrine whatever the code currently produces, regression
+// included, and destroy the test's value.
 func TestRootGoldenVector(t *testing.T) {
 	s := New()
 	s.Set(types.Address{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1788,7 +1789,14 @@ func TestRootGoldenVector(t *testing.T) {
 	s.Set(types.Address{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, Account{Balance: 18446744073709551615, Nonce: 0})
 
-	var want [32]byte // REPLACE with the value this implementation actually produces
+	// Frozen and verified load-bearing: changing the "b10coin-account" domain
+	// label makes this test fail. Do NOT re-capture this value from a fresh run -
+	// re-capturing would enshrine whatever the code happens to produce, including a
+	// regression. If it fails, the root construction changed and that is the point.
+	want := [32]byte{
+		0x69, 0x38, 0x3e, 0xe3, 0xc1, 0xb9, 0x2d, 0xa5, 0x0c, 0x46, 0xbc, 0xa8, 0x97, 0x47, 0x6d, 0xc1,
+		0xde, 0xde, 0xd1, 0xec, 0x5b, 0x47, 0x08, 0x6d, 0xee, 0xc2, 0xa0, 0x9e, 0x7d, 0x37, 0x29, 0x5e,
+	}
 	if got := s.Root(); got != want {
 		t.Fatalf("golden root changed:\n got %x\nwant %x", got, want)
 	}
