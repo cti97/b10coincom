@@ -1,0 +1,31 @@
+# Secrets and keys — NEVER commit these.
+# A validator private key in git history means a permanently compromised validator.
+.env
+.env.*
+*.key
+*.pem
+keys/
+secrets/
+genesis/private/
+validator-keys/
+
+# Build output
+/bin/
+/dist/
+/build/
+*.exe
+
+# Local devnet / testnet data (regenerable, never authoritative)
+/devnet-data/
+/testnet-data/
+/data/
+
+# Test artifacts
+*.log
+*.prof
+coverage.out
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
