@@ -29,3 +29,6 @@ coverage.out
 .DS_Store
 .idea/
 .vscode/
+
+# SDD controller scratch: ledger, task briefs, reports and build caches.
+.superpowers/
