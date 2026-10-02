@@ -3348,8 +3348,17 @@ func TestAppendRejectsWrongHeight(t *testing.T) {
 // from silently accepting a block that claims a state it did not compute.
 func TestAppendRejectsTamperedStateRoot(t *testing.T) {
 	c, priv := devChain(t)
-	b, _ := c.Build(priv, nil, 1_700_000_100)
+	b, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tamper the root and RE-SIGN it, modelling a validator that signs a state
+	// root it did not compute. Without the re-signature the signature check
+	// rejects the block first and this test passes for the wrong reason,
+	// never reaching the state-root guard it names.
 	b.Header.StateRoot = crypto.HashParts([]byte("fabricated"))
+	headerHash := b.Header.SigningHash()
+	b.Sig = crypto.Sign(priv, headerHash[:])
 	if err := c.Append(b); !errors.Is(err, ErrBadStateRoot) {
 		t.Fatalf("expected ErrBadStateRoot, got %v", err)
 	}
