@@ -1416,7 +1416,10 @@ func (b *Block) Encode() []byte {
 	e.Raw(b.Header.Encode())
 	e.Len(len(b.Txs))
 	for i := range b.Txs {
-		e.Raw(b.Txs[i].Encode())
+		// VarBytes, not Raw: DecodeBlock frames each transaction with
+		// d.VarBytes(), so the encoder MUST write the matching length
+		// prefix. Raw here produced blocks that could not be decoded.
+		e.VarBytes(b.Txs[i].Encode())
 	}
 	return e.Bytes()
 }
