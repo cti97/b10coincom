@@ -198,18 +198,18 @@ protocol's claim rule. There is no human key, no insider allocation, and no sale
 
 | Parameter | Value | Notes |
 |---|---|---|
-| Base unit | **spark** (1 ember = 10⁸ sparks) | Mirrors satoshi; `u64` throughout |
-| Total supply cap | **21,000,000 embers** | Terminal; emission reaches zero |
-| Initial block reward | 0.5 ember = 50,000,000 sparks | Paid into the faucet account |
+| Base unit | **spark** (1 b10 = 10⁸ sparks) | Mirrors satoshi; `u64` throughout |
+| Total supply cap | **21,000,000 b10** | Terminal; emission reaches zero |
+| Initial block reward | 0.5 b10 = 50,000,000 sparks | Paid into the faucet account |
 | Halving interval | every 21,000,000 blocks | ≈1.33 years at 2 s blocks |
-| Emission endpoint | ~20 halvings | Sum = `0.5 × 21,000,000 × 2` = 21,000,000 embers ✓ |
-| `CLAIM_AMOUNT` | 100 embers per key per epoch | Genesis-configurable |
+| Emission endpoint | ~20 halvings | Sum = `0.5 × 21,000,000 × 2` = 21,000,000 b10 ✓ |
+| `CLAIM_AMOUNT` | 100 b10 per key per epoch | Genesis-configurable |
 | Faucet puzzle | Argon2id, tuned to ≈3 s on a Pi 4 | Memory-hard; ASICs do not help |
 | Claims allowed | one per key per epoch | The actual anti-farming rule |
 | After emission ends | **fees only** | No perpetual inflation |
 
 Emission arithmetic check: `R0 × HALVING_INTERVAL × 2 = 50,000,000 sparks ×
-21,000,000 × 2 = 2.1 × 10¹⁵ sparks = 21,000,000 embers`. Fits in `u64`
+21,000,000 × 2 = 2.1 × 10¹⁵ sparks = 21,000,000 b10`. Fits in `u64`
 (max ≈1.8 × 10¹⁹). ✓
 
 **Invariant:** a `FaucetClaim` is valid only if the faucet balance covers
@@ -226,7 +226,7 @@ confer no meaningful advantage.
 No stake required. This is an honest starting condition, not something to hide —
 Bitcoin's equivalent was one person mining alone.
 
-**v2 (staking, M5):** `Bond` ≥ `MIN_STAKE` (1,000 embers) registers a candidate.
+**v2 (staking, M5):** `Bond` ≥ `MIN_STAKE` (1,000 b10) registers a candidate.
 The committee is the top 21 candidates by bonded stake. Exiting requires
 `Unbond` and a `UNBONDING_BLOCKS` cooldown before `Withdraw`.
 
