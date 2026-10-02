@@ -2106,8 +2106,25 @@ func TestFaucetAddressIsDeterministicAndKeyless(t *testing.T) {
 	if f1 != f2 {
 		t.Fatal("faucet address is not deterministic")
 	}
-	// The faucet address must not be derivable as address-of-a-pubkey for
-	// any key we hold, and it must differ from every validator address.
+
+	// Independently recompute the specified construction. This is the assertion
+	// that actually guards the domain label and the derivation: without it,
+	// replacing the body with `AddressFromPub(gh[:])` makes the faucet spendable
+	// by anyone holding ed25519.NewKeyFromSeed(genesisHash) and every other
+	// assertion below still passes.
+	gh := g.Hash()
+	want := crypto.HashParts([]byte("b10coin-faucet"), gh[:])
+	var expected types.Address
+	copy(expected[:], want[:types.AddressSize])
+	if f1 != expected {
+		t.Fatalf("faucet derivation changed:\n got %v\nwant %v", f1, expected)
+	}
+
+	// Negative: the faucet must not be the address of any public key we can
+	// name, including the genesis hash reinterpreted as one.
+	if f1 == types.AddressFromPub(gh[:]) {
+		t.Fatal("faucet address is key-derived and therefore spendable")
+	}
 	for _, v := range g.Validators {
 		if types.AddressFromPub(v.PubKey) == f1 {
 			t.Fatal("faucet address collided with a validator address")
@@ -2115,6 +2132,23 @@ func TestFaucetAddressIsDeterministicAndKeyless(t *testing.T) {
 	}
 	if f1 == types.AddressFromPub([]byte("any")) {
 		t.Fatal("faucet address looks like a normal key-derived address")
+	}
+}
+
+// TestSupplyCapIsPinned pins the ABSOLUTE monetary values. The emission test
+// only checks the identity R0 * interval * 2 == supply, which any proportional
+// mutation satisfies - halving both the supply and the reward would pass it
+// while changing monetary policy. This test is what stops that.
+func TestSupplyCapIsPinned(t *testing.T) {
+	if SparksPerB10 != 100_000_000 {
+		t.Fatalf("SparksPerB10 = %d, want 100000000", SparksPerB10)
+	}
+	const wantCapSparks = 21_000_000 * SparksPerB10
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		if g.Params.TotalSupplySparks != wantCapSparks {
+			t.Fatalf("%s: TotalSupplySparks = %d, want %d",
+				g.Params.ChainID, g.Params.TotalSupplySparks, wantCapSparks)
+		}
 	}
 }
 
@@ -2303,6 +2337,12 @@ func (g *Genesis) FaucetAddress() types.Address {
 func (g *Genesis) Validate() error {
 	if g.ChainID == "" {
 		return fmt.Errorf("%w: empty chain ID", ErrBadGenesis)
+	}
+	// ChainID is duplicated on Genesis and Params; a mismatch would let a
+	// genesis describe two different chains at once.
+	if g.Params.ChainID != g.ChainID {
+		return fmt.Errorf("%w: Params.ChainID %q does not match ChainID %q",
+			ErrBadGenesis, g.Params.ChainID, g.ChainID)
 	}
 	// An empty validator set is legal: the testnet genesis is defined before
 	// any operator keys exist. Such a chain simply cannot advance, because
