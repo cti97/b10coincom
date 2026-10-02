@@ -14,7 +14,7 @@
 
 - **Module path:** `github.com/cti97/b10coincom`
 - **Go floor:** `go 1.23`
-- **Toolchain caveat (verified 2026-10-02):** this machine has **go1.21.4** installed. With `GOTOOLCHAIN=auto`, Go will try to download the 1.23 toolchain on the first build; that download needs network plus a writable module cache. If it is unavailable, either install a current Go (`brew install go`, a system-level change) or lower this floor to `go 1.21` — nothing in this plan uses a language feature newer than 1.21.
+- **Toolchain (verified 2026-10-02):** `brew install go` upgraded this machine from go1.21.4 to **go1.27.1**, which satisfies this floor. No toolchain download or floor change is needed.
 - **Dependencies:** exactly one external module, `lukechampine.com/blake3`. No others. Do not add a CLI framework, a logging framework, a test framework, or a database.
 - **Base unit is `spark`**; `1 b10 = 10^8 sparks`. All monetary values are `uint64` sparks. Never use floats for money.
 - **Canonical encoding only.** Every consensus structure is encoded with the helpers from Task 2. Never `encoding/gob`, never JSON for anything that gets hashed or signed, never iterate a Go `map` when producing bytes.
