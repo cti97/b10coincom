@@ -2711,6 +2711,10 @@ func TestTruncatedTailIsDiscardedOnOpen(t *testing.T) {
 	s.Close()
 
 	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	good, err := os.Stat(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f, err := os.OpenFile(seg, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -2734,6 +2738,15 @@ func TestTruncatedTailIsDiscardedOnOpen(t *testing.T) {
 	if _, err := s2.Read(3); err != nil {
 		t.Fatalf("good records must survive: %v", err)
 	}
+	// The partial record must be cut out of the file itself, not merely
+	// skipped by the index; otherwise the next segment write lands after it.
+	dropped, err := os.Stat(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped.Size() != good.Size() {
+		t.Fatalf("Open left the partial tail in place: size = %d, want %d", dropped.Size(), good.Size())
+	}
 }
 
 // A corrupted payload must be detected by the checksum.
@@ -2750,7 +2763,7 @@ func TestCorruptPayloadIsDetected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[len(raw)-3] ^= 0xFF // flip a payload byte, leaving it intact in length
+	raw[2] ^= 0xFF // flip a payload byte; the length stays intact, so only the checksum can catch this
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2783,6 +2796,42 @@ func TestSegmentRolloverAtBlocksPerSegment(t *testing.T) {
 		t.Fatalf("expected a second segment file, got %d files", len(entries))
 	}
 }
+
+// Beyond the brief's eight tests: binding constraint check. A damaged record
+// in a NON-final segment is genuine corruption — earlier segments are closed,
+// so no crash could have cut a record there — and must fail Open instead of
+// being truncated away like a crashed tail.
+func TestCorruptRecordInEarlierSegmentFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(1); h <= BlocksPerSegment+2; h++ {
+		if err := s.Append(h, []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Heights 1..999 live in segment 0, which is non-final here because
+	// segment 1 already holds heights 1000..1002.
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[1] ^= 0xFF // corrupt the first record's payload byte, keeping the length valid
+	if err := os.WriteFile(seg, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("corruption in a non-final segment must fail Open with ErrCorruptRecord, got %v", err)
+	}
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -2799,11 +2848,15 @@ Create `internal/store/store.go`:
 //
 // Record layout:
 //
-//	varint(len(payload)) || payload || uint32be(crc32c(payload))
+//	uvarint(len(payload)) || payload || uint32be(crc32c(payload))
 //
-// Open scans the final segment and truncates a partial or corrupt trailing
-// record. That is what makes a crash mid-write survivable: the node restarts,
-// re-syncs from the last good block, and loses nothing already committed.
+// Open scans the final segment and truncates any partial trailing record:
+// that is what makes a crash mid-write survivable. The node restarts,
+// re-syncs from the last good block, and loses nothing already committed. A
+// structurally complete record whose checksum fails is indexed but never
+// trusted: Read reports it as ErrCorruptRecord instead of silently dropping
+// committed heights. A damaged record in any non-final segment is genuine
+// corruption and fails Open.
 package store
 
 import (
@@ -2828,15 +2881,17 @@ var (
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
-// Store is an append-only block log.
+// Store is an append-only block log over opaque payloads.
 type Store struct {
 	dir   string
-	file  *os.File
-	last  uint64
+	file  *os.File // append handle on the segment receiving writes
+	last  uint64   // highest height present, corrupt ones included
 	have  bool
-	index map[uint64]int64 // height -> offset within its segment
+	index map[uint64]int64 // height -> record offset within its segment
 }
 
+// segmentName maps a height to the segment file holding it. Names are
+// zero-padded, so lexical order is height order.
 func segmentName(height uint64) string {
 	return fmt.Sprintf("%08d.seg", height/BlocksPerSegment)
 }
@@ -2866,7 +2921,7 @@ func (s *Store) segmentPath() string {
 	return filepath.Join(s.dir, segmentName(0))
 }
 
-// scan rebuilds the index from disk and truncates any damaged tail.
+// scan rebuilds the index from disk and repairs the final segment's tail.
 func (s *Store) scan() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -2878,54 +2933,75 @@ func (s *Store) scan() error {
 			segs = append(segs, e.Name())
 		}
 	}
-	// File names are zero-padded, so lexical order is height order.
 	slices.Sort(segs)
 
 	for si, name := range segs {
-		path := filepath.Join(s.dir, name)
-		raw, err := os.ReadFile(path)
-		if err != nil {
+		if err := s.scanSegment(name, si == len(segs)-1); err != nil {
 			return err
-		}
-		off := int64(0)
-		i := 0
-		lastSegment := si == len(segs)-1
-		for i < len(raw) {
-			n, m := binary.Uvarint(raw[i:])
-			if m <= 0 {
-				if lastSegment {
-					return s.truncate(path, off)
-				}
-				return fmt.Errorf("%w: bad length in %s", ErrCorruptRecord, name)
-			}
-			total := int64(m) + int64(n) + 4
-			if off+total > int64(len(raw)) {
-				if lastSegment {
-					return s.truncate(path, off)
-				}
-				return fmt.Errorf("%w: truncated record in %s", ErrCorruptRecord, name)
-			}
-			payloadStart := i + m
-			payload := raw[payloadStart : payloadStart+int(n)]
-			want := binary.BigEndian.Uint32(raw[payloadStart+int(n) : payloadStart+int(n)+4])
-			if crc32.Checksum(payload, crcTable) != want {
-				if lastSegment {
-					return s.truncate(path, off)
-				}
-				return fmt.Errorf("%w: in %s", ErrCorruptRecord, name)
-			}
-			height := s.last + 1
-			s.index[height] = off
-			s.last = height
-			s.have = true
-			off += total
-			i += int(total)
 		}
 	}
 	return nil
 }
 
-func (s *Store) truncate(path string, size int64) error {
+// scanSegment walks one segment record by record. Earlier segments are
+// closed, so a damaged record there is real corruption and fails Open; the
+// final segment is the only place a crash could have cut a record, so its
+// tail is repaired instead: a partial trailing record is truncated away, and
+// a complete record with a bad checksum keeps its index slot for Read to
+// reject.
+func (s *Store) scanSegment(name string, final bool) error {
+	path := filepath.Join(s.dir, name)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	goodHeight := s.last // height of the last checksum-verified record here
+	off := int64(0)
+	for off < int64(len(raw)) {
+		n, m := binary.Uvarint(raw[off:])
+		// A length prefix beyond the file cannot be a valid record and
+		// would overflow the arithmetic below.
+		if m <= 0 || n > uint64(len(raw)) {
+			if final {
+				return s.truncateTail(path, goodHeight, off)
+			}
+			return fmt.Errorf("%w: bad length prefix in %s at offset %d", ErrCorruptRecord, name, off)
+		}
+		recEnd := off + int64(m) + int64(n) + 4
+		if recEnd > int64(len(raw)) {
+			if final {
+				return s.truncateTail(path, goodHeight, off)
+			}
+			return fmt.Errorf("%w: truncated record in %s at offset %d", ErrCorruptRecord, name, off)
+		}
+		payStart := off + int64(m)
+		payload := raw[payStart : payStart+int64(n) : payStart+int64(n)]
+		want := binary.BigEndian.Uint32(raw[payStart+int64(n) : recEnd])
+		corrupt := crc32.Checksum(payload, crcTable) != want
+		if corrupt && !final {
+			return fmt.Errorf("%w: checksum mismatch in %s at offset %d", ErrCorruptRecord, name, off)
+		}
+		h := s.last + 1
+		s.index[h] = off
+		s.last = h
+		s.have = true
+		if !corrupt {
+			goodHeight = h
+		}
+		off = recEnd
+	}
+	return nil
+}
+
+// truncateTail cuts path back to size and forgets every index slot past
+// goodHeight. Only the last checksum-verified record survives a crash
+// mid-write.
+func (s *Store) truncateTail(path string, goodHeight uint64, size int64) error {
+	for h := s.last; h > goodHeight; h-- {
+		delete(s.index, h)
+	}
+	s.last = goodHeight
+	s.have = goodHeight > 0
 	return os.Truncate(path, size)
 }
 
@@ -2950,10 +3026,6 @@ func (s *Store) Append(height uint64, payload []byte) error {
 			return err
 		}
 		s.file = f
-		s.last = height
-		s.have = true
-		s.index[height] = 0
-		return writeRecord(s.file, payload)
 	}
 
 	off, err := s.file.Seek(0, io.SeekEnd)
@@ -2961,6 +3033,9 @@ func (s *Store) Append(height uint64, payload []byte) error {
 		return err
 	}
 	if err := writeRecord(s.file, payload); err != nil {
+		// Cut a partial record back off so later appends start clean; the
+		// next Open also self-heals if this truncate fails.
+		_ = s.file.Truncate(off)
 		return err
 	}
 	s.index[height] = off
@@ -2986,7 +3061,7 @@ func writeRecord(f *os.File, payload []byte) error {
 	return f.Sync()
 }
 
-// Read returns the payload stored at height.
+// Read returns a copy of the payload stored at height.
 func (s *Store) Read(height uint64) ([]byte, error) {
 	off, ok := s.index[height]
 	if !ok {
@@ -3030,7 +3105,7 @@ func (s *Store) Close() error {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `go test ./internal/store/ -v`
-Expected: PASS for all eight tests.
+Expected: PASS for all nine tests.
 
 - [ ] **Step 5: Commit**
 
