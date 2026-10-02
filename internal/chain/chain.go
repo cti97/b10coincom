@@ -109,6 +109,23 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 		if err != nil {
 			return nil, err
 		}
+		// The store indexes segments by record count, so a lost or rewritten
+		// segment would silently renumber every stored block. applyValidated
+		// deliberately skips structure, proposer and signature checks, and
+		// the state-root check below cannot substitute for these either:
+		// blocks that carry no transactions change no state, so a renumbered
+		// chain would replay to the very roots the rewritten headers claim.
+		// The cheapest authentication of the stored bytes is to require each
+		// block to claim the position it sits at and to link exactly the
+		// block replayed before it (the synthesized genesis at height 1).
+		if blk.Header.Height != h {
+			return nil, fmt.Errorf("%w at height %d: stored block claims height %d", ErrGenesisReplay, h, blk.Header.Height)
+		}
+		wantParent := c.head.ID()
+		if blk.Header.ParentHash != wantParent {
+			return nil, fmt.Errorf("%w at height %d: stored block does not link its predecessor (parent %x, expected %x)",
+				ErrGenesisReplay, h, blk.Header.ParentHash[:8], wantParent[:8])
+		}
 		if err := c.applyValidated(blk); err != nil {
 			return nil, fmt.Errorf("%w at height %d: %v", ErrGenesisReplay, h, err)
 		}

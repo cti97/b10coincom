@@ -354,3 +354,48 @@ func TestZeroLengthPayloadRoundTrips(t *testing.T) {
 		t.Fatalf("Read(2) = %q, %v; want \"after\", nil", b, err)
 	}
 }
+
+// A length prefix is stored data, and binary.Uvarint legally decodes up to
+// 2^64-1. Read must bound it BEFORE any offset arithmetic — int(n) overflows
+// for lengths above MaxInt64, so end := start + int(n) wraps negative and the
+// old truncation guard (end+4 > len(raw)) passed, crashing Read with a slice
+// bug ([10:9]) instead of reporting corruption. scanSegment never had this
+// hole: it rejects n > len(raw) before doing arithmetic. The file must hold
+// more than 13 bytes for the old truncated-record guard to be reached with a
+// negative end at all, hence three records.
+func TestReadRejectsOverflowingLengthPrefixInsteadOfPanicking(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The store is deliberately left OPEN while its file is rewritten
+	// underneath it: a reopen would repair the tail and hide the bug.
+	defer s.Close()
+	for h := uint64(1); h <= 3; h++ {
+		if err := s.Append(h, []byte(fmt.Sprintf("payload-%d", h))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) < 13 {
+		t.Fatalf("segment is %d bytes; the corrupt-prefix layout needs more", len(raw))
+	}
+	// Overwrite the FIRST record's length prefix with the 10-byte varint
+	// encoding of 2^64-1 (nine 0xFF continuations plus a final 0x01).
+	giant := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}
+	copy(raw, giant)
+	if err := os.WriteFile(seg, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Must report corruption, not panic.
+	if _, err := s.Read(1); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("Read(1) = %v, want an error wrapping ErrCorruptRecord (and no panic)", err)
+	}
+}

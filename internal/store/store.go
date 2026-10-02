@@ -225,13 +225,26 @@ func (s *Store) Read(height uint64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The index offsets come from the store's own scan, but the segment file
+	// can be rewritten underneath an open store: nothing here may panic on
+	// those bytes.
+	if int64(len(raw)) <= off {
+		return nil, fmt.Errorf("%w: index offset %d is past the end of %s", ErrCorruptRecord, off, segmentName(height))
+	}
 	n, m := binary.Uvarint(raw[off:])
-	if m <= 0 {
+	// A length prefix is stored data, not a trusted size: Uvarint legally
+	// yields up to 2^64-1, and int(n) overflows for anything above MaxInt64
+	// (end would wrap negative, so the truncation guard below would pass).
+	// Bound BEFORE any offset arithmetic, exactly as scanSegment does before
+	// indexing.
+	if m <= 0 || n > uint64(len(raw)) {
 		return nil, fmt.Errorf("%w: bad length at %d", ErrCorruptRecord, off)
 	}
 	start := int(off) + m
 	end := start + int(n)
-	if end+4 > len(raw) {
+	// Defensive: end may not fall below start, and the record's trailing
+	// checksum must still lie inside the segment.
+	if end < start || end+4 > len(raw) {
 		return nil, fmt.Errorf("%w: truncated record at %d", ErrCorruptRecord, off)
 	}
 	payload := raw[start:end]

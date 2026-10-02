@@ -121,9 +121,16 @@ func cmdNode(args []string) error {
 	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
 		version.Version, *addr, c.Genesis().ChainID, c.Height())
 
+	// A failed listen must reach the shell as a failure, not as exit 0: the
+	// goroutine delivers its error into the buffered channel BEFORE calling
+	// stop(), so by the time n.Run returns from that cancellation the error
+	// is already available to be read below — no window in which a failure is
+	// visible only to the node loop.
+	serveErr := make(chan error, 1)
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintln(os.Stderr, "http:", err)
+			serveErr <- err
 			stop()
 		}
 	}()
@@ -131,5 +138,14 @@ func cmdNode(args []string) error {
 	if err := n.Run(ctx, *blockTime); err != nil && ctx.Err() == nil {
 		return err
 	}
-	return nil
+	// A cancelled context is either a clean SIGINT shutdown — success — or
+	// the consequence of a failed listen, which must fail the process. The
+	// buffered serve error is guaranteed present in the latter case and
+	// absent in the former, so the read is non-blocking in both.
+	select {
+	case err := <-serveErr:
+		return err
+	default:
+		return nil
+	}
 }

@@ -1,7 +1,11 @@
 package genesis
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
+	"os"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -158,5 +162,96 @@ func TestTestnetGenesisValidatesWithoutValidators(t *testing.T) {
 func TestDevnetGenesisValidates(t *testing.T) {
 	if err := Devnet().Validate(); err != nil {
 		t.Fatalf("devnet genesis must validate: %v", err)
+	}
+}
+
+// genesisRecord is the JSON shape of the checked records in ../../genesis/.
+// JSON is never read by the node — it must never enter a hashed path — so
+// these files are records OF the Go constructors below, which are the source
+// of truth the node runs from. The test that follows keeps the records
+// honest: either copy drifting from the other fails the suite.
+type genesisRecord struct {
+	ChainID     string `json:"chain_id"`
+	Validators  int    `json:"validators"`
+	DevAccounts int    `json:"dev_accounts"`
+	Note        string `json:"note"`
+	Params      struct {
+		BlockTimeMS           uint64 `json:"block_time_ms"`
+		TotalSupplySparks     uint64 `json:"total_supply_sparks"`
+		InitialRewardSparks   uint64 `json:"initial_reward_sparks"`
+		HalvingIntervalBlocks uint64 `json:"halving_interval_blocks"`
+		ClaimAmountSparks     uint64 `json:"claim_amount_sparks"`
+		MinStakeSparks        uint64 `json:"min_stake_sparks"`
+		EpochBlocks           uint64 `json:"epoch_blocks"`
+		UnbondingEpochs       uint64 `json:"unbonding_epochs"`
+		CommitteeSize         int    `json:"committee_size"`
+	} `json:"params"`
+}
+
+// Each genesis JSON record must agree field-for-field with the Go
+// constructor it mirrors: chain_id, validator and dev-account counts, and
+// every protocol parameter. DisallowUnknownFields makes the check bind both
+// ways: an extra or renamed field — for example a rogue premine array the
+// constructor never agreed to — fails too. (encoding/json is used HERE ONLY;
+// it appears in no non-test file.)
+func TestGenesisJSONRecordsMatchTheGoConstructors(t *testing.T) {
+	for _, tc := range []struct {
+		file string
+		g    *Genesis
+	}{
+		{"../../genesis/devnet.json", Devnet()},
+		{"../../genesis/testnet.json", Testnet()},
+	} {
+		raw, err := os.ReadFile(tc.file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		var j genesisRecord
+		if err := dec.Decode(&j); err != nil {
+			t.Fatalf("%s: %v", tc.file, err)
+		}
+		// A checked record is one clean document: anything after it (another
+		// object, a duplicate document) is not part of the record and must
+		// fail rather than be glossed over.
+		var extra genesisRecord
+		if err := dec.Decode(&extra); err != io.EOF {
+			t.Fatalf("%s: trailing content after the JSON document", tc.file)
+		}
+
+		if j.ChainID != tc.g.ChainID {
+			t.Errorf("%s: chain_id = %q, constructor says %q", tc.file, j.ChainID, tc.g.ChainID)
+		}
+		if j.Validators != len(tc.g.Validators) {
+			t.Errorf("%s: validators = %d, constructor has %d", tc.file, j.Validators, len(tc.g.Validators))
+		}
+		if j.DevAccounts != len(tc.g.DevAccounts) {
+			t.Errorf("%s: dev_accounts = %d, constructor has %d", tc.file, j.DevAccounts, len(tc.g.DevAccounts))
+		}
+
+		p, q := tc.g.Params, j.Params
+		for _, c := range []struct {
+			name  string
+			jsonV uint64
+			goV   uint64
+		}{
+			{"block_time_ms", q.BlockTimeMS, p.BlockTimeMS},
+			{"total_supply_sparks", q.TotalSupplySparks, p.TotalSupplySparks},
+			{"initial_reward_sparks", q.InitialRewardSparks, p.InitialRewardSparks},
+			{"halving_interval_blocks", q.HalvingIntervalBlocks, p.HalvingIntervalBlocks},
+			{"claim_amount_sparks", q.ClaimAmountSparks, p.ClaimAmountSparks},
+			{"min_stake_sparks", q.MinStakeSparks, p.MinStakeSparks},
+			{"epoch_blocks", q.EpochBlocks, p.EpochBlocks},
+			{"unbonding_epochs", q.UnbondingEpochs, p.UnbondingEpochs},
+		} {
+			if c.jsonV != c.goV {
+				t.Errorf("%s: params.%s = %d, constructor says %d", tc.file, c.name, c.jsonV, c.goV)
+			}
+		}
+		if q.CommitteeSize != p.CommitteeSize {
+			t.Errorf("%s: params.committee_size = %d, constructor says %d",
+				tc.file, q.CommitteeSize, p.CommitteeSize)
+		}
 	}
 }

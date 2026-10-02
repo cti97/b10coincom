@@ -2,7 +2,11 @@ package chain
 
 import (
 	"crypto/ed25519"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -355,6 +359,60 @@ func TestBlockAtReadsHistoricalBlocks(t *testing.T) {
 }
 
 func devKey() (ed25519.PublicKey, ed25519.PrivateKey) { return genesis.DevValidatorKey() }
+
+// The store indexes segments by RECORD COUNT, so a lost or rewritten segment
+// would silently renumber every stored block: replay must refuse to apply a
+// stored block whose own header (height, parent link) does not match its
+// position. Rewriting the segment here drops the FIRST record, shifting every
+// remaining block one slot down — the renumbering a lost segment induces.
+// All blocks were built without transactions, so the pre-fix state-root check
+// alone would pass across the renumbered chain; the height/link check is what
+// catches this, and Open must fail with ErrGenesisReplay rather than succeed.
+func TestOpenRejectsRenumberedStoredChain(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	_, priv := devKey()
+
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := 1; h <= 3; h++ {
+		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Skip record 1 entirely: uvarint length prefix, payload, uint32be CRC.
+	recLen, m := binary.Uvarint(raw)
+	if m <= 0 || m+int(recLen)+4 > len(raw) {
+		t.Fatalf("malformed first record in %s; cannot drop it", seg)
+	}
+	if err := os.WriteFile(seg, raw[m+int(recLen)+4:], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := Open(g, dir)
+	if err == nil {
+		c2.Close()
+		t.Fatal("Open succeeded on a renumbered chain — the stored bytes no longer support the reported heights")
+	}
+	if !errors.Is(err, ErrGenesisReplay) {
+		t.Fatalf("Open = %v, want an error wrapping ErrGenesisReplay", err)
+	}
+}
 
 func devPrivateKey(t *testing.T) ed25519.PrivateKey {
 	t.Helper()

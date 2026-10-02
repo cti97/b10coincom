@@ -105,7 +105,7 @@ Import direction is `cmd → devnet → {chain, rpc, node}` and
 | `internal/state` | Address → account state map; the transfer transition (signature, nonce, balance rules) applied atomically per block on a clone; sorted-leaf Merkle state root; zero-value accounts pruned |
 | `internal/genesis` | Protocol parameters, genesis hash and validation, the devnet and testnet configurations, deterministic public dev fixtures, and the keyless faucet address |
 | `internal/store` | Append-only block segment files (1,000 blocks per segment), each record CRC32C-checksummed; a partial trailing record from a crash is truncated on open and a damaged record is reported, never silently dropped |
-| `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup and verifies the resulting state root against each committed header; internal state is mutex-guarded for RPC concurrency |
+| `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency |
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
 | `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size), `GET /block/{height}`, and `POST /tx` (hex-encoded canonical transaction bytes) |
@@ -155,7 +155,14 @@ Import direction is `cmd → devnet → {chain, rpc, node}` and
 ## Genesis configurations
 
 Two configurations ship in `genesis/`, mirroring the design's devnet and
-testnet chains. Both share the same monetary protocol constants: 2,000 ms
+testnet chains. The Go constructors in `internal/genesis` (`genesis.Devnet`,
+`genesis.Testnet`) are the source of truth the node runs from — nothing parses
+the JSON at runtime, so JSON never enters a hashed path. The JSON files are
+**checked records**: `TestGenesisJSONRecordsMatchTheGoConstructors` unmarshals
+each one and requires it to agree field-for-field with the corresponding
+constructor (`chain_id`, validator and dev-account counts, every `params`
+value), so either copy drifting from the other fails the suite. Both chains
+share the same monetary protocol constants: 2,000 ms
 block time, 21,000,000 b10 supply cap, 50,000,000 sparks (0.5 b10) initial
 reward, 21,000,000-block halving interval, 100 b10 per faucet claim, 1,000 b10
 minimum stake, 10,000-block epochs, 2 unbonding epochs.
@@ -164,15 +171,15 @@ minimum stake, 10,000-block epochs, 2 unbonding epochs.
 |---|---|---|
 | `chain_id` | `b10coin-devnet-1` | `b10coin-testnet-1` |
 | Validators | 1, from a deterministic public test key | 0 (validator keys arrive with real networking, M4) |
-| Funded accounts | 2 test accounts, for transfers before the M2 faucet exists | **none** |
+| Dev accounts | 1 funded account plus 1 zero-balance recipient, for transfers before the M2 faucet exists | **none** |
 | Committee size | 1 | 21 |
 
 The devnet fixture exists to exercise transfers and the CLI; the testnet
-configuration is the no-premine contract:
+configuration is where the no-premine promise lives:
 
 | Promise | How the code enforces it |
 |---|---|
-| No premine on testnet | `genesis/testnet.json` funds zero accounts, and `TestTestnetGenesisHasNoPremine` fails the suite if any account is ever funded |
+| No premine on testnet | `TestTestnetGenesisHasNoPremine` rejects any funded account in the `genesis.Testnet` constructor — the Go source of truth the node runs from — and `TestGenesisJSONRecordsMatchTheGoConstructors` requires `genesis/testnet.json` to agree field-for-field with it, so a funded entry in the JSON record fails the suite too |
 | No key can spend from the faucet | the faucet address is hash-of-genesis, not hash-of-pubkey; the derivation is pinned by a test |
 | Emission closes exactly at the cap | `Genesis.Validate` enforces `InitialRewardSparks × HalvingIntervalBlocks × 2 == TotalSupplySparks`; `TestSupplyCapIsPinned` pins the absolute monetary values, so a proportional "renegotiation" cannot pass |
 
