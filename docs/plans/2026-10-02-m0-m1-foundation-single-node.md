@@ -3246,6 +3246,22 @@ git commit -m "feat: add crash-tolerant append-only block store"
 
 ### Task 10: Chain — build, validate, append, replay
 
+> **As-built corrections (controller, after review).** This task's fragments
+> were superseded during implementation. The reference is now
+> `internal/chain/chain.go` and `internal/chain/chain_test.go` themselves.
+> Corrections applied after review, all reflected in the code:
+> 1. `TestAppendRejectsTamperedStateRoot` must RE-SIGN the tampered header —
+>    otherwise the signature check rejects first and the state-root guard is
+>    never reached.
+> 2. `TestAppendRejectsForgedSignature` was added: the pre-existing test only
+>    cleared `Sig`, so `crypto.Verify` could be deleted with the whole suite
+>    still green (controller-verified with a compiling mutant).
+> 3. `TestReplayRebuildsIdenticalState` now includes a real signed transfer;
+>    with only empty blocks every stored root equalled the genesis root, so
+>    the durability guarantee never compared re-derived transaction effects.
+> 4. `Open` closes the store on its replay-failure paths, and `Append`/`Head`
+>    document that a caller must not mutate a block after appending it.
+
 **Files:**
 - Create: `internal/chain/chain.go`, `internal/chain/chain_test.go`
 
@@ -3434,13 +3450,37 @@ func TestReplayRebuildsIdenticalState(t *testing.T) {
 	g := genesis.Devnet()
 	_, priv := devKey()
 
+	fromPub := g.DevAccounts[0].PubKey
+	toPub := g.DevAccounts[1].PubKey
+	from := types.AddressFromPub(fromPub)
+	to := types.AddressFromPub(toPub)
+	// The devnet validator key is not the dev account key, so txs are
+	// signed with the dev account's deterministic key.
+	devPriv := devPrivateKey(t)
+
 	c, err := Open(g, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	genesisRoot := c.State().Root()
+
 	var roots [][32]byte
 	for h := 1; h <= 5; h++ {
-		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		// Block h pays h b10 from dev account 0 to dev account 1. The
+		// nonce is the account's current replay counter, so each block's
+		// transfer chains onto the previous one's effect.
+		tx := &types.Tx{
+			Type:   types.TxTransfer,
+			From:   from,
+			PubKey: fromPub,
+			Nonce:  c.State().Get(from).Nonce,
+			To:     to,
+			Amount: uint64(h) * genesis.SparksPerB10,
+		}
+		sigHash := tx.SigningHash()
+		tx.Sig = crypto.Sign(devPriv, sigHash[:])
+
+		b, err := c.Build(priv, []types.Tx{*tx}, int64(1_700_000_000+h))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3466,6 +3506,12 @@ func TestReplayRebuildsIdenticalState(t *testing.T) {
 	}
 	if c2.State().Root() != roots[len(roots)-1] {
 		t.Fatal("replayed state root differs from the stored header")
+	}
+	// Without this the test could pass with blocks that carry no txs at
+	// all: the root-differs assertion is what proves replay re-derived
+	// transaction effects from the stored blocks.
+	if c2.State().Root() == genesisRoot {
+		t.Fatal("replayed state root equals the genesis root after five real transfers; replay did not re-derive transaction effects")
 	}
 }
 
