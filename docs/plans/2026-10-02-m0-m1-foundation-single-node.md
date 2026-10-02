@@ -15,7 +15,7 @@
 - **Module path:** `github.com/cti97/b10coincom`
 - **Go floor:** `go 1.23`
 - **Toolchain (verified 2026-10-02):** `brew install go` upgraded this machine from go1.21.4 to **go1.27.1**, which satisfies this floor. No toolchain download or floor change is needed.
-- **Dependencies:** exactly one external module, `lukechampine.com/blake3`. No others. Do not add a CLI framework, a logging framework, a test framework, or a database.
+- **Dependencies:** exactly one *direct* external module, `lukechampine.com/blake3` (v1.4.1). It pulls one transitive requirement, `github.com/klauspost/cpuid/v2`, recorded `// indirect` in `go.mod` — that is unavoidable and is not a second chosen dependency. Do not add a CLI framework, a logging framework, a test framework, a database, or any other direct dependency.
 - **Base unit is `spark`**; `1 b10 = 10^8 sparks`. All monetary values are `uint64` sparks. Never use floats for money.
 - **Canonical encoding only.** Every consensus structure is encoded with the helpers from Task 2. Never `encoding/gob`, never JSON for anything that gets hashed or signed, never iterate a Go `map` when producing bytes.
 - **No premine on testnet.** The testnet genesis must have zero funded accounts. Task 8 includes a test that enforces this.
@@ -550,7 +550,10 @@ func TestMerkleRootHandlesOddLeafCounts(t *testing.T) {
 		if got == ([32]byte{}) {
 			t.Fatalf("n=%d produced the empty root", n)
 		}
-		if !bytes.Equal(got[:], MerkleRoot(leaves)[:]) {
+		// MerkleRoot's result is an unaddressable array and cannot be sliced
+		// in place, so bind it before comparing.
+		again := MerkleRoot(leaves)
+		if !bytes.Equal(got[:], again[:]) {
 			t.Fatalf("n=%d is not deterministic", n)
 		}
 	}
