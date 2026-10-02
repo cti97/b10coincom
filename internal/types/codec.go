@@ -167,3 +167,13 @@ func (d *Decoder) Fixed32() ([32]byte, error) {
 	d.off += 32
 	return v, nil
 }
+
+func (d *Decoder) Fixed20() (Address, error) {
+	var a Address
+	if d.remaining() < AddressSize {
+		return a, ErrShortBuffer
+	}
+	copy(a[:], d.buf[d.off:d.off+AddressSize])
+	d.off += AddressSize
+	return a, nil
+}
