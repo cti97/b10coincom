@@ -2594,7 +2594,7 @@ git commit -m "feat: add genesis parameters, keyless faucet address, and no-prem
 - Create: `internal/store/store.go`, `internal/store/store_test.go`
 
 **Interfaces:**
-- Consumes: `types.NewEncoder`, `types.Decoder`
+- Consumes: nothing from other b10coin packages — the store deals in opaque `[]byte` and imports the standard library only
 - Produces:
   - `const BlocksPerSegment = 1000`
   - `type Store struct{}` with `Open(dir string) (*Store, error)`, `(*Store) Append(height uint64, payload []byte) error`, `(*Store) Read(height uint64) ([]byte, error)`, `(*Store) Height() (uint64, bool)`, `(*Store) Close() error`
