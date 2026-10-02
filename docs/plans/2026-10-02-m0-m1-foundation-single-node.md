@@ -4122,8 +4122,10 @@ import (
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/chain"
+	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/mempool"
+	"github.com/cti97/b10coincom/internal/types"
 )
 
 func testServer(t *testing.T) (*Server, *httptest.Server) {
@@ -4202,6 +4204,32 @@ func TestTxEndpointRejectsGarbage(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
+}
+
+// buildSignedTx returns a valid transfer signed by a fresh key. The RPC
+// endpoint only decodes a transaction and verifies its signature - it never
+// checks balances - so an unfunded key is sufficient here.
+func buildSignedTx(t *testing.T) *types.Tx {
+	t.Helper()
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherPub, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &types.Tx{
+		Type:   types.TxTransfer,
+		From:   types.AddressFromPub(pub),
+		PubKey: pub,
+		Nonce:  0,
+		To:     types.AddressFromPub(otherPub),
+		Amount: 1,
+	}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+	return tx
 }
 
 func TestTxEndpointAcceptsValidTx(t *testing.T) {
