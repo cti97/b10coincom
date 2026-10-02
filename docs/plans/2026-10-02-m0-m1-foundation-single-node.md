@@ -900,7 +900,7 @@ git commit -m "feat: add Ed25519 signing and checksummed base32 addresses"
   - `(*Tx) SigningHash() [32]byte`, `(*Tx) ID() [32]byte`, `(*Tx) Encode() []byte`, `(*Tx) VerifySignature() error`, `DecodeTx([]byte) (*Tx, error)`
   - `ErrUnsupportedTxType`, `ErrBadSignature`, `ErrAddressMismatch`
 
-**Note:** M1 implements `TxTransfer` end to end. The remaining type constants are reserved so the wire format does not need to change later; `Encode`/`DecodeTx` return `ErrUnsupportedTxType` for them, and `state` rejects them. M2 adds `TxFaucetClaim`; M5 adds the staking types.
+**Note:** M1 implements `TxTransfer` end to end. The remaining type constants are reserved so the wire format does not need to change later; `DecodeTx` returns `ErrUnsupportedTxType` for them, and `state` rejects them. (`Tx.Encode` has no error return, so it can only ever produce the transfer shape.) M2 adds `TxFaucetClaim`; M5 adds the staking types.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -935,7 +935,8 @@ func signedTransfer(t *testing.T, nonce, amount uint64) *Tx {
 		To:     AddressFromPub(otherPub),
 		Amount: amount,
 	}
-	tx.Sig = crypto.Sign(priv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return tx
 }
 
@@ -1113,7 +1114,8 @@ func (tx *Tx) VerifySignature() error {
 	if AddressFromPub(tx.PubKey) != tx.From {
 		return ErrAddressMismatch
 	}
-	if !crypto.Verify(tx.PubKey, tx.SigningHash()[:], tx.Sig) {
+	sigHash := tx.SigningHash()
+	if !crypto.Verify(tx.PubKey, sigHash[:], tx.Sig) {
 		return ErrBadSignature
 	}
 	return nil
@@ -1572,7 +1574,8 @@ func transfer(t *testing.T, fromPub, fromPriv []byte, from types.Address, nonce,
 		To:     to,
 		Amount: amount,
 	}
-	tx.Sig = crypto.Sign(fromPriv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 	return tx
 }
 
@@ -2205,7 +2208,8 @@ func (g *Genesis) Hash() [32]byte {
 // ever be produced for it. Coins can only leave this account through the
 // protocol's claim rule.
 func (g *Genesis) FaucetAddress() types.Address {
-	h := crypto.HashParts([]byte("b10coin-faucet"), g.Hash()[:])
+	gh := g.Hash()
+	h := crypto.HashParts([]byte("b10coin-faucet"), gh[:])
 	var a types.Address
 	copy(a[:], h[:types.AddressSize])
 	return a
@@ -3129,7 +3133,8 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 		To:     to,
 		Amount: 250 * genesis.SparksPerB10,
 	}
-	tx.Sig = crypto.Sign(devPriv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(devPriv, sigHash[:])
 
 	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
 	if err != nil {
@@ -3382,7 +3387,11 @@ func (c *Chain) Append(b *types.Block) error {
 	if !c.isValidator(b.Header.Proposer) {
 		return ErrNotValidator
 	}
-	if b.Sig == nil || !crypto.Verify(b.Header.Proposer, b.Header.SigningHash()[:], b.Sig) {
+	if b.Sig == nil {
+		return ErrBadProposerSig
+	}
+	headerHash := b.Header.SigningHash()
+	if !crypto.Verify(b.Header.Proposer, headerHash[:], b.Sig) {
 		return ErrBadProposerSig
 	}
 
@@ -3442,7 +3451,8 @@ extend `DecodeBlock` to read it back:
 before the `return b, nil`:
 
 ```go
-	b.Sig = crypto.Sign(proposer, b.Header.SigningHash()[:])
+	headerHash := b.Header.SigningHash()
+	b.Sig = crypto.Sign(proposer, headerHash[:])
 ```
 
 Also add this test to guard that the signature is over the header only:
@@ -3516,7 +3526,8 @@ func mkTx(t *testing.T, nonce uint64) types.Tx {
 		To:     types.AddressFromPub(otherPub),
 		Amount: 1,
 	}
-	tx.Sig = crypto.Sign(priv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return *tx
 }
 
@@ -4117,7 +4128,8 @@ func TestRunOnceIncludesMempoolTransactions(t *testing.T) {
 		To:     types.AddressFromPub(toPub),
 		Amount: 10 * genesis.SparksPerB10,
 	}
-	tx.Sig = crypto.Sign(fromPriv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 
 	mp := mempool.New(100)
 	if err := mp.Add([]types.Tx{*tx})[0]; err != nil {
@@ -4370,7 +4382,8 @@ func devTransfer(c *chain.Chain, amount uint64) (*types.Tx, error) {
 		To:     types.AddressFromPub(toPub),
 		Amount: amount,
 	}
-	tx.Sig = crypto.Sign(fromPriv, tx.SigningHash()[:])
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 	return tx, nil
 }
 
