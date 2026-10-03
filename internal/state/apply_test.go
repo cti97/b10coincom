@@ -2,6 +2,7 @@ package state
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -714,5 +715,34 @@ func TestHeightIsExecutionContextOnly(t *testing.T) {
 	}
 	if s.Clone().height != 300 {
 		t.Fatal("Clone did not carry the height")
+	}
+}
+
+// The claimant-credit overflow guard must run BEFORE the faucet debit. Both
+// of this file's entry points' doc comments promise that every validation
+// runs before the first write, so a rejected claim must leave the state -
+// INCLUDING the faucet - completely unchanged; a guard below the debit would
+// leave the faucet debited and the claimant uncredited on an (unreachable,
+// while supply is bounded) overflow - a partial application.
+func TestClaimBalanceOverflowRejectsBeforeTheDebit(t *testing.T) {
+	p := testParams(t)
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: 1_000})
+
+	tx := solvedClaim(t, p, 1, 0)
+	claimant := tx.From
+	// A balance that cannot take p.ClaimAmount more sparks: only the
+	// claimant-credit overflow guard can reject this otherwise perfectly
+	// formed claim.
+	s.Set(claimant, Account{Balance: math.MaxUint64})
+	before := s.Root()
+	if err := s.ApplyTx(tx); !errors.Is(err, ErrBalanceOverflow) {
+		t.Fatalf("expected ErrBalanceOverflow, got %v", err)
+	}
+	if got := s.Get(p.FaucetAddress).Balance; got != 1_000 {
+		t.Fatalf("the faucet balance = %d, want 1_000 - the faucet was debited before the overflow guard ran", got)
+	}
+	if s.Root() != before {
+		t.Fatal("an overflowed claim changed the state")
 	}
 }

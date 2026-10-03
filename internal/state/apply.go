@@ -123,6 +123,17 @@ func (s *State) applyFaucetClaim(tx *types.Tx) error {
 		return fmt.Errorf("%w: holds %d, one claim needs %d", ErrFaucetEmpty, faucetAcc.Balance, s.params.ClaimAmount)
 	}
 
+	// The credit side carries the same overflow guard applyTransfer puts on
+	// the recipient: an addition must return an error, never wrap. Unreachable
+	// while the supply is bounded, but free and consistent. It runs BEFORE the
+	// debit, honouring the every-validation-before-the-first-write promise both
+	// entry points make: with the guard below the debit, this unreachable
+	// overflow would leave the faucet debited and the claimant uncredited -
+	// a partial application.
+	if claimant.Balance > math.MaxUint64-s.params.ClaimAmount {
+		return ErrBalanceOverflow
+	}
+
 	// THE single place in the codebase where an account is modified without
 	// its owner's signature. It is sound because the faucet address is derived
 	// from the GENESIS HASH, not from a public key: no private key exists for
@@ -141,13 +152,6 @@ func (s *State) applyFaucetClaim(tx *types.Tx) error {
 	// which is exactly why no runtime check is spent on it here.
 	faucetAcc.Balance -= s.params.ClaimAmount
 	s.Set(s.params.FaucetAddress, faucetAcc)
-
-	// The credit side carries the same overflow guard applyTransfer puts on
-	// the recipient: an addition must return an error, never wrap. Unreachable
-	// while the supply is bounded, but free and consistent.
-	if claimant.Balance > math.MaxUint64-s.params.ClaimAmount {
-		return ErrBalanceOverflow
-	}
 
 	claimant.Balance += s.params.ClaimAmount
 	claimant.Nonce++
