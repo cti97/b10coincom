@@ -40,7 +40,7 @@
 
 **7. A vote for `nil` is a first-class vote.** Validators must be able to advance past a round where no proposal arrived, so `Vote.BlockID` of all-zeros means "this round produced nothing I will accept". Treating nil votes as abstentions would deadlock the chain whenever a proposer is offline.
 
-**8. Committing is the only place consensus mutates the chain.** The engine collects precommits, and on quorum calls `chain.Append` exactly once, then advances to the next height. It never speculatively applies a block, so a stalled height leaves the chain untouched.
+**8. Committing is the only place consensus mutates the chain.** The engine collects precommits and reports the quorum decision through `Committed()`; the DRIVER calls `chain.Append` exactly once on that decision, then advances to the next height. The engine never touches the chain at all - it holds no chain object, because a pure state machine that did I/O could not be replayed from a seed (Design Decision 1). Consensus never speculatively applies a block, so a stalled height leaves the chain untouched.
 
 **9. The committee is the genesis validator set, fixed for the milestone.** Epoch-bound validator-set changes are M5 (staking). M3 builds the `height → committee` seam (a `CommitteeAt(height)` function) so M5 has somewhere to plug in, but returns the genesis set for every height.
 

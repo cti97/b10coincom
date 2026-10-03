@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"crypto/ed25519"
+	"fmt"
 	"testing"
 	"time"
 
@@ -74,12 +75,20 @@ func countWire(t *testing.T, rec *recordingTransport) (proposals []*Proposal, vo
 // the driver's clock by driveStep and the simulated network by the same 10ms,
 // then one extra half-step Tick so anything a delivery flushed can react while
 // the round's timer cannot fire early (deadline re-arms are multiples of 10).
-// until stops the loop early, the way a test waits for one commit.
+// until stops the loop EARLY, the way a test waits for one commit. It is
+// checked after every Tick, not once per iteration: with a validator's own
+// vote tallied (review finding F1) a one-validator committee commits on every
+// Tick, so a test that pins post-commit state (the re-armed timeout of review
+// finding F2) must observe it on the exact Tick that appended, before the next
+// half-Tick can commit yet another height.
 func drive(t *testing.T, d *Driver, net *sim.Net, iterations int, until func() bool) {
 	t.Helper()
 	for i := 0; i < iterations; i++ {
 		now := int64(i) * driveStep
 		d.Tick(now)
+		if until != nil && until() {
+			return
+		}
 		net.Advance(netStep)
 		d.Tick(now + driveStep/2)
 		if until != nil && until() {
@@ -90,21 +99,23 @@ func drive(t *testing.T, d *Driver, net *sim.Net, iterations int, until func() b
 
 // oneValidatorFixture is the brief's single-validator fixture: quorum is 1, so
 // the validator's own prevote and precommit each reach the threshold and the
-// appendix path runs for real, no multi-node harness needed.
+// append path runs for real, no multi-node harness needed.
 //
 // The 1/4 power cap must be configured as 1/1 here, not the spec's 1/4: below
 // four validators the largest holder always holds at least total/3, so a 1/4
 // cap is satisfiable nowhere and cfg.Validate would reject the fixture before
 // the test could run.
 //
-// The fixture also adds one relay peer. The engine tallies votes ONLY as they
-// arrive through OnMessage and the sim never echoes a sender's own broadcast,
-// so a one-validator committee would otherwise never see its own prevote
-// return and could never tally its own weight into the quorum of 1. The relay
-// replays everything v0 broadcasts back into v0 through the sim: the driver
-// still only ever calls Broadcast, and the commit below arises from the
-// unmodified StartProposing -> prevote -> precommit -> commit path, just with
-// the whole committee being the proposer it is also delivering to.
+// Review finding F1 removed this fixture's original relay peer. The relay
+// existed only to loop v0's broadcasts back to it: the engine used to tally
+// votes solely as they arrived through OnMessage, the sim never echoes a
+// sender's own broadcast, and a one-validator committee could therefore never
+// tally its own weight into a quorum of 1. The engine now delivers its own
+// vote to its own tally through the same OnMessage path a received vote takes,
+// so the commit below arises from the unmodified StartProposing -> prevote ->
+// precommit -> commit path with nothing but the driver's Broadcast between
+// them - the fixture no longer masks, with test-only traffic, a tally the
+// network would not really perform.
 func oneValidatorFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *recordingTransport, net *sim.Net, pub ed25519.PublicKey, priv ed25519.PrivateKey, g *genesis.Genesis, dir string) {
 	t.Helper()
 	pub, priv, err := crypto.GenerateKey()
@@ -130,14 +141,6 @@ func oneValidatorFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *recordi
 	net.AddPeer("v0")
 	rec = &recordingTransport{Transport: net.TransportFor("v0")}
 	d = NewDriver(cfg, ch, priv, rec)
-
-	// The relay: peer "loop" re-broadcasts whatever it receives, so v0's own
-	// messages return to it with real transport latency.
-	net.AddPeer("loop")
-	relay := net.TransportFor("loop")
-	relay.OnMessage(func(m transport.Message) {
-		_ = relay.Broadcast(m.Data)
-	})
 	return d, ch, rec, net, pub, priv, g, dir
 }
 
@@ -181,7 +184,11 @@ func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *record
 // A one-validator committee has a quorum of 1, so it can drive itself all the
 // way to a commit. That makes the whole append-on-commit path testable without
 // the multi-node harness, and it is a POSITIVE test: the chain must actually
-// advance, by exactly one block, exactly once.
+// advance. Review finding F2 extended it from stopping at the FIRST commit to
+// driving to before+2: stopping at the first commit let a mutant that deletes
+// the post-commit engine swap (`d.eng = NewEngine(...)` in flush) pass every
+// driver test, leaving Design Decision 8's "then advances to the next height"
+// pinned by nothing.
 func TestDriverAppendsOnCommit(t *testing.T) {
 	d, ch, rec, net, _, _, g, dir := oneValidatorFixture(t)
 
@@ -191,31 +198,56 @@ func TestDriverAppendsOnCommit(t *testing.T) {
 	}
 	parentID := ch.Head().ID()
 
-	drive(t, d, net, 200, func() bool { return ch.Height() > before })
+	// Drive to before+2, not to the first commit: the commit at before+1 must
+	// be FOLLOWED by a second one, appended by the fresh engine the driver
+	// swapped in over the block just committed.
+	drive(t, d, net, 200, func() bool { return ch.Height() >= before+2 })
 
-	if ch.Height() != before+1 {
-		t.Fatalf("the chain did not advance past height %d: the commit path never appended (height %d, %d messages broadcast)",
-			before, ch.Height(), len(rec.broadcasts))
+	if ch.Height() != before+2 {
+		t.Fatalf("the chain did not advance to height %d: the commit path never appended twice (height %d, %d messages broadcast)",
+			before+2, ch.Height(), len(rec.broadcasts))
 	}
-	head, err := ch.BlockAt(ch.Height())
+	// The parent chain must really link back: the first appended block parents
+	// the chain head the driver started from, and the second parents the first.
+	first, err := ch.BlockAt(before + 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if head.Header.Height != before+1 {
-		t.Fatalf("appended a block at height %d, want %d", head.Header.Height, before+1)
+	if first.Header.Height != before+1 {
+		t.Fatalf("appended a block at height %d, want %d", first.Header.Height, before+1)
 	}
-	if head.Header.ParentHash != parentID {
+	if first.Header.ParentHash != parentID {
 		t.Fatalf("the committed block parents %x, want the chain head before the commit (%x)",
-			head.Header.ParentHash[:8], parentID[:8])
+			first.Header.ParentHash[:8], parentID[:8])
 	}
-	// And it must not overshoot: committing appends EXACTLY one block. A
-	// double append that slipped past the chain's own guards would leave a
-	// block at the next height too.
-	if _, err := ch.BlockAt(before + 2); err == nil {
-		t.Fatalf("a block exists at height %d: the commit appended more than once", before+2)
+	second, err := ch.BlockAt(before + 2)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The block is durably stored exactly once: reopen the same directory and
-	// the store must replay to exactly one block past the genesis.
+	firstID := first.ID()
+	if second.Header.ParentHash != firstID {
+		t.Fatalf("the second committed block parents %x, want the first committed block (%x): the chain did not advance twice over a correct parent chain",
+			second.Header.ParentHash[:8], firstID[:8])
+	}
+	// And it must not overshoot: two committed heights append EXACTLY two
+	// blocks. A double append that slipped past the chain's own guards would
+	// leave a block at the next height too.
+	if _, err := ch.BlockAt(before + 3); err == nil {
+		t.Fatalf("a block exists at height %d: the commit path appended more than it committed", before+3)
+	}
+	// After the commit that replaced the engine, the new engine's round 0 is
+	// armed with a full TimeoutBase from the CURRENT clock reading. Pinning
+	// this kills the `timeoutAt = 0` mutant: a reset that forgets the elapsed
+	// time arms the deadline in the past, and the very next Tick fires a
+	// timeout the fresh round has not earned - the new engine burns its round-0
+	// proposal on an instant timeout (its round-trips race in the same Tick)
+	// instead of getting the armed window.
+	if want := d.now + d.cfg.TimeoutBase; d.timeoutAt != want {
+		t.Fatalf("after the commit the new engine's timeout is armed at %d, want the current reading plus one TimeoutBase (%d)",
+			d.timeoutAt, want)
+	}
+	// The blocks are durably stored exactly once: reopen the same directory and
+	// the store must replay to exactly two blocks past the genesis.
 	if err := ch.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -224,9 +256,9 @@ func TestDriverAppendsOnCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if reopened.Height() != before+1 {
-		t.Fatalf("replayed chain sits at height %d, want %d: the commit did not append exactly one durably stored block",
-			reopened.Height(), before+1)
+	if reopened.Height() != before+2 {
+		t.Fatalf("replayed chain sits at height %d, want %d: the commits did not append exactly two durably stored blocks",
+			reopened.Height(), before+2)
 	}
 }
 
@@ -432,6 +464,108 @@ func TestDriverEndsTheRoundItIsInOnTimeout(t *testing.T) {
 	}
 	if len(nilRounds) < 3 {
 		t.Fatalf("only rounds %v emitted the nil prevote of a stalled round; rounds whose timeouts the engine ignored are missing from the list", keysOf(nilRounds))
+	}
+}
+
+// fourValidatorsOneSilentFixture builds a four-validator committee with real
+// drivers on validators 0..2 and a SILENT fourth: peer "v3" is registered on
+// the network but has no driver, no engine and no chain - it listens and never
+// emits. That is the review's High finding (F1) measured end to end: three live
+// validators against a quorum of 3 of TOTAL power, which must still commit.
+func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Chain, net *sim.Net) {
+	t.Helper()
+	vals := make([]genesis.Validator, 0, 4)
+	for i := 0; i < 4; i++ {
+		vals = append(vals, testValidator(i, 1))
+	}
+	g := genesis.Devnet()
+	g.Validators = vals
+	g.Params.CommitteeSize = 4
+
+	// n = 4 is the first size where the spec's 1/4 power cap can bind, and 1/4
+	// of 4 is exactly one honest validator's power, so the cap sits at its
+	// ceiling here: 1/4.
+	cfg := Config{Committee: g.Validators, TimeoutBase: roundBase, TimeoutStep: roundStep, PowerCapNum: 1, PowerCapDen: 4}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	net = sim.New(sim.Options{Seed: 1, Latency: 1})
+	for i := 0; i < 4; i++ {
+		net.AddPeer(fmt.Sprintf("v%d", i))
+	}
+	for i := 0; i < 3; i++ {
+		ch, err := chain.Open(g, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := NewDriver(cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)))
+		ds = append(ds, d)
+		chs = append(chs, ch)
+	}
+	// v3 gets no driver: the sim drops deliveries to a handler-less endpoint,
+	// which is exactly what a silent validator is.
+	return ds, chs, net
+}
+
+// A validator's own vote must count toward its own tally, or a validator's
+// ceiling is n-1 and not n. The review measured the consequence on four
+// validators with one silent: the three live validators each saw only the other
+// two (2 of the quorum of 3), never committed, and every live chain sat at
+// height 0 - the committee tolerated ZERO silent validators, and Task 9's
+// TestScenarioOneOfflineStillAdvances could never pass. Tolerating a silent
+// validator is the entire point of BFT.
+//
+// With the self-tally in place, the three live validators - each one counting
+// its own vote through the same path a received vote takes - hold exactly the
+// quorum of 3 whenever a live validator proposes (the silent one is drawn as
+// proposer in about a quarter of rounds; those rounds end on the timeout and
+// the committee moves on). The test drives the real protocol over the sim on
+// virtual time and requires not merely SOME progress but CONSENSUS: the three
+// live chains must agree, block for block.
+func TestFourValidatorsOneSilentStillCommitHeights(t *testing.T) {
+	ds, chs, net := fourValidatorsOneSilentFixture(t)
+	defer func() {
+		for _, ch := range chs {
+			_ = ch.Close()
+		}
+	}()
+
+	const iterations = 600 // 6000 virtual ms: dozens of rounds
+	for i := 0; i < iterations; i++ {
+		now := int64(i) * driveStep
+		for _, d := range ds {
+			d.Tick(now)
+		}
+		net.Advance(netStep)
+		for _, d := range ds {
+			d.Tick(now + driveStep/2)
+		}
+	}
+
+	h := chs[0].Height()
+	const minHeight = 3
+	if h < minHeight {
+		t.Fatalf("with one validator silent, the three live ones still reached only height %d (want >= %d): "+
+			"a validator's own vote is not being counted toward its own tally", h, minHeight)
+	}
+	for i, ch := range chs[1:] {
+		if ch.Height() != h {
+			t.Fatalf("live validator %d sits at height %d while validator 0 sits at %d: the live validators diverged",
+				i+1, ch.Height(), h)
+		}
+		head0 := chs[0].Head().ID()
+		if id := ch.Head().ID(); id != head0 {
+			t.Fatalf("live validator %d head %x differs from validator 0's head %x at the same height: divergent commits",
+				i+1, id[:8], head0[:8])
+		}
+	}
+	// Nothing may exist at the height after the live validators' head: each
+	// height commits exactly once, appending exactly one block.
+	for _, ch := range chs {
+		if _, err := ch.BlockAt(ch.Height() + 1); err == nil {
+			t.Fatalf("a block exists at height %d: the commit path appended more than once", ch.Height()+1)
+		}
 	}
 }
 

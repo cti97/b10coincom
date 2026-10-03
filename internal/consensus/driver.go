@@ -32,6 +32,18 @@ type Driver struct {
 	now int64
 	// timeoutAt is the reading at which the engine's current round expires.
 	timeoutAt int64
+	// appendRefused records that the chain REFUSED this engine's committed
+	// block, so flush never offers it again. The refusal is deterministic and
+	// permanent while the engine stays: this driver is M3's only chain writer,
+	// the chain head therefore never moves on its own, and Append re-validates
+	// against that head - the same block offered again fails for the identical
+	// reason. Retrying it on every flush would take the chain's write lock
+	// forever for no possible effect, so the retry stops instead; the node
+	// stays parked at the undecided height (Design Decision 8: a refused block
+	// is never silently skipped, because advancing past it would diverge this
+	// node from every peer that accepted it). A future milestone that gives a
+	// node a way to adopt a peer's block must clear this flag when it does.
+	appendRefused bool
 }
 
 // NewDriver starts a driver that will extend ch from its current head.
@@ -120,9 +132,11 @@ func (d *Driver) OnMessage(m transport.Message) {
 // Exactly once is structural, not a flag: a successful Append is followed
 // immediately below by replacing the engine with one for the next height, and
 // a fresh engine has committed nothing. A REJECTED Append swaps nothing, so
-// the driver stays at the undecided height and keeps retrying on later
-// flushes - the chain refused the block, and silently advancing past a
-// refused block is how one node diverges from every peer that accepted it.
+// the driver stays at the undecided height - the chain refused the block, and
+// silently advancing past a refused block is how one node diverges from every
+// peer that accepted it. The refusal is also the LAST offer: appendRefused
+// makes the driver stop retrying, because the same block re-offered against a
+// head that cannot move fails identically forever (see the field comment).
 func (d *Driver) flush() {
 	for _, o := range d.eng.Drain() {
 		// An empty To is a broadcast, and the Transport interface has no
@@ -134,27 +148,37 @@ func (d *Driver) flush() {
 		}
 	}
 	id, ok := d.eng.Committed()
-	if !ok {
+	if !ok || d.appendRefused {
 		return
 	}
-	// The committed block is the proposal this engine accepted - the one its
-	// committee's precommits named. If the engine holds a commitment for
-	// something it never judged, the driver appends nothing rather than
-	// guess.
+	// The committed block is the proposal this engine accepted: the driver can
+	// only append bytes it actually holds, and only the proposal it judged
+	// carries them. A quorum CAN precommit a block whose proposal this engine
+	// never received (the proposal is lost while the precommits it caused
+	// still arrive): the engine has legitimately judged that ID on its
+	// precommit evidence, but this node holds no block bytes to append and
+	// must not guess or reconstruct any. It appends nothing and stays at the
+	// undecided height - reporting a lower height than the peers that did
+	// receive the proposal, never a fabricated one.
 	if d.eng.proposal == nil || d.eng.proposal.ID() != id {
 		return
 	}
 	// Append re-validates the block against the chain - parent link, height,
 	// proposer signature and state root - so a bug above this line cannot
 	// inject an invalid block: it fails here and the chain stays untouched.
+	// The failure is recorded so no later flush re-offers the same refused
+	// block to the chain's write lock.
 	if err := d.ch.Append(d.eng.proposal); err != nil {
+		d.appendRefused = true
 		return
 	}
 	// The height is decided. Replace the engine: the next height starts the
 	// same way a fresh node would (its lock state is per-height), judging
 	// head+1 over the block just committed. Its round 0 gets TimeoutBase from
 	// the driver's current reading, so its propose phase runs before its
-	// timer can fire.
+	// timer can fire. The refusal flag belonged to the replaced engine's
+	// commit and starts over with the fresh one.
 	d.eng = NewEngine(d.cfg, d.ch.Height()+1, d.ch.Head().ID(), d.priv, d.build)
+	d.appendRefused = false
 	d.timeoutAt = d.now + d.cfg.TimeoutBase
 }

@@ -189,11 +189,46 @@ func (e *Engine) enterRound(round uint32) {
 	e.precommits = NewVoteSet(e.cfg, e.height, round, MsgPrecommit)
 }
 
+// emitVote signs the vote this validator owes for the current round, queues it
+// for broadcast, and delivers it to the engine's own tally through the same
+// path a vote received from a peer takes.
+//
+// The delivery is correctness, not a convenience. A real network never echoes a
+// sender's own broadcast back to it, so tallying only what arrives through
+// OnMessage leaves a validator's weight out of its own tally: a ceiling of n-1,
+// not n. Measured on a four-validator committee with one silent validator, the
+// three live validators could then gather at most 2 of the quorum of 3 and
+// NEVER committed - a committee that tolerates zero silent validators, which
+// defeats the point of BFT. The delivery below runs the full received-vote path
+// (decode, signature, duplicate rule, membership check, then the quorum logic),
+// so the self-vote is exercised by exactly the rules a peer's vote faces, and a
+// stray echo of our own broadcast is still collapsed by the duplicate rule.
+//
+// Re-entrancy, and why it needs no goroutine, channel or lock: the delivery may
+// synchronously run maybePrecommit (the own prevote can complete the polka),
+// and from there maybeCommit (the own precommit can complete the commit) while
+// the calling frame is still on the stack. That is made safe by ordering, not
+// by mutual exclusion: every caller records its step transition BEFORE the
+// emission - maybePrevote sets StepPrevote, maybePrecommit sets StepPrecommit
+// and locks - so a re-entered guard observes the mid-state the round is really
+// in, the deepest transition wins, and no caller writes state after an
+// emission. OnTimeout's nil prevote needs no such ordering: a nil vote can
+// never complete a non-nil quorum (AnyQuorum skips nil), so nothing it triggers
+// can survive the enterRound that immediately follows.
+//
+// The delivery cannot fail for a correctly constructed engine: the vote is
+// signed here, names the engine's own height and round, and its key was admitted
+// at construction. A panic on refusal is deliberate - a silent drop would
+// quietly reinstate the n-1 bug for a misconfigured committee.
 func (e *Engine) emitVote(typ MsgType, id [32]byte) {
 	v := &Vote{Type: typ, Height: e.height, Round: e.round, BlockID: id, Validator: e.pub}
 	h := v.SigningHash()
 	v.Sig = crypto.Sign(e.priv, h[:])
-	e.emit(EncodeVote(v))
+	data := EncodeVote(v)
+	e.emit(data)
+	if err := e.OnMessage(data); err != nil {
+		panic(fmt.Sprintf("consensus: the engine's own vote was refused by its own tally: %v", err))
+	}
 }
 
 // OnMessage processes one wire message. An error means the message was malformed
@@ -272,12 +307,22 @@ func (e *Engine) maybePrevote() {
 		// validator that emits nothing leaves its weight out of the nil tally, so
 		// the round can never end and the chain stalls on exactly the safety path
 		// this gate protects.
-		e.emitVote(MsgPrevote, [32]byte{})
+		//
+		// The step is recorded BEFORE the emission: emitVote tallies the engine's
+		// own vote, and a late-arriving peer prevote may already sit one vote
+		// short of the polka - the self-tally can synchronously re-enter
+		// maybePrecommit while this frame is on the stack. Writing the step after
+		// the emission would clobber the deeper transition.
 		e.step = StepPrevote
+		e.emitVote(MsgPrevote, [32]byte{})
 		return
 	}
-	e.emitVote(MsgPrevote, id)
+	// Same ordering as the nil branch above: the step goes down first, so the
+	// re-entrant precommit-or-commit the own prevote may trigger inside
+	// emitVote lands on top of a consistent mid-state instead of being
+	// overwritten here.
 	e.step = StepPrevote
+	e.emitVote(MsgPrevote, id)
 }
 
 func (e *Engine) maybePrecommit() {
@@ -288,12 +333,21 @@ func (e *Engine) maybePrecommit() {
 	if !ok {
 		return
 	}
-	e.emitVote(MsgPrecommit, id)
+	// The step and the lock are recorded BEFORE the emission. emitVote tallies
+	// the engine's own precommit, which may complete the commit and synchronously
+	// re-enter maybeCommit while this frame is still on the stack: tallying your
+	// own precommit inside emitVote re-enters the commit decision. With the
+	// step left until after, maybeCommit's StepCommit would be overwritten here
+	// and a timeout would then treat a decided height as undecided. With the
+	// step written first, the re-entered maybeCommit observes the true mid-state
+	// (precommitted, locked, not yet committed) and its deeper transition
+	// survives the unwinding.
 	e.step = StepPrecommit
 	// Precommitting IS locking: this is the promise the lock records. Doing it
 	// anywhere else, or only on commit, would leave the safety rule unenforced
 	// for exactly the window it exists to cover.
 	e.lk.lockOn(e.round, id)
+	e.emitVote(MsgPrecommit, id)
 }
 
 func (e *Engine) maybeCommit() {

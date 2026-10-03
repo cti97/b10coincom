@@ -239,6 +239,67 @@ func TestProposerProposesAndPrevotesItsOwnBlock(t *testing.T) {
 	}
 }
 
+// A validator's own vote must count toward its own tally. The engine tallies a
+// vote when it arrives, and a real network never echoes a sender's own
+// broadcast back, so before the self-tally fix (review finding F1) a validator's
+// prevote existed only on the wire: its tally ceiling was n-1, not n. With four
+// validators and one silent, the three live ones could then gather at most 2 of
+// the quorum of 3 and no height ever committed - a committee tolerant of zero
+// silent validators.
+//
+// The scenario below is exactly that boundary, at the engine level: the engine
+// emits its own prevote, two peers join, and the third peer's prevote must
+// complete a POLKA - possible only if the engine's own vote was tallied.
+func TestOwnPrevoteCountsTowardTheTally(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 0, true, parent)
+	e := newTestEngine(t, cfg, 0, h, parent)
+
+	if err := e.StartProposing(); err != nil {
+		t.Fatal(err)
+	}
+	var ownPrevote []byte
+	for _, o := range e.Drain() {
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote && string(v.Validator) == string(e.pub) {
+			ownPrevote = o.Data
+		}
+	}
+	if ownPrevote == nil {
+		t.Fatal("fixture: the proposer emitted no prevote of its own")
+	}
+	id := e.proposal.ID()
+	if got := e.prevotes.PowerFor(id); got != 1 {
+		t.Fatalf("the engine's own prevote is missing from its own tally: power %d, want 1 (the self-vote was never tallied)", got)
+	}
+	// A duplicate of our own vote arriving over the wire must be collapsed by
+	// the duplicate rule, not double-counted: the self-delivery in emitVote
+	// walks the same received-vote path, so the same one-vote-per-validator
+	// rule faces it.
+	if err := e.OnMessage(ownPrevote); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.prevotes.PowerFor(id); got != 1 {
+		t.Fatalf("a duplicate of the engine's own prevote was counted again: power %d, want 1", got)
+	}
+
+	// One peer prevote: 2 of 4, below the bar of 3. No precommit may fire.
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 1, MsgPrevote, h, 0, id))); err != nil {
+		t.Fatal(err)
+	}
+	if e.Step() == StepPrecommit || e.Step() == StepCommit {
+		t.Fatal("2 of 4 produced a precommit: the bar moved")
+	}
+	// The second peer reaches 3 of 4 - the quorum of 3 exists ONLY because the
+	// engine's own prevote sits in the tally.
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 2, MsgPrevote, h, 0, id))); err != nil {
+		t.Fatal(err)
+	}
+	if !e.Locked() || e.lk.blockID() != id {
+		t.Fatalf("3 of 4 prevotes did not lock the block: the engine's own vote is not counted (locked=%v)", e.Locked())
+	}
+}
+
 // A non-proposer at round 0 must prevote NIL, not stall: without nil votes a round
 // whose proposer is offline could never be left behind.
 func TestNonProposerEmitsANilPrevoteWhenNoProposalArrives(t *testing.T) {
