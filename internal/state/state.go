@@ -13,10 +13,11 @@ import (
 )
 
 // Account is a single account's balance, replay counter and faucet-claim
-// marker. ClaimedEpoch is the epoch of the account's most recent faucet claim
-// (0 means no claim was recorded, which is also how a claim made in epoch 0
-// looks, and the two behave identically). It is committed consensus state, not
-// local policy.
+// marker. ClaimedEpoch is the epoch of the account's most recent faucet claim.
+// 0 unambiguously means "never claimed": epochs are 1-based precisely so that
+// the marker of a claim can never collide with the never-claimed value — under
+// 0-based epochs a fresh account would be refused in epoch 0. The marker is
+// committed consensus state, not local policy.
 type Account struct {
 	Balance      uint64
 	Nonce        uint64

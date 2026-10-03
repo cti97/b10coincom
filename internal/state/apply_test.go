@@ -342,8 +342,9 @@ func TestZeroAccountsArePruned(t *testing.T) {
 	}
 }
 
-// An account that has claimed in epoch 0 has non-zero committed state and must
-// survive pruning, or the one-claim-per-epoch rule would reset on every prune.
+// An account that has claimed (ClaimedEpoch: 1, the first epoch — epochs are
+// 1-based) has non-zero committed state and must survive pruning, or the
+// one-claim-per-epoch rule would reset on every prune.
 func TestClaimMarkerSurvivesPruning(t *testing.T) {
 	a, _, _ := keypair(t)
 	s := New()
