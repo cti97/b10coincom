@@ -96,8 +96,9 @@ func (s *State) applyFaucetClaim(tx *types.Tx) error {
 	}
 
 	// One claim per key per epoch. Epochs are 1-BASED, so a never-claimed
-	// account holds ClaimedEpoch == 0 and is accepted at epoch 1; the >= also
-	// refuses any solution claimed on a stale epoch.
+	// account holds ClaimedEpoch == 0 and is accepted at epoch 1. The >=
+	// refuses a repeat claim in the SAME epoch: a stale epoch never reaches
+	// this line, because the epoch-equality check above rejects it first.
 	claimant := s.Get(tx.From)
 	if claimant.ClaimedEpoch >= tx.Epoch {
 		return fmt.Errorf("%w: last claimed in epoch %d, claim is for epoch %d",
@@ -129,8 +130,24 @@ func (s *State) applyFaucetClaim(tx *types.Tx) error {
 	// produce one either. The claimant's signature above authorises the CREDIT
 	// side; the protocol rule - one Argon2id puzzle, one claim per key per
 	// epoch - authorises the debit side.
+	//
+	// The account is snapshotted BEFORE the debit (the faucetAcc read at the
+	// ErrFaucetEmpty guard) and the claimant is Set last, so a tx whose From
+	// were the faucet address would re-publish the PRE-debit faucet account
+	// plus a credit, net-INFLATING the faucet by one claim. That aliasing is
+	// unreachable: VerifySignature forces tx.From == AddressFromPub(tx.PubKey)
+	// (else ErrAddressMismatch), and the faucet address is derived from the
+	// genesis hash rather than a public key, so no public key can produce it -
+	// which is exactly why no runtime check is spent on it here.
 	faucetAcc.Balance -= s.params.ClaimAmount
 	s.Set(s.params.FaucetAddress, faucetAcc)
+
+	// The credit side carries the same overflow guard applyTransfer puts on
+	// the recipient: an addition must return an error, never wrap. Unreachable
+	// while the supply is bounded, but free and consistent.
+	if claimant.Balance > math.MaxUint64-s.params.ClaimAmount {
+		return ErrBalanceOverflow
+	}
 
 	claimant.Balance += s.params.ClaimAmount
 	claimant.Nonce++

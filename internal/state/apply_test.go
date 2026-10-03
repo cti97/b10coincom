@@ -494,8 +494,14 @@ func TestClaimRejectsBadProofOfWork(t *testing.T) {
 	sigHash := tx.SigningHash()
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 
+	before := s.Root()
 	if err := s.ApplyTx(tx); !errors.Is(err, ErrBadProofOfWork) {
 		t.Fatalf("expected ErrBadProofOfWork, got %v", err)
+	}
+	// Like every other reject test: a rejected claim must leave the state
+	// completely unchanged.
+	if s.Root() != before {
+		t.Fatal("a rejected claim changed the state")
 	}
 }
 
@@ -637,6 +643,57 @@ func TestClaimRequiresTheCurrentEpoch(t *testing.T) {
 	}
 	if got := s.Get(current.From).ClaimedEpoch; got != 2 {
 		t.Fatalf("claim marker = %d, want 2", got)
+	}
+}
+
+// A key that claims in a LATER epoch is paid again, and its credit ACCUMULATES
+// rather than being overwritten. This is the only test that pins the mandated
+// nonce bump and the += on the credit: every other claim test starts its
+// claimant at balance 0 with nonce 0, so `+=` and `=` are indistinguishable
+// there, and removing `claimant.Nonce++` leaves the whole suite green.
+func TestClaimPaysAgainInALaterEpochAndAccumulates(t *testing.T) {
+	p := testParams(t)
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: 10_000})
+
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := func(epoch, nonce uint64) {
+		t.Helper()
+		pow, ok := faucet.Solve(pub, epoch, p.PowTarget, p.PowArgon2, 1_000_000)
+		if !ok {
+			t.Fatal("could not solve the test puzzle")
+		}
+		tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+			Nonce: nonce, Epoch: epoch, PowNonce: pow}
+		sigHash := tx.SigningHash()
+		tx.Sig = crypto.Sign(priv, sigHash[:])
+		if err := s.ApplyTx(tx); err != nil {
+			t.Fatalf("claim(epoch=%d, nonce=%d): %v", epoch, nonce, err)
+		}
+	}
+
+	claim(1, 0)
+	// Height 10 is the FIRST block of epoch 2 (10/10+1), the same boundary the
+	// current-epoch test pins: without moving the height the epoch-2 claim
+	// would be rejected as EARLY rather than exercised.
+	s.SetHeight(10)
+	claim(2, 1)
+
+	acc := s.Get(types.AddressFromPub(pub))
+	if acc.Balance != 2*p.ClaimAmount {
+		t.Fatalf("balance = %d, want %d - the credit did not accumulate", acc.Balance, 2*p.ClaimAmount)
+	}
+	if acc.Nonce != 2 {
+		t.Fatalf("nonce = %d, want 2 - the mandated nonce bump is missing", acc.Nonce)
+	}
+	if acc.ClaimedEpoch != 2 {
+		t.Fatalf("claim marker = %d, want 2", acc.ClaimedEpoch)
+	}
+	if got := s.Get(p.FaucetAddress).Balance; got != 10_000-2*p.ClaimAmount {
+		t.Fatalf("faucet balance = %d, want %d", got, 10_000-2*p.ClaimAmount)
 	}
 }
 
