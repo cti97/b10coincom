@@ -2,6 +2,10 @@ package devnet
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/chain"
@@ -298,5 +302,284 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 	// anti-farming rule working.
 	if err := c.State().Clone().ApplyTx(second); !errors.Is(err, state.ErrClaimTooSoon) {
 		t.Fatalf("the second same-epoch claim failed for the wrong reason: %v", err)
+	}
+}
+
+// --- The multi-validator devnet (M3) ---
+
+// The milestone's acceptance: four validators must AGREE, not merely each
+// build blocks. A single node producing blocks proves nothing about consensus.
+//
+// Killing mutant A (compiled): drive reports Agreed unconditionally true. The
+// forked-committee test below owns that kill; this test would happily pass
+// with a lying Agreed, which is exactly why it also pins the pieces a lying
+// boolean hides: the committee DROVEN (four chain directories on disk), the
+// committee REPORTED (one height per index, all four present), the committee's
+// own chain ID, and the longest height.
+func TestRunMultiWithFourValidatorsAgrees(t *testing.T) {
+	dir := t.TempDir()
+	s, err := RunMulti(Options{Dir: dir, Blocks: 50, Validators: 4})
+	if err != nil {
+		t.Fatalf("RunMulti: %v", err)
+	}
+	if s.Validators != 4 {
+		t.Fatalf("validators = %d, want 4", s.Validators)
+	}
+	// Index by index, not by ranging the map: a run that drove two validators
+	// while reporting four would still cover whatever the map happens to hold.
+	if len(s.ValidatorHeights) != 4 {
+		t.Fatalf("ValidatorHeights holds %d entries, want one per driven validator", len(s.ValidatorHeights))
+	}
+	for i := 0; i < 4; i++ {
+		h, ok := s.ValidatorHeights[i]
+		if !ok {
+			t.Fatalf("no height reported for validator %d", i)
+		}
+		if h < 50 {
+			t.Fatalf("validator %d finalised only %d of 50 blocks", i, h)
+		}
+	}
+	if !s.Agreed {
+		t.Fatal("the validators did not agree on a single chain")
+	}
+	if s.Height != 50 {
+		t.Fatalf("Height = %d, want the longest validator's height 50", s.Height)
+	}
+	// The chain ID literal pins the harness's committee naming (simGenesis
+	// derives it from the size): a devnet that reported a stale or invented
+	// chain ID fails here.
+	if s.ChainID != "b10coin-simnet-4" {
+		t.Fatalf("chain ID = %q, want the four-validator committee's own %q", s.ChainID, "b10coin-simnet-4")
+	}
+	// The committee the run REPORTS is the committee it DROVE: four validators,
+	// four chain directories on disk under the run's directory.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirs := 0
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "v") {
+			dirs++
+		}
+	}
+	if dirs != 4 {
+		t.Fatalf("found %d validator chain directories under the run's dir, want 4", dirs)
+	}
+}
+
+// RunMulti with Validators: 1 behaves deliberately, not accidentally: it does
+// NOT fall back to the single-node Run. They are different code paths over
+// different genesis — Run drives the devnet fixture (one signer, no round
+// protocol, transaction and claim paths); RunMulti drives the real four-phase
+// round even with nobody to disagree with, over the committee's own chain
+// b10coin-simnet-1. So the flag means what it says — "run consensus with N
+// validators" — and --validators 1 is observable as the one-member committee,
+// not as the devnet fixture wearing a different flag. Agreement is VACUOUSLY
+// true for one validator (one history trivially is the one history; the
+// harness's prefix check degenerates to a self-comparison), and this test
+// asserts that documented reading rather than pretending the check compared
+// anything.
+func TestRunMultiWithOneValidatorDrivesAOneMemberCommitteeNotTheSingleNodeRun(t *testing.T) {
+	s, err := RunMulti(Options{Dir: t.TempDir(), Blocks: 20, Validators: 1})
+	if err != nil {
+		t.Fatalf("RunMulti: %v", err)
+	}
+	if s.Validators != 1 || len(s.ValidatorHeights) != 1 {
+		t.Fatalf("validators = %d with %d heights, want exactly the one-validator committee",
+			s.Validators, len(s.ValidatorHeights))
+	}
+	if got := s.ValidatorHeights[0]; got < 20 {
+		t.Fatalf("the single validator finalised only %d of 20 blocks", got)
+	}
+	if !s.Agreed {
+		t.Fatal("a one-validator run's single history trivially agrees; the check reported otherwise")
+	}
+	// The load-bearing assertion: a fallback to Run would report the devnet
+	// fixture's chain ID, not the committee's own.
+	if s.ChainID != "b10coin-simnet-1" {
+		t.Fatalf("chain ID = %q, want %q — a value of %q here would mean the single-node devnet fixture ran instead of a one-validator committee",
+			s.ChainID, "b10coin-simnet-1", "b10coin-devnet-1")
+	}
+}
+
+// The milestone's central liveness property at n=4, exercised through the
+// devnet's own surface: with one validator powered off for the whole run, the
+// three online validators hold EXACTLY two thirds of TOTAL voting power (the
+// bar itself, with no vote to spare) and the chain must still finalise
+// o.Blocks. The offline validator keeps its committee seat — the bar is
+// unmoved by the outage — and, with no catch-up in M3, its height stays frozen
+// at zero; its frozen history must remain a strict prefix of the longest
+// chain, so the run still reports agreement.
+//
+// Killing mutant E (compiled): RunMulti ignores OfflineValidators. Then all
+// four validators run, and the frozen assertion fails first (validator 3
+// reaches 30 instead of standing at 0).
+func TestRunMultiWithAValidatorOfflineStillAdvances(t *testing.T) {
+	s, err := RunMulti(Options{Dir: t.TempDir(), Blocks: 30, Validators: 4, OfflineValidators: []int{3}})
+	if err != nil {
+		t.Fatalf("RunMulti: %v (3 of 4 online is exactly the two-thirds-of-TOTAL bar; the chain must advance)", err)
+	}
+	for i := 0; i < 3; i++ {
+		if got := s.ValidatorHeights[i]; got < 30 {
+			t.Fatalf("validator %d finalised only %d of 30 blocks with a validator offline", i, got)
+		}
+	}
+	if got := s.ValidatorHeights[3]; got != 0 {
+		t.Fatalf("OFFLINE validator 3 committed %d blocks; a powered-off validator can take no part in the rounds", got)
+	}
+	if !s.Agreed {
+		t.Fatal("the frozen validator's history must remain a strict prefix of the longest chain (behind, never forked); the run reported disagreement")
+	}
+}
+
+// RunMulti refuses what it cannot honestly do: no committee, no blocks, no
+// claims (the claim scenario has no transaction path into a consensus-only
+// committee, so accepting --claims here would silently drop it and print
+// claims paid = 0 like a broken faucet).
+func TestRunMultiRejectsImpossibleOptions(t *testing.T) {
+	if _, err := RunMulti(Options{Dir: t.TempDir(), Blocks: 5, Validators: 0}); !errors.Is(err, ErrNoValidators) {
+		t.Fatalf("Validators: 0 must fail with ErrNoValidators, got %v", err)
+	}
+	if _, err := RunMulti(Options{Dir: t.TempDir(), Blocks: 0, Validators: 4}); !errors.Is(err, ErrNoBlocks) {
+		t.Fatalf("Blocks: 0 must fail with ErrNoBlocks, got %v", err)
+	}
+	if _, err := RunMulti(Options{Dir: t.TempDir(), Blocks: 5, Validators: 4, Claims: 1}); !errors.Is(err, ErrClaimsAreMultiUnsupported) {
+		t.Fatalf("Claims in a multi-validator run must fail with ErrClaimsAreMultiUnsupported, got %v", err)
+	}
+	// An out-of-range offline index is a caller bug and fails before any run.
+	if _, err := RunMulti(Options{Dir: t.TempDir(), Blocks: 5, Validators: 4, OfflineValidators: []int{7}}); err == nil {
+		t.Fatal("an OfflineValidators index outside the committee must fail the run")
+	}
+}
+
+// forkNet is the stand-in that lets the disagreement path be tested at all.
+// Honest simnet validators never disagree — one history is the safety property
+// the protocol guarantees — so there is no committee the real harness could
+// build that would make Agreed report false. The disagreement is instead
+// injected at the layer underneath: two REAL chains opened from the same
+// genesis, a conflicting block appended to each at height 1 — a fork no honest
+// committee can produce and exactly what a broken tally would produce —
+// served through the same multiNet contract RunMulti drives. AssertPrefix
+// mirrors simnet.AssertPrefix's documented contract: validator i's whole
+// history must be an exact prefix of the longest chain's, block for block.
+type forkNet struct {
+	chains []*chain.Chain
+}
+
+func (f *forkNet) RunBlocks(target uint64) (map[uint64]uint64, error) {
+	hs := make(map[uint64]uint64, len(f.chains))
+	for i, c := range f.chains {
+		hs[uint64(i)] = c.Height()
+	}
+	return hs, nil
+}
+
+func (f *forkNet) AssertPrefix(i int) error {
+	if i < 0 || i >= len(f.chains) {
+		return fmt.Errorf("validator index %d out of range", i)
+	}
+	ref, refHeight := f.chains[0], f.chains[0].Height()
+	for _, c := range f.chains {
+		if c.Height() > refHeight {
+			ref, refHeight = c, c.Height()
+		}
+	}
+	c := f.chains[i]
+	if c.Height() > refHeight {
+		return fmt.Errorf("validator %d stands above the longest chain: it committed blocks nobody else did", i)
+	}
+	for h := uint64(0); h <= c.Height(); h++ {
+		bi, err := c.BlockAt(h)
+		if err != nil {
+			return err
+		}
+		br, err := ref.BlockAt(h)
+		if err != nil {
+			return err
+		}
+		if bi.ID() != br.ID() {
+			return fmt.Errorf("validator %d DIVERGED at height %d: a fork, not a lag", i, h)
+		}
+	}
+	return nil
+}
+
+// forkedCommittee builds the two-chain fixture. With fork, the chains commit
+// conflicting blocks at height 1 (different timestamps, different block IDs);
+// without it, both commit byte-identical blocks — the positive control that
+// proves the detector fires on divergence and not on the fixture itself.
+func forkedCommittee(t *testing.T, fork bool) *forkNet {
+	t.Helper()
+	g := genesis.Devnet()
+	_, priv := genesis.DevValidatorKey()
+	root := t.TempDir()
+	a, err := chain.Open(g, filepath.Join(root, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	b, err := chain.Open(g, filepath.Join(root, "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+
+	ts := int64(1000)
+	if fork {
+		ts = 2000
+	}
+	bA, err := a.Build(priv, nil, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Append(bA); err != nil {
+		t.Fatal(err)
+	}
+	bB, err := b.Build(priv, nil, ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Append(bB); err != nil {
+		t.Fatal(err)
+	}
+	if fork && bA.ID() == bB.ID() {
+		t.Fatal("test setup: the two chains did not fork; the disagreement drive would assert nothing")
+	}
+	if !fork && bA.ID() != bB.ID() {
+		t.Fatal("test setup: the control chains committed different blocks at height 1")
+	}
+	return &forkNet{chains: []*chain.Chain{a, b}}
+}
+
+// THE test that proves Agreed can be false. Two validators hold conflicting
+// blocks at height 1; the driver must name the divergence, fail the run, and
+// report Agreed == false. A boolean hardcoded to true (mutant A) fails here —
+// both on the error and on !s.Agreed.
+func TestDriveReportsAgreedFalseAndFailsWhenValidatorsDisagree(t *testing.T) {
+	s, err := drive(forkedCommittee(t, true), Options{Blocks: 1, Validators: 2})
+	if err == nil {
+		t.Fatal("a network whose validators hold conflicting blocks at height 1 must FAIL the run, not merely report itself")
+	}
+	if !strings.Contains(err.Error(), "DIVERGED at height 1") {
+		t.Fatalf("the divergence error must name the fork site, got: %v", err)
+	}
+	if s.Agreed {
+		t.Fatal("Agreed reported true for validators holding conflicting blocks at height 1")
+	}
+	if s.Validators != 2 || len(s.ValidatorHeights) != 2 {
+		t.Fatalf("the failed run's summary must still report the committee it drove: got %d validators, %d heights",
+			s.Validators, len(s.ValidatorHeights))
+	}
+
+	// Positive control: the SAME driver over byte-identical chains reports
+	// agreement with no error, so the refusal above is the fork and not a
+	// detector that fires at everything.
+	s, err = drive(forkedCommittee(t, false), Options{Blocks: 1, Validators: 2})
+	if err != nil {
+		t.Fatalf("two byte-identical chains must agree: %v", err)
+	}
+	if !s.Agreed {
+		t.Fatal("the disagreement detector fired on chains that are identical")
 	}
 }

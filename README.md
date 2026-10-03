@@ -22,7 +22,8 @@ node but could never *earn* the coin. The real objection to PoW is therefore
 distributional, and the project puts its difficulty in **issuance and
 distribution** rather than in consensus: a capped emission schedule and a
 keyless claim faucet, with consensus treated as a solved problem instead of an
-invention (Tendermint-style BFT, arriving in M3). The accepted trade-off is the
+invention (Tendermint-style BFT; implemented in M3 — see
+[Consensus](#consensus)). The accepted trade-off is the
 design's, stated honestly in §3: *permissionless + fairly distributed + no-PoW
 — pick two*. b10coin begins federated (genesis validators are hardcoded) with
 staking-based admission on the roadmap. Where PoW does survive, in the M2
@@ -38,7 +39,8 @@ Argon2id). From the repository root:
 ```sh
 make build                                # go build -o bin/b10coin ./cmd/b10coin
 make test                                 # go test -count=1 ./...
-go run ./cmd/b10coin devnet --blocks 100  # the acceptance check
+go run ./cmd/b10coin devnet --blocks 100  # the single-node acceptance check
+go run ./cmd/b10coin devnet --validators 4 --blocks 100  # the consensus acceptance check
 ```
 
 `devnet --blocks 100` builds a fresh local chain in a temporary directory,
@@ -65,6 +67,22 @@ OK
 
 and exits 0.
 
+The multi-validator acceptance command runs the same idea as a consensus
+committee: four validators, each with its own chain, driven to height 100 over
+a deterministic simulated network, and a report of each validator's final
+height plus whether the validators hold one history. A single node producing
+blocks proves nothing about consensus, so the run fails (no `OK`, exit 1)
+unless the validators agree:
+
+```text
+$ go run ./cmd/b10coin devnet --validators 4 --blocks 100
+chain        b10coin-simnet-4
+validators   4
+heights      v0=100 v1=100 v2=100 v3=100
+agreed       yes
+OK
+```
+
 ## The CLI
 
 `cmd/b10coin` implements five subcommands. With no subcommand, or with an
@@ -73,19 +91,30 @@ unknown one, it prints the usage text and exits with code 2.
 ### `b10coin devnet`
 
 Builds and verifies a self-contained local chain — the milestone acceptance
-check (M0–M2), shared by the CLI and the test suite.
+check (M0–M2), shared by the CLI and the test suite. Since M3 it is also the
+consensus acceptance check: `--validators N` swaps the single-node fixture for
+a committee of `N` consensus validators driven through the simulated network,
+reported per validator, and failing unless the validators hold one history.
+The faucet-claim scenario is the single-node path's proof — a committee
+accepts no transactions — so `--claims` alongside an explicit `--validators`
+is refused rather than silently dropped.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--blocks N` | `100` | number of blocks to produce (must be > 0) |
-| `--claims N` | `1` | faucet-claim attempts after the block loop; each paid claim is followed by the same key's same-epoch double claim, which must be refused (a run that sees the double claim applied fails) |
-| `--dir PATH` | *fresh temporary directory* | data directory; a temporary one is deleted afterwards, an explicit path is kept |
+| `--claims N` | `1` | faucet-claim attempts after the block loop (single-node run only); each paid claim is followed by the same key's same-epoch double claim, which must be refused (a run that sees the double claim applied fails) |
+| `--validators N` | *unset (single node)* | committee size; omitting the flag keeps the M0–M2 single-node run as it shipped, and any explicit value — `1` included — runs the consensus committee of that size |
+| `--dir PATH` | *fresh temporary directory* | data directory; a temporary one is deleted afterwards, an explicit path is kept (multi-validator runs lay out one chain per validator under `PATH/v0`, `PATH/v1`, …) |
 
 ### `b10coin node`
 
-Runs a single-node chain serving HTTP RPC. In M1 a node produces blocks
-unilaterally, one block per tick — there is no consensus yet; agreement between
-validators arrives in M3. Nodes currently run the **devnet** genesis and sign
+Runs a single-node chain serving HTTP RPC. In M1 a node produced blocks
+unilaterally, one block per tick, because a single node needs no agreement;
+the consensus engine exists since M3 and is exercised through the
+`devnet --validators` runs above, while `node` itself still runs the
+single-validator devnet fixture — a real committee of separate processes
+needs real networking, which is M4. Nodes currently run the
+**devnet** genesis and sign
 with a deterministic, public test key that is safe only because devnet coins
 are valueless; the testnet genesis has no validator keys yet.
 
@@ -140,9 +169,10 @@ almost nothing over commodity hardware; the difficulty is chosen so a
 Raspberry Pi 4 completes a puzzle in seconds rather than minutes.
 
 **PoW here is a rate limiter, not consensus.** No block is ever produced by
-mining: validators (a single federated signer until M3, staked rotation from
-M5) produce blocks without solving anything. The puzzle's only job is to
-throttle how fast one key can drain the faucet.
+mining: validators (a consensus committee since M3 — one signer in the devnet
+fixture, with staked rotation from M5) produce blocks without solving
+anything. The puzzle's only job is to throttle how fast one key can drain the
+faucet.
 
 The parameters are per-chain genesis parameters, recorded in
 `genesis/devnet.json` and `genesis/testnet.json`:
@@ -186,10 +216,69 @@ The honest trade-off stands: a determined attacker with many keys is
 rate-limited by the puzzle, not prevented — that is what the spec accepted
 when it chose a faucet over a premine.
 
+## Consensus
+
+M3 ships the consensus the design picked from the start: a Tendermint-style
+BFT round, run by every validator for every height over the real chain
+machinery — proposals, prevotes and precommits are signed, verified and
+tallied messages, and a block is committed exactly when the tally says so.
+**This is still a valueless testnet: consensus makes the toy chain correct,
+not valuable, and there is no sale and no mainnet.**
+
+A round has four phases — **propose → prevote → precommit → commit**. The
+proposer for each (height, round) is drawn weighted by voting power and seeded
+by `(height, round, parent hash)`, so every validator computes the same
+proposer without communication; a round that produces no decision times out
+into the next round, with slightly longer timeouts.
+
+Three rules carry the safety, and all three are about the arithmetic of
+distrust:
+
+- **A quorum is two thirds of TOTAL voting power — not of online power.**
+  Committing (and every unlock, below) needs strictly more than two thirds of
+  the power the committee held at genesis. Taking validators offline therefore
+  makes committing *harder*, never easier: with four equal validators, three
+  must agree, and two cannot. An attacker who silences a third of the set
+  lowers nothing — the bar stays pinned to the full committee, offline
+  members included.
+- **A validator that precommits is locked.** Precommitting block B at height h
+  is a promise: from then on the validator prevotes only B (or nothing) at
+  that height. It will not — cannot, within the protocol — help commit a
+  conflicting block at the same height, which is why two conflicting blocks
+  cannot each collect a quorum unless more than a third of the power breaks
+  its promise.
+- **A locked validator unlocks only on evidence.** The one way out is a
+  proposal for a conflicting block at a strictly later round that CARRIES its
+  proof: a justification of quorum prevotes — verified signatures, counted
+  once per validator — showing that block in fact reached two thirds at an
+  earlier round. A bare claim that "we moved on" is not evidence; a proposal
+  whose claimed justification has no prevotes behind it is refused outright,
+  not even nil-prevoted.
+
+The committee in this milestone is the genesis set: equal test validators with
+a fixed cap of one quarter of total power each, enforced by configuration
+validation. Validator-set changes by stake arrive with M5.
+
+**How this is verified.** The `devnet --validators 4 --blocks 100` acceptance
+command above is the milestone's own check — four validators, one history, or
+the run fails. Behind it sit the six failure scenarios of the design's
+verification plan (`internal/simnet`), every one driven from a fixed seed over
+a clock-free simulated network, so a failure replays exactly: the 1,000-block
+happy path; one validator powered off while the chain advances at exactly the
+two-thirds bar; two offline — below two thirds — so the chain stalls without
+forking; a partition healed with the isolated validator left strictly behind,
+never forked; a Byzantine validator equivocating on the wire while the
+committee still agrees; and a mid-epoch restart whose replayed state root
+matches its peers'. M3's honest limits are recorded with the scenarios: a
+validator that falls behind cannot catch up yet (block sync is M4's
+networking work), and a lost proposal parks a validator permanently, so
+liveness scenarios run drop-free.
+
 ## Architecture
 
-Twelve Go packages under `internal/`, plus the CLI in `cmd/b10coin`.
-Import direction is `cmd → devnet → {chain, rpc, node}` and
+Thirteen Go packages under `internal/` (plus the simulated transport under
+`internal/transport/sim`), and the CLI in `cmd/b10coin`. Import direction is
+`cmd → devnet → {chain, rpc, node, simnet}` and
 `chain → {store, state, genesis, types, crypto, faucet}`; `types` never imports
 `state`, `state` never imports `chain`, `chain` never imports `rpc`, and
 `internal/faucet` (the puzzle and emission arithmetic) sits under `state` and
@@ -207,7 +296,11 @@ Import direction is `cmd → devnet → {chain, rpc, node}` and
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
 | `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size), `GET /block/{height}`, and `POST /tx` (hex-encoded canonical transaction bytes) |
-| `internal/devnet` | The in-process devnet driver used by both the CLI acceptance command and the tests: transfer, claim and double-claim-refusal scenario, plus replay verification |
+| `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters |
+| `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
+| `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
+| `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, and prefix-agreement assertions — the harness the six seeded scenarios drive, and the multi-validator devnet with it |
+| `internal/devnet` | The in-process devnet driver used by both the CLI acceptance commands and the tests: the single-node transfer, claim and double-claim-refusal scenario with replay verification, and — since M3 — the multi-validator committee run reporting per-validator heights and agreement |
 | `internal/version` | The semantic version constant (`0.1.0`) |
 | `cmd/b10coin` | CLI entrypoint: `devnet`, `node`, `claim`, `version`, `help` |
 
@@ -295,10 +388,10 @@ configuration is where the no-premine promise lives:
 
 ## Checks
 
-`go test -count=1 ./...` and `go test -race ./...` are green across all twelve
-test packages, and `go vet ./...` and `gofmt` are clean on this repository as
-committed. CI (`.github/workflows/ci.yml`) runs the two acceptance commands on
-every push and pull request as well, on Go 1.23:
+`go test -count=1 ./...` and `go test -race ./...` are green across the test
+suite, and `go vet ./...` and `gofmt` are clean on this repository as
+committed. CI (`.github/workflows/ci.yml`) runs all three acceptance commands
+on every push and pull request as well, on Go 1.23:
 
 | Check | Command |
 |---|---|
@@ -313,7 +406,7 @@ vet`, `make fmt`, and `make devnet` (build followed by the acceptance check).
 
 ## Status and roadmap
 
-Implemented — modules M0, M1 and M2:
+Implemented — modules M0, M1, M2 and M3:
 
 - **M0** — repository skeleton, canonical encoding, crypto wrappers, CI.
 - **M1** — single-node chain: account state machine, block production,
@@ -321,14 +414,21 @@ Implemented — modules M0, M1 and M2:
 - **M2** — faucet: claimable coins from the keyless protocol faucet, paid
   from the capped emission schedule and rate-limited by the Argon2id puzzle
   (one claim per key per epoch; consensus is unaffected).
+- **M3** — Tendermint-style BFT consensus: the four-phase round,
+  two-thirds-of-total-power quorum, weighted proposer selection and precommit
+  locking unlockable only on evidence, over a deterministic in-process
+  simulated network; verified by the six seeded failure scenarios in
+  `internal/simnet` — safety under partition, outage and equivocation,
+  liveness at and above the two-thirds bar — and by the four-validator
+  `devnet --validators 4 --blocks 100` acceptance command.
 
 Pending:
 
-- **M3** — Tendermint-style BFT consensus over a deterministic in-process
-  simulated network, with safety verified under partitions and equivocation.
 - **M4** — real networking (TCP transport plus a small outbound relay so home
   validators need no port forwarding), cross-compiled ARM64 binaries, and
-  validators on actual Raspberry Pis.
+  validators on actual Raspberry Pis. Block catch-up — letting a validator
+  that fell behind adopt its peers' blocks — arrives with real networking
+  too.
 
 The design's milestone table defines further stages beyond M4 — staking and
 committee rotation (M5), and a wallet CLI with a minimal explorer and faucet
@@ -347,3 +447,6 @@ transport.
 - `docs/plans/2026-10-02-m2-faucet.md` — the M2 faucet implementation plan:
   the puzzle, the emission schedule, the claim rule and this milestone's
   acceptance gate.
+- `docs/plans/2026-10-03-m3-bft-consensus.md` — the M3 consensus
+  implementation plan: the engine and its locking rule, the simulated network,
+  the six verification scenarios and this milestone's acceptance gate.

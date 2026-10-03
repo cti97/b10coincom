@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -59,7 +60,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `b10coin — a testnet cryptocurrency for small computers
 
 Usage:
-  b10coin devnet --blocks N [--dir PATH] [--claims N]   Build and verify a local chain
+  b10coin devnet --blocks N [--validators N] [--dir PATH] [--claims N]   Build and verify a local chain (or, with --validators > 1, a consensus devnet)
   b10coin node   --dir PATH [--http ADDR] [--block-time DURATION]
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
   b10coin version
@@ -76,11 +77,34 @@ func cmdDevnet(args []string) error {
 	// faucet must be exercised without a flag. Every default run pays one
 	// claim against a solved puzzle and proves the same-epoch double claim
 	// refused. --claims 0 keeps the plain transfer-only runs available.
-	claims := fs.Uint64("claims", 1, "faucet claim attempts to make after the block loop")
+	claims := fs.Uint64("claims", 1, "faucet claim attempts to make after the block loop (single-node run only)")
+	// Default 1: exactly the single-node acceptance check M0-M2 shipped.
+	// Anything above 1 swaps the whole run for the multi-validator consensus
+	// path — that is the acceptance check the design named at M0
+	// (`devnet --validators 4 --blocks 100`) and could not honour until M3,
+	// because a single node needs no agreement.
+	validators := fs.Uint64("validators", 1, "committee size; a value above 1 runs a multi-validator consensus devnet (the faucet-claim scenario does not apply)")
 	dir := fs.String("dir", "", "data directory (default: a fresh temporary directory)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Whether --claims was given explicitly (its default is 1, so the flag's
+	// value alone cannot tell "asked for claims" from "left the default").
+	// The same applies to --validators: an EXPLICIT value — including
+	// `--validators 1` — names the committee that gets run. Only the flag's
+	// ABSENCE means the single-node run; otherwise `--validators 0` would
+	// silently become the single-node path and the flag would lie.
+	claimsSet := false
+	validatorsSet := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "claims":
+			claimsSet = true
+		case "validators":
+			validatorsSet = true
+		}
+	})
+
 	if *dir == "" {
 		d, err := os.MkdirTemp("", "b10coin-devnet-")
 		if err != nil {
@@ -88,6 +112,32 @@ func cmdDevnet(args []string) error {
 		}
 		defer os.RemoveAll(d)
 		*dir = d
+	}
+
+	// The multi-validator path: a consensus committee over the simnet
+	// harness, reported per validator, failing unless the validators hold one
+	// history (--validators 0 fails inside RunMulti as ErrNoValidators). The
+	// faucet-claim scenario is the SINGLE-NODE path's proof — a committee
+	// accepts no transactions — so an explicit --claims there is a misuse to
+	// refuse, not a value to drop on the floor.
+	if *validators > 1 || validatorsSet {
+		if claimsSet && *claims > 0 {
+			return fmt.Errorf("--claims runs the single-node faucet scenario and does not apply to a --validators %d run; drop --claims (the single-node default still pays one)", *validators)
+		}
+		summary, err := devnet.RunMulti(devnet.Options{Dir: *dir, Blocks: *blocks, Validators: *validators})
+		// Only a run that RAN (its summary names a committee) prints a report;
+		// an option-validation failure returns an empty summary, and printing
+		// `validators   0` ahead of its error would be noise, not diagnosis.
+		if summary.Validators > 0 {
+			printMultiDevnet(summary)
+		}
+		if err != nil {
+			// The summary lines above are whatever the run produced — on a
+			// stall or a disagreement they are the diagnosis.
+			return err
+		}
+		fmt.Println("OK")
+		return nil
 	}
 
 	summary, err := devnet.Run(devnet.Options{Dir: *dir, Blocks: *blocks, Claims: *claims})
@@ -116,6 +166,36 @@ func cmdDevnet(args []string) error {
 	}
 	fmt.Println("OK")
 	return nil
+}
+
+// printMultiDevnet prints the committee report of a multi-validator run:
+// every validator's final height, and whether the validators hold one
+// history. The run FAILS (no OK, exit 1) unless they agree — that check is
+// RunMulti's, surfaced here as the error above.
+func printMultiDevnet(s devnet.Summary) {
+	fmt.Printf("chain        %s\n", s.ChainID)
+	fmt.Printf("validators   %d\n", s.Validators)
+	fmt.Printf("heights      %s\n", validatorHeightsLine(s.ValidatorHeights))
+	agreed := "no"
+	if s.Agreed {
+		agreed = "yes"
+	}
+	fmt.Printf("agreed       %s\n", agreed)
+}
+
+// validatorHeightsLine renders the per-validator heights as v0=H v1=H ... in
+// committee-index order.
+func validatorHeightsLine(h map[int]uint64) string {
+	indexes := make([]int, 0, len(h))
+	for i := range h {
+		indexes = append(indexes, i)
+	}
+	sort.Ints(indexes)
+	parts := make([]string, 0, len(indexes))
+	for _, i := range indexes {
+		parts = append(parts, fmt.Sprintf("v%d=%d", i, h[i]))
+	}
+	return strings.Join(parts, " ")
 }
 
 // claimHTTP bounds RPC round trips for the claim command; the puzzle itself

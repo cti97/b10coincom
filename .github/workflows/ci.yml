@@ -18,6 +18,10 @@ jobs:
       # The first is the default run — its --claims default makes it pay one
       # claim and prove the same-epoch double claim refused — and the second
       # runs the claim variant explicitly so the faucet path cannot degrade
-      # with the flag's default unnoticed.
+      # with the flag's default unnoticed. The third is M3's: four validators
+      # must AGREE, not merely each produce blocks — the multi-validator
+      # devnet reports each validator's final height and fails the job unless
+      # the validators hold one history.
       - run: go run ./cmd/b10coin devnet --blocks 100
       - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1
+      - run: go run ./cmd/b10coin devnet --validators 4 --blocks 100
