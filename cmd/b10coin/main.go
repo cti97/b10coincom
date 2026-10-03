@@ -60,7 +60,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `b10coin — a testnet cryptocurrency for small computers
 
 Usage:
-  b10coin devnet --blocks N [--validators N] [--dir PATH] [--claims N]   Build and verify a local chain (or, with --validators > 1, a consensus devnet)
+  b10coin devnet --blocks N [--validators N] [--dir PATH] [--claims N]   Build and verify a local chain (or, with --validators given, a consensus devnet)
   b10coin node   --dir PATH [--http ADDR] [--block-time DURATION]
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
   b10coin version
@@ -79,11 +79,13 @@ func cmdDevnet(args []string) error {
 	// refused. --claims 0 keeps the plain transfer-only runs available.
 	claims := fs.Uint64("claims", 1, "faucet claim attempts to make after the block loop (single-node run only)")
 	// Default 1: exactly the single-node acceptance check M0-M2 shipped.
-	// Anything above 1 swaps the whole run for the multi-validator consensus
-	// path — that is the acceptance check the design named at M0
+	// An EXPLICIT value - 1 included - swaps the whole run for the
+	// multi-validator consensus path (see validatorsSet below): `--validators
+	// 1` deliberately runs a one-member committee. That is the acceptance
+	// check the design named at M0
 	// (`devnet --validators 4 --blocks 100`) and could not honour until M3,
 	// because a single node needs no agreement.
-	validators := fs.Uint64("validators", 1, "committee size; a value above 1 runs a multi-validator consensus devnet (the faucet-claim scenario does not apply)")
+	validators := fs.Uint64("validators", 1, "committee size; giving the flag at all — 1 included — runs a multi-validator consensus devnet (the faucet-claim scenario does not apply)")
 	dir := fs.String("dir", "", "data directory (default: a fresh temporary directory)")
 	if err := fs.Parse(args); err != nil {
 		return err

@@ -256,8 +256,10 @@ distrust:
   not even nil-prevoted.
 
 The committee in this milestone is the genesis set: equal test validators with
-a fixed cap of one quarter of total power each, enforced by configuration
-validation. Validator-set changes by stake arrive with M5.
+a fixed cap of one quarter of total power each — enforced, for committees of
+four or more, by configuration validation, while any smaller committee runs
+under a 1/1 cap, because below four equal holders no one-quarter share is
+satisfiable. Validator-set changes by stake arrive with M5.
 
 **How this is verified.** The `devnet --validators 4 --blocks 100` acceptance
 command above is the milestone's own check — four validators, one history, or
@@ -276,9 +278,10 @@ liveness scenarios run drop-free.
 
 ## Architecture
 
-Thirteen Go packages under `internal/` (plus the simulated transport under
-`internal/transport/sim`), and the CLI in `cmd/b10coin`. Import direction is
-`cmd → devnet → {chain, rpc, node, simnet}` and
+Sixteen Go packages under `internal/` (the simulated transport is one of them,
+at `internal/transport/sim`), and the CLI in `cmd/b10coin`. Import direction is
+`cmd → devnet → {chain, node, simnet}` — the RPC layer is brought in by `cmd`
+alone, not by `devnet` — and
 `chain → {store, state, genesis, types, crypto, faucet}`; `types` never imports
 `state`, `state` never imports `chain`, `chain` never imports `rpc`, and
 `internal/faucet` (the puzzle and emission arithmetic) sits under `state` and
@@ -400,6 +403,7 @@ on every push and pull request as well, on Go 1.23:
 | Build | `go build ./...` |
 | Acceptance check, default run | `go run ./cmd/b10coin devnet --blocks 100` |
 | Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
+| Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
 
 Makefile targets: `make test`, `make build` (produces `bin/b10coin`), `make
 vet`, `make fmt`, and `make devnet` (build followed by the acceptance check).
