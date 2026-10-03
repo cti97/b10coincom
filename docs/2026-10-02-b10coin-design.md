@@ -209,14 +209,19 @@ protocol's claim rule. There is no human key, no insider allocation, and no sale
 | Initial block reward | 0.5 b10 = 50,000,000 sparks | Paid into the faucet account |
 | Halving interval | every 21,000,000 blocks | ≈1.33 years at 2 s blocks |
 | Emission endpoint | ~20 halvings | Sum = `0.5 × 21,000,000 × 2` = 21,000,000 b10 ✓ |
-| `CLAIM_AMOUNT` | 100 b10 per key per epoch | Genesis-configurable |
+| `CLAIM_AMOUNT` | 100 b10 per key per epoch (testnet) | Genesis-configurable; the devnet fixture claims 1 b10 so a short devnet run can pay one |
 | Faucet puzzle | Argon2id, tuned to ≈3 s on a Pi 4 | Memory-hard; ASICs do not help |
 | Claims allowed | one per key per epoch | The actual anti-farming rule |
 | After emission ends | **fees only** | No perpetual inflation |
 
 Emission arithmetic check: `R0 × HALVING_INTERVAL × 2 = 50,000,000 sparks ×
 21,000,000 × 2 = 2.1 × 10¹⁵ sparks = 21,000,000 b10`. Fits in `u64`
-(max ≈1.8 × 10¹⁹). ✓
+(max ≈1.8 × 10¹⁹). ✓ That product is the idealized identity the genesis
+validation enforces; because each halving's shift truncates, the realized
+series totals 20,999,997.48 b10 (2,099,999,748,000,000 sparks) — **2.52 b10
+short of the cap** — so the cap is a maximum the schedule can never exceed,
+never a target: the 252,000,000 sparks the truncation loses are simply never
+minted, by design rather than by bug.
 
 **Invariant:** a `FaucetClaim` is valid only if the faucet balance covers
 `CLAIM_AMOUNT`. If the faucet is empty, claims fail until more emission accrues.
@@ -364,15 +369,27 @@ Stored in `genesis/devnet.json` and `genesis/testnet.json`:
     "total_supply_sparks": 2100000000000000,
     "initial_reward_sparks": 50000000,
     "halving_interval_blocks": 21000000,
-    "claim_amount_sparks": 10000000000,
+    "claim_amount_sparks": 100000000,
     "min_stake_sparks": 100000000000,
-    "faucet_pow_argon2": { "m_kib": 65536, "t": 3, "p": 1 }
+    "faucet_pow_argon2": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+    "faucet_pow_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
   }
 }
 ```
 
 `faucet_pubkey` is `null` by design: the faucet account is derived
 deterministically from the genesis hash and has no corresponding private key.
+The difficulty target is recorded as the 64-character lowercase hex of its
+32-byte big-endian value: hex is byte-exact, where a decimal rendering could
+not preserve leading zero bytes.
+
+`claim_amount_sparks` is genesis-configurable and is set per chain. The devnet
+record above is a fixture — 1,000-block epochs, minutes of block production —
+so it claims **1 b10 (100,000,000 sparks)**: a short devnet run must be able to
+fund a claim from emission, which at 0.5 b10 per block arrives quickly. The
+testnet keeps the spec-level **100 b10** of §6.4. The shipped records in
+`genesis/`, which mirror the Go constructors field for field, carry both values
+and the per-chain puzzle tuning verbatim.
 
 ---
 
