@@ -6,6 +6,7 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"time"
 
@@ -66,24 +67,28 @@ func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 }
 
 // reAdd puts txs back into the mempool after a failed block attempt and
-// returns the block failure unchanged when every transaction was accepted.
-// If any re-add fails, the work would be lost silently, so the returned
-// error is wrapped with the count and the re-add reasons — the caller still
-// sees the original cause first, and errors.Is against it keeps working. No
-// logging framework or new dependency is involved.
+// returns the block failure unchanged when nothing was stranded. If any
+// re-add fails beyond a duplicate, the transaction would be lost silently,
+// so the returned error is wrapped with the count and the re-add reasons.
+// An ErrDuplicate is NOT a loss — mempool.Add reports it when the
+// transaction is already present (for example a client re-submitted the same
+// transaction between Take and this re-add), and it remains eligible for a
+// later block — so only the other failures inflate the count. The caller
+// still sees the original cause first, and errors.Is against it keeps
+// working. No logging framework or new dependency is involved.
 func reAdd(mp *mempool.Mempool, txs []types.Tx, cause error) error {
 	errs := mp.Add(txs)
-	lost := 0
+	stranded := make([]error, 0, len(errs))
 	for i := range errs {
-		if errs[i] != nil {
-			lost++
+		if errs[i] != nil && !errors.Is(errs[i], mempool.ErrDuplicate) {
+			stranded = append(stranded, errs[i])
 		}
 	}
-	if lost == 0 {
+	if len(stranded) == 0 {
 		return cause
 	}
 	return fmt.Errorf("%w (in addition, %d of %d valid transactions could not be re-added to the mempool and are lost: %v)",
-		cause, lost, len(txs), errs)
+		cause, len(stranded), len(txs), stranded)
 }
 
 // Run produces blocks every interval until ctx is cancelled.

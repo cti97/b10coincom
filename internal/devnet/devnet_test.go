@@ -57,6 +57,15 @@ func TestDevnetReplayMatches(t *testing.T) {
 	if replayed.Height != first.Height {
 		t.Fatalf("replay height = %d, want %d", replayed.Height, first.Height)
 	}
+	// A replayed hard zero would be indistinguishable from a chain that
+	// genuinely included nothing: Replay must report the same non-zero count
+	// the run did, recomputed from the stored blocks.
+	if first.TxsIncluded == 0 {
+		t.Fatal("test setup: the run included no transactions")
+	}
+	if replayed.TxsIncluded != first.TxsIncluded {
+		t.Fatalf("replay TxsIncluded = %d, run reported %d", replayed.TxsIncluded, first.TxsIncluded)
+	}
 }
 
 func TestDevnetRejectsZeroBlocks(t *testing.T) {

@@ -104,9 +104,24 @@ func TestDecodeTxRejectsUnsupportedType(t *testing.T) {
 	}
 }
 
+// The signature must cover the sender's address: if From were dropped from
+// the signed body, a signature over the body would survive changing From to
+// any other account (the address-binding check in VerifySignature only
+// compares PubKey against From AFTER the fact — it cannot catch a digest
+// that never contained From).
+func TestSigningHashCoversFrom(t *testing.T) {
+	tx := signedTransfer(t, 1, 10)
+	before := tx.SigningHash()
+	tx.From = AddressFromPub([]byte("a-different-sender"))
+	if tx.SigningHash() == before {
+		t.Fatal("SigningHash ignored the sender address: From is not in the signed body")
+	}
+}
+
 func TestDecodeTxRejectsTrailingBytes(t *testing.T) {
 	enc := signedTransfer(t, 1, 5).Encode()
-	if _, err := DecodeTx(append(enc, 0xFF)); err == nil {
-		t.Fatal("expected an error for trailing bytes")
+	_, err := DecodeTx(append(enc, 0xFF))
+	if !errors.Is(err, ErrTrailingBytes) {
+		t.Fatalf("expected ErrTrailingBytes, got %v", err)
 	}
 }

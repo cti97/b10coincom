@@ -1,6 +1,8 @@
 package node
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/chain"
@@ -133,5 +135,43 @@ func TestRunOnceEvictsOnlyInvalidTransactions(t *testing.T) {
 	}
 	if c.Height() != 1 {
 		t.Fatalf("chain height = %d, want 1", c.Height())
+	}
+}
+
+// A client can re-submit a transaction between Take and a failed block's
+// re-add; Mempool.Add then reports ErrDuplicate. That transaction is not
+// lost — it is already queued for a later block — so it must not inflate
+// the lost count or appear in the lost list.
+func TestReAddDoesNotCountDuplicatesAsLost(t *testing.T) {
+	mp := mempool.New(10)
+	if err := mp.Add([]types.Tx{mkTransfer(t, 0)})[0]; err != nil {
+		t.Fatalf("mempool.Add: %v", err)
+	}
+	// The same transaction again (deterministic devnet keys: identical ID).
+	cause := errors.New("block build failed: test cause")
+	err := reAdd(mp, []types.Tx{mkTransfer(t, 0)}, cause)
+	if !errors.Is(err, cause) {
+		t.Fatalf("expected the cause returned unchanged, got %v", err)
+	}
+	if strings.Contains(err.Error(), "are lost") {
+		t.Fatalf("an already-present transaction was reported as lost: %v", err)
+	}
+}
+
+// A genuine re-add failure (a full mempool) still strands the transaction
+// and must be surfaced: cause kept, count and reasons wrapped with exactly
+// one %w so errors.Is keeps working.
+func TestReAddCountsRealFailuresAsLost(t *testing.T) {
+	mp := mempool.New(1)
+	if err := mp.Add([]types.Tx{mkTransfer(t, 0)})[0]; err != nil {
+		t.Fatalf("mempool.Add: %v", err)
+	}
+	cause := errors.New("block append failed: test cause")
+	err := reAdd(mp, []types.Tx{mkTransfer(t, 1)}, cause) // mempool is full
+	if !errors.Is(err, cause) {
+		t.Fatalf("expected the original cause to stay wrapped, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "1 of 1 valid transactions could not be re-added to the mempool and are lost") {
+		t.Fatalf("expected the stranded transaction to be reported as lost, got %v", err)
 	}
 }

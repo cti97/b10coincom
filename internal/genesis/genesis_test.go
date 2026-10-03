@@ -104,6 +104,54 @@ func TestValidateRejectsChainIDMismatch(t *testing.T) {
 	}
 }
 
+// These pin the two ErrEmissionMath guards. That the real Devnet() and
+// Testnet() still satisfy them is asserted by TestDevnetGenesisValidates and
+// TestTestnetGenesisValidatesWithoutValidators in this same suite.
+
+// (a) An all-zero parameter set must be rejected: 0*0*2 == 0 equals a zero
+// supply cap, so only the zero-factor rejection (not the product) stops it.
+// The chain ID is kept valid so the test reaches the emission guard rather
+// than failing the empty-ChainID check that runs first.
+func TestValidateRejectsAllZeroParams(t *testing.T) {
+	g := Devnet()
+	g.Params = Params{ChainID: g.Params.ChainID}
+	if err := g.Validate(); !errors.Is(err, ErrEmissionMath) {
+		t.Fatalf("expected ErrEmissionMath for an all-zero parameter set, got %v", err)
+	}
+}
+
+// (b) The emission product must be checked without uint64 overflow. The
+// parameter pairs below WRAP to exactly TotalSupplySparks when computed with
+// plain uint64 arithmetic — a wrap-blind implementation would accept them —
+// and are only the low 64 bits of a genuinely larger product.
+func TestValidateRejectsOverflowingEmissionProduct(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		initial uint64
+		halving uint64
+	}{
+		// 4 * halving = 2^64 + 1_050_000_000_000_000: the first Mul64 leg
+		// overflows.
+		{"first leg overflows", 4, 4_611_948_518_427_387_904},
+		// (2^63 + 1_050_000_000_000_000) fits, but *2 = 2^64 + supply: the
+		// second Mul64 leg overflows.
+		{"second leg overflows", 9_224_422_036_854_775_808, 1},
+	} {
+		g := Devnet()
+		g.Params.InitialRewardSparks = tc.initial
+		g.Params.HalvingIntervalBlocks = tc.halving
+		// Sanity: the wrap-blind product really does equal the supply cap, so
+		// only the overflow (hi) check can reject these values.
+		if blind := tc.initial * tc.halving * 2; blind != g.Params.TotalSupplySparks {
+			t.Fatalf("%s: test setup: wrap-blind product = %d, want %d",
+				tc.name, blind, g.Params.TotalSupplySparks)
+		}
+		if err := g.Validate(); !errors.Is(err, ErrEmissionMath) {
+			t.Fatalf("%s: expected ErrEmissionMath, got %v", tc.name, err)
+		}
+	}
+}
+
 func TestEmissionMathReachesExactlyTheSupplyCap(t *testing.T) {
 	for _, g := range []*Genesis{Devnet(), Testnet()} {
 		p := g.Params
@@ -218,6 +266,38 @@ func TestGenesisJSONRecordsMatchTheGoConstructors(t *testing.T) {
 		var extra genesisRecord
 		if err := dec.Decode(&extra); err != io.EOF {
 			t.Fatalf("%s: trailing content after the JSON document", tc.file)
+		}
+
+		// Zero-count blind spot: struct decoding turns an ABSENT key into the
+		// zero value, which for the testnet record's zero counts (validators
+		// 0, dev_accounts 0) is indistinguishable from the constructor's
+		// value — a deleted key passes the field-by-field comparisons above.
+		// The raw-map checks below therefore require every expected key to be
+		// PRESENT in the file. The literal lists mirror genesisRecord's json
+		// tags; DisallowUnknownFields already rejects any key not in them.
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &top); err != nil {
+			t.Fatalf("%s: %v", tc.file, err)
+		}
+		for _, key := range []string{"chain_id", "note", "validators", "dev_accounts", "params"} {
+			if _, ok := top[key]; !ok {
+				t.Errorf("%s: missing required key %q", tc.file, key)
+			}
+		}
+		var params map[string]json.RawMessage
+		if paramsRaw, ok := top["params"]; ok && len(paramsRaw) > 0 {
+			if err := json.Unmarshal(paramsRaw, &params); err != nil {
+				t.Fatalf("%s: params: %v", tc.file, err)
+			}
+		}
+		for _, key := range []string{
+			"block_time_ms", "total_supply_sparks", "initial_reward_sparks",
+			"halving_interval_blocks", "claim_amount_sparks", "min_stake_sparks",
+			"epoch_blocks", "unbonding_epochs", "committee_size",
+		} {
+			if _, ok := params[key]; !ok {
+				t.Errorf("%s: params missing required key %q", tc.file, key)
+			}
 		}
 
 		if j.ChainID != tc.g.ChainID {

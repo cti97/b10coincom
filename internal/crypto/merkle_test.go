@@ -1,7 +1,6 @@
 package crypto
 
 import (
-	"bytes"
 	"testing"
 )
 
@@ -59,22 +58,61 @@ func TestMerkleRootDetectsTampering(t *testing.T) {
 	}
 }
 
+// TestMerkleRootHandlesOddLeafCounts asserts the odd-promotion CONSTRUCTION
+// it names, not merely a non-zero, stable output. Each expected root is
+// derived by hand from the rule documented on MerkleRoot — leaf =
+// HashParts(0x00, data), internal = HashParts(0x01, left, right), and an odd
+// node at any level hashed with itself — written out longhand per level, so a
+// changed promotion rule (different padding hash, un-promoted odd node, a
+// different pairing order) fails here even though the result would still be
+// deterministic and non-zero.
 func TestMerkleRootHandlesOddLeafCounts(t *testing.T) {
-	// 1, 3 and 5 leaves exercise the odd-promotion path.
-	for _, n := range []int{1, 3, 5} {
-		leaves := make([][32]byte, n)
-		for i := range leaves {
-			leaves[i] = HashParts([]byte{byte(i)})
-		}
-		got := MerkleRoot(leaves)
-		// MerkleRoot's result is an unaddressable array, so it cannot be
-		// sliced in place; bind it to a variable before the comparison.
-		again := MerkleRoot(leaves)
-		if got == ([32]byte{}) {
-			t.Fatalf("n=%d produced the empty root", n)
-		}
-		if !bytes.Equal(got[:], again[:]) {
-			t.Fatalf("n=%d is not deterministic", n)
-		}
+	// MerkleRoot consumes leaf DATA and applies the leaf rule itself, so the
+	// inputs below are raw data blobs and every expectation starts by hashing
+	// the data with the 0x00 leaf domain.
+	data := func(b byte) [32]byte {
+		var v [32]byte
+		v[0] = b
+		return v
 	}
+	leaf := func(b byte) [32]byte { // the documented leaf hash
+		v := data(b)
+		return HashParts([]byte{0x00}, v[:])
+	}
+	pair := func(l, r [32]byte) [32]byte { // the documented internal hash
+		return HashParts([]byte{0x01}, l[:], r[:])
+	}
+
+	t.Run("n=1", func(t *testing.T) {
+		// A single leaf IS the root: there is no level above it, so it is
+		// not promoted a second time.
+		want := leaf(0)
+		if got := MerkleRoot([][32]byte{data(0)}); got != want {
+			t.Fatalf("n=1 root changed:\n got %x\nwant %x", got, want)
+		}
+	})
+
+	t.Run("n=3", func(t *testing.T) {
+		// Level 1: the pair, and the odd third leaf hashed with itself.
+		left := pair(leaf(0), leaf(1))
+		promoted := pair(leaf(2), leaf(2))
+		// Level 2: the two odd-level nodes pair into the root.
+		want := pair(left, promoted)
+		if got := MerkleRoot([][32]byte{data(0), data(1), data(2)}); got != want {
+			t.Fatalf("n=3 root changed:\n got %x\nwant %x", got, want)
+		}
+	})
+
+	t.Run("n=5", func(t *testing.T) {
+		// Level 1: two pairs and the odd fifth leaf hashed with itself.
+		a := pair(leaf(0), leaf(1))
+		b := pair(leaf(2), leaf(3))
+		c := pair(leaf(4), leaf(4))
+		// Level 2: ODD AGAIN — the promoted c is hashed with itself once more.
+		want := pair(pair(a, b), pair(c, c))
+		got := MerkleRoot([][32]byte{data(0), data(1), data(2), data(3), data(4)})
+		if got != want {
+			t.Fatalf("n=5 root changed:\n got %x\nwant %x", got, want)
+		}
+	})
 }
