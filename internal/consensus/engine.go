@@ -126,25 +126,56 @@ func (e *Engine) Drain() []Outbound {
 
 func (e *Engine) emit(data []byte) { e.out = append(e.out, Outbound{Data: data}) }
 
-// OnTimeout advances the round. It is how a stalled round is left behind.
+// OnTimeout ends the current round. The event must name the round the engine is
+// actually in - the driver owns the clock and fires the timer for the round it
+// sees, so it passes Height == e.Height() and Round == e.Round(). A round that
+// has already been left is a stale re-fire; a round the engine has not entered
+// is not the engine's to judge. Both are ignored, which is why neither the
+// driver nor the engine gets a second, divergent notion of "the current round".
+//
+// Ending a round keeps two concerns apart, in this order:
+//
+//  1. The round that ran out is CLOSED: the validator casts any vote it still
+//     owes it. A validator that never received a usable proposal prevotes NIL
+//     exactly once for that round - its weight must leave the round or the
+//     round can never be left behind. A validator that already voted this
+//     round (prevote via maybePrevote, or precommit after it) casts nothing.
+//  2. The NEXT round is ENTERED: enterRound resets the per-round tallies and
+//     the proposal slots and parks the validator at StepPropose, waiting for
+//     the new round's proposal. Entering a round EMITS NOTHING - in
+//     particular no nil prevote for a round nobody has proposed into yet,
+//     which is what collapsing these two concerns used to produce.
+//
+// The lock deliberately survives this transition (it survives enterRound,
+// which is where the transition lands): the timeout rescues a stalled round,
+// it does not launder a promise.
 func (e *Engine) OnTimeout(ev TimeoutEvent) {
-	if ev.Height < e.height || (ev.Height == e.height && ev.Round < e.round) {
-		return // stale
+	if ev.Height != e.height {
+		return // another height: behind us or not reached, not ours to judge
 	}
-	if ev.Height > e.height {
-		return // a future height we have not reached; the driver will re-fire
+	if ev.Round != e.round {
+		return // a stale re-fire for a round already left, or one not yet entered
 	}
-	if ev.Round > e.round {
-		e.enterRound(ev.Round)
+	if e.step == StepCommit {
+		return // the height is decided; the driver moves to the next height
 	}
-	if e.step == StepPropose {
-		e.step = StepPrevote
+	if e.round == math.MaxUint32 {
+		// e.round+1 would wrap to 0 and resurrect a long-settled round's
+		// tallies. There is no next round to enter; unreachable under any real
+		// timeout schedule, but the wrap must not be silent.
+		return
 	}
-	// In StepPrevote with no proposal, the validator votes nil so the round can end.
-	if e.step == StepPrevote && e.proposal == nil {
+	if e.step == StepPropose && e.proposal == nil {
+		// No usable proposal arrived before the round ran out: the one vote
+		// this round is owed is NIL. Emitted while e.round is still the round
+		// that is ending, so the vote is signed and tallied as that round's.
 		e.emitVote(MsgPrevote, [32]byte{})
-		e.step = StepPrecommit
 	}
+	// The vote, if any, is cast: StepPrevote and StepPrecommit validators voted
+	// earlier through maybePrevote / maybePrecommit, and a validator holding a
+	// proposal whose justification failed stays silent by the gate's rule (no
+	// vote may rest on evidence that does not exist). Leave the round behind.
+	e.enterRound(e.round + 1)
 }
 
 // enterRound moves to a later round, resetting the per-round tally. The lock
@@ -290,14 +321,20 @@ func (e *Engine) StartProposing() error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrProposeFn, err)
 	}
-	h := b.Header.SigningHash()
 	// ValidRound -1: a fresh block carries no polka yet. It must be SET, not left
 	// at the zero value, because 0 CLAIMS a polka at round 0 - which no one has
 	// given and this engine could not honestly prove.
 	p := &Proposal{
 		Height: e.height, Round: e.round, Block: b, ValidRound: -1,
-		Validator: e.pub, Sig: crypto.Sign(e.priv, h[:]),
+		Validator: e.pub,
 	}
+	// The signature must cover the envelope's own SigningHash(): that is the
+	// exact hash Proposal.Verify checks on every peer, over the envelope fields
+	// plus the block header. Signing the bare header hash instead would produce
+	// two different domain-separated hashes - a proposal every peer would reject
+	// with ErrBadProposalSignature, so no height could ever gather a prevote.
+	h := p.SigningHash()
+	p.Sig = crypto.Sign(e.priv, h[:])
 	e.proposal = &b
 	e.proposalEn = p
 	e.emit(EncodeProposal(p))
