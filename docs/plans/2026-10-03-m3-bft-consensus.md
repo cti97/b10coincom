@@ -3326,3 +3326,72 @@ git commit -m "feat: run a four-validator devnet, and make it the acceptance che
 Neither is a defect in what M3 built; both are the boundary of what M3 set out to build, and both are recorded here so the milestone's claims are read no more broadly than they hold.
 
 **Honest limits.** The simulator models latency, jitter, loss, reordering and partitions, but not clock skew, disk failure, or real network partitions — M4's real-hardware step is what tests those, and nothing here should be read as claiming otherwise. The liveness scenarios are seeded and finite; they demonstrate the protocol survives the failures injected, not that it survives every failure a real network can produce. And the Byzantine scenario models an equivocating validator, which is the most direct attack but not the only one: a validator that withholds votes selectively or delays them is not simulated, because those are liveness attacks the timeout path already covers.
+
+---
+
+## Task 11: Bound faucet claims per block, as a consensus rule
+
+**Why this exists.** M3 Task 0 bounded claims in the LOCAL mempool, which stops a node burning CPU on its own pool. It does not stop a **proposer** packing a block with claims: `applyFaucetClaim` runs a full Argon2id evaluation before it can reject, `ApplyBlock` has no bound on how many it will attempt, and `types.MaxTxsPerBlock` is 10,000. So a single malicious proposer makes every validator pay ~10,000 Argon2id evaluations per block — at the committed testnet tuning (64 MiB × 3, ≈3 s each) that is **hours of work to validate one block**, on every validator, repeatedly. A block is attacker-chosen input, so this is the same amplifier Task 0 fixed, moved to a worse position: consensus now depends on it.
+
+**Files:**
+- Modify: `internal/state/apply.go`, `internal/state/apply_test.go`, `internal/genesis/genesis.go`, `internal/genesis/genesis_test.go`, `README.md`
+
+**Interfaces:**
+- Produces: `genesis.Params.MaxClaimsPerBlock uint64`, carried through `Encode`/`DecodeGenesis`; `state.ErrTooManyClaims`
+
+- [ ] **Step 1: Write the failing tests**
+
+```go
+// A block is attacker-chosen input. Because validating one faucet claim costs a full
+// Argon2id evaluation, a block carrying an unbounded number of them lets one proposer
+// force every validator to spend hours on a single block. A block over the bound must
+// therefore be INVALID, not merely slow.
+func TestApplyBlockRejectsABlockWithTooManyClaims(t *testing.T) {
+	// build a block whose transaction list carries MaxClaimsPerBlock+1 validly-signed
+	// claims, and assert ApplyBlock returns ErrTooManyClaims without evaluating them:
+	// the count must be checked BEFORE the first puzzle is verified, or the bound
+	// protects nothing.
+}
+
+func TestApplyBlockAcceptsABlockAtTheClaimBound(t *testing.T) {
+	// exactly MaxClaimsPerBlock claims: accepted. The bound is inclusive, so the
+	// off-by-one is pinned in both directions.
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `go test ./internal/state/ -run TestApplyBlockRejectsABlockWithTooManyClaims -v`
+Expected: FAIL — `undefined: ErrTooManyClaims`
+
+- [ ] **Step 3: Implement the bound**
+
+Count the claims in the block's transaction list and reject the whole block if the count exceeds `MaxClaimsPerBlock`, **before verifying any puzzle**. The check must come first: a bound that is enforced after the expensive work bounds nothing.
+
+Reuse the mempool's value so the two cannot drift, or pin both to the genesis parameter with a test asserting they agree — say which you chose and why.
+
+- [ ] **Step 4: Re-derive the testnet Argon2 tuning**
+
+The spec's ≈3 s target was chosen for the **claimer**, who pays it once. Validators pay it **per claim per block**, so `MaxClaimsPerBlock × verify-time` must fit inside the block interval. At 64 MiB × 3 the bound would need to be 0. Re-derive the testnet parameters (and the bound) so the worst-case block validates inside a small multiple of the 2 s block interval, and **state the arithmetic in the code comment** rather than asserting an unexplained pair of numbers. Keep the devnet's trivial tuning untouched.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `go test -count=1 ./... && go test -race -count=1 ./...`
+Expected: PASS. The acceptance root must be **unchanged**: the devnet carries at most one claim per block, well under any sensible bound.
+
+- [ ] **Step 6: Document the rule**
+
+In `README.md`, state that a block may carry at most `MaxClaimsPerBlock` faucet claims and **why**: validation cost is per-claim, and a block is attacker-chosen. Remove or correct any claim that the mempool bound protects the chain — it protects the local node only.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add internal/state internal/genesis README.md
+git commit -m "feat: bound faucet claims per block as a consensus rule
+
+Validating a claim costs a full Argon2id evaluation, and a block is
+attacker-chosen input, so an unbounded claim count let one proposer force
+every validator to spend hours validating a single block. A block over the
+bound is now invalid, checked BEFORE any puzzle is evaluated. The testnet
+tuning is re-derived so the worst case fits the block interval."
+```
