@@ -14,5 +14,10 @@ jobs:
       - run: go test -count=1 ./...
       - run: go test -race -count=1 ./...
       - run: go build ./...
-      # The milestone acceptance command must keep printing OK with exit 0.
+      # The milestone acceptance commands must keep printing OK with exit 0.
+      # The first is the default run — its --claims default makes it pay one
+      # claim and prove the same-epoch double claim refused — and the second
+      # runs the claim variant explicitly so the faucet path cannot degrade
+      # with the flag's default unnoticed.
       - run: go run ./cmd/b10coin devnet --blocks 100
+      - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1

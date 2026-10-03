@@ -72,7 +72,11 @@ stored: there is no key file and no keystore.
 func cmdDevnet(args []string) error {
 	fs := flag.NewFlagSet("devnet", flag.ExitOnError)
 	blocks := fs.Uint64("blocks", 100, "number of blocks to produce")
-	claims := fs.Uint64("claims", 0, "faucet claim attempts to make after the block loop")
+	// Default 1: the acceptance check IS the milestone's proof, so the
+	// faucet must be exercised without a flag. Every default run pays one
+	// claim against a solved puzzle and proves the same-epoch double claim
+	// refused. --claims 0 keeps the plain transfer-only runs available.
+	claims := fs.Uint64("claims", 1, "faucet claim attempts to make after the block loop")
 	dir := fs.String("dir", "", "data directory (default: a fresh temporary directory)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -97,15 +101,18 @@ func cmdDevnet(args []string) error {
 	if *claims > 0 {
 		fmt.Printf("claims paid  %d of %d attempts, %d sparks each\n",
 			summary.Claimed, *claims, summary.ClaimAmount)
+		fmt.Printf("double claims refused %d (one claim per key per epoch)\n", summary.DoubleClaimsRefused)
 		fmt.Printf("claimant bal %d sparks\n", summary.ClaimedBalance)
 		fmt.Printf("faucet bal   %d sparks (emitted %d sparks in total)\n",
 			summary.FaucetBalance, summary.EmittedTotal)
 	}
-	// Every claim attempt takes exactly one following block (RunOnce appends
-	// one block per call, empty when its claim is refused), so the expected
-	// final height is blocks plus attempts.
-	if summary.Height != *blocks+*claims {
-		return fmt.Errorf("expected height %d, got %d", *blocks+*claims, summary.Height)
+	// Every claim attempt takes exactly one following block, and the double
+	// claim of every PAID attempt takes one more (RunOnce appends one block
+	// per call — empty when the probe refuses the transaction), so the
+	// expected final height is blocks plus attempts plus the refused double
+	// claims the scenario proved.
+	if summary.Height != *blocks+*claims+summary.DoubleClaimsRefused {
+		return fmt.Errorf("expected height %d, got %d", *blocks+*claims+summary.DoubleClaimsRefused, summary.Height)
 	}
 	fmt.Println("OK")
 	return nil

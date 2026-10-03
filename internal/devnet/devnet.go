@@ -3,7 +3,10 @@
 // transfer, persists it and reports a reproducible state root. M2 adds the
 // faucet: Options.Claims submits puzzle-solved claim attempts after the block
 // loop, so one call also exercises the claim path end to end — emission funds
-// the faucet, a solved puzzle buys a claim, and the claimant is paid.
+// the faucet, a solved puzzle buys a claim, and the claimant is paid. Each
+// PAID claim is immediately followed by a second, solved claim from the same
+// key in the same epoch, so one call also proves the anti-farming rule: that
+// attempt must be refused, or the run fails.
 package devnet
 
 import (
@@ -37,7 +40,10 @@ type Options struct {
 	// next block makes current and is submitted in the block that follows;
 	// an attempt the probe refuses (an empty faucet) is evicted and its
 	// block is simply empty. Only the paid ones count towards
-	// Summary.Claimed.
+	// Summary.Claimed. Every paid attempt is additionally followed by that
+	// same key's same-epoch double claim, which the probe must evict (an
+	// applied double claim fails the run) and which takes one further empty
+	// block per paid claim.
 	Claims uint64
 }
 
@@ -57,11 +63,20 @@ type Summary struct {
 	// credited into the faucet, heights 0..Height inclusive — emission is
 	// the only thing that funds it, so
 	// FaucetBalance == EmittedTotal - Claimed*ClaimAmount exactly.
-	Claimed        uint64
-	ClaimAmount    uint64
-	ClaimedBalance uint64
-	FaucetBalance  uint64
-	EmittedTotal   uint64
+	//
+	// DoubleClaimsRefused counts the same-epoch double-claim attempts the
+	// scenario made and the node refused. The run FAILS if any double claim
+	// is applied, so in a successful run every paid claim also has its
+	// double-claim rejection behind it: DoubleClaimsRefused == Claimed
+	// whenever Claims > 0. It is a run-side report, not a replayable one: a
+	// stored chain cannot distinguish the empty block a refused double claim
+	// left behind from any other empty block.
+	DoubleClaimsRefused uint64
+	Claimed             uint64
+	ClaimAmount         uint64
+	ClaimedBalance      uint64
+	FaucetBalance       uint64
+	EmittedTotal        uint64
 }
 
 // Run creates a fresh devnet and drives it to o.Blocks. One transfer is
@@ -106,20 +121,35 @@ func Run(o Options) (Summary, error) {
 	// the block that will apply it makes current; the claim rides the node's
 	// own RunOnce, so the probe must mirror the transition for the claim to
 	// survive. A refused attempt leaves its block empty and is not counted.
+	//
+	// After a PAID attempt the scenario proves the anti-farming rule live:
+	// the same key immediately attempts a second claim IN THE SAME EPOCH.
+	// That double claim is solved and signed just like the first — the
+	// puzzle binds only (key, epoch), so the first claim's solution still
+	// verifies — which is exactly why only the claim-epoch marker can reject
+	// it. The node's probe must evict it, so its block is empty; a block
+	// that carries the double claim means the rule is broken and the run
+	// fails. Every RunOnce call appends exactly one block, so timestamps and
+	// heights both advance once per call: one block per claim attempt, one
+	// more per paid claim.
 	claimed := uint64(0)
 	claimedBalance := uint64(0)
+	refusedDoubleClaims := uint64(0)
+	ts := g0Time + int64(o.Blocks)
 	for attempt := uint64(0); attempt < o.Claims; attempt++ {
 		pub, priv := claimantKey(attempt)
+		claimant := types.AddressFromPub(pub)
 		epoch := (c.Height()+1)/g.Params.EpochBlocks + 1
 		pow, ok := faucet.Solve(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, maxPuzzleAttempts)
 		if !ok {
 			return Summary{}, fmt.Errorf("devnet: claim attempt %d of %d did not solve the fixture puzzle", attempt+1, o.Claims)
 		}
-		claim := devClaim(pub, priv, epoch, pow)
+		claim := devClaim(pub, priv, c.State().Get(claimant).Nonce, epoch, pow)
 		if err := mp.Add([]types.Tx{*claim})[0]; err != nil {
 			return Summary{}, err
 		}
-		b, err := n.RunOnce(g0Time + int64(o.Blocks) + int64(attempt) + 1)
+		ts++
+		b, err := n.RunOnce(ts)
 		if err != nil {
 			return Summary{}, err
 		}
@@ -128,16 +158,45 @@ func Run(o Options) (Summary, error) {
 		// the same number for this run.
 		included += len(b.Txs)
 		id := claim.ID()
+		var paid bool
 		for i := range b.Txs {
 			if b.Txs[i].ID() == id {
+				paid = true
 				claimed++
 				// Read the paid balance from the chain itself rather than
 				// deriving it, so a claim that moved anything other than the
 				// claim amount would show up in the summary instead of being
 				// papered over by arithmetic.
-				claimedBalance = c.State().Get(claim.From).Balance
+				claimedBalance = c.State().Get(claimant).Balance
 			}
 		}
+		if !paid {
+			continue
+		}
+
+		// The double claim reuses the first claim's solution (the puzzle binds
+		// pubkey, epoch and nonce, not the transaction) and spends the account
+		// nonce the paid claim just advanced.
+		double := devClaim(pub, priv, c.State().Get(claimant).Nonce, epoch, pow)
+		if err := mp.Add([]types.Tx{*double})[0]; err != nil {
+			return Summary{}, err
+		}
+		ts++
+		bd, err := n.RunOnce(ts)
+		if err != nil {
+			return Summary{}, err
+		}
+		// An empty double-claim block is EXPECTED: the probe refused the
+		// transaction, so it is evicted, never stored, and the replayed chain
+		// cannot even tell it happened. Inclusion is the one outcome this
+		// scenario must never accept.
+		doubleID := double.ID()
+		for i := range bd.Txs {
+			if bd.Txs[i].ID() == doubleID {
+				return Summary{}, fmt.Errorf("devnet: a second claim from claimant %x in epoch %d was applied; the one-claim-per-epoch rule is broken", claimant, epoch)
+			}
+		}
+		refusedDoubleClaims++
 	}
 
 	// Emission is the ONLY thing that funds the faucet: every reward the run
@@ -151,15 +210,16 @@ func Run(o Options) (Summary, error) {
 	}
 
 	return Summary{
-		ChainID:        g.ChainID,
-		Height:         c.Height(),
-		StateRoot:      c.State().Root(),
-		TxsIncluded:    included,
-		Claimed:        claimed,
-		ClaimAmount:    g.Params.ClaimAmountSparks,
-		ClaimedBalance: claimedBalance,
-		FaucetBalance:  c.State().Get(g.FaucetAddress()).Balance,
-		EmittedTotal:   emitted,
+		ChainID:             g.ChainID,
+		Height:              c.Height(),
+		StateRoot:           c.State().Root(),
+		TxsIncluded:         included,
+		DoubleClaimsRefused: refusedDoubleClaims,
+		Claimed:             claimed,
+		ClaimAmount:         g.Params.ClaimAmountSparks,
+		ClaimedBalance:      claimedBalance,
+		FaucetBalance:       c.State().Get(g.FaucetAddress()).Balance,
+		EmittedTotal:        emitted,
 	}, nil
 }
 
@@ -167,7 +227,10 @@ func Run(o Options) (Summary, error) {
 // state. TxsIncluded is recomputed from the stored blocks rather than left
 // at zero, because a hard zero would be indistinguishable from a chain that
 // genuinely included no transactions; the faucet fields are recomputed the
-// same way rather than zeroed, for the same reason.
+// same way rather than zeroed, for the same reason. DoubleClaimsRefused is
+// the exception: a stored chain carries no trace of a refused double claim
+// (its block is empty and indistinguishable from any other empty block), so
+// leaving it at zero is the honest reading rather than a guess.
 func Replay(dir string) (Summary, error) {
 	g := genesis.Devnet()
 	c, err := chain.Open(g, dir)
@@ -232,14 +295,16 @@ func devTransfer(c *chain.Chain, amount uint64) (*types.Tx, error) {
 }
 
 // devClaim builds and signs one faucet-claim transaction from pub (its
-// solution pow already found for epoch). The nonce is always zero because a
-// devnet claimant key has never transacted: one claim, one spent nonce.
-func devClaim(pub ed25519.PublicKey, priv ed25519.PrivateKey, epoch, pow uint64) *types.Tx {
+// solution pow already found for epoch). nonce is the claimant's replay
+// counter at application time: zero for a claimant key that has never
+// transacted, and the value the paid claim advanced for the same key's
+// double claim.
+func devClaim(pub ed25519.PublicKey, priv ed25519.PrivateKey, nonce, epoch, pow uint64) *types.Tx {
 	tx := &types.Tx{
 		Type:     types.TxFaucetClaim,
 		From:     types.AddressFromPub(pub),
 		PubKey:   pub,
-		Nonce:    0,
+		Nonce:    nonce,
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
