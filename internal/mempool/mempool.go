@@ -14,6 +14,14 @@ var (
 	ErrFull      = errors.New("mempool: at capacity")
 )
 
+// MaxFaucetClaimsPerBlock bounds how many faucet claims the pool will hand to a
+// single block. A claim costs a full Argon2id evaluation to verify - ~3 s at the
+// testnet tuning - while costing a submitter one Ed25519 signature, so without a
+// bound a full pool of signature-valid claims with garbage proofs would stall
+// block production for hours. Ordinary transactions are not bounded here: they
+// are cheap to validate and the block size limits already cap them.
+const MaxFaucetClaimsPerBlock = 8
+
 // Mempool is a bounded, deduplicated set of pending transactions. It is
 // safe for concurrent use: mu guards every field, because one process may
 // serve the RPC server (Add via POST /tx, Len via GET /status) while the
@@ -56,23 +64,40 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 	return errs
 }
 
-// Take removes and returns up to max transactions. A non-positive max
-// removes nothing and returns an empty slice.
+// Take removes and returns up to max transactions, in insertion order. At
+// most MaxFaucetClaimsPerBlock of them are faucet claims: each claim costs a
+// full Argon2id evaluation to verify, so claims encountered beyond that bound
+// are skipped and left in the pool for a later block instead of being handed
+// over or dropped. A non-positive max removes nothing and returns an empty
+// slice.
 func (m *Mempool) Take(max int) []types.Tx {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if max <= 0 {
 		return []types.Tx{}
 	}
-	if max > len(m.txs) {
-		max = len(m.txs)
+	var out, keep []types.Tx
+	claims := 0
+	for _, tx := range m.txs {
+		// The total still respects max, and once it is reached everything
+		// remaining stays in the pool - claims and transfers alike.
+		if len(out) >= max {
+			keep = append(keep, tx)
+			continue
+		}
+		if tx.Type == types.TxFaucetClaim {
+			claims++
+			if claims > MaxFaucetClaimsPerBlock {
+				keep = append(keep, tx)
+				continue
+			}
+		}
+		out = append(out, tx)
 	}
-	out := make([]types.Tx, max)
-	copy(out, m.txs[:max])
 	for i := range out {
 		delete(m.seen, out[i].ID())
 	}
-	m.txs = append([]types.Tx(nil), m.txs[max:]...)
+	m.txs = keep
 	return out
 }
 
