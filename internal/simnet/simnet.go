@@ -33,19 +33,33 @@ const (
 	// RunBlocksStepMS is how much virtual time one step advances. Every online
 	// driver ticks once per step and the network delivers once per step.
 	runBlocksStepMS = int64(10)
-	// runBlocksStepBudget bounds a RunBlocks call: at 10 virtual ms per step
-	// this is 1000 virtual seconds, far past anything a live network needs,
-	// and the cap is what turns a liveness bug into an error instead of a
-	// hung test.
+	// runBlocksStepBudget is the HARD bound on one runUntil call (RunBlocks /
+	// RunBlocksAmong run the same loop). It is rarely reached: a run whose
+	// wait set stops making height progress errors at the stall limit instead
+	// (runUntil / stallStepLimit), so only a run that keeps inching forward
+	// forever can burn the whole budget.
 	runBlocksStepBudget = 100_000
 )
 
 // Options configures a simulated network.
 type Options struct {
-	TempDir     string
-	Seed        int64
-	LatencyMS   int64
-	JitterMS    int64
+	TempDir   string
+	Seed      int64
+	LatencyMS int64
+	JitterMS  int64
+	// DropPercent is the percentage of deliveries the network drops (0-100),
+	// applied per delivery after the partition cut.
+	//
+	// MILESTONE LIMIT (M3): DropPercent cannot be used for any liveness
+	// scenario. A validator whose quorum-committing proposal is lost never
+	// holds the block bytes, so when the quorum's precommits arrive it cannot
+	// APPEND - and the driver parks at that undecided height permanently,
+	// because M3 has no catch-up, rejoin or block-sync path to adopt a peer's
+	// block. Any "everyone reaches target" run with drops enabled therefore
+	// parks the first time a commit-critical proposal is lost and stalls for
+	// the rest of its budget. Until a milestone gives a node a way to adopt a
+	// peer's block, run liveness scenarios at DropPercent 0 with only latency
+	// and jitter; drops are honest only where liveness is not asserted.
 	DropPercent int
 	TimeoutBase int64 // virtual ms before a round expires; 0 takes the default
 	TimeoutStep int64 // virtual ms added per further round; 0 takes the default
@@ -59,13 +73,21 @@ type Net struct {
 	drv  []*consensus.Driver
 	ch   []*chain.Chain
 	keys []keyPair
+	// taps is each validator's recording wrapper, sitting between its driver
+	// and the sim endpoint. Every scenario-injected driver (New, the restart
+	// scenario's rebuild, MakeEquivocator) must route through it (use
+	// transportFor), so a scenario can observe what a validator actually sent
+	// and received - an offline validator's tap staying frozen is the direct
+	// proof that "powered off" deafens as well as stills it.
+	taps []*tap
 	// g is the genesis every validator was opened with; genesis() hands it back
 	// so a scenario can reopen a stopped validator's chain from disk.
 	g *genesis.Genesis
-	// offline marks validators that no longer tick. They stay in the committee:
-	// TakeOffline models a powered-off machine, not a validator-set change, and
-	// removing a member would lower the quorum and make committing EASIER - the
-	// opposite of what an outage does.
+	// offline marks validators that no longer tick AND no longer receive: the
+	// sim endpoint's callback is swapped for a discarder. They stay in the
+	// committee: TakeOffline models a powered-off machine, not a validator-set
+	// change, and removing a member would lower the quorum and make committing
+	// EASIER - the opposite of what an outage does.
 	offline map[int]bool
 	// now is the virtual clock in milliseconds. It lives on the Net rather than
 	// in a RunBlocks local so repeated RunBlocks calls (as the plan's scenarios
@@ -159,7 +181,12 @@ func New(n int, opts Options) (*Net, error) {
 		out.ch = append(out.ch, c)
 		priv := simKey(i)
 		out.keys = append(out.keys, keyPair{priv: priv})
-		out.drv = append(out.drv, consensus.NewDriver(out.cfg, c, priv, out.sim.TransportFor(id)))
+		// The driver sits over a tap, not over the raw endpoint: the tap is a
+		// transparent recorder (see tap), so the run's rng draws, delivery
+		// order and peer iteration are exactly the sim's own.
+		tp := &tap{inner: out.sim.TransportFor(id)}
+		out.taps = append(out.taps, tp)
+		out.drv = append(out.drv, consensus.NewDriver(out.cfg, c, priv, tp))
 	}
 	return out, nil
 }
@@ -169,11 +196,85 @@ func New(n int, opts Options) (*Net, error) {
 // directory.
 func (n *Net) genesis() *genesis.Genesis { return n.g }
 
-// RunBlocks advances virtual time until every ONLINE validator has committed
-// target blocks, or the step budget is exhausted. It returns each validator's
-// height by index either way, so a stalled run can be diagnosed from its final
-// state instead of only its error.
+// transportFor returns validator i's transport handle - the SAME transport the
+// validator's driver was built over, tap included. Anything that rebuilds a
+// driver (the restart scenario, MakeEquivocator) must route the new driver
+// through this rather than through the raw sim endpoint, or the rebuild
+// silently un-taps the validator and later observations miss its traffic.
+func (n *Net) transportFor(i int) transport.Transport { return n.taps[i] }
+
+// RunBlocks advances virtual time until every ONLINE validator (the wait set,
+// recorded at call start) has committed target blocks, or the run stalls.
+//
+// Two limits end an unfinished run:
+//
+//   - The stall limit: if no validator in the wait set reaches a new height
+//     for stallStepLimit() consecutive steps, the run is declared stalled and
+//     errors EARLY, naming the steps taken, the waited validators' heights and
+//     the seed - a run that cannot commit must not burn the whole budget (a
+//     pre-fix two-offline stall spent 100,000 steps, minutes of wall time,
+//     before erroring). The wait set, not the whole network, is watched: a
+//     partitioned minority cut away from a progressing majority is NOT stall.
+//   - The step budget (runBlocksStepBudget): the hard cap for a run that keeps
+//     inching forward without ever reaching the target.
+//
+// It returns each validator's height by index either way, so a stalled run can
+// be diagnosed from its final state instead of only its error. Success still
+// means exactly what it always did: every online validator at or past target.
 func (n *Net) RunBlocks(target uint64) (map[uint64]uint64, error) {
+	wait := make([]int, 0, len(n.drv))
+	for i := range n.drv {
+		if !n.offline[i] {
+			wait = append(wait, i)
+		}
+	}
+	return n.runUntil(target, wait)
+}
+
+// RunBlocksAmong is RunBlocks with a NARROWED wait set: it advances virtual
+// time until the NAMED validators have committed target blocks, ignoring the
+// heights of everyone else. This is how a scenario expresses "wait for the
+// validators that CAN progress": with a minority partitioned or otherwise cut
+// off, RunBlocks would block on the cut validator forever while the majority
+// commits on untouched.
+//
+// The wait set must name validators that exist and are ONLINE; an offline
+// validator can never progress by construction, so waiting on one is a caller
+// bug and is refused up front rather than after a stall window. The stall and
+// budget limits of RunBlocks apply unchanged, with the watch and the success
+// condition keyed to the named set: validators OUTSIDE it may sit at any
+// height on a successful return (that is the point), so a caller that narrows
+// the set asserts only what it names.
+func (n *Net) RunBlocksAmong(target uint64, validators []int) (map[uint64]uint64, error) {
+	if len(validators) == 0 {
+		return n.Heights(), fmt.Errorf("simnet: RunBlocksAmong: empty wait set; there is no progress to wait for")
+	}
+	for _, i := range validators {
+		if i < 0 || i >= len(n.drv) {
+			return n.Heights(), fmt.Errorf("simnet: RunBlocksAmong: validator index %d out of range 0..%d", i, len(n.drv)-1)
+		}
+		if n.offline[i] {
+			return n.Heights(), fmt.Errorf("simnet: RunBlocksAmong: validator %d is offline and can never progress; waiting on it would stall", i)
+		}
+	}
+	return n.runUntil(target, validators)
+}
+
+// runUntil is the step loop both RunBlocks and RunBlocksAmong drive. The ticks,
+// the sim advance and the delivery order are untouched by the wait set: only
+// the success check and the stall watch are keyed to it.
+func (n *Net) runUntil(target uint64, waited []int) (map[uint64]uint64, error) {
+	if len(waited) == 0 {
+		return n.Heights(), fmt.Errorf("simnet: no online validator can ever commit height %d; there is nothing to wait for", target)
+	}
+	isWaited := make([]bool, len(n.drv))
+	last := make([]uint64, len(n.drv))
+	for _, i := range waited {
+		isWaited[i] = true
+		last[i] = n.ch[i].Height()
+	}
+	limit := n.stallStepLimit()
+	quiet := 0 // the step at which the wait set last made height progress
 	for step := 0; step < runBlocksStepBudget; step++ {
 		n.now += runBlocksStepMS
 		for i, d := range n.drv {
@@ -183,16 +284,30 @@ func (n *Net) RunBlocks(target uint64) (map[uint64]uint64, error) {
 			d.Tick(n.now)
 		}
 		n.sim.Advance(ms(runBlocksStepMS))
-		if n.allAtLeast(target) {
+		if n.waitedAtLeast(isWaited, target) {
 			return n.Heights(), nil
+		}
+		for _, i := range waited {
+			if h := n.ch[i].Height(); h > last[i] {
+				last[i], quiet = h, step
+			}
+		}
+		if step-quiet >= limit {
+			stuck := make(map[uint64]uint64, len(waited))
+			for _, i := range waited {
+				stuck[uint64(i)] = n.ch[i].Height()
+			}
+			return n.Heights(), fmt.Errorf(
+				"simnet: stalled below height %d after %d steps: nothing in the wait set progressed for %d consecutive steps (waited heights %v, seed %d)",
+				target, step+1, limit, stuck, n.opts.Seed)
 		}
 	}
 	return n.Heights(), fmt.Errorf("simnet: stalled below height %d after %d steps (heights %v, seed %d)", target, runBlocksStepBudget, n.Heights(), n.opts.Seed)
 }
 
-func (n *Net) allAtLeast(target uint64) bool {
+func (n *Net) waitedAtLeast(isWaited []bool, target uint64) bool {
 	for i, c := range n.ch {
-		if n.offline[i] {
+		if !isWaited[i] {
 			continue
 		}
 		if c.Height() < target {
@@ -200,6 +315,21 @@ func (n *Net) allAtLeast(target uint64) bool {
 		}
 	}
 	return true
+}
+
+// stallStepLimit is how many consecutive steps a wait set may show no height
+// progress before runUntil declares the run stalled. It is derived from the
+// configured round timeouts rather than fixed: a healthy commit lands within
+// one round (TimeoutBase, plus the escalated round's TimeoutStep for a
+// re-proposal), so five such windows is generous grace, and the floor of 200
+// steps (two virtual seconds, twenty base timeouts at the defaults) keeps
+// fast-timeout configurations from flapping on start-up.
+func (n *Net) stallStepLimit() int {
+	limit := int((n.opts.TimeoutBase+n.opts.TimeoutStep)/runBlocksStepMS) * 5
+	if limit < 200 {
+		limit = 200
+	}
+	return limit
 }
 
 // Heights reports every validator's chain height by index.
@@ -218,7 +348,21 @@ func (n *Net) Heights() map[uint64]uint64 {
 // they all share. Two validators presenting different blocks at a shared height
 // would be a broken two-thirds safety assumption, which is exactly what a
 // scenario must be able to detect.
+//
+// With fewer than two validators online there is nothing to agree ABOUT, and a
+// bare nil would be a vacuous pass: the call returns an error naming the online
+// count instead. A committee of one, or a fully offline network, has no
+// agreement claim to test.
 func (n *Net) AssertSameChain() error {
+	online := 0
+	for i := range n.ch {
+		if !n.offline[i] {
+			online++
+		}
+	}
+	if online < 2 {
+		return fmt.Errorf("simnet: AssertSameChain compares %d online validator(s); fewer than two makes agreement vacuous and cannot be tested", online)
+	}
 	var ref [32]byte
 	var refHeight uint64
 	first := true
@@ -260,15 +404,46 @@ func (n *Net) Partition(a, b []int) {
 // Heal restores full connectivity.
 func (n *Net) Heal() { n.sim.Heal() }
 
-// TakeOffline stops a validator from ticking, as if its machine were powered off.
+// TakeOffline stops validator i from ticking AND cuts its links in the
+// simulated network, as if its machine were powered off: the machine is no
+// longer running, so it neither sends nor receives. Skipping only the tick is
+// NOT a power-off - the network would still deliver to the validator's
+// endpoint, its driver would keep prevoting, precommitting and APPENDING on
+// messages, and the one-offline liveness claim would pass while the
+// two-offline stall happened for the wrong reason. The cut lives at the sim
+// endpoint (its receive callback is swapped for a discarder) rather than in a
+// partition group, because a powered-off machine is deaf to everyone INCLUDING
+// other offline validators, and because the callback survives Heal and later
+// Partition calls, which reassign partition groups wholesale. The swap is made
+// on the raw endpoint, below the validator's tap, so while a validator is
+// offline its tap stays frozen - that frozen log is the direct, observable
+// definition of "this validator sends and receives nothing" (simnet_test.go
+// asserts exactly that).
+//
 // It stays in the committee, so quorum does NOT become easier: the config's
 // committee, total power and quorum threshold are all left untouched by design -
 // silencing a validator must never be a way to lower the bar.
-func (n *Net) TakeOffline(i int) { n.offline[i] = true }
+//
+// The cut is one-way by design: M3 has no catch-up or rejoin, so a validator
+// cannot merely be marked online again. Coming back means a restart - reopen
+// the chain from disk and build a fresh driver over transportFor(i); the new
+// driver's OnMessage registration restores the link.
+func (n *Net) TakeOffline(i int) {
+	if n.offline[i] {
+		return
+	}
+	n.offline[i] = true
+	// Cut the links: nothing delivered to this endpoint reaches the driver any
+	// more, and with no Tick and no OnMessage the driver never flushes, so it
+	// can emit nothing either. Messages already in flight towards the
+	// validator are still delivered - into the discarder, where a real
+	// power-off would drop them at the (stopped) NIC.
+	n.sim.TransportFor(fmt.Sprintf("v%d", i)).OnMessage(func(transport.Message) {})
+}
 
 // MakeEquivocator replaces validator i's transport with one that duplicates every
-// prevote it sends as a prevote for a DIFFERENT block ID, signed with the key i
-// genuinely owns.
+// non-nil prevote it sends as a prevote for a DIFFERENT block ID, signed with the
+// key i genuinely owns.
 //
 // Signing with a REAL committee key is essential: a forged vote carrying a
 // stranger's key would be rejected by the tally as a non-member, and the scenario
@@ -277,20 +452,76 @@ func (n *Net) TakeOffline(i int) { n.offline[i] = true }
 // the Validator field, so peers see two equally valid, mutually conflicting
 // prevotes from a committee member of good standing.
 //
-// OnMessage, Peers and Close forward to the wrapped transport: the driver that is
-// rebuilt over this wrapper re-registers its callback and lists its peers through
-// exactly these three methods, so dropping any of them would deafen or blind the
-// driver and stall the scenario for the wrong reason.
-func (n *Net) MakeEquivocator(i int) {
-	inner := n.sim.TransportFor(fmt.Sprintf("v%d", i))
+// The rebuild is also what puts the forgery on the wire: driver flushes reach
+// the transport ONLY through Broadcast, so the forged vote is a second
+// Broadcast through i's own wrapper into the live network - peers receive it
+// like any other message (simnet_test.go asserts the forged bytes both on i's
+// outgoing tap AND in another validator's received log; a forge that stayed
+// local would leave both empty and the Byzantine scenario vacuous).
+//
+// Only OnMessage is a method the driver actually exercises - NewDriver
+// re-registers its receive callback through it, so forwarding it is what keeps
+// the rebuilt driver from going deaf. Peers and Close forward purely to
+// satisfy the Transport interface: the driver never lists peers (its broadcasts
+// reach the transport's whole peer set) and never closes its transport.
+//
+// The call errors when i is out of range, and on an OFFLINE validator: the
+// rebuild re-registers a live receive callback, which would silently lift the
+// power-off cut - a powered-off machine cannot be Byzantine.
+func (n *Net) MakeEquivocator(i int) error {
+	if i < 0 || i >= len(n.drv) {
+		return fmt.Errorf("simnet: MakeEquivocator: validator index %d out of range 0..%d", i, len(n.drv)-1)
+	}
+	if n.offline[i] {
+		return fmt.Errorf("simnet: MakeEquivocator: validator %d is offline; a powered-off machine cannot be Byzantine", i)
+	}
 	eq := &equivocating{
-		inner:   inner,
+		inner:   n.transportFor(i),
 		priv:    n.keys[i].priv,
 		forgeID: crypto.HashParts([]byte("b10coin-forged-block")),
 	}
 	n.equivs[i] = eq
 	n.drv[i] = consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, eq)
+	return nil
 }
+
+// tap is a transparent recording wrapper around one validator's transport. It
+// exists so a scenario can assert what a validator actually put on the wire and
+// what its driver actually consumed, without poking consensus internals: the
+// offline validator whose tap stays frozen, the Byzantine validator whose
+// forged bytes appear in both its own send log and its peers' receive logs.
+// The wrapper records only; every call forwards unchanged to the sim endpoint,
+// so the seeded rng, the (at, seq) delivery order and the sorted peer
+// iteration are exactly the sim's own.
+type tap struct {
+	inner transport.Transport
+	// sent holds a copy of every payload this validator broadcast, in send
+	// order. A partition can stop a broadcast from being delivered; it is on
+	// this validator's wire either way, which is the level this log reports.
+	sent [][]byte
+	// recv holds a copy of every payload DELIVERED TO THE DRIVER, in delivery
+	// order. TakeOffline replaces the endpoint's callback below this wrapper,
+	// so messages to a powered-off validator are dropped by the simulation and
+	// never appear here: recv measures what the validator's engine acted on.
+	recv [][]byte
+}
+
+func (t *tap) Broadcast(data []byte) error {
+	t.sent = append(t.sent, append([]byte(nil), data...))
+	return t.inner.Broadcast(data)
+}
+
+// OnMessage wraps the receive callback so a payload is counted as received
+// only when it actually reaches the driver.
+func (t *tap) OnMessage(fn func(transport.Message)) {
+	t.inner.OnMessage(func(m transport.Message) {
+		t.recv = append(t.recv, append([]byte(nil), m.Data...))
+		fn(m)
+	})
+}
+
+func (t *tap) Peers() []transport.PeerID { return t.inner.Peers() }
+func (t *tap) Close() error              { return t.inner.Close() }
 
 // equivocating wraps a Transport and re-sends every prevote as a conflicting one.
 type equivocating struct {
@@ -345,9 +576,6 @@ func ids(is []int) []string {
 // closed by a restart scenario stays closed: Close errors on it are suppressed.
 func (n *Net) Close() {
 	for _, c := range n.ch {
-		if c == nil {
-			continue
-		}
 		_ = c.Close()
 	}
 }
