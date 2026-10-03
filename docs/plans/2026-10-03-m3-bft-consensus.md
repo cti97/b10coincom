@@ -1437,10 +1437,13 @@ func testSignRaw(t *testing.T, priv ed25519PrivateKey, h [32]byte) []byte {
 }
 ```
 
-and to the alias file:
+**`testCommitteeKey` already exists** in `testkeys_test.go`, added by Task 3's review fix,
+where it was made the single source of the validator-key derivation so that a later task
+changing it would break a test. **Do NOT re-declare it** - that is a duplicate-declaration
+compile error. It is:
 
 ```go
-func testCommitteeKey(idx int) ed25519.PrivateKey {
+func testCommitteeKey(idx int) ed25519PrivateKey {
 	h := crypto.HashParts([]byte("b10coin-test-validator"), []byte{byte(idx)})
 	return ed25519.NewKeyFromSeed(h[:])
 }
