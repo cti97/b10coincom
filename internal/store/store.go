@@ -1,9 +1,7 @@
 // Package store persists blocks as append-only segment files and a
 // per-height lock log, both over opaque payloads.
 //
-// Record layout (blocks and locks alike):
-//
-//	uvarint(len(payload)) || payload || uint32be(crc32c(payload))
+// Record layout: uvarint(len(payload)) || payload || uint32be(crc32c(payload)).
 //
 // Open scans the final segment and truncates any partial trailing record:
 // that is what makes a crash mid-write survivable. The node restarts,
@@ -14,14 +12,19 @@
 // corruption and fails Open.
 //
 // The lock log (separate file, same framing) holds one validator's own
-// lockedRound/lockedBlock per height. Its corruption is treated the opposite
-// way round: a structurally torn tail is truncated as the crash it almost
-// certainly is, but a complete record with a bad checksum FAILS Open,
-// because this log's failure mode must never be "silently unlocked" - a
-// degrading reader would re-vote the very conflicting block the lock exists
-// to refuse. Blocks are judged content-based through their state roots, so a
-// bad block can only stall a Read; a lock's whole value is its mere
-// existence, and a missing one reads as unlocked.
+// lockedRound/lockedBlock per height. Its records have a FIXED payload
+// (see lockPayloadLen), so a frame's length prefix can only ever be one
+// exact byte - and it is checked against the constant instead of trusted.
+// That closes a hole a length-prefix repair would leave: without the check,
+// a single flipped bit in an intact record's length byte is indistinguishable
+// from a crash for the scanner, and "repairing" it truncates the log and the
+// promise with it - degrading a validator to unlocked, the exact unsafe
+// direction the lock exists to refuse. So here the truncate is confined to
+// what only a crash can produce: a complete length prefix whose record runs
+// past EOF. Everything else is corruption and FAILS Open. Blocks are judged
+// content-based through their state roots, so a bad block can only stall a
+// Read; a lock's whole value is its mere existence, and a missing one reads
+// as unlocked.
 package store
 
 import (
@@ -30,7 +33,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -51,6 +53,18 @@ var (
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// lockPayloadLen is the fixed payload size of one lock record: 8 bytes of
+// big-endian height, 4 bytes of big-endian round, 32 bytes of block ID.
+//
+// The size is a constant of the CODE, not data the file repeats: the length
+// prefix that framing puts in front of every record is checked against it.
+// Because it never depends on the file's bytes, no single flipped bit - or
+// any corruption at all - can make one record's length lie into a shape the
+// scanner would mistake for a torn tail and "repair" by truncating: the
+// length is either exactly this constant (the only value a write of this
+// record format ever produces) or the log is corrupt and Open refuses it.
+const lockPayloadLen = 8 + 4 + 32
 
 // LockRecord is the persisted form of a validator's lock: the safety
 // promise that the validator precommitted BlockID at Height inRound, and
@@ -315,14 +329,28 @@ func (s *Store) Height() (uint64, bool) { return s.last, s.have }
 // scanLocks rebuilds the lock index from the lock log.
 //
 // The error policy is deliberately asymmetric with the block segments' and
-// is the whole point of the log. A structurally torn tail (a length prefix
-// or record that runs past EOF) is the signature of a crash mid-write and is
-// truncated away, exactly like a block segment's tail. But a COMPLETE record
-// whose checksum fails means the bytes on disk changed under us or were
-// written badly, and "treat it as absent" would degrade the validator to
-// unlocked - the exact unsafe direction the lock exists to close. So a bad
-// checksum here fails Open loudly and the node stays down: refusing to start
-// without a promise is safer than keeping a promise you cannot see.
+// is the whole point of the log. What may be truncated is ONLY the one
+// signature a crash mid-write can leave here: a complete, correct length
+// prefix whose record runs past EOF. Everything else fails Open loudly,
+// never truncates:
+//
+//   - A length prefix that is not exactly the record's constant size is
+//     corruption. A write of this record format can emit one byte - the
+//     constant - and nothing else, so a torn tail cannot produce a different
+//     one, while a single flipped bit in an intact record's length byte can.
+//     Truncating it would be how a corrupt log "repairs" itself into
+//     unlocked: the destroyed record is replaced by silence, and silence
+//     here is a validator free to prevote the very conflicting block its
+//     lock exists to refuse. The evidence is also preserved - the file is
+//     not rewritten, so what bit rot happened stays readable afterwards.
+//   - A COMPLETE record whose checksum fails means the bytes on disk changed
+//     under us or were written badly: again loud, for the same reason.
+//   - Decode is strict on top (a fixed-width payload that is not exactly
+//     lockPayloadLen bytes is corruption), though the framing check above
+//     already leaves it nothing of that shape to see.
+//
+// The node staying down is the honest failure: refusing to start without a
+// promise is safer than keeping a promise you cannot see.
 func (s *Store) scanLocks() error {
 	path := filepath.Join(s.dir, lockLogName)
 	raw, err := os.ReadFile(path)
@@ -335,13 +363,21 @@ func (s *Store) scanLocks() error {
 	off := int64(0)
 	for off < int64(len(raw)) {
 		n, m := binary.Uvarint(raw[off:])
-		// Anything that cannot even be framed is a torn tail: the record
-		// could not have completed, so nothing from this offset on is intact.
-		if m <= 0 || n > uint64(len(raw)) {
-			return s.truncateTail(path, off)
+		// A length prefix this record format cannot have written - because
+		// it always writes exactly the one-byte constant - is corruption,
+		// not a torn tail: fail loudly, never truncate here. Both parts of
+		// the check matter: one flipped bit can turn the constant prefix
+		// into either a different single byte (m stays 1) or a multi-byte
+		// varint whose DECODED value happens to equal the constant again
+		// (m becomes 2) - so a value check alone is not enough; the varint
+		// must be exactly as wide as the constant is.
+		if m != 1 || n != lockPayloadLen {
+			return fmt.Errorf("%w: lock record length prefix at offset %d of %s is not the constant %d (corruption, not a torn tail); got length %d, %d varint bytes", ErrCorruptRecord, off, lockLogName, lockPayloadLen, n, m)
 		}
 		recEnd := off + int64(m) + int64(n) + 4
 		if recEnd > int64(len(raw)) {
+			// The tail a crash actually cuts: the framing byte completed,
+			// the record never did. Nothing from this offset on is intact.
 			return s.truncateTail(path, off)
 		}
 		payStart := off + int64(m)
@@ -362,42 +398,34 @@ func (s *Store) scanLocks() error {
 	return nil
 }
 
-// encodeLockRecord renders a lock as uvarint(height) || uvarint(round) ||
-// the 32-byte block ID: the payload the store's CRC framing then wraps.
+// encodeLockRecord renders a lock as its fixed-size payload: 8 bytes of
+// big-endian height, 4 bytes of big-endian round, the 32-byte block ID -
+// exactly lockPayloadLen bytes, the payload the store's CRC framing wraps.
+//
+// The width is fixed so the framing's length prefix is a value the CODE
+// decides, not data the file states: scanLocks can compare the prefix
+// against this constant and refuse any disagreement, rather than having to
+// guess whether a weird length is bit rot or a crash.
 func encodeLockRecord(rec LockRecord) []byte {
-	var hb, rb [binary.MaxVarintLen64]byte
-	hbLen := binary.PutUvarint(hb[:], rec.Height)
-	rbLen := binary.PutUvarint(rb[:], uint64(rec.Round))
-	out := make([]byte, 0, hbLen+rbLen+32)
-	out = append(out, hb[:hbLen]...)
-	out = append(out, rb[:rbLen]...)
-	out = append(out, rec.BlockID[:]...)
+	out := make([]byte, lockPayloadLen)
+	binary.BigEndian.PutUint64(out[0:8], rec.Height)
+	binary.BigEndian.PutUint32(out[8:12], rec.Round)
+	copy(out[12:], rec.BlockID[:])
 	return out
 }
 
 // decodeLockRecord reads encodeLockRecord's payload back. It is strict: a
-// round above uint32, or a short or trailing-garbage block ID, is corruption
-// rather than a lock - a silently truncated record that still decoded would
-// read as a promise it never was.
+// payload that is not exactly the fixed-width layout is corruption rather
+// than a lock - a misframed reading must never decode into a promise it
+// never was.
 func decodeLockRecord(payload []byte) (LockRecord, error) {
 	var rec LockRecord
-	height, used := binary.Uvarint(payload)
-	if used <= 0 {
-		return rec, errors.New("bad height prefix")
+	if len(payload) != lockPayloadLen {
+		return rec, fmt.Errorf("lock record payload is %d bytes, want the fixed %d", len(payload), lockPayloadLen)
 	}
-	round, used2 := binary.Uvarint(payload[used:])
-	if used2 <= 0 {
-		return rec, errors.New("bad round prefix")
-	}
-	if round > math.MaxUint32 {
-		return rec, fmt.Errorf("round %d does not fit uint32", round)
-	}
-	rest := payload[used+used2:]
-	if len(rest) != len(rec.BlockID) {
-		return rec, fmt.Errorf("block ID is %d bytes, want %d", len(rest), len(rec.BlockID))
-	}
-	copy(rec.BlockID[:], rest)
-	rec.Height, rec.Round = height, uint32(round)
+	rec.Height = binary.BigEndian.Uint64(payload[0:8])
+	rec.Round = binary.BigEndian.Uint32(payload[8:12])
+	copy(rec.BlockID[:], payload[12:12+32])
 	return rec, nil
 }
 
@@ -433,18 +461,21 @@ func (s *Store) LockAt(height uint64) (LockRecord, bool) {
 	return rec, ok
 }
 
+// Close releases both handles - the block segment and the lock log - and
+// reports BOTH failures: an early return on the first error would leak the
+// other open descriptor every time one close fails. The fields are cleared
+// unconditionally (a close error can fire after the descriptor is really
+// gone - see Append's rollover), so a repeated Close cannot spin on the
+// same handle.
 func (s *Store) Close() error {
+	var fileErr, lockErr error
 	if s.file != nil {
-		if err := s.file.Close(); err != nil {
-			return err
-		}
+		fileErr = s.file.Close()
 		s.file = nil
 	}
 	if s.lockFile != nil {
-		if err := s.lockFile.Close(); err != nil {
-			return err
-		}
+		lockErr = s.lockFile.Close()
 		s.lockFile = nil
 	}
-	return nil
+	return errors.Join(fileErr, lockErr)
 }

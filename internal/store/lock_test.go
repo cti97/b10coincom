@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -127,10 +128,10 @@ func TestOpenFailsOnCorruptLockRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 1+2+32+4 {
-		t.Fatalf("lock log is %d bytes; expected the 1-byte length prefix, 2-byte varints, 32-byte ID and 4-byte CRC", len(raw))
+	if len(raw) != 1+lockPayloadLen+4 {
+		t.Fatalf("lock log is %d bytes; expected the 1-byte length prefix, the fixed %d-byte payload (8-byte height, 4-byte round, 32-byte ID) and 4-byte CRC", len(raw), lockPayloadLen)
 	}
-	raw[3] ^= 0xFF // first payload byte: inside the record's payload
+	raw[3] ^= 0xFF // a byte inside the record's fixed-width height field
 	if err := os.WriteFile(logPath, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -149,6 +150,81 @@ func TestOpenFailsOnCorruptLockRecord(t *testing.T) {
 	// repeatedly keeps failing, so a broken log cannot be outlived.
 	if _, err := Open(dir); !errors.Is(err, ErrCorruptRecord) {
 		t.Fatalf("the corruption is stable: reopening gave %v", err)
+	}
+}
+
+// A CORRUPT LENGTH PREFIX must fail Open loudly and must NOT be "repaired" by
+// truncating. This is the review's demonstrated defect, before the fix: scan
+// could not tell a crashed-half-written tail from bit rot in the length byte,
+// so a flipped bit led it to destroy the intact record - Open returned nil,
+// the log went to 0 bytes on disk, and a validator that had precommitted came
+// back UNLOCKED, the exact unsafe direction. The framing's length prefix is
+// now checked against the record's constant size, so any other value is
+// corruption and fails Open; the destructive truncate is gone, the bytes
+// (the evidence) stay on disk.
+func TestOpenFailsOnCorruptLengthPrefixLoudly(t *testing.T) {
+	// bit 7 turns the single-byte constant prefix into a MULTI-BYTE varint
+	// (the scanner reads the next payload byte as continuation data); bit 0
+	// leaves it single-byte but with a different value. Both are exactly the
+	// one flipped bit the review demands cannot degrade a validator to
+	// unlocked, and they exercise both bad-prefix shapes.
+	for name, mask := range map[string]byte{"bit7": 0x80, "bit0": 0x01} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := LockRecord{Height: 5, Round: 2, BlockID: idOf(9)}
+			if err := s.PutLock(rec); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			logPath := filepath.Join(dir, lockLogName)
+			raw, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(raw) != 1+lockPayloadLen+4 {
+				t.Fatalf("lock log is %d bytes, want one whole 49-byte record", len(raw))
+			}
+			sizeBefore, err := fileSize(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if raw[0] != byte(lockPayloadLen) {
+				t.Fatalf("the length prefix is %#x, want the constant %#x the writer emits", raw[0], byte(lockPayloadLen))
+			}
+			raw[0] ^= mask // corrupt ONLY the length prefix
+			if err := os.WriteFile(logPath, raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			fresh, err := Open(dir)
+			if fresh != nil {
+				_ = fresh.Close()
+			}
+			if !errors.Is(err, ErrCorruptRecord) {
+				t.Fatalf("a corrupt length prefix got %v, want a LOUD ErrCorruptRecord at Open - truncating it would return the validator as unlocked", err)
+			}
+			// The truncate must be gone: the log is untouched, so the intact
+			// record's framing is still there for a later run to diagnose.
+			sizeAfter, err := fileSize(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sizeAfter != sizeBefore {
+				t.Fatalf("the corrupt length destroyed the record: log shrank %d -> %d bytes on disk (the review's truncate must never run)", sizeBefore, sizeAfter)
+			}
+			// And the failure is stable: the node cannot outlive the corrupt
+			// log by simply trying again.
+			if _, err := Open(dir); !errors.Is(err, ErrCorruptRecord) {
+				t.Fatalf("the corruption must stay loud: reopening gave %v", err)
+			}
+		})
 	}
 }
 
@@ -171,9 +247,11 @@ func TestTornLockTailIsTruncatedNotReadAsALock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate a crash inside the next record: a length prefix, the start of
-	// a payload for height 6 round 1 - and no checksum, because the write
-	// never completed.
+	// Simulate a crash inside the next record: the framing byte (the ONLY
+	// byte this format's length prefix can be), then the start of a payload
+	// for height 6 round 1 - and no checksum, because the write never
+	// completed. A tail of this shape is what a crash actually costs, and
+	// truncating it is what the repair is for.
 	logPath := filepath.Join(dir, lockLogName)
 	intactLen, err := fileSize(logPath)
 	if err != nil {
@@ -183,7 +261,15 @@ func TestTornLockTailIsTruncatedNotReadAsALock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tear := []byte{byte(2 + 32), 0x06, 0x01, 0xAA, 0xBB} // length, height 6, round 1, 2 of 32 ID bytes
+	tear := make([]byte, 0, 1+8+4+2)
+	tear = append(tear, byte(lockPayloadLen))
+	var hb [8]byte
+	binary.BigEndian.PutUint64(hb[:], 6)
+	var rb [4]byte
+	binary.BigEndian.PutUint32(rb[:], 1)
+	tear = append(tear, hb[:]...)
+	tear = append(tear, rb[:]...)
+	tear = append(tear, 0xAA, 0xBB) // 2 of the 32 ID bytes
 	var torn []byte
 	torn = append(torn, prefix...)
 	torn = append(torn, tear...)
@@ -227,6 +313,38 @@ func TestTornLockTailIsTruncatedNotReadAsALock(t *testing.T) {
 	}
 }
 
+// Close must close BOTH handles - the block segment and the lock log - and
+// report every close's failure, not bail at the first one: an early return on
+// the first error leaks the other descriptor exactly whenever one close
+// fails, which is the only situation Close's error reporting exists for.
+// The lock handle is Task 12's addition, so this is the test that keeps it
+// from being stranded by an early return.
+func TestCloseClosesBothHandlesAndReportsBothErrors(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutLock(LockRecord{Height: 1, Round: 0, BlockID: idOf(1)}); err != nil {
+		t.Fatal(err)
+	}
+	// Replace the segment handle with one whose Close FAILS (a bogus
+	// descriptor: close(2) answers EBADF), without closing the real one -
+	// abandoning it is this test's own leak, not the store's path.
+	bogus := os.NewFile(1<<20, "b10coin-test-bogus-fd")
+	s.file = bogus
+	seg := s.lockFile
+	closeErr := s.Close()
+	if closeErr == nil {
+		t.Fatal("Close must report the failing handle's error, not nil")
+	}
+	// The early-return shape (s.file.Close errors; return) would leave the
+	// lock handle OPEN here: closing it again must instead say it is already
+	// closed, proving Close got to it despite the segment's error.
+	if err := seg.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("the second handle was leaked by Close's early return: closing it reports %v, want os.ErrClosed", err)
+	}
+}
+
 func fileSize(path string) (int64, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -236,15 +354,21 @@ func fileSize(path string) (int64, error) {
 }
 
 // A lock record's payload must be laid out exactly as the store's CRC framing
-// wraps it, height-then-round-then-block-ID: this is the record a restart
-// reads and the framing a foreign tail-byte flip is tested against.
+// wraps it: fixed-width big-endian height (8 bytes), then big-endian round
+// (4 bytes), the 32-byte block ID - and nothing else, so decode can reject a
+// payload of any other width as corruption instead of decoding a promise it
+// never was. This is the record a restart reads and the framing the
+// length-prefix tests are written against.
 func TestLockRecordPayloadFraming(t *testing.T) {
 	raw := encodeLockRecord(LockRecord{Height: 5, Round: 2, BlockID: idOf(7)})
-	if len(raw) != 34 {
-		t.Fatalf("payload is %d bytes, want 34 (1-byte height + 1-byte round + 32-byte ID)", len(raw))
+	if len(raw) != lockPayloadLen {
+		t.Fatalf("payload is %d bytes, want the fixed %d (8-byte height + 4-byte round + 32-byte ID)", len(raw), lockPayloadLen)
 	}
-	if raw[0] != 0x05 || raw[1] != 0x02 {
-		t.Fatalf("payload head % x, want height 0x05 then round 0x02", raw[:2])
+	if got := binary.BigEndian.Uint64(raw[0:8]); got != 5 {
+		t.Fatalf("payload height is %d, want 5 as big-endian bytes at the head", got)
+	}
+	if got := binary.BigEndian.Uint32(raw[8:12]); got != 2 {
+		t.Fatalf("payload round is %d, want 2 as big-endian bytes at offset 8", got)
 	}
 	got, err := decodeLockRecord(raw)
 	if err != nil {
@@ -253,32 +377,25 @@ func TestLockRecordPayloadFraming(t *testing.T) {
 	if got.Height != 5 || got.Round != 2 || got.BlockID != idOf(7) {
 		t.Fatalf("decode = %+v, want the encoded record", got)
 	}
-	// Strictness: a payload claiming a round above uint32, or a block ID with
-	// junk after it, is corruption - it must be rejected rather than decoded
-	// with silently wrapped or dropped bytes.
-	var huge []byte
-	huge = append(huge, 0x05)
-	huge = append(huge, uvarintBytes(1<<32)...)
-	huge = append(huge, make([]byte, 32)...)
-	if _, err := decodeLockRecord(huge); err == nil {
-		t.Fatal("a round above uint32 must not decode silently truncated")
+	// Big heights keep the layout constant: no varint anywhere in the payload
+	// may silently change its width, or the length prefix stops being a
+	// constant the scan can check.
+	wide := encodeLockRecord(LockRecord{Height: 1 << 40, Round: 1 << 30, BlockID: idOf(1)})
+	if len(wide) != lockPayloadLen {
+		t.Fatalf("a big record is %d bytes; the payload width must not depend on the values", len(wide))
 	}
-	trailing := append(encodeLockRecord(LockRecord{Height: 5, Round: 2, BlockID: idOf(1)}), 0xFF)
-	if _, err := decodeLockRecord(trailing); err == nil {
+	if got, err := decodeLockRecord(wide); err != nil {
+		t.Fatalf("a wide record must decode in the same fixed layout: %v", err)
+	} else if got.Height != 1<<40 || got.Round != 1<<30 || got.BlockID != idOf(1) {
+		t.Fatalf("the wide record decoded as %+v, want what was encoded", got)
+	}
+	// Strictness: a payload of ANY other width is corruption.
+	if _, err := decodeLockRecord(raw[:lockPayloadLen-1]); err == nil {
+		t.Fatal("a short payload must be rejected, not decoded")
+	}
+	if _, err := decodeLockRecord(append(append([]byte(nil), raw...), 0xFF)); err == nil {
 		t.Fatal("a payload with junk after the block ID must be rejected, not decoded")
 	}
-}
-
-func uvarintBytes(v uint64) []byte {
-	var buf [10]byte
-	n := 0
-	for v > 0x7F {
-		buf[n] = byte(v) | 0x80
-		v >>= 7
-		n++
-	}
-	buf[n] = byte(v)
-	return buf[:n+1]
 }
 
 // PutLock fsyncs through the same writeRecord the blocks use; a move must be

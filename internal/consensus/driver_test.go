@@ -9,6 +9,7 @@ import (
 	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/genesis"
+	"github.com/cti97/b10coincom/internal/store"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/transport/sim"
 	"github.com/cti97/b10coincom/internal/types"
@@ -259,6 +260,46 @@ func TestDriverAppendsOnCommit(t *testing.T) {
 	if reopened.Height() != before+2 {
 		t.Fatalf("replayed chain sits at height %d, want %d: the commits did not append exactly two durably stored blocks",
 			reopened.Height(), before+2)
+	}
+}
+
+// TestDriverPostCommitSwapStillCarriesTheLock pins the OTHER engine-creation
+// site: the post-commit swap inside flush. The restore/persist guarantee is a
+// per-CREATION guarantee (any engine, any site), so a swap built on the bare
+// constructor silently makes every engine after the first commit persist
+// NOTHING and restore NO lock - memory-only locks from height 2 on, i.e. the
+// exact defect persisting the lock exists to fix, arrived through one
+// unreviewed line. The test drives far enough that the post-commit swap has
+// created the engines judging heights 2 and 3, then requires those engines'
+// own lock moves to be in the store: if the swap lost its restore/persist
+// wiring, nothing reaches the lock log after height 1 and this fails.
+func TestDriverPostCommitSwapStillCarriesTheLock(t *testing.T) {
+	d, ch, rec, net, _, _, _, _ := oneValidatorFixture(t)
+
+	// Three commits: heights 1, 2 and 3. The first engine is NewDriver's
+	// creation; every engine after it comes from flush's post-commit swap,
+	// which is the line the mutant reverts.
+	drive(t, d, net, 200, func() bool { return ch.Height() >= 3 })
+	if ch.Height() < 3 {
+		t.Fatalf("only %d block(s) committed in 200 drive iterations (%d messages): the post-commit swap never ran, the assertion below would be vacuous", ch.Height(), len(rec.broadcasts))
+	}
+
+	for _, h := range []uint64{2, 3} {
+		blk, err := ch.BlockAt(h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantID := blk.ID()
+		// Height h's engine precommitted its own proposal before committing it,
+		// so its lock (round 0, the committed block) must be durable - no
+		// pruning exists yet, a committed lock record stays readable.
+		got, ok := ch.LockAt(h)
+		if !ok {
+			t.Fatalf("the lock taken at committed height %d never reached the store: the engine the post-commit swap created is holding locks in memory only - a restart would re-enter unlocked", h)
+		}
+		if got != (store.LockRecord{Height: h, Round: 0, BlockID: wantID}) {
+			t.Fatalf("LockAt(%d) = %+v, want the own-proposal lock (round 0, block %x) the commit itself proves was taken", h, got, wantID[:8])
+		}
 	}
 }
 
