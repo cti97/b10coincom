@@ -74,3 +74,14 @@ func TestSeriesTotalSaturatesRatherThanWraps(t *testing.T) {
 		t.Fatalf("SeriesTotal on overflow = %d, want saturation to %d", got, ^uint64(0))
 	}
 }
+
+// The accumulator itself must saturate: a huge R0 makes the SUM of halvings
+// overflow BEFORE the multiplication guard runs (SeriesTotal(^uint64(0), 1) once
+// returned 2^64-66 because `halved` wrapped inside the loop and then slipped
+// under the guard). The must-saturate-rather-than-wrap constraint has to hold
+// for the accumulator, not just for the product.
+func TestSeriesTotalSaturatesWhenTheAccumulatorOverflows(t *testing.T) {
+	if got := SeriesTotal(^uint64(0), 1); got != ^uint64(0) {
+		t.Fatalf("SeriesTotal(^uint64(0), 1) = %d, want saturation to %d (accumulator wrapped before the guard)", got, ^uint64(0))
+	}
+}

@@ -39,6 +39,12 @@ func SeriesTotal(initialReward, halvingInterval uint64) uint64 {
 		if r == 0 {
 			break
 		}
+		// The accumulator can overflow before the guard below runs (a huge R0
+		// makes the sum of halvings wrap into a smaller number), so saturate
+		// during accumulation: a wrapped total could pass a cap check.
+		if r > ^uint64(0)-halved {
+			return ^uint64(0)
+		}
 		halved += r
 	}
 	// Each halving interval spans exactly halvingInterval heights, and interval 0
