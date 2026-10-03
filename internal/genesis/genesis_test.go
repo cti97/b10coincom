@@ -2,6 +2,7 @@ package genesis
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -265,6 +266,17 @@ type genesisRecord struct {
 		EpochBlocks           uint64 `json:"epoch_blocks"`
 		UnbondingEpochs       uint64 `json:"unbonding_epochs"`
 		CommitteeSize         int    `json:"committee_size"`
+		// The faucet puzzle's parameters, recorded the way the Go
+		// constructor holds them: the Argon2 tuning as a nested object, and
+		// the 32-byte difficulty target as the 64-character lowercase
+		// hex string of its big-endian bytes (hex is byte-exact where a
+		// decimal number would drop leading zero bytes).
+		FaucetPowArgon2 struct {
+			MemoryKiB   uint32 `json:"memory_kib"`
+			Iterations  uint32 `json:"iterations"`
+			Parallelism uint8  `json:"parallelism"`
+		} `json:"faucet_pow_argon2"`
+		FaucetPowTarget string `json:"faucet_pow_target"`
 	} `json:"params"`
 }
 
@@ -359,6 +371,39 @@ func TestGenesisJSONRecordsMatchTheGoConstructors(t *testing.T) {
 			t.Errorf("%s: params.committee_size = %d, constructor says %d",
 				tc.file, q.CommitteeSize, p.CommitteeSize)
 		}
+
+		// The faucet puzzle parameters, compared field-for-field the way the
+		// other params are. Every shipped Argon2 parameter is non-zero in
+		// both records, so a DELETED nested key decodes to zero and fails the
+		// comparison; the whole object's presence is still required by the
+		// key-presence list the same way the scalar params are.
+		a, b := j.Params.FaucetPowArgon2, p.FaucetPowArgon2
+		if a.MemoryKiB != b.MemoryKiB {
+			t.Errorf("%s: params.faucet_pow_argon2.memory_kib = %d, constructor says %d",
+				tc.file, a.MemoryKiB, b.MemoryKiB)
+		}
+		if a.Iterations != b.Iterations {
+			t.Errorf("%s: params.faucet_pow_argon2.iterations = %d, constructor says %d",
+				tc.file, a.Iterations, b.Iterations)
+		}
+		if a.Parallelism != b.Parallelism {
+			t.Errorf("%s: params.faucet_pow_argon2.parallelism = %d, constructor says %d",
+				tc.file, a.Parallelism, b.Parallelism)
+		}
+		// The target: decode the recorded hex back to exactly 32 bytes and
+		// compare against the constructor's value byte for byte.
+		targetRaw, err := hex.DecodeString(j.Params.FaucetPowTarget)
+		if err != nil || len(targetRaw) != 32 {
+			t.Errorf("%s: params.faucet_pow_target = %q, want the 64-char lowercase hex encoding of the 32-byte target",
+				tc.file, j.Params.FaucetPowTarget)
+		} else {
+			var recorded [32]byte
+			copy(recorded[:], targetRaw)
+			if recorded != p.FaucetPowTarget {
+				t.Errorf("%s: params.faucet_pow_target = %x, constructor says %x",
+					tc.file, recorded, p.FaucetPowTarget)
+			}
+		}
 	}
 }
 
@@ -374,6 +419,7 @@ func requiredParamsMissing(params map[string]json.RawMessage) []string {
 		"block_time_ms", "total_supply_sparks", "initial_reward_sparks",
 		"halving_interval_blocks", "claim_amount_sparks", "min_stake_sparks",
 		"epoch_blocks", "unbonding_epochs", "committee_size",
+		"faucet_pow_argon2", "faucet_pow_target",
 	} {
 		if _, ok := params[key]; !ok {
 			missing = append(missing, key)
@@ -385,8 +431,8 @@ func requiredParamsMissing(params map[string]json.RawMessage) []string {
 // The params-level key-presence list is unexercised by the shipped records: no
 // parameter is zero, so the field-by-field comparisons cannot distinguish a
 // deleted params key from the constructor's value. This case calls the helper
-// directly on the devnet record's params object with epoch_blocks deleted and
-// asserts that key, and only that key, is reported missing.
+// directly on the devnet record's params object with keys deleted one at a
+// time and asserts that exactly the deleted key is reported missing.
 func TestParamsKeyPresenceListDetectsAMissingKey(t *testing.T) {
 	raw, err := os.ReadFile("../../genesis/devnet.json")
 	if err != nil {
@@ -400,14 +446,20 @@ func TestParamsKeyPresenceListDetectsAMissingKey(t *testing.T) {
 	if err := json.Unmarshal(top["params"], &params); err != nil {
 		t.Fatalf("params: %v", err)
 	}
-	if _, ok := params["epoch_blocks"]; !ok {
-		t.Fatal("fixture error: devnet.json has no epoch_blocks under params")
-	}
-	delete(params, "epoch_blocks")
+	for _, key := range []string{"epoch_blocks", "faucet_pow_argon2", "faucet_pow_target"} {
+		if _, ok := params[key]; !ok {
+			t.Fatalf("fixture error: devnet.json has no %q under params", key)
+		}
+		one := map[string]json.RawMessage{}
+		for k, v := range params {
+			one[k] = v
+		}
+		delete(one, key)
 
-	got := requiredParamsMissing(params)
-	if len(got) != 1 || got[0] != "epoch_blocks" {
-		t.Fatalf("requiredParamsMissing = %v, want exactly [epoch_blocks]", got)
+		got := requiredParamsMissing(one)
+		if len(got) != 1 || got[0] != key {
+			t.Fatalf("requiredParamsMissing after deleting %q = %v, want exactly [%s]", key, got, key)
+		}
 	}
 }
 

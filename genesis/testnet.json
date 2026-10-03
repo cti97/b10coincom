@@ -12,6 +12,12 @@
     "min_stake_sparks": 100000000000,
     "epoch_blocks": 10000,
     "unbonding_epochs": 2,
-    "committee_size": 21
+    "committee_size": 21,
+    "faucet_pow_argon2": {
+      "memory_kib": 65536,
+      "iterations": 3,
+      "parallelism": 1
+    },
+    "faucet_pow_target": "0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
   }
 }
