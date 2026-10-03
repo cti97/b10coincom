@@ -113,23 +113,26 @@ func TestMempoolRemove(t *testing.T) {
 // TestTakeBoundsFaucetClaimsPerBlock below asserts claimsTaken <=
 // MaxFaucetClaimsPerBlock - an inequality against the very constant it reads -
 // so raising the constant to 50 or even 10,000 leaves that suite green while
-// restoring the multi-hour stall the bound exists to prevent. The constant's
-// smallness IS the mitigation, so the value itself must be pinned here.
-// Why anything near 16 (or above) is not a bound: at the testnet tuning one
-// claim costs ~3 s of Argon2id to verify and a block is targeted every ~2 s,
-// so 8 claims already allow ~24 s of verification per block - a higher value
-// just scales the stall back up rather than capping it.
+// restoring the unbounded per-block verification the bound exists to prevent.
+// The constant's smallness IS the mitigation, so the value itself must be
+// pinned here. Why anything near 16 (or above) is not a bound: at the testnet
+// tuning one claim costs ~0.125 s of Argon2id to verify and a block is targeted
+// every 2 s, so 8 claims already cost ~1.0 s per block and 16 eat the whole
+// interval - a higher value just scales the cost back up rather than capping
+// it. Figures are Pi-4 estimates pending re-measurement (Testnet's tuning
+// comment).
 func TestMaxFaucetClaimsPerBlockIsActuallyABound(t *testing.T) {
 	if MaxFaucetClaimsPerBlock > 16 {
-		t.Fatalf("MaxFaucetClaimsPerBlock = %d - at ~3 s of Argon2id per claim against a ~2 s block interval, a value this large no longer caps the per-block verification cost, which is the entire point of the bound",
+		t.Fatalf("MaxFaucetClaimsPerBlock = %d - at ~0.125 s of Argon2id per claim against a 2 s block interval (Pi-4 estimate, pending re-measurement), a value this large no longer caps the per-block verification cost, which is the entire point of the bound",
 			MaxFaucetClaimsPerBlock)
 	}
 }
 
 // A mempool full of signature-valid faucet claims must not force the node to
 // evaluate an unbounded number of Argon2id puzzles per block. At the testnet
-// tuning one claim costs ~3 s of CPU, so ten thousand of them would stall block
-// production for hours; the pool must bound how many claims it will hand over.
+// tuning one claim costs ~0.125 s of CPU (a Pi-4 estimate pending
+// re-measurement), so the ten thousand a full node pool holds would cost ~21
+// min of work per block; the pool must bound how many claims it will hand over.
 func TestTakeBoundsFaucetClaimsPerBlock(t *testing.T) {
 	m := New(1000)
 

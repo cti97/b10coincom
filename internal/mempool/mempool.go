@@ -15,18 +15,22 @@ var (
 )
 
 // MaxFaucetClaimsPerBlock bounds how many faucet claims the pool will hand to a
-// single block. A claim costs a full Argon2id evaluation to verify - ~3 s at the
-// testnet tuning - while costing a submitter one Ed25519 signature, so without a
-// bound a full pool of signature-valid claims with garbage proofs would stall
-// block production for hours. Ordinary transactions are not bounded here: they
-// are cheap to validate and the block size limits already cap them.
+// single block. A claim costs a full Argon2id evaluation to verify - ~0.125 s
+// at the testnet tuning (8 MiB × 1 pass; a Pi-4 estimate pending
+// re-measurement, cost basis in Testnet's tuning comment) - while costing a
+// submitter one Ed25519 signature, so without a bound a pool at the node's
+// 10,000-transaction capacity full of signature-valid claims with garbage
+// proofs would hand block production ~21 min of Argon2id work per block.
+// Ordinary transactions are not bounded here: they are cheap to validate and
+// the block size limits already cap them.
 //
 // The value 8 is a judgment call, not a derivation. At the testnet tuning it
-// still permits roughly 24 s of Argon2id work per block against the ~2 s target
-// block interval, so it caps the amplification a flooder can force rather than
-// restoring liveness under a sustained flood: a proposal can still be built
-// while the pool sits full of unproven claims, but building it stays slow for
-// as long as the flood lasts.
+// permits a worst-case block of 8 × ~0.125 s = ~1.0 s of Argon2id work against
+// the 2_000 ms block interval, so it caps the amplification a flooder can force
+// at roughly half the interval - unproven claims still fill the pool, but no
+// block can be made to cost more than that ~1.0 s to accept or reject. Both
+// figures are Pi-4 estimates pending re-measurement (Testnet's tuning comment
+// carries the arithmetic), so the margin rides on one unverified number.
 const MaxFaucetClaimsPerBlock = 8
 
 // Mempool is a bounded, deduplicated set of pending transactions. It is
