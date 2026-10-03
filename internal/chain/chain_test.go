@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/types"
 )
@@ -292,13 +293,13 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 	}
 }
 
-// Total supply must be conserved by transfers.
-// Total supply must be conserved BY A REAL TRANSFER: value moves between
-// accounts and none is created. The original version of this test built a
-// block with the dev ACCOUNT key, discarded it, and asserted supply was
-// unchanged - and since Build never mutates state, it could not fail for the
-// reason it named.
-func TestTotalSupplyIsConserved(t *testing.T) {
+// Total supply must change across a block by EXACTLY the block's emission and
+// nothing else: the transfer in the block still creates nothing and destroys
+// nothing. (Supersedes the M0-M1 version, which asserted supply was IDENTICAL
+// across a transfer, legitimate now that each block also mints its Reward -
+// and stricter: the exact per-height reward must account for the whole
+// delta.)
+func TestTotalSupplyChangesOnlyByTheBlockEmission(t *testing.T) {
 	c, priv := devChain(t)
 	before := c.State().TotalBalance()
 	if before == 0 {
@@ -328,8 +329,10 @@ func TestTotalSupplyIsConserved(t *testing.T) {
 	if err := c.Append(b); err != nil {
 		t.Fatal(err)
 	}
-	if got := c.State().TotalBalance(); got != before {
-		t.Fatalf("supply changed across a transfer: %d -> %d", before, got)
+	want := before + faucet.Reward(b.Header.Height, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks)
+	if got := c.State().TotalBalance(); got != want {
+		t.Fatalf("total supply = %d, want %d (before %d plus exactly one block's emission)",
+			got, want, before)
 	}
 }
 
@@ -418,4 +421,185 @@ func devPrivateKey(t *testing.T) ed25519.PrivateKey {
 	t.Helper()
 	_, priv := genesis.DevAccountKey(0)
 	return priv
+}
+
+// Emission must be credited exactly once per height, and only once - a second
+// application would inflate the supply.
+func TestEmissionIsCreditedOncePerBlock(t *testing.T) {
+	c, priv := devChain(t)
+	faucetAddr := c.Genesis().FaucetAddress()
+
+	genesisBalance := c.State().Get(faucetAddr).Balance
+	if want := faucet.Reward(0, c.Genesis().Params.InitialRewardSparks, c.Genesis().Params.HalvingIntervalBlocks); genesisBalance != want {
+		t.Fatalf("genesis faucet balance = %d, want the height-0 reward %d", genesisBalance, want)
+	}
+	for h := uint64(1); h <= 3; h++ {
+		before := c.State().Get(faucetAddr).Balance
+		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Build must NOT mutate the chain; the faucet moves only on Append.
+		if c.State().Get(faucetAddr).Balance != before {
+			t.Fatal("Build mutated the chain's state")
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+		want := before + faucet.Reward(h, c.Genesis().Params.InitialRewardSparks, c.Genesis().Params.HalvingIntervalBlocks)
+		if got := c.State().Get(faucetAddr).Balance; got != want {
+			t.Fatalf("faucet balance after block %d = %d, want %d", h, got, want)
+		}
+	}
+}
+
+// A claim INSIDE block h may spend block h's emission: advanceLocked credits
+// the emission BEFORE applying the block's transactions (plan Decision 3).
+// The claim amount here exceeds everything the faucet holds BEFORE block 1's
+// emission (the 50M genesis mint) but fits what it holds AFTER it, so only
+// the emission-before-transactions ordering can pay this claim; applied in
+// the other order the claim fails ErrFaucetEmpty.
+func TestClaimMaySpendTheBlocksOwnEmission(t *testing.T) {
+	g := *genesis.Devnet()
+	g.Params.ClaimAmountSparks = 60_000_000 // genesis mint is 50M; only block 1's own emission covers the rest
+	c, err := Open(&g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, priv := genesis.DevValidatorKey()
+
+	pub, key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pow, ok := faucet.Solve(pub, 1, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1_000_000)
+	if !ok {
+		t.Fatal("could not solve the test puzzle")
+	}
+	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 0, Epoch: 1, PowNonce: pow}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(key, sigHash[:])
+
+	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
+	if err != nil {
+		t.Fatalf("the emission must be credited before block 1's transactions: %v", err)
+	}
+	if err := c.Append(b); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.State().Get(types.AddressFromPub(pub)).Balance; got != g.Params.ClaimAmountSparks {
+		t.Fatalf("claimant balance = %d, want %d", got, g.Params.ClaimAmountSparks)
+	}
+	// 50M genesis mint + 50M block-1 emission - the 60M claim.
+	if got := c.State().Get(g.FaucetAddress()).Balance; got != 100_000_000-g.Params.ClaimAmountSparks {
+		t.Fatalf("faucet balance = %d, want %d", got, 100_000_000-g.Params.ClaimAmountSparks)
+	}
+}
+
+// The claim rule's epoch derives from the height advanceLocked sets on the
+// state (execution context, plan Decision 9a). Under EpochBlocks = 2, block 2
+// is the first block of epoch 2, so a claim carrying epoch 2 must verify
+// there. Without the SetHeight call the transition's state would still carry
+// the genesis state's zero height (epoch 1) and Build would reject this claim
+// instead.
+func TestClaimVerifiesTheCurrentEpochThroughTheTransition(t *testing.T) {
+	g := *genesis.Devnet()
+	g.Params.EpochBlocks = 2         // block 2 opens epoch 2
+	g.Params.ClaimAmountSparks = 100 // small: the emission already banked covers it
+	c, err := Open(&g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, priv := genesis.DevValidatorKey()
+
+	// Block 1 opens epoch 1; nothing claims in it.
+	b1, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Append(b1); err != nil {
+		t.Fatal(err)
+	}
+
+	pub, key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimant := types.AddressFromPub(pub)
+	pow, ok := faucet.Solve(pub, 2, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1_000_000)
+	if !ok {
+		t.Fatal("could not solve the test puzzle")
+	}
+	tx := &types.Tx{Type: types.TxFaucetClaim, From: claimant, PubKey: pub,
+		Nonce: 0, Epoch: 2, PowNonce: pow}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(key, sigHash[:])
+
+	b2, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_101)
+	if err != nil {
+		t.Fatalf("a claim for block 2's epoch must verify inside block 2: %v", err)
+	}
+	if err := c.Append(b2); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.State().Get(claimant).Balance; got != g.Params.ClaimAmountSparks {
+		t.Fatalf("claimant balance = %d, want %d", got, g.Params.ClaimAmountSparks)
+	}
+	if got := c.State().Get(claimant).ClaimedEpoch; got != 2 {
+		t.Fatalf("claim marker = %d, want 2", got)
+	}
+}
+
+// Replay must reproduce emission, or a restarted node diverges.
+func TestReplayReproducesEmission(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	_, priv := genesis.DevValidatorKey()
+
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(1); h <= 4; h++ {
+		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	faucetAddr := g.FaucetAddress()
+	wantBalance := c.State().Get(faucetAddr).Balance
+	// Fixture guard: without emission there is nothing to reproduce and the
+	// replay comparison below would be vacuous (both sides would agree on a
+	// zero balance). Four blocks of live emission must have been credited
+	// before the restart, ON TOP of the genesis mint, for the comparison to
+	// mean anything.
+	genesisMint := faucet.Reward(0, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks)
+	if wantBalance == 0 || wantBalance == genesisMint {
+		t.Fatalf("fixture error: pre-restart faucet balance %d carries no block emission; the replay comparison would be vacuous", wantBalance)
+	}
+	wantRoot := c.State().Root()
+	wantHead := c.Head().ID()
+	c.Close()
+
+	c2, err := Open(g, dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer c2.Close()
+
+	if got := c2.State().Get(faucetAddr).Balance; got != wantBalance {
+		t.Fatalf("replayed faucet balance = %d, want %d - replay did not reproduce emission", got, wantBalance)
+	}
+	if got := c2.State().Root(); got != wantRoot {
+		t.Fatalf("replayed state root diverged:\n got %x\nwant %x", got, wantRoot)
+	}
+	if got := c2.Head().ID(); got != wantHead {
+		t.Fatal("replayed head differs from the stored head")
+	}
 }

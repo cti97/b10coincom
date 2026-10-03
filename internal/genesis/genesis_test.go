@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -190,6 +191,15 @@ func TestGenesisRoundTripThroughEncoding(t *testing.T) {
 	}
 	if got.Hash() != g.Hash() {
 		t.Fatal("genesis round trip changed the hash")
+	}
+	// Explicit field assertions alongside the hash: the hash can only say the
+	// round trip broke, these name WHICH parameter failed to survive, so a
+	// decode bug is diagnosed rather than merely detected.
+	if got.Params.FaucetPowArgon2 != g.Params.FaucetPowArgon2 ||
+		got.Params.FaucetPowTarget != g.Params.FaucetPowTarget {
+		t.Fatalf("genesis round trip lost the faucet puzzle parameters:\n got %+v target %x\nwant %+v target %x",
+			got.Params.FaucetPowArgon2, got.Params.FaucetPowTarget,
+			g.Params.FaucetPowArgon2, g.Params.FaucetPowTarget)
 	}
 }
 
@@ -376,5 +386,82 @@ func TestParamsKeyPresenceListDetectsAMissingKey(t *testing.T) {
 	got := requiredParamsMissing(params)
 	if len(got) != 1 || got[0] != "epoch_blocks" {
 		t.Fatalf("requiredParamsMissing = %v, want exactly [epoch_blocks]", got)
+	}
+}
+
+// independentTarget builds a 0xFF-filled [32]byte with the top byte `top`.
+// It deliberately does NOT call the constructors' helper (genesis.go's
+// puzzleTarget): the pin below is only load-bearing because the expectation
+// is constructed independently of the value under test.
+func independentTarget(top byte) [32]byte {
+	var t [32]byte
+	for i := range t {
+		t[i] = 0xFF
+	}
+	t[0] = top
+	return t
+}
+
+// The cap is a HARD MAXIMUM on what the chain will actually mint. The
+// identity test above (TestEmissionMathReachesExactlyTheSupplyCap) checks the
+// idealized relation R0 * interval * 2 == cap, which any proportional
+// parameter change satisfies; SeriesTotal is the truncated sum the transition
+// really pays, so it is the value that must stay under the cap.
+func TestEmissionNeverExceedsTheCap(t *testing.T) {
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		total := faucet.SeriesTotal(g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks)
+		if total > g.Params.TotalSupplySparks {
+			t.Fatalf("%s: realized emission %d exceeds the cap %d",
+				g.Params.ChainID, total, g.Params.TotalSupplySparks)
+		}
+	}
+}
+
+// A zero target is unsatisfiable: a claim verifies only if its digest is
+// strictly below the target, and no digest is strictly below zero. On any
+// chain that must actually pay claims this makes every claim fail forever.
+func TestValidateRejectsAnUnsatisfiableTestnetTarget(t *testing.T) {
+	g := Testnet()
+	g.Params.FaucetPowTarget = [32]byte{}
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis for a zero pow target, got %v", err)
+	}
+}
+
+// The claim rule derives epochs as height/EpochBlocks + 1, so a zero here is
+// a divide-by-zero panic reachable from a malformed genesis. The state
+// machine guards it too, but a genesis should never validate with it.
+func TestValidateRejectsAZeroEpochBlocks(t *testing.T) {
+	g := Testnet()
+	g.Params.EpochBlocks = 0
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis for EpochBlocks == 0, got %v", err)
+	}
+}
+
+// The two chain tunings are protocol values pinned verbatim from the task
+// brief: a devnet puzzle a laptop solves in a blink, a testnet puzzle at the
+// spec's ~3 s Argon2id tuning with the placeholder target the constructors
+// record. Any change to either must be a deliberate re-pinning, and the
+// testnet target must stay strictly below the devnet target (the brief's
+// "much smaller") or the difficulty ordering silently inverts.
+func TestArgon2TuningsArePinnedPerChain(t *testing.T) {
+	devnet, testnet := Devnet(), Testnet()
+
+	if devnet.Params.FaucetPowArgon2 != (faucet.Argon2Params{MemoryKiB: 64, Iterations: 1, Parallelism: 1}) {
+		t.Fatalf("devnet Argon2 tuning = %+v, want {MemoryKiB:64, Iterations:1, Parallelism:1}", devnet.Params.FaucetPowArgon2)
+	}
+	if devnet.Params.FaucetPowTarget != independentTarget(0x7F) {
+		t.Fatalf("devnet pow target = %x, want 0x7F followed by 31 0xFF bytes", devnet.Params.FaucetPowTarget)
+	}
+
+	if testnet.Params.FaucetPowArgon2 != (faucet.Argon2Params{MemoryKiB: 65536, Iterations: 3, Parallelism: 1}) {
+		t.Fatalf("testnet Argon2 tuning = %+v, want {MemoryKiB:65536, Iterations:3, Parallelism:1}", testnet.Params.FaucetPowArgon2)
+	}
+	if testnet.Params.FaucetPowTarget != independentTarget(0x0F) {
+		t.Fatalf("testnet pow target = %x, want 0x0F followed by 31 0xFF bytes", testnet.Params.FaucetPowTarget)
+	}
+	if bytes.Compare(testnet.Params.FaucetPowTarget[:], devnet.Params.FaucetPowTarget[:]) >= 0 {
+		t.Fatal("the testnet target must be strictly smaller than the devnet target")
 	}
 }

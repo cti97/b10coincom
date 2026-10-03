@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/state"
 	"github.com/cti97/b10coincom/internal/store"
@@ -43,20 +44,41 @@ type Chain struct {
 	store *store.Store
 	state *state.State
 	head  *types.Block
+
+	// faucet is the protocol-controlled faucet address this chain mints into,
+	// derived from the genesis hash (so no private key exists for it). Set
+	// once in Open; advanceLocked uses it rather than recomputing per block.
+	faucet types.Address
 }
 
-// genesisState builds the state that block 1 builds upon. It cannot fail:
-// genesis validation has already checked every key length, so the error
-// return is omitted.
+// genesisState builds the state that block 1 builds upon. It applies the
+// height-0 emission (the genesis mint the spec names: Reward is NOT
+// special-cased at height 0, so the mint uses the same formula every later
+// block uses) and wires the faucet claim's parameters, without which no
+// claim could ever verify. It cannot fail: genesis validation has already
+// checked every key length, so the error return is omitted.
 func genesisState(g *genesis.Genesis) *state.State {
-	s := state.New()
+	st := state.NewWithParams(state.Params{
+		FaucetAddress: g.FaucetAddress(),
+		ClaimAmount:   g.Params.ClaimAmountSparks,
+		EpochBlocks:   g.Params.EpochBlocks,
+		PowArgon2:     g.Params.FaucetPowArgon2,
+		PowTarget:     g.Params.FaucetPowTarget,
+	})
 	for _, d := range g.DevAccounts {
 		addr := types.AddressFromPub(d.PubKey)
-		acc := s.Get(addr)
+		acc := st.Get(addr)
 		acc.Balance += d.BalanceSparks
-		s.Set(addr, acc)
+		st.Set(addr, acc)
 	}
-	return s
+	// The genesis mint the spec names. Reward is not special-cased at height 0,
+	// so this is the same formula every later block uses.
+	if r := faucet.Reward(0, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks); r > 0 {
+		acc := st.Get(g.FaucetAddress())
+		acc.Balance += r
+		st.Set(g.FaucetAddress(), acc)
+	}
+	return st
 }
 
 func genesisBlock(g *genesis.Genesis, st *state.State) *types.Block {
@@ -93,7 +115,7 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 			_ = s.Close()
 		}
 	}()
-	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st)}
+	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st), faucet: g.FaucetAddress()}
 
 	height, ok := s.Height()
 	if !ok {
@@ -178,6 +200,36 @@ func (c *Chain) isValidator(pub []byte) bool {
 	return false
 }
 
+// creditEmissionLocked pays the block's emission into the faucet account. It
+// runs BEFORE the block's transactions, for every height including genesis,
+// so a claim in block h may spend block h's emission. Build, Append and
+// replay must all call this or their state roots diverge.
+//
+// Called from advanceLocked only, which always holds c.mu.
+func (c *Chain) creditEmissionLocked(st *state.State, height uint64) {
+	r := faucet.Reward(height, c.gen.Params.InitialRewardSparks, c.gen.Params.HalvingIntervalBlocks)
+	if r == 0 {
+		return
+	}
+	acc := st.Get(c.faucet)
+	acc.Balance += r
+	st.Set(c.faucet, acc)
+}
+
+// advanceLocked applies one block's state transition: emission FIRST, then the
+// block's transactions, in that order. Every path that moves the chain forward
+// calls this - if any of them applied the transactions first, or skipped the
+// emission, its state root would differ from the others and the chain would fork.
+//
+// It mutates only the clone it returns, never c.state; the caller must hold
+// c.mu (reading is enough, which is how Build uses it).
+func (c *Chain) advanceLocked(height uint64, txs []types.Tx) (*state.State, error) {
+	next := c.state.Clone()
+	next.SetHeight(height) // execution context only: the claim rule derives its epoch from it
+	c.creditEmissionLocked(next, height)
+	return next.ApplyBlock(txs)
+}
+
 // Build constructs and signs a candidate block. It does not mutate the
 // chain: the caller decides whether to Append.
 func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int64) (*types.Block, error) {
@@ -187,7 +239,7 @@ func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int
 	if !ok {
 		return nil, ErrUnknownProposer
 	}
-	next, err := c.state.ApplyBlock(txs)
+	next, err := c.advanceLocked(c.head.Header.Height+1, txs)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +272,7 @@ func (c *Chain) applyValidated(b *types.Block) error {
 }
 
 func (c *Chain) applyValidatedLocked(b *types.Block) error {
-	next, err := c.state.ApplyBlock(b.Txs)
+	next, err := c.advanceLocked(b.Header.Height, b.Txs)
 	if err != nil {
 		return err
 	}
@@ -261,7 +313,7 @@ func (c *Chain) Append(b *types.Block) error {
 		return ErrBadProposerSig
 	}
 
-	next, err := c.state.ApplyBlock(b.Txs)
+	next, err := c.advanceLocked(b.Header.Height, b.Txs)
 	if err != nil {
 		return err
 	}
