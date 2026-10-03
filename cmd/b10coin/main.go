@@ -131,12 +131,13 @@ func cmdClaim(args []string) error {
 	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC to submit the claim to")
 	// --dir keeps the command surface uniform with the other commands, but
 	// claim reads NOTHING from disk: the devnet genesis it must agree with is
-	// compiled in, and the key must never be written anywhere.
-	dir := fs.String("dir", "./b10coin-data", "the node's data directory (unused by the claim itself; the devnet genesis is compiled in)")
+	// compiled in, and the key must never be written anywhere. The flag is
+	// accepted so scripts built on the other commands keep working; its value
+	// is deliberately never read here.
+	fs.String("dir", "./b10coin-data", "the node's data directory (unused by the claim itself; the devnet genesis is compiled in)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	_ = dir
 
 	// The puzzle's parameters are GENESIS state, not carried on the wire:
 	// claimant and verifier must agree on them, so the command solves with
