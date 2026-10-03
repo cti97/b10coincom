@@ -1,6 +1,7 @@
 package faucet
 
 import (
+	"encoding/hex"
 	"testing"
 )
 
@@ -82,5 +83,30 @@ func TestSolveThenVerify(t *testing.T) {
 	}
 	if !MeetsTarget(PowDigest(pub, 3, nonce, fastParams), target) {
 		t.Fatalf("the nonce Solve returned (%d) does not verify", nonce)
+	}
+}
+
+// TestPowDigestKnownAnswer pins the exact preimage layout and salt. Neither
+// travels in genesis, so without this a change to either is invisible to every
+// other test while silently invalidating solutions across builds.
+//
+// GOLDEN VECTOR. Captured once from the initial implementation. Do NOT
+// re-capture this value from a fresh run to make a failure go away: if this
+// test fails, the digest changed and cross-build verification broke. Fix the
+// code or change the pinned value only as a deliberate, documented decision,
+// never because the run produced something different.
+func TestPowDigestKnownAnswer(t *testing.T) {
+	pub := make([]byte, 32) // all-zero pubkey keeps the vector readable
+	// Epoch and nonce are deliberately NON-zero: a zero encodes to eight 0x00
+	// bytes under either endianness, so a 0/0 vector is blind to a switch of the
+	// nonce encoding between big- and little-endian.
+	// PowDigest(32 zero bytes, epoch=1, nonce=1, {MemoryKiB: 64, Iterations: 1, Parallelism: 1})
+	const digest = "ae1e9529f230f3b44759b4c0689af2626b77f6dab609d3a172b41bbe6e9d6815"
+	var want [32]byte
+	if _, err := hex.Decode(want[:], []byte(digest)); err != nil {
+		t.Fatalf("bad golden vector literal: %v", err)
+	}
+	if got := PowDigest(pub, 1, 1, Argon2Params{MemoryKiB: 64, Iterations: 1, Parallelism: 1}); got != want {
+		t.Fatalf("puzzle digest changed:\n got %x\nwant %x", got, want)
 	}
 }
