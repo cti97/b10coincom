@@ -2415,6 +2415,7 @@ func TestDriverAppendsOnCommit(t *testing.T) {
 		t.Fatalf("appended a block at height %d, want %d", head.Header.Height, before+1)
 	}
 }
+```
 > **Implementer note:** this test needs `github.com/cti97/b10coincom/internal/transport/sim` in the test file's imports, plus `time`. It drives one validator to a real commit, so it fails if the driver never appends.
 
 - [ ] **Step 2: Run the test to verify it fails**
