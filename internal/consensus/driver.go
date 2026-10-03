@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/cti97/b10coincom/internal/chain"
+	"github.com/cti97/b10coincom/internal/store"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/types"
 )
@@ -51,12 +52,62 @@ type Driver struct {
 // The engine begins at head+1 with the head as its parent, and its round 0 is
 // armed with exactly TimeoutBase: the first round a validator is in gets the
 // full configured window before any timeout can end it.
+//
+// The engine is not necessarily unlocked, even at round 0: if this validator
+// precommitted at head+1 and crashed before the height was decided, the lock
+// it persisted is restored here (newEngine) - a restart may not re-enter a
+// height the validator has already promised about.
 func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport) *Driver {
 	d := &Driver{cfg: cfg, ch: ch, priv: priv, tp: tp}
-	d.eng = NewEngine(cfg, ch.Height()+1, ch.Head().ID(), priv, d.build)
+	d.eng = d.newEngine(ch.Height()+1, ch.Head().ID())
 	d.timeoutAt = d.cfg.TimeoutBase
 	tp.OnMessage(d.OnMessage)
 	return d
+}
+
+// newEngine builds the engine for (height, parent) and connects it to the
+// store through the chain: the persistLock hook makes every future lock move
+// durable the moment it happens, and any lock previously persisted for THIS
+// height - the height the engine is about to judge - is restored into it.
+//
+// Restoring is not optional and not best-effort cosmetic: the locking rule's
+// safety argument assumes a locked validator STAYS locked, and a validator
+// that precommitted and then restarted re-enters this height with no
+// in-memory state at all. Without the restore the fresh engine would be
+// unlocked, prevote a conflicting block, and reproduce exactly the
+// counterexample the lock exists to prevent.
+//
+// The restore target is lockOn itself, the same forward-only mutator an
+// in-memory lock uses, so a restored lock is not a second class of lock: it
+// survives enterRound and it refuses a differing block until a verified
+// justification exceeds its round.
+func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
+	eng := NewEngine(d.cfg, height, parent, d.priv, d.build)
+	eng.persistLock = d.persistLock
+	if rec, ok := d.ch.LockAt(height); ok {
+		eng.restoreLock(rec.Round, rec.BlockID)
+	}
+	return eng
+}
+
+// persistLock is the hook the engine calls the moment its lock moves, before
+// the precommit that records it is signed or shipped: the promise must be
+// durable first, or the crash window leaves a promise on the wire that no
+// restart can remember (and that a restarted validator would then vote
+// against - the exact unsafe direction).
+//
+// A persistence failure PANICS deliberately. Broadcasting the precommit
+// would keep the engine running on a promise it could not make durable - the
+// validator would behave as locked and come back unlocked after a crash,
+// which is precisely the defect this hook closes; a node that cannot keep
+// its promise durable must stop instead of voting. A panic does not corrupt
+// anything: the store's writes are atomic per record (append + fsync, torn
+// writes truncated at Open), so the promise before this one still stands.
+func (d *Driver) persistLock(height uint64, round uint32, id [32]byte) {
+	rec := store.LockRecord{Height: height, Round: round, BlockID: id}
+	if err := d.ch.PutLock(rec); err != nil {
+		panic(fmt.Sprintf("consensus: the lock taken at height %d round %d could not be made durable: %v", height, round, err))
+	}
 }
 
 // build constructs the block this node would propose at the height it is asked
@@ -173,12 +224,14 @@ func (d *Driver) flush() {
 		return
 	}
 	// The height is decided. Replace the engine: the next height starts the
-	// same way a fresh node would (its lock state is per-height), judging
-	// head+1 over the block just committed. Its round 0 gets TimeoutBase from
-	// the driver's current reading, so its propose phase runs before its
-	// timer can fire. The refusal flag belonged to the replaced engine's
-	// commit and starts over with the fresh one.
-	d.eng = NewEngine(d.cfg, d.ch.Height()+1, d.ch.Head().ID(), d.priv, d.build)
+	// same way a fresh node would (its lock state is per-height, and any
+	// previously persisted lock for THIS height is restored - the restart
+	// guarantee is a per-creation guarantee, not a start-of-process one),
+	// judging head+1 over the block just committed. Its round 0 gets
+	// TimeoutBase from the driver's current reading, so its propose phase
+	// runs before its timer can fire. The refusal flag belonged to the
+	// replaced engine's commit and starts over with the fresh one.
+	d.eng = d.newEngine(d.ch.Height()+1, d.ch.Head().ID())
 	d.appendRefused = false
 	d.timeoutAt = d.now + d.cfg.TimeoutBase
 }

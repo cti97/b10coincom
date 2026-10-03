@@ -56,7 +56,7 @@ It prints:
 ```text
 chain        b10coin-devnet-1
 height       102
-state root   54023d2de4548c1d222c372eaa1722045eadb83bdf61ae03dc2308325ec0c2bb
+state root   be1c9e90914d23292d47873727e512a6dd76f6ccb7117b03bae189e9e51837ea
 txs included 2
 claims paid  1 of 1 attempts, 100000000 sparks each
 double claims refused 1 (one claim per key per epoch)
@@ -281,12 +281,19 @@ distrust:
   must agree, and two cannot. An attacker who silences a third of the set
   lowers nothing — the bar stays pinned to the full committee, offline
   members included.
-- **A validator that precommits is locked.** Precommitting block B at height h
-  is a promise: from then on the validator prevotes only B (or nothing) at
-  that height. It will not — cannot, within the protocol — help commit a
-  conflicting block at the same height, which is why two conflicting blocks
-  cannot each collect a quorum unless more than a third of the power breaks
-  its promise.
+- **A validator that precommits is locked — and the lock survives a restart.**
+  Precommitting block B at height h is a promise: from then on the validator
+  prevotes only B (or nothing) at that height. It will not — cannot, within
+  the protocol — help commit a conflicting block at the same height, which is
+  why two conflicting blocks cannot each collect a quorum unless more than a
+  third of the power breaks its promise. The promise is not just memory: it is
+  written to the crash-tolerant store the moment the lock moves (before the
+  precommit that records it is signed or shipped), and a validator that
+  crashes mid-height and restarts re-enters that height still locked, refusing
+  a conflicting block exactly as before. A corrupt lock record fails the node
+  loudly at startup rather than degrading to "unlocked" — silently re-entering
+  unlocked is precisely the unsafe direction. This is what makes the promise
+  unconditional: a locked validator stays locked whether or not it restarts.
 - **A locked validator unlocks only on evidence.** The one way out is a
   proposal for a conflicting block at a strictly later round that CARRIES its
   proof: a justification of quorum prevotes — verified signatures, counted
@@ -314,7 +321,16 @@ committee still agrees; and a mid-epoch restart whose replayed state root
 matches its peers'. M3's honest limits are recorded with the scenarios: a
 validator that falls behind cannot catch up yet (block sync is M4's
 networking work), and a lost proposal parks a validator permanently, so
-liveness scenarios run drop-free.
+liveness scenarios run drop-free. The persisted lock has its own limits,
+recorded here rather than hidden: no scenario injects message reordering, so
+the restart-time refusal is exercised with in-order delivery only; the
+justification gate's unlock path is unreachable from any shipped driver —
+honest proposals never carry a polka for a conflicting block, so in
+production the gate is refusal-only and the unlock-on-evidence half is
+exercised by tests alone; and consensus blocks carry no transactions, so the
+claim bound's motivating threat (a proposer stuffing a block with heavy
+faucet claims) never arises on the consensus path in M3. None of these are
+defects in what M3 built; all three are the boundary of what it claims.
 
 ## Architecture
 

@@ -82,6 +82,15 @@ type Engine struct {
 	prevotes   *VoteSet
 	precommits *VoteSet
 
+	// persistLock, when non-nil, is called the instant the lock moves: the
+	// driver installs it after construction so the promise is made durable
+	// BEFORE the precommit that records it is signed or shipped (a promise
+	// broadcast before it can survive a crash is the promise a restart
+	// loses). The engine itself performs no I/O - like propose, this is an
+	// injected seam, and it stays nil for engines built without a driver,
+	// whose lock is in-memory only, exactly as before this field existed.
+	persistLock func(height uint64, round uint32, id [32]byte)
+
 	committed    [32]byte
 	hasCommitted bool
 	out          []Outbound
@@ -115,6 +124,17 @@ func (e *Engine) IsProposer() bool { return string(e.Proposer()) == string(e.pub
 
 // Committed reports the block this engine has committed, if any.
 func (e *Engine) Committed() ([32]byte, bool) { return e.committed, e.hasCommitted }
+
+// restoreLock reinstates a lock taken in the engine's previous life: the
+// driver reads the persisted lock for this height out of the store and hands
+// it here when a crashed precommit must keep its promise.
+//
+// A restored lock is not a lesser lock. It goes in through the same
+// forward-only mutator an in-memory lock uses, so it survives enterRound and
+// refuses a differing block exactly as a promise taken mid-run does - and a
+// lock recorded at a round the promise already exceeds cannot pull the
+// engine backwards.
+func (e *Engine) restoreLock(round uint32, id [32]byte) { e.lk.lockOn(round, id) }
 
 // Drain returns and clears the messages the engine wants sent. The caller owns
 // delivery, so the engine never performs I/O.
@@ -347,6 +367,13 @@ func (e *Engine) maybePrecommit() {
 	// anywhere else, or only on commit, would leave the safety rule unenforced
 	// for exactly the window it exists to cover.
 	e.lk.lockOn(e.round, id)
+	// The promise is made durable the moment it moves, before the precommit
+	// that records it leaves this process. Skipping this hook would leave the
+	// lock memory-only, and a restart would re-enter the height unlocked -
+	// the exact unsafe re-vote the lock exists to prevent.
+	if e.persistLock != nil {
+		e.persistLock(e.height, e.round, id)
+	}
 	e.emitVote(MsgPrecommit, id)
 }
 

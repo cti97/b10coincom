@@ -581,3 +581,274 @@ func keysOf(m map[uint32]bool) []uint32 {
 	}
 	return out
 }
+
+// stalledTransport is a transport that records broadcasts and delivers
+// nothing: a node whose peers are all absent. Every message the engine or
+// driver emits under it is on record, and every message that "arrives" is one
+// the test injected by hand.
+type stalledTransport struct {
+	broadcasts [][]byte
+}
+
+func (s *stalledTransport) Broadcast(data []byte) error {
+	s.broadcasts = append(s.broadcasts, append([]byte(nil), data...))
+	return nil
+}
+func (s *stalledTransport) OnMessage(fn func(transport.Message)) {}
+func (s *stalledTransport) Peers() []transport.PeerID            { return []transport.PeerID{"v0", "v1"} }
+func (s *stalledTransport) Close() error                         { return nil }
+
+// restartCommittee is two equal validators: the fresh engine's quorum of 2
+// needs BOTH precommits, so one validator's precommit locks it WITHOUT
+// committing - the exact mid-height state a crashed validator is found in.
+// The keys are the deterministic committee keys, identical across both runs,
+// so the restarted validator is the same committee member.
+func restartCommittee(t *testing.T) (cfg Config, pub0 ed25519.PublicKey, priv0 ed25519.PrivateKey, g *genesis.Genesis) {
+	t.Helper()
+	pub0 = testCommitteeKey(0).Public().(ed25519.PublicKey)
+	priv0 = testCommitteeKey(0)
+	pub1 := testCommitteeKey(1).Public().(ed25519.PublicKey)
+	g = genesis.Devnet()
+	g.Validators = []genesis.Validator{{PubKey: pub0, Power: 1}, {PubKey: pub1, Power: 1}}
+	g.Params.CommitteeSize = 2
+	cfg = Config{Committee: g.Validators, TimeoutBase: roundBase, TimeoutStep: roundStep, PowerCapNum: 1, PowerCapDen: 1}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, pub0, priv0, g
+}
+
+func precommitFor(t *testing.T, rec *stalledTransport, height uint64, round uint32, id [32]byte) *Vote {
+	t.Helper()
+	for _, raw := range rec.broadcasts {
+		c := decodeWire(t, raw)
+		if c.vote != nil && c.vote.Type == MsgPrecommit &&
+			c.vote.Height == height && c.vote.Round == round && c.vote.BlockID == id {
+			return c.vote
+		}
+	}
+	return nil
+}
+
+func nonNilPrevoteFor(t *testing.T, rec *stalledTransport, height uint64, round uint32, id [32]byte) *Vote {
+	t.Helper()
+	for _, raw := range rec.broadcasts {
+		c := decodeWire(t, raw)
+		if c.vote != nil && c.vote.Type == MsgPrevote && !c.vote.IsNil() &&
+			c.vote.Height == height && c.vote.Round == round && c.vote.BlockID == id {
+			return c.vote
+		}
+	}
+	return nil
+}
+
+// The locking rule's safety argument assumes a locked validator STAYS locked.
+// Without persisting the lock, a validator that precommitted and then
+// restarted re-entered the height UNLOCKED and would help commit a
+// conflicting block - which is precisely the case the locking rule exists to
+// prevent, and the hole this test exists to keep closed.
+//
+// The two runs share nothing but the on-disk directory: the first run's
+// chain is Closed (a process exit), its driver, engine and transport are
+// dropped wholesale, and the second run replays the chain from disk and
+// builds a brand-new driver through the ordinary NewDriver path. The
+// conflicting proposal genuinely carries NO justification (nil slice,
+// ValidRound -1): it is the Design Decision 11 counterexample, arriving at an
+// engine that did not exist when the promise was made.
+func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
+	cfg, pub0, priv0, g := restartCommittee(t)
+
+	// ---- Run 1: lock on B at height 1, then stop mid-height. ----
+	dir := t.TempDir()
+	ch1, err := chain.Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := ch1.Head().ID()
+	tp1 := &stalledTransport{}
+	d1 := NewDriver(cfg, ch1, priv0, tp1)
+	d1Engine := d1.eng // kept only to prove the restart built a different engine
+
+	// Walk the rounds until this validator is drawn as proposer at (1, r),
+	// then play the rest of the committee with one signed prevote for the
+	// proposal it just received. No sim is needed: the injected vote carries
+	// the real committee key, i.e. it faces exactly the trust boundary the
+	// tally enforces on the wire. The clock stays at 5ms - below the round
+	// timeout - so no tick can propose AND timeout in one call; a manual
+	// OnTimeout leaves each round the engine did not lock in, which is what
+	// keeps the injected prevote in the round it belongs to.
+	now := int64(5)
+	var lockRoundInt int64 = -1
+	var lockID [32]byte
+	for r := uint32(0); r < 64 && lockRoundInt < 0; r++ {
+		d1.Tick(now)
+		if string(cfg.Proposer(d1.eng.Height(), r, parent)) == string(pub0) &&
+			d1.eng.Round() == r && d1.eng.proposal != nil {
+			// v0 proposed B and prevoted it this round (its own prevote is
+			// tallied). One peer signature completes the prevote polka, which
+			// completes the precommit - and precommitting IS locking.
+			d1.OnMessage(transport.Message{From: "v1", Data: EncodeVote(
+				voteFrom(t, cfg, 1, MsgPrevote, d1.eng.Height(), r, d1.eng.proposal.ID()))})
+			if d1.eng.lk.locked() {
+				lockRoundInt = d1.eng.lk.round()
+				lockID = d1.eng.lk.blockID()
+			}
+		}
+		if lockRoundInt < 0 {
+			d1.eng.OnTimeout(TimeoutEvent{Height: d1.eng.Height(), Round: d1.eng.Round(), Step: d1.eng.Step()})
+		}
+	}
+	if lockRoundInt < 0 {
+		t.Fatalf("in 64 rounds the fixture never reached one this validator proposed in: no lock was taken to restart from")
+	}
+	lockRound := uint32(lockRoundInt)
+
+	// Non-vacuity, run 1: the promise is real - a precommit for B actually
+	// left this validator - and the height did NOT commit (the chain head
+	// never moved), so the restart must re-judge this very height.
+	if ch1.Height() != 0 {
+		t.Fatalf("height committed during the lock run: %d (the fixture must stop mid-height)", ch1.Height())
+	}
+	if d1eng := d1.eng; d1eng.hasCommitted {
+		t.Fatal("the engine committed although the peer's precommit never arrived; a commit here would make the restart vacuous")
+	}
+	if precommitFor(t, tp1, 1, lockRound, lockID) == nil {
+		t.Fatalf("no precommit for the locked block (%x at round %d) was broadcast: the promise never reached the wire", lockID[:8], lockRound)
+	}
+	// The promise must already be durable while the engine is alive - the
+	// moment the lock moved, before any restart enters the picture.
+	if got, ok := ch1.LockAt(1); !ok || got.Round != lockRound || got.BlockID != lockID {
+		t.Fatalf("the lock was not persisted on the move: LockAt(1) = %+v,%v, want round %d block %x", got, ok, lockRound, lockID[:8])
+	}
+
+	// ---- Stop: everything in memory is gone; only the directory remains. ----
+	if err := ch1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d1, ch1, tp1 = nil, nil, nil
+
+	// ---- Run 2: restart from the same directory, from scratch. ----
+	ch2, err := chain.Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ch2.Close()
+	if ch2.Height() != 0 {
+		t.Fatalf("the replayed chain sits at height %d; the restart must re-judge the undecided height 1", ch2.Height())
+	}
+	tp2 := &stalledTransport{}
+	d2 := NewDriver(cfg, ch2, priv0, tp2)
+
+	// The restored lock, checked the instant the engine exists - before the
+	// engine has seen one message or one tick, i.e. before anything in run 2
+	// could have reconstructed the promise from protocol traffic instead of
+	// disk.
+	if !d2.eng.lk.locked() {
+		t.Fatal("the restarted validator re-entered the height it had precommitted UNLOCKED: it will now prevote a conflicting block")
+	}
+	if d2.eng.lk.round() != int64(lockRound) || d2.eng.lk.blockID() != lockID {
+		gotLockID := d2.eng.lk.blockID()
+		t.Fatalf("restored lock = (round %d, block %x), want (round %d, block %x): the promise came back wrong",
+			d2.eng.lk.round(), gotLockID[:8], lockRound, lockID[:8])
+	}
+	if d2.eng != nil && d2.eng == d1Engine {
+		t.Fatal("the restart reused the old engine object: the in-memory state was never really discarded")
+	}
+	if len(tp2.broadcasts) != 0 {
+		t.Fatalf("the fresh engine emitted %d message(s) at construction; nothing may leave before it judges anything", len(tp2.broadcasts))
+	}
+	if got, _ := ch2.LockAt(1); got.Round != lockRound || got.BlockID != lockID {
+		t.Fatalf("the store no longer carries the promise: LockAt(1) = %+v", got)
+	}
+
+	// ---- The conflicting block, with NO justification, at the height held. ----
+	badBlock := conflictingBlock(t, cfg, 1, 0, parent, 0xB7)
+	badProp := &Proposal{
+		Height: 1, Round: 0, Block: badBlock,
+		ValidRound:    -1,
+		Justification: nil, // NO justification: a claim with no evidence behind it
+		Validator:     cfg.Proposer(1, 0, parent),
+	}
+	badProp.Sig = signProposal(t, cfg, badProp)
+
+	// Vacuity guards, stated where they matter:
+	if badProp.Justification != nil || badProp.ValidRound != -1 {
+		t.Fatal("the conflicting proposal must genuinely carry no justification")
+	}
+	if badBlock.ID() == lockID {
+		t.Fatal("the conflicting block must genuinely differ from the locked one")
+	}
+	d2.OnMessage(transport.Message{From: "v1", Data: EncodeProposal(badProp)})
+
+	// A validator that holds a proposal the lock refuses prevotes NIL - the
+	// refusal must speak. What it must NEVER do is prevote the conflict.
+	sawNonNilAfterConflict := false
+	sawNilPrevote := false
+	for _, raw := range tp2.broadcasts {
+		c := decodeWire(t, raw)
+		if c.vote == nil || c.vote.Type != MsgPrevote {
+			continue
+		}
+		if c.vote.IsNil() {
+			sawNilPrevote = true
+			if c.vote.Height != 1 || c.vote.Round != 0 {
+				t.Fatalf("the nil prevote must be at (height 1, round 0), got (h=%d, r=%d)", c.vote.Height, c.vote.Round)
+			}
+			continue
+		}
+		sawNonNilAfterConflict = true
+		t.Fatalf("a restarted validator prevoted conflicting block %x, which its persistent promise refuses", c.vote.BlockID[:4])
+	}
+	if sawNonNilAfterConflict {
+		t.Fatal("a fresh (unrestored) engine reaches this line: the conflicting prevote is what a restart must not emit")
+	}
+	if !sawNilPrevote {
+		t.Fatal("no nil prevote was broadcast for the refused proposal: a silent refusal leaves the validator's weight out of the nil tally")
+	}
+
+	// ---- The restored lock is a REAL lock: it survives the round change, ----
+	// and it still releases the validator on verified evidence from a round
+	// strictly beyond its promise - persistence must not revoke liveness.
+	d2.eng.OnTimeout(TimeoutEvent{Height: d2.eng.Height(), Round: d2.eng.Round(), Step: d2.eng.Step()})
+	if !d2.eng.lk.locked() || d2.eng.lk.blockID() != lockID || d2.eng.lk.round() != int64(lockRound) {
+		survivedID := d2.eng.lk.blockID()
+		t.Fatalf("the restored lock did not survive enterRound: now locked=%v (round %d, block %x)",
+			d2.eng.lk.locked(), d2.eng.lk.round(), survivedID[:8])
+	}
+
+	newBlock := conflictingBlock(t, cfg, 1, 1, parent, 0xA7)
+	newID := newBlock.ID()
+	if newID == lockID || newID == badBlock.ID() {
+		t.Fatal("the justified block must genuinely differ from both the locked and the refused one")
+	}
+	// Evidence of the polka that legitimately moves the validator: quorum
+	// prevotes for the conflicting block at a round strictly greater than the
+	// stored lock. The quorum of 2 needs both committee members' signatures,
+	// and this test holds both keys - which is exactly why it can fabricate
+	// evidence the verification gate will accept.
+	propRound := lockRound + 1
+	goodProp := &Proposal{
+		Height: 1, Round: 1, Block: newBlock, ValidRound: int64(propRound), Validator: cfg.Proposer(1, 1, parent),
+		Justification: encodeJustification([]*Vote{
+			voteFrom(t, cfg, 0, MsgPrevote, 1, propRound, newID),
+			voteFrom(t, cfg, 1, MsgPrevote, 1, propRound, newID),
+		}),
+	}
+	goodProp.Sig = signProposal(t, cfg, goodProp)
+	if len(goodProp.Justification) == 0 {
+		t.Fatal("the justified proposal must genuinely carry its polka")
+	}
+	d2.OnMessage(transport.Message{From: "v1", Data: EncodeProposal(goodProp)})
+	if nonNilPrevoteFor(t, tp2, 1, 1, newID) == nil {
+		t.Fatal("a restored lock that refuses verified evidence from a strictly newer round would turn persistence into a permanent stop")
+	}
+
+	// Nothing in run 2 moved the chain or the promise: no quorum was reached,
+	// so the height stays undecided for the restarted validator.
+	if ch2.Height() != 0 {
+		t.Fatalf("the restarted validator's chain moved to height %d at a height it never reached quorum for", ch2.Height())
+	}
+	if d2.eng.lk.blockID() != lockID {
+		t.Fatal("prevoting the justified block must not itself move the lock")
+	}
+}
