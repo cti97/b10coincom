@@ -553,6 +553,127 @@ func TestClaimVerifiesTheCurrentEpochThroughTheTransition(t *testing.T) {
 	}
 }
 
+// Probe must run the SAME transition a block at head+1 runs — height set,
+// emission credited, transactions applied — without persisting anything. The
+// claim below is payable ONLY after block 1's emission is credited (the
+// genesis mint of 50M is below the devnet's 100M claim amount), so a probe
+// that skipped the emission would refuse to apply it and RunOnce would evict
+// a valid claim. The unchanged-height/root assertions are what catch a probe
+// that quietly advanced the chain.
+func TestProbeMirrorsTheBlockTransition(t *testing.T) {
+	c, priv := devChain(t)
+	g := c.Genesis()
+
+	pub, key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pow, ok := faucet.Solve(pub, 1, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1_000_000)
+	if !ok {
+		t.Fatal("could not solve the test puzzle")
+	}
+	claim := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 0, Epoch: 1, PowNonce: pow}
+	sigHash := claim.SigningHash()
+	claim.Sig = crypto.Sign(key, sigHash[:])
+
+	// Fixture guard: the claim must NEED the block's own emission, or this
+	// test can no longer distinguish the mirrored probe from the old
+	// head-clone probe.
+	faucetBefore := c.State().Get(g.FaucetAddress()).Balance
+	if faucetBefore >= g.Params.ClaimAmountSparks {
+		t.Fatalf("fixture error: the faucet already holds %d; this claim no longer needs block 1's emission", faucetBefore)
+	}
+
+	head := c.Head()
+	beforeRoot := c.State().Root()
+
+	probed, err := c.Probe([]types.Tx{*claim})
+	if err != nil {
+		t.Fatalf("the probe skipped the transition a block at head+1 runs: %v", err)
+	}
+	if c.Height() != head.Header.Height {
+		t.Fatalf("Probe advanced the chain to height %d", c.Height())
+	}
+	if c.State().Root() != beforeRoot {
+		t.Fatal("Probe mutated the chain's committed state")
+	}
+	if got := probed.Get(types.AddressFromPub(pub)).Balance; got != g.Params.ClaimAmountSparks {
+		t.Fatalf("probed claimant balance = %d, want %d", got, g.Params.ClaimAmountSparks)
+	}
+
+	// The mirror property: appending the probed transactions for real must
+	// reach exactly the root the probe reported.
+	b, err := c.Build(priv, []types.Tx{*claim}, 1_700_000_100)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if err := c.Append(b); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if c.State().Root() != probed.Root() {
+		t.Fatalf("the probe diverged from Append:\n probe  %x\n append %x", probed.Root(), c.State().Root())
+	}
+}
+
+// Probe derives its epoch from the NEXT block's height, not the head's: the
+// claim below carries block 2's epoch (EpochBlocks = 2), which the transition
+// at head+1 = 2 accepts. A probe that used the head's height would refuse it
+// with ErrWrongEpoch and evict a valid claim from RunOnce's filter.
+func TestProbeUsesTheNextBlocksEpoch(t *testing.T) {
+	g := *genesis.Devnet()
+	g.Params.EpochBlocks = 2         // block 2 opens epoch 2
+	g.Params.ClaimAmountSparks = 100 // small: the banked emission already covers it
+	c, err := Open(&g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, priv := genesis.DevValidatorKey()
+
+	// Block 1 is empty; the head's execution context stays at epoch 1.
+	b1, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Append(b1); err != nil {
+		t.Fatal(err)
+	}
+
+	pub, key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pow, ok := faucet.Solve(pub, 2, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1_000_000)
+	if !ok {
+		t.Fatal("could not solve the test puzzle")
+	}
+	claim := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 0, Epoch: 2, PowNonce: pow}
+	sigHash := claim.SigningHash()
+	claim.Sig = crypto.Sign(key, sigHash[:])
+
+	probed, err := c.Probe([]types.Tx{*claim})
+	if err != nil {
+		t.Fatalf("a claim for block 2's epoch must survive a probe at head+1: %v", err)
+	}
+	if got := probed.Get(types.AddressFromPub(pub)).Balance; got != g.Params.ClaimAmountSparks {
+		t.Fatalf("probed claimant balance = %d, want %d", got, g.Params.ClaimAmountSparks)
+	}
+
+	// And appending the same claim for real reaches the probed root.
+	b2, err := c.Build(priv, []types.Tx{*claim}, 1_700_000_101)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if err := c.Append(b2); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if c.State().Root() != probed.Root() {
+		t.Fatalf("the probe diverged from Append:\n probe  %x\n append %x", probed.Root(), c.State().Root())
+	}
+}
+
 // Replay must reproduce emission, or a restarted node diverges.
 func TestReplayReproducesEmission(t *testing.T) {
 	dir := t.TempDir()

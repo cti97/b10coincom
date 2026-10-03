@@ -230,6 +230,16 @@ func (c *Chain) advanceLocked(height uint64, txs []types.Tx) (*state.State, erro
 	return next.ApplyBlock(txs)
 }
 
+// Probe reports the state a block at head+1 carrying txs would produce, without
+// appending anything. It runs the SAME transition as Append - height set, emission
+// credited, transactions applied - because a probe that skipped the emission or used the
+// head's height would evict valid faucet claims.
+func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.advanceLocked(c.head.Header.Height+1, txs)
+}
+
 // Build constructs and signs a candidate block. It does not mutate the
 // chain: the caller decides whether to Append.
 func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int64) (*types.Block, error) {
