@@ -46,6 +46,33 @@
 
 **10. `--validators N` becomes real.** The spec's §9 named `devnet --validators 4 --blocks 100` as its proof; M0–M1 could not honour it because a single node needed no agreement. M3 makes a devnet of four validators finalizing blocks the milestone's acceptance check.
 
+**11. A locked validator unlocks ONLY on evidence, not on a round number (the justification gate).**
+The spec's §6.3 phrasing — *"in any later round it prevotes only for `B` or for a proposal at a round `> r`"* — implemented literally is **not safe**, and the M3 review demonstrated the counterexample: if `B` commits at round `r` then ≥2/3 prevoted `B` at `r`, so ≥1/3 honest validators are locked on `B`; a malicious proposer then offers a conflicting `B'` at round `r+1`, and the literal rule PERMITS every one of those locked validators to prevote `B'` merely because `r+1 > r`. `B'` reaches 2/3 prevotes, then 2/3 precommits, and commits. Two conflicting commits at one height, which is exactly what the rule was written to prevent.
+
+What actually prevents it is Tendermint's **proof of lock change**. A proposal carries a `ValidRound` and a `Justification`: the set of prevotes proving that block reached a polka (2/3 prevotes) at `ValidRound`. A locked validator prevotes a DIFFERING block only when that block's polka came from a round **strictly greater than its own lock round**:
+
+```go
+// canPrevote reports whether id may be prevoted, given that the proposal carries a
+// polka for id from validRound (-1 when it carries none).
+func (l *lock) canPrevote(round uint32, id [32]byte, validRound int64) bool {
+	if l.lockedRound < 0 {
+		return true
+	}
+	if id == l.lockedBlock {
+		return true
+	}
+	return validRound > l.lockedRound
+}
+```
+
+Note what changed: the unlock condition is the **block's polka round**, not the round the proposal happens to be in. A validator locked at `r` does not unlock just because time passed — it unlocks when it is shown that a supermajority moved on without it.
+
+The lemma this restores: *if `B` committed at round `r`, no conflicting block can have a polka at any round `≥ r`.* Proof: take the first such round `r*`; the ≥1/3 honest prevotes for the conflict at `r*` would each have required a polka from a round `> ` their lock round (≥ `r`), and `r*` is the first such round, so no such polka exists yet. Contradiction. Hence no conflicting polka, hence no conflicting commit.
+
+**The justification must be VERIFIED, not trusted.** The engine decodes the carried prevotes, tallies them against the committee, and requires both that they reach quorum and that they are for the proposal's own block ID at exactly `ValidRound`. An unverified justification would be worse than none: it would let a proposer assert an unlock that never happened.
+
+This is a change the spec does not name, adopted because the spec's stated GOAL ("never two conflicting commits at one height") requires it and its stated RULE does not achieve it. It is recorded here as a deliberate departure.
+
 ## File structure
 
 | File | Responsibility |
@@ -1712,14 +1739,17 @@ func (l *lock) lockOn(round uint32, id [32]byte) {
 // this lock. The rule, verbatim from the spec: a locked validator prevotes its
 // locked block, or a block proposed at a round STRICTLY GREATER than the one it is
 // locked on. Anything else is refused.
-func (l *lock) canPrevote(round uint32, id [32]byte) bool {
+func (l *lock) canPrevote(round uint32, id [32]byte, validRound int64) bool {
 	if l.lockedRound < 0 {
 		return true // not locked: anything goes
 	}
 	if id == l.lockedBlock {
 		return true // its own promise, at any round
 	}
-	return int64(round) > l.lockedRound // a strictly newer round, so the network has moved on
+	// Unlock ONLY on evidence: the proposal must carry a polka for id from a round
+	// strictly greater than this validator's lock. A round number alone is not
+	// evidence - see Design Decision 11 for the counterexample that proves it.
+	return validRound > l.lockedRound
 }
 
 func (l *lock) locked() bool            { return l.lockedRound >= 0 }
