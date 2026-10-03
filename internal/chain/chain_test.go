@@ -12,6 +12,7 @@ import (
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
+	"github.com/cti97/b10coincom/internal/state"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -722,5 +723,162 @@ func TestReplayReproducesEmission(t *testing.T) {
 	}
 	if got := c2.Head().ID(); got != wantHead {
 		t.Fatal("replayed head differs from the stored head")
+	}
+}
+
+// The per-block claim bound is consensus only where it is WIRED into real
+// chains. state.ApplyBlock enforces MaxClaimsPerBlock, but only against states
+// it is handed; the single connection to chains a caller can run is the
+// MaxClaimsPerBlock line in genesisState (chain.go). This test walks the
+// caller's path - Open a chain from a genesis whose bound is K, then Build AND
+// Append a block carrying K+1 genuinely valid claims - and demands the CHAIN
+// rejects it with state.ErrTooManyClaims. Deleting the genesisState wiring
+// line still compiles: the state layer keeps its hand-made-state tests, every
+// real chain silently runs with bound 0 ("not engaged"), and the over-bound
+// block below is accepted instead. Only this test goes red, which is exactly
+// the silent inertness it exists to make loud.
+func TestChainRejectsABlockOverTheGenesisClaimBound(t *testing.T) {
+	// An explicit bound, not the shared 8: a small fixture, and proof that the
+	// enforced bound is the genesis PARAMETER rather than any constant.
+	g := *genesis.Devnet()
+	g.Params.MaxClaimsPerBlock = 2
+	// Small claim amount: every claim below is individually payable, so the
+	// bound is the ONLY thing in the transition that can reject the block.
+	g.Params.ClaimAmountSparks = 100
+	bound := g.Params.MaxClaimsPerBlock
+	c, err := Open(&g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	valPub, valPriv := genesis.DevValidatorKey()
+
+	// bound+1 claims from bound+1 distinct fresh keys, each with a genuine
+	// signature and a genuine puzzle for epoch 1 (block 1 at the devnet's
+	// EpochBlocks). Nothing about them is invalid except their NUMBER.
+	txs := make([]types.Tx, 0, bound+1)
+	for i := uint64(0); i <= bound; i++ {
+		claimantPub, key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pow, ok := faucet.Solve(claimantPub, 1, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1_000_000)
+		if !ok {
+			t.Fatalf("claim %d: could not solve the devnet puzzle", i)
+		}
+		tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(claimantPub), PubKey: claimantPub,
+			Nonce: 0, Epoch: 1, PowNonce: pow}
+		sigHash := tx.SigningHash()
+		tx.Sig = crypto.Sign(key, sigHash[:])
+		txs = append(txs, *tx)
+	}
+
+	// Fixture guard: the faucet (genesis mint plus block 1's emission, credited
+	// by the transition) must be able to pay every claim individually. Without
+	// it, a deleted wiring line could fail below on ErrFaucetEmpty instead of
+	// demonstrating acceptance, and the mutant proof would rest on the wrong
+	// error.
+	faucetAddress := g.FaucetAddress()
+	if got := c.State().Get(faucetAddress).Balance; got < (bound+1)*g.Params.ClaimAmountSparks {
+		t.Fatalf("fixture error: faucet holds %d, needs to cover %d claims of %d each",
+			got, bound+1, g.Params.ClaimAmountSparks)
+	}
+
+	// The honest proposer's path: Build runs the same transition Append runs
+	// (advanceLocked -> state.ApplyBlock) and must stop the over-bound block
+	// before it exists. Build returns no block on rejection, so the rejection
+	// here leaves nothing to Append - the hostile path below covers Append.
+	b, err := c.Build(valPriv, txs, 1_700_000_100)
+	switch {
+	case errors.Is(err, state.ErrTooManyClaims):
+		// The bound fired: this is the whole test.
+	case err == nil:
+		// Concrete acceptance, so an unwired bound fails THIS test with a
+		// message naming the inertness rather than a bare "no error".
+		if err := c.Append(b); err != nil {
+			t.Fatalf("the over-bound block built, but could not append: %v", err)
+		}
+		t.Fatalf("a block carrying %d claims against a genesis bound of %d was ACCEPTED through Build+Append (chain now at height %d) - the claim bound is not wired into the chain (genesisState's MaxClaimsPerBlock line)",
+			len(txs), bound, c.Height())
+	default:
+		t.Fatalf("expected state.ErrTooManyClaims for %d claims against a genesis bound of %d, got %v",
+			len(txs), bound, err)
+	}
+
+	// The validator's path: a hostile proposer can still hand every validator a
+	// structurally valid, correctly signed block over the SAME over-bound
+	// claims, claiming whatever root it likes. Append must reject it at the
+	// count check - which state.ApplyBlock runs BEFORE any transaction is even
+	// verified, so the fabricated root below is never reached - and not accept
+	// the block or fail on anything else.
+	hostile := &types.Block{
+		Header: types.Header{
+			Height:     c.Height() + 1,
+			ParentHash: c.Head().ID(),
+			StateRoot:  [32]byte{}, // fabricated; the count check must fire first
+			TxRoot:     types.ComputeTxRoot(txs),
+			Timestamp:  1_700_000_101,
+			Proposer:   valPub,
+		},
+		Txs: txs,
+	}
+	headerHash := hostile.Header.SigningHash()
+	hostile.Sig = crypto.Sign(valPriv, headerHash[:])
+	if err := c.Append(hostile); !errors.Is(err, state.ErrTooManyClaims) {
+		t.Fatalf("Append must reject an over-bound block at the count check, got %v", err)
+	}
+}
+
+// Only CLAIMS count against the per-block bound. A mutant that counts every
+// transaction as a claim survives the suite: it would reject any block
+// carrying more than the bound transfers. This pins the count to
+// types.TxFaucetClaim specifically through the chain path - more ordinary
+// transfers than the genesis bound, zero claims, and the block must be
+// accepted.
+func TestTransfersDoNotCountAgainstTheClaimBound(t *testing.T) {
+	c, priv := devChain(t)
+	g := c.Genesis()
+	bound := g.Params.MaxClaimsPerBlock
+	// More ordinary transfers than the bound: only the tx TYPE can still let
+	// this block through.
+	n := int(bound) + 4
+
+	fromPub := g.DevAccounts[0].PubKey
+	from := types.AddressFromPub(fromPub)
+	to := types.AddressFromPub(g.DevAccounts[1].PubKey)
+	devPriv := devPrivateKey(t)
+
+	txs := make([]types.Tx, 0, n)
+	for i := 0; i < n; i++ {
+		tx := &types.Tx{
+			Type:   types.TxTransfer,
+			From:   from,
+			PubKey: fromPub,
+			Nonce:  uint64(i),
+			To:     to,
+			Amount: 1,
+		}
+		sigHash := tx.SigningHash()
+		tx.Sig = crypto.Sign(devPriv, sigHash[:])
+		txs = append(txs, *tx)
+	}
+
+	// Fixture guard: this block must exceed the bound, or the test stops
+	// distinguishing "only claims count" from "transactions count".
+	if len(txs) <= int(bound) {
+		t.Fatalf("fixture error: %d transfers do not exceed the genesis bound of %d", len(txs), bound)
+	}
+
+	b, err := c.Build(priv, txs, 1_700_000_100)
+	if err != nil {
+		t.Fatalf("a block of %d transfers with zero claims must build under a genesis bound of %d: %v",
+			len(txs), bound, err)
+	}
+	if err := c.Append(b); err != nil {
+		t.Fatalf("a block of %d transfers with zero claims must append under a genesis bound of %d: %v",
+			len(txs), bound, err)
+	}
+	if c.Height() != 1 {
+		t.Fatalf("height after the transfers-only block = %d, want 1", c.Height())
 	}
 }
