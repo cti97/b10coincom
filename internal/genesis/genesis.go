@@ -50,12 +50,21 @@ type Params struct {
 	InitialRewardSparks   uint64
 	HalvingIntervalBlocks uint64
 	ClaimAmountSparks     uint64
-	MinStakeSparks        uint64
-	EpochBlocks           uint64
-	UnbondingEpochs       uint64
-	CommitteeSize         int
-	FaucetPowArgon2       faucet.Argon2Params
-	FaucetPowTarget       [32]byte
+	// MaxClaimsPerBlock bounds how many faucet claims one block may carry.
+	// It is a consensus parameter and is committed in the genesis encoding:
+	// two nodes that agreed on every other parameter but held different
+	// bounds here would accept and reject the same blocks, so it must travel
+	// with everything else that is hashed. state.ApplyBlock enforces it
+	// before verifying any puzzle; internal/mempool's local per-block claim
+	// courtesy is pinned equal to the shipped chains' value by a test in
+	// this package. Validate refuses a genesis that leaves it zero.
+	MaxClaimsPerBlock uint64
+	MinStakeSparks    uint64
+	EpochBlocks       uint64
+	UnbondingEpochs   uint64
+	CommitteeSize     int
+	FaucetPowArgon2   faucet.Argon2Params
+	FaucetPowTarget   [32]byte
 }
 
 // Validator is a genesis validator with its initial voting power.
@@ -103,6 +112,7 @@ func (g *Genesis) Encode() []byte {
 	e.U64(g.Params.InitialRewardSparks)
 	e.U64(g.Params.HalvingIntervalBlocks)
 	e.U64(g.Params.ClaimAmountSparks)
+	e.U64(g.Params.MaxClaimsPerBlock)
 	e.U64(g.Params.MinStakeSparks)
 	e.U64(g.Params.EpochBlocks)
 	e.U64(g.Params.UnbondingEpochs)
@@ -197,6 +207,16 @@ func (g *Genesis) Validate() error {
 	if p.EpochBlocks == 0 {
 		return fmt.Errorf("%w: EpochBlocks must not be zero (the claim rule divides by it)", ErrBadGenesis)
 	}
+	// A genesis that leaves the per-block claim bound at zero cannot be
+	// validated: any chain paying faucet claims needs the bound, because a
+	// block is attacker-chosen input and verifying one claim costs a full
+	// Argon2id evaluation (see ApplyBlock in internal/state). state.Params
+	// treats a zero bound as "not engaged" for legacy unparameterized
+	// states, so without this rule a zero-valued genesis could silently ship
+	// the per-block amplification this parameter exists to close.
+	if p.MaxClaimsPerBlock == 0 {
+		return fmt.Errorf("%w: MaxClaimsPerBlock must be at least 1 (an unbounded claim count per block is the amplification the state machine rejects)", ErrBadGenesis)
+	}
 	return nil
 }
 
@@ -258,6 +278,9 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 	if g.Params.ClaimAmountSparks, err = d.U64(); err != nil {
 		return nil, err
 	}
+	if g.Params.MaxClaimsPerBlock, err = d.U64(); err != nil {
+		return nil, err
+	}
 	if g.Params.MinStakeSparks, err = d.U64(); err != nil {
 		return nil, err
 	}
@@ -312,10 +335,19 @@ func sharedParams(chainID string, epochBlocks, claimAmountSparks uint64, committ
 		InitialRewardSparks:   50_000_000, // 0.5 b10
 		HalvingIntervalBlocks: 21_000_000,
 		ClaimAmountSparks:     claimAmountSparks,
-		MinStakeSparks:        1_000 * SparksPerB10,
-		EpochBlocks:           epochBlocks,
-		UnbondingEpochs:       2,
-		CommitteeSize:         committee,
+		// The per-block claim bound, shared by both chains. Verifying one
+		// claim costs one Argon2id evaluation, so the worst-case block costs
+		// MaxClaimsPerBlock × per-eval time and must fit inside a small
+		// multiple of the 2_000 ms block interval — the derivation is in
+		// Testnet's tuning comment, where the per-eval cost that constrains
+		// this bound is set. internal/mempool's MaxFaucetClaimsPerBlock is
+		// pinned equal to this value by a test in this package, so the pool
+		// can never hand a block producer more claims than the chain accepts.
+		MaxClaimsPerBlock: 8,
+		MinStakeSparks:    1_000 * SparksPerB10,
+		EpochBlocks:       epochBlocks,
+		UnbondingEpochs:   2,
+		CommitteeSize:     committee,
 	}
 }
 
@@ -347,16 +379,43 @@ func Devnet() *Genesis {
 // deliberately no funded accounts.
 func Testnet() *Genesis {
 	params := sharedParams("b10coin-testnet-1", 10_000, 100*SparksPerB10, 21)
-	// The spec's ≈3 s Argon2id tuning for a Raspberry Pi 4: 64 MiB of memory
-	// and three passes, as §8 of the design spec records. A target of 0x0F
-	// followed by 31 0xFF bytes is a PLACEHOLDER: it demands roughly sixteen
-	// qualifying runs per claim, so a testnet claim costs minutes at this
-	// tuning.
+	// The puzzle tuning was re-derived in M3's claim-bound task TOGETHER with
+	// MaxClaimsPerBlock (8, in sharedParams). The spec's original pairing —
+	// 64 MiB × 3 passes at the 0x0F target — was chosen for the CLAIMER, who
+	// pays one puzzle once; validators pay PER CLAIM PER BLOCK, and the two
+	// budgets cannot both be met at 64 MiB × 3, as the arithmetic below shows.
 	//
-	// This target MUST be re-tuned against real hardware (measured end-to-end
-	// on a Pi 4, including the solver's attempt policy) before any public
-	// testnet opens.
-	params.FaucetPowArgon2 = faucet.Argon2Params{MemoryKiB: 65536, Iterations: 3, Parallelism: 1}
+	// Budgets. A block may carry MaxClaimsPerBlock = 8 claims and blocks are
+	// spaced BlockTimeMS = 2_000 ms apart, so the worst-case block must
+	// verify well inside 2 × 2 s, giving per-eval <= 4 s / 8 = 0.5 s. The
+	// claimer budget is tighter: the 0x0F target accepts one digest in 2^4 =
+	// 16, so a solve takes ~16 evaluations, and the spec gives the claimer
+	// ~3 s, giving per-eval <= 3 s / 16 = 0.1875 s.
+	//
+	// Cost basis. The spec records ~3 s per Argon2id evaluation for 64 MiB ×
+	// 3 passes = 192 MiB·passes on its Raspberry Pi 4 reference, i.e. ~15.6
+	// ms per MiB·pass. 8 MiB × 1 pass therefore lands at ~0.125 s per eval,
+	// inside BOTH budgets.
+	//
+	// Check, on the same reference: a claimer solves in 16 × 0.125 s = 2.0 s
+	// (within the ~3 s budget), and the worst-case block verifies in 8 ×
+	// 0.125 s = 1.0 s — half the block interval. At the old 64 MiB × 3
+	// tuning the same arithmetic gives 16 × 3 s = 48 s to solve one claim
+	// and a validator budget of 4 s / 3 s, a bound of 1 — the amplification
+	// a per-block bound exists to prevent was priced in by the tuning itself.
+	//
+	// Trade-off, stated rather than hidden: 8 MiB is a far smaller memory
+	// cost than 64 MiB, so the puzzle buys less against GPU-heavy attackers.
+	// The faucet's purpose — a rate limit on how fast one key drains the
+	// faucet, with the one-claim-per-key-per-epoch rule behind it — does not
+	// need mining resistance; the bounded block cost and the bounded per-key
+	// payout are what it must guarantee.
+	//
+	// Everything here is derived from the spec's ONE hardware measurement.
+	// The tuning, the target and the bound MUST all be re-measured and
+	// re-derived together against real Pi 4 hardware (end to end, including
+	// the solver's attempt policy) before any public testnet opens.
+	params.FaucetPowArgon2 = faucet.Argon2Params{MemoryKiB: 8192, Iterations: 1, Parallelism: 1}
 	params.FaucetPowTarget = puzzleTarget(0x0F)
 	return &Genesis{
 		ChainID:     "b10coin-testnet-1",

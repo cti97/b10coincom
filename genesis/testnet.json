@@ -9,13 +9,14 @@
     "initial_reward_sparks": 50000000,
     "halving_interval_blocks": 21000000,
     "claim_amount_sparks": 10000000000,
+    "max_claims_per_block": 8,
     "min_stake_sparks": 100000000000,
     "epoch_blocks": 10000,
     "unbonding_epochs": 2,
     "committee_size": 21,
     "faucet_pow_argon2": {
-      "memory_kib": 65536,
-      "iterations": 3,
+      "memory_kib": 8192,
+      "iterations": 1,
       "parallelism": 1
     },
     "faucet_pow_target": "0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"

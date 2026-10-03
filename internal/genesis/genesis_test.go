@@ -11,6 +11,7 @@ import (
 
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/faucet"
+	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -224,6 +225,14 @@ func TestGenesisRoundTripThroughEncoding(t *testing.T) {
 			got.Params.FaucetPowArgon2, got.Params.FaucetPowTarget,
 			g.Params.FaucetPowArgon2, g.Params.FaucetPowTarget)
 	}
+	// MaxClaimsPerBlock is consensus - it decides which blocks are valid - so
+	// a decode that drops it would leave every node silently unbounded while
+	// agreeing on the genesis hash... unless it is encoded like any other
+	// param, which this assertion pins.
+	if got.Params.MaxClaimsPerBlock != g.Params.MaxClaimsPerBlock {
+		t.Fatalf("genesis round trip lost MaxClaimsPerBlock: got %d, want %d",
+			got.Params.MaxClaimsPerBlock, g.Params.MaxClaimsPerBlock)
+	}
 }
 
 func TestGenesisUsesBlake3Domain(t *testing.T) {
@@ -262,6 +271,7 @@ type genesisRecord struct {
 		InitialRewardSparks   uint64 `json:"initial_reward_sparks"`
 		HalvingIntervalBlocks uint64 `json:"halving_interval_blocks"`
 		ClaimAmountSparks     uint64 `json:"claim_amount_sparks"`
+		MaxClaimsPerBlock     uint64 `json:"max_claims_per_block"`
 		MinStakeSparks        uint64 `json:"min_stake_sparks"`
 		EpochBlocks           uint64 `json:"epoch_blocks"`
 		UnbondingEpochs       uint64 `json:"unbonding_epochs"`
@@ -359,6 +369,7 @@ func TestGenesisJSONRecordsMatchTheGoConstructors(t *testing.T) {
 			{"initial_reward_sparks", q.InitialRewardSparks, p.InitialRewardSparks},
 			{"halving_interval_blocks", q.HalvingIntervalBlocks, p.HalvingIntervalBlocks},
 			{"claim_amount_sparks", q.ClaimAmountSparks, p.ClaimAmountSparks},
+			{"max_claims_per_block", q.MaxClaimsPerBlock, p.MaxClaimsPerBlock},
 			{"min_stake_sparks", q.MinStakeSparks, p.MinStakeSparks},
 			{"epoch_blocks", q.EpochBlocks, p.EpochBlocks},
 			{"unbonding_epochs", q.UnbondingEpochs, p.UnbondingEpochs},
@@ -417,7 +428,8 @@ func requiredParamsMissing(params map[string]json.RawMessage) []string {
 	var missing []string
 	for _, key := range []string{
 		"block_time_ms", "total_supply_sparks", "initial_reward_sparks",
-		"halving_interval_blocks", "claim_amount_sparks", "min_stake_sparks",
+		"halving_interval_blocks", "claim_amount_sparks", "max_claims_per_block",
+		"min_stake_sparks",
 		"epoch_blocks", "unbonding_epochs", "committee_size",
 		"faucet_pow_argon2", "faucet_pow_target",
 	} {
@@ -446,7 +458,7 @@ func TestParamsKeyPresenceListDetectsAMissingKey(t *testing.T) {
 	if err := json.Unmarshal(top["params"], &params); err != nil {
 		t.Fatalf("params: %v", err)
 	}
-	for _, key := range []string{"epoch_blocks", "faucet_pow_argon2", "faucet_pow_target"} {
+	for _, key := range []string{"epoch_blocks", "faucet_pow_argon2", "faucet_pow_target", "max_claims_per_block"} {
 		if _, ok := params[key]; !ok {
 			t.Fatalf("fixture error: devnet.json has no %q under params", key)
 		}
@@ -513,12 +525,14 @@ func TestValidateRejectsAZeroEpochBlocks(t *testing.T) {
 	}
 }
 
-// The two chain tunings are protocol values pinned verbatim from the task
-// brief: a devnet puzzle a laptop solves in a blink, a testnet puzzle at the
-// spec's ~3 s Argon2id tuning with the placeholder target the constructors
-// record. Any change to either must be a deliberate re-pinning, and the
-// testnet target must stay strictly below the devnet target (the brief's
-// "much smaller") or the difficulty ordering silently inverts.
+// The two chain tunings are protocol values pinned verbatim. The devnet's is
+// the trivial fixture tuning it has always had; the testnet's was RE-DERIVED
+// in M3's claim-bound task together with MaxClaimsPerBlock, with the
+// arithmetic recorded in Testnet's comment (the spec's 64 MiB × 3 pairing
+// priced every validator out of its own block interval). Any change to either
+// must be a deliberate re-pinning, and the testnet target must stay strictly
+// below the devnet target (the brief's "much smaller") or the difficulty
+// ordering silently inverts.
 func TestArgon2TuningsArePinnedPerChain(t *testing.T) {
 	devnet, testnet := Devnet(), Testnet()
 
@@ -529,13 +543,46 @@ func TestArgon2TuningsArePinnedPerChain(t *testing.T) {
 		t.Fatalf("devnet pow target = %x, want 0x7F followed by 31 0xFF bytes", devnet.Params.FaucetPowTarget)
 	}
 
-	if testnet.Params.FaucetPowArgon2 != (faucet.Argon2Params{MemoryKiB: 65536, Iterations: 3, Parallelism: 1}) {
-		t.Fatalf("testnet Argon2 tuning = %+v, want {MemoryKiB:65536, Iterations:3, Parallelism:1}", testnet.Params.FaucetPowArgon2)
+	if testnet.Params.FaucetPowArgon2 != (faucet.Argon2Params{MemoryKiB: 8192, Iterations: 1, Parallelism: 1}) {
+		t.Fatalf("testnet Argon2 tuning = %+v, want the re-derived {MemoryKiB:8192, Iterations:1, Parallelism:1} (8 MiB × 1 pass; Testnet's comment carries the arithmetic)", testnet.Params.FaucetPowArgon2)
 	}
 	if testnet.Params.FaucetPowTarget != independentTarget(0x0F) {
 		t.Fatalf("testnet pow target = %x, want 0x0F followed by 31 0xFF bytes", testnet.Params.FaucetPowTarget)
 	}
 	if bytes.Compare(testnet.Params.FaucetPowTarget[:], devnet.Params.FaucetPowTarget[:]) >= 0 {
 		t.Fatal("the testnet target must be strictly smaller than the devnet target")
+	}
+}
+
+// MaxClaimsPerBlock is a consensus parameter: state.ApplyBlock invalidates
+// any block carrying more claims than it. This test pins the shipped value
+// and its one supporting invariant. The bound must EQUAL internal/mempool's
+// MaxFaucetClaimsPerBlock for both chains: the mempool is the LOCAL half of
+// the same defence — it stops a node building a block the chain would reject,
+// and nothing more — so if the two ever disagree, either the pool offers
+// blocks the chain invalidates wholesale, or the chain is stricter than its
+// own pool with nobody noticing. The pin is load-bearing in both directions:
+// changing either value fails here.
+func TestMaxClaimsPerBlockIsPinnedAndMatchesTheMempoolBound(t *testing.T) {
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		if g.Params.MaxClaimsPerBlock != 8 {
+			t.Fatalf("%s: MaxClaimsPerBlock = %d, want the derived 8 (see Testnet's tuning comment)",
+				g.Params.ChainID, g.Params.MaxClaimsPerBlock)
+		}
+		if g.Params.MaxClaimsPerBlock != mempool.MaxFaucetClaimsPerBlock {
+			t.Fatalf("%s: MaxClaimsPerBlock = %d but the mempool bound is %d - the consensus rule and the local pool courtesy must be derived from the same number",
+				g.Params.ChainID, g.Params.MaxClaimsPerBlock, mempool.MaxFaucetClaimsPerBlock)
+		}
+	}
+}
+
+// The bound is consensus: a genesis that leaves it at zero would let every
+// node run unbounded — exactly the per-proposer amplification the parameter
+// exists to close — so Validate refuses it.
+func TestValidateRejectsAZeroMaxClaimsPerBlock(t *testing.T) {
+	g := Testnet()
+	g.Params.MaxClaimsPerBlock = 0
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis for MaxClaimsPerBlock == 0, got %v", err)
 	}
 }

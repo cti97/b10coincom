@@ -746,3 +746,134 @@ func TestClaimBalanceOverflowRejectsBeforeTheDebit(t *testing.T) {
 		t.Fatal("an overflowed claim changed the state")
 	}
 }
+
+// A block is attacker-chosen input. Because validating one faucet claim costs a full
+// Argon2id evaluation, a block carrying an unbounded number of them lets one proposer
+// force every validator to spend hours on a single block. A block over the bound must
+// therefore be INVALID, not merely slow.
+//
+// The tests below set the bound explicitly rather than inheriting any package
+// default, so the expectation is independent of the shipped genesis constants.
+const testClaimBound = 8
+
+// signedClaim builds a claim from a fresh key whose signature is valid but
+// whose puzzle is garbage (PowNonce 0). Its only use is proving that
+// ApplyBlock rejects on the COUNT before evaluating anything - the puzzle is
+// never reached.
+func signedClaim(t *testing.T, epoch, nonce uint64) *types.Tx {
+	t.Helper()
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &types.Tx{
+		Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: nonce, Epoch: epoch, PowNonce: 0,
+	}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+	return tx
+}
+
+// One block carrying testClaimBound+1 GENUINELY SOLVED, validly signed claims:
+// every puzzle below the bound would verify, so only the count rule can reject
+// the block. Remove the count check and this block is accepted wholesale -
+// which is the amplification attack: bound claims cost bound Argon2id
+// evaluations on every validator, per block.
+func TestApplyBlockRejectsABlockWithTooManyClaims(t *testing.T) {
+	p := testParams(t)
+	p.MaxClaimsPerBlock = testClaimBound
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: 100 * testClaimBound})
+
+	txs := make([]types.Tx, 0, testClaimBound+1)
+	for i := 0; i <= testClaimBound; i++ {
+		txs = append(txs, *solvedClaim(t, p, 1, 0))
+	}
+	before := s.Root()
+	if _, err := s.ApplyBlock(txs); !errors.Is(err, ErrTooManyClaims) {
+		t.Fatalf("expected ErrTooManyClaims for %d claims against a bound of %d, got %v",
+			testClaimBound+1, testClaimBound, err)
+	}
+	if s.Root() != before {
+		t.Fatal("a block rejected for too many claims changed the state")
+	}
+}
+
+// The bound is checked BEFORE the first puzzle is evaluated, or it bounds
+// nothing: the attacker still extracts the work and only the verdict changes.
+// This test pins the PLACEMENT, not just the verdict, by making evaluation
+// itself observable: the puzzle parameters are deliberately zeroed, so the
+// first line of applyFaucetClaim rejects ANY evaluated claim with
+// ErrBadProofOfWork - without running Argon2id. Every transaction in the
+// block is therefore a tripwire. Correctly placed, the count check fires
+// first and the error is ErrTooManyClaims; a check moved after the
+// transaction loop, or inside applyFaucetClaim below its guard, evaluates
+// tx 0 first and returns ErrBadProofOfWork - and this test fails.
+func TestApplyBlockCountsClaimsBeforeEvaluatingAnyTransaction(t *testing.T) {
+	p := testParams(t)
+	p.MaxClaimsPerBlock = testClaimBound
+	p.PowArgon2 = faucet.Argon2Params{} // any evaluated claim would trip the zero-param guard
+	p.EpochBlocks = 0
+	s := NewWithParams(p)
+
+	txs := make([]types.Tx, 0, testClaimBound+1)
+	for i := 0; i <= testClaimBound; i++ {
+		txs = append(txs, *signedClaim(t, 1, 0))
+	}
+	if _, err := s.ApplyBlock(txs); !errors.Is(err, ErrTooManyClaims) {
+		t.Fatalf("expected ErrTooManyClaims before any claim was evaluated, got %v", err)
+	}
+}
+
+// A block carrying EXACTLY the bound is valid: the bound is inclusive, so the
+// off-by-one is pinned in both directions - a check that rejects at the bound
+// fails this test (TestApplyBlockAcceptsABlockAtTheClaimBound), and a check
+// that accepts one past the bound fails
+// TestApplyBlockRejectsABlockWithTooManyClaims. Every claim here is genuinely
+// solved and from its own fresh key, so acceptance proves the whole block
+// really applied rather than failing for some unrelated rule.
+func TestApplyBlockAcceptsABlockAtTheClaimBound(t *testing.T) {
+	p := testParams(t)
+	p.MaxClaimsPerBlock = testClaimBound
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: testClaimBound * p.ClaimAmount})
+
+	txs := make([]types.Tx, 0, testClaimBound)
+	for i := 0; i < testClaimBound; i++ {
+		txs = append(txs, *solvedClaim(t, p, 1, 0))
+	}
+	next, err := s.ApplyBlock(txs)
+	if err != nil {
+		t.Fatalf("a block at the claim bound must be accepted: %v", err)
+	}
+	if got := next.Get(p.FaucetAddress).Balance; got != 0 {
+		t.Fatalf("faucet balance = %d, want 0 - the bound claims were not all paid", got)
+	}
+	for _, tx := range txs {
+		if got := next.Get(tx.From).Balance; got != p.ClaimAmount {
+			t.Fatalf("claimant %x balance = %d, want %d", tx.From, got, p.ClaimAmount)
+		}
+	}
+}
+
+// A block UNDER the bound with no claims at all is unaffected by the rule:
+// the default zero bound means "not engaged" for states constructed without
+// parameters, so this pins that the count check never fires on claim-free
+// blocks (and never divides the bound space into anything surprising).
+func TestApplyBlockAcceptsAClaimFreeBlockWithTheBoundUnset(t *testing.T) {
+	p := testParams(t) // MaxClaimsPerBlock deliberately left 0: bound not engaged
+	s := NewWithParams(p)
+
+	from, pub, priv := keypair(t)
+	to, _, _ := keypair(t)
+	s.Set(from, Account{Balance: 100})
+	txs := []types.Tx{*transfer(t, pub, priv, from, 0, 40, to)}
+	next, err := s.ApplyBlock(txs)
+	if err != nil {
+		t.Fatalf("a claim-free block must be accepted with the bound unset: %v", err)
+	}
+	if next.Get(to).Balance != 40 {
+		t.Fatalf("recipient balance = %d, want 40", next.Get(to).Balance)
+	}
+}

@@ -62,6 +62,16 @@ type Params struct {
 	EpochBlocks   uint64
 	PowArgon2     faucet.Argon2Params
 	PowTarget     [32]byte
+
+	// MaxClaimsPerBlock is the consensus bound on how many faucet claims one
+	// block may carry; ApplyBlock enforces it before evaluating any
+	// transaction. It comes from genesis.Params.MaxClaimsPerBlock via the
+	// chain. The zero value means "not engaged" - legacy New() states and
+	// test fixtures that never set it behave exactly as before - and
+	// genesis.Validate refuses to validate a genesis that leaves it at zero,
+	// so a state parameterised by a chain that pays claims is always
+	// bounded.
+	MaxClaimsPerBlock uint64
 }
 
 // New returns a state with zero-valued params: the M0-M1 behaviour. Claims are

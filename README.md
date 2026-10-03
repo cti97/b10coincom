@@ -180,7 +180,21 @@ The parameters are per-chain genesis parameters, recorded in
 | | Argon2id tuning | Difficulty target |
 |---|---|---|
 | devnet (fixture) | 64 KiB × 1 iteration × 1 lane | `0x7f` followed by 31 `0xff` bytes — a handful of attempts, so tests and CI stay fast |
-| testnet (spec) | 64 MiB × 3 iterations × 1 lane | `0x0f` followed by 31 `0xff` bytes — the spec's ≈3 s on a Pi 4; asserted from the spec, not measured on hardware, and to be re-tuned before any public testnet opens |
+| testnet (re-derived) | 8 MiB × 1 iteration × 1 lane | `0x0f` followed by 31 `0xff` bytes — ~16 expected attempts per solve |
+
+The testnet tuning is **derived, not asserted**: the spec's original 64 MiB × 3
+pairing was sized for the *claimer*, but validators pay *per claim per block*,
+and a block may carry `max_claims_per_block` claims (below), so the worst-case
+block costs `8 × per-eval` time. On the spec's Raspberry Pi 4 reference
+(≈3 s for 64 MiB × 3 ≈ 15.6 ms per MiB·pass), 8 MiB × 1 lands at ≈0.125 s per
+eval: a claimer solves in ≈2.0 s and the worst-case block verifies in ≈1.0 s —
+half the 2,000 ms block interval. The trade-off is stated rather than hidden:
+8 MiB buys less GPU asymmetry than the spec's 64 MiB would have, but the
+puzzle's job here is a per-key rate limit (with the per-epoch marker and the
+per-block bound behind it), not mining resistance. The full arithmetic is
+recorded in the
+`Testnet` constructor's comment, and the tuning, target and bound must be
+re-measured together on real hardware before any public testnet opens.
 
 ### The emission schedule
 
@@ -215,6 +229,32 @@ spec's **100 b10** (see [Genesis configurations](#genesis-configurations)).
 The honest trade-off stands: a determined attacker with many keys is
 rate-limited by the puzzle, not prevented — that is what the spec accepted
 when it chose a faucet over a premine.
+
+### The per-block claim bound
+
+**A block may carry at most `max_claims_per_block` faucet claims (8 on both
+shipped chains). Carrying more makes the block invalid — not merely slow.**
+This is a consensus rule, enforced by `state.ApplyBlock` **before any puzzle
+is verified**, because of two facts it cannot escape:
+
+- **Validating a claim is expensive per claim.** Every claim in a block costs
+  every validator one full Argon2id evaluation — the puzzle's worst case is
+  what a validator pays for every block it checks.
+- **A block is attacker-chosen input.** `types.MaxTxsPerBlock` allows 10,000
+  transactions in a block, so without a bound one malicious proposer could
+  pack a block with claims and force every validator to evaluate ~10,000
+  puzzles for it — hours of work to validate one block, on every validator,
+  repeatedly, with consensus itself held hostage.
+
+The bound and the testnet puzzle tuning are derived together so the
+worst-case block fits inside a small multiple of the 2,000 ms block interval
+(see the table above and the `Testnet` constructor's comment). One scope
+note so the two layers are never confused: the mempool's own
+`MaxFaucetClaimsPerBlock` — equal to the genesis bound by a pinning test —
+protects **the local node only**. It stops this node's pool from assembling
+a block the chain would have to reject; it does not protect the chain,
+because the pool is local policy. The genesis parameter is what makes the
+count a rule every validator enforces, identically.
 
 ## Consensus
 
@@ -363,13 +403,17 @@ value including the faucet puzzle parameters and difficulty target), so either
 copy drifting from the other fails the suite. Both chains share the same
 monetary protocol constants: 2,000 ms block time, 21,000,000 b10 supply cap,
 50,000,000 sparks (0.5 b10) initial reward, 21,000,000-block halving interval,
-1,000 b10 minimum stake, and 2 unbonding epochs. The chains differ in these
+1,000 b10 minimum stake, and 2 unbonding epochs. They also share the
+**per-block faucet-claim bound of 8 claims** (`max_claims_per_block`), the
+consensus rule from [the per-block claim bound](#the-per-block-claim-bound).
+The chains differ in these
 parameters: epoch length is **1,000-block epochs on devnet, 10,000-block
 epochs on testnet**, per the design's §6.3; the faucet claim amount is
 deliberately **1 b10 on devnet** (a fixture claim a short devnet run can fund)
 and **the spec's 100 b10 on testnet**; and the faucet puzzle is tuned per
-chain (fast on devnet, the spec's ≈3 s on testnet). The other differences are
-in the table below.
+chain (trivial on devnet, the re-derived 8 MiB × 1 on testnet — its
+derivation is recorded in the `Testnet` constructor's comment). The other
+differences are in the table below.
 
 | | `genesis/devnet.json` | `genesis/testnet.json` |
 |---|---|---|
@@ -378,7 +422,8 @@ in the table below.
 | Dev accounts | 1 funded account plus 1 zero-balance recipient, for transfers before the M2 faucet exists | **none** |
 | Committee size | 1 | 21 |
 | Faucet claim amount | 1 b10 (100,000,000 sparks) | 100 b10 (10,000,000,000 sparks) |
-| Faucet puzzle | Argon2id 64 KiB × 1 iteration × 1 lane, target `0x7f` + 31 × `0xff` | Argon2id 64 MiB × 3 iterations × 1 lane, target `0x0f` + 31 × `0xff` |
+| Max claims per block | 8 | 8 |
+| Faucet puzzle | Argon2id 64 KiB × 1 iteration × 1 lane, target `0x7f` + 31 × `0xff` | Argon2id 8 MiB × 1 iteration × 1 lane, target `0x0f` + 31 × `0xff` (re-derived with the claim bound; arithmetic in `Testnet`) |
 
 The devnet fixture exists to exercise transfers and the CLI; the testnet
 configuration is where the no-premine promise lives:
@@ -417,11 +462,14 @@ Implemented — modules M0, M1, M2 and M3:
   durable persistence and replay, HTTP RPC, and the devnet acceptance check.
 - **M2** — faucet: claimable coins from the keyless protocol faucet, paid
   from the capped emission schedule and rate-limited by the Argon2id puzzle
-  (one claim per key per epoch; consensus is unaffected).
+  (one claim per key per epoch). At M2 the consensus path was untouched; M3
+  closed the last gap by making the per-block claim count a consensus rule.
 - **M3** — Tendermint-style BFT consensus: the four-phase round,
   two-thirds-of-total-power quorum, weighted proposer selection and precommit
   locking unlockable only on evidence, over a deterministic in-process
-  simulated network; verified by the six seeded failure scenarios in
+  simulated network; a block over `max_claims_per_block` faucet claims is
+  invalid before any puzzle is verified (the per-block claim bound, derived
+  together with the testnet tuning); verified by the six seeded failure scenarios in
   `internal/simnet` — safety under partition, outage and equivocation,
   liveness at and above the two-thirds bar — and by the four-validator
   `devnet --validators 4 --blocks 100` acceptance command.

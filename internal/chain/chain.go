@@ -64,6 +64,11 @@ func genesisState(g *genesis.Genesis) *state.State {
 		EpochBlocks:   g.Params.EpochBlocks,
 		PowArgon2:     g.Params.FaucetPowArgon2,
 		PowTarget:     g.Params.FaucetPowTarget,
+		// The per-block claim bound is consensus state-machine behaviour
+		// parameterised by genesis, exactly like the epoch length: without
+		// wiring it here the bound would exist only in states that tests
+		// construct by hand, and no real chain would enforce it.
+		MaxClaimsPerBlock: g.Params.MaxClaimsPerBlock,
 	})
 	for _, d := range g.DevAccounts {
 		addr := types.AddressFromPub(d.PubKey)
