@@ -394,6 +394,61 @@ func (n *Net) AssertSameChain() error {
 	return nil
 }
 
+// AssertPrefix reports whether validator i's history is an exact prefix of the
+// longest chain in the network: for every height i has committed, i's block must
+// be the identical block the longest chain holds at that height, and i's head may
+// not stand above the longest chain's head (a validator taller than everyone else
+// holds blocks nobody else committed, which is a fork by definition).
+//
+// This is the honest safety assertion for a LAGGING validator under the M3
+// milestone limits: with no block catch-up, a validator isolated behind the
+// quorum cannot adopt the blocks it missed, so the strongest claim a scenario can
+// make about it is "behind, never forked". Requiring it to reconverge would
+// assert a mechanism M3 does not have.
+//
+// It lives in the non-test half of the package (moved out of the scenarios at
+// review): the plan's interface list ships AssertPrefix, and a helper defined
+// only in a _test file does not exist for any non-test caller - Task 10's
+// devnet included.
+func (n *Net) AssertPrefix(i int) error {
+	if i < 0 || i >= len(n.ch) {
+		return fmt.Errorf("simnet: AssertPrefix: validator index %d out of range 0..%d", i, len(n.ch)-1)
+	}
+	// The longest chain is the reference: the majority's chain, which the
+	// scenarios keep advancing while i sits behind.
+	refHeight := uint64(0)
+	var ref *chain.Chain
+	for _, c := range n.ch {
+		if c.Height() > refHeight {
+			refHeight, ref = c.Height(), c
+		}
+	}
+	if ref == nil {
+		return fmt.Errorf("simnet: AssertPrefix: no validator chain to compare against")
+	}
+	c := n.ch[i]
+	if c.Height() > refHeight {
+		return fmt.Errorf("simnet: validator %d stands at height %d, above the longest chain at %d: it committed blocks the network never agreed on",
+			i, c.Height(), refHeight)
+	}
+	for h := uint64(0); h <= c.Height(); h++ {
+		bi, err := c.BlockAt(h)
+		if err != nil {
+			return fmt.Errorf("simnet: reading validator %d at height %d: %w", i, h, err)
+		}
+		br, err := ref.BlockAt(h)
+		if err != nil {
+			return fmt.Errorf("simnet: reading the longest chain at height %d: %w", h, err)
+		}
+		if bi.ID() != br.ID() {
+			id1, id2 := bi.ID(), br.ID()
+			return fmt.Errorf("simnet: validator %d DIVERGED at height %d: %x vs the longest chain's %x - a fork, not a lag",
+				i, h, id1[:8], id2[:8])
+		}
+	}
+	return nil
+}
+
 // Partition cuts the network between two groups of validator indices. Messages
 // within a group still flow; messages across the cut are dropped.
 func (n *Net) Partition(a, b []int) {

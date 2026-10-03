@@ -18,9 +18,10 @@ package simnet
 //     height forever: there is no recovery path in M3. Every scenario below runs
 //     drop-free with latency only, so a stall means consensus, not a lost packet.
 //
-// AssertPrefix is defined in this file because the plan's interface list places
-// it in the simnet package but the Task 8 harness landed without it; defining it
-// here keeps the change inside this file, the only file this task owns.
+// AssertPrefix moved into simnet.go at review (F2): the plan's interface list
+// ships simnet.AssertPrefix(i), and a helper that lives only in a _test file is
+// invisible to every non-test caller - including Task 10's devnet. Behaviour is
+// unchanged; the scenarios below call the same method, now in the built package.
 
 import (
 	"crypto/ed25519"
@@ -69,54 +70,51 @@ func assertAgreedOnEverySharedHeight(t *testing.T, n *Net, where string) {
 	}
 }
 
-// AssertPrefix reports whether validator i's history is an exact prefix of the
-// longest chain in the network: for every height i has committed, i's block must
-// be the identical block the longest chain holds at that height, and i's head may
-// not stand above the longest chain's head (a validator taller than everyone else
-// holds blocks nobody else committed, which is a fork by definition).
-//
-// This is the honest safety assertion for a LAGGING validator under the M3
-// milestone limits: with no block catch-up, a validator isolated behind the
-// quorum cannot adopt the blocks it missed, so the strongest claim a scenario can
-// make about it is "behind, never forked". Requiring it to reconverge would
-// assert a mechanism M3 does not have.
-func (n *Net) AssertPrefix(i int) error {
-	if i < 0 || i >= len(n.ch) {
-		return fmt.Errorf("simnet: AssertPrefix: validator index %d out of range 0..%d", i, len(n.ch)-1)
+// assertSetAgreesThrough is the same safety property as the walk above, but
+// over a RELEVANT SET through an EXPLICIT height window, not up to the
+// network's lowest common height: for every height from..to (inclusive), every
+// validator in the named set must hold the identical block ID, each being
+// compared against the set's first member (agreement with one common reference
+// is pairwise agreement, transitively). It exists because the shared-height
+// walk stops at the LOWEST height any validator reached, so the blocks a
+// majority commits while a member sits partitioned away or restarted behind it
+// - the partition-era window, the peer window after a restart - are never
+// compared with each other: exactly the heights a fork confined to that window
+// would occupy, and exactly where M3's no-catch-up milestone leaves the
+// scenarios blind unless the window is named. Naming the window is the caller
+// stating the relevant set; a set member shorter than `to` is a caller bug and
+// fails loudly instead of silently narrowing the check.
+func assertSetAgreesThrough(t *testing.T, n *Net, where string, validators []int, from, to uint64) {
+	t.Helper()
+	if len(validators) < 2 {
+		t.Fatalf("%s: agreement over %d validator(s) is vacuous", where, len(validators))
 	}
-	// The longest chain is the reference: the majority's chain, which the
-	// scenarios keep advancing while i sits behind.
-	refHeight := uint64(0)
-	var ref *chain.Chain
-	for _, c := range n.ch {
-		if c.Height() > refHeight {
-			refHeight, ref = c.Height(), c
+	for _, i := range validators {
+		if i < 0 || i >= len(n.ch) {
+			t.Fatalf("%s: validator %d does not exist", where, i)
+		}
+		if h := n.ch[i].Height(); uint64(h) < to {
+			t.Fatalf("%s: validator %d stands at height %d, below the window's top %d; the relevant set is wrong", where, i, h, to)
 		}
 	}
-	if ref == nil {
-		return fmt.Errorf("simnet: AssertPrefix: no validator chain to compare against")
-	}
-	c := n.ch[i]
-	if c.Height() > refHeight {
-		return fmt.Errorf("simnet: validator %d stands at height %d, above the longest chain at %d: it committed blocks the network never agreed on",
-			i, c.Height(), refHeight)
-	}
-	for h := uint64(0); h <= c.Height(); h++ {
-		bi, err := c.BlockAt(h)
+	ref := validators[0]
+	for h := from; h <= to; h++ {
+		refBlock, err := n.ch[ref].BlockAt(h)
 		if err != nil {
-			return fmt.Errorf("simnet: reading validator %d at height %d: %w", i, h, err)
+			t.Fatalf("%s: reading validator %d at height %d: %v", where, ref, h, err)
 		}
-		br, err := ref.BlockAt(h)
-		if err != nil {
-			return fmt.Errorf("simnet: reading the longest chain at height %d: %w", h, err)
-		}
-		if bi.ID() != br.ID() {
-			id1, id2 := bi.ID(), br.ID()
-			return fmt.Errorf("simnet: validator %d DIVERGED at height %d: %x vs the longest chain's %x - a fork, not a lag",
-				i, h, id1[:8], id2[:8])
+		for _, i := range validators[1:] {
+			b, err := n.ch[i].BlockAt(h)
+			if err != nil {
+				t.Fatalf("%s: reading validator %d at height %d: %v", where, i, h, err)
+			}
+			if b.ID() != refBlock.ID() {
+				id1, id2 := refBlock.ID(), b.ID()
+				t.Fatalf("%s: SAFETY VIOLATION: validators %d and %d hold conflicting blocks at height %d: %x vs %x",
+					where, ref, i, h, id1[:8], id2[:8])
+			}
 		}
 	}
-	return nil
 }
 
 // stallShape asserts that a stalled run ended the honest way: the run error
@@ -358,11 +356,14 @@ func TestScenarioTwoOfflineStallsWithoutForks(t *testing.T) {
 // majority's chain (AssertPrefix), and no conflicting block anywhere. Demanding
 // reconvergence would need block sync, which is M4's networking work.
 //
-// Killing mutant (M5): AssertPrefix short-circuited to nil. The scenario still
-// passes, because the freeze and the every-height agreement walk pin the same
-// property through independent paths - the report records the probe and the
-// fork-injection demonstration that shows the scenario catches a real divergence
-// with AssertPrefix neutered.
+// Killing mutant (M5): AssertPrefix's per-height divergence return is neutered
+// - the mutant anchors only on the ID comparison inside the prefix walk; the
+// index range guard and the stands-above-the-longest-chain guard still run.
+// The plain scenario survives that mutant (recorded honestly in the task
+// report): the freeze, the majority-progress assertions and the agreement
+// walks pin the same "behind, never forked" property through independent
+// paths, and the report's fork-injection demonstration shows the scenario
+// catching a real divergence with the helper neutered.
 func TestScenarioPartitionThenHeal(t *testing.T) {
 	n, err := New(4, Options{TempDir: t.TempDir(), Seed: 4, LatencyMS: 5, TimeoutBase: 200, TimeoutStep: 100})
 	if err != nil {
@@ -406,6 +407,14 @@ func TestScenarioPartitionThenHeal(t *testing.T) {
 		t.Fatalf("a safety violation across the partition: %v", err)
 	}
 	assertAgreedOnEverySharedHeight(t, n, "partition then heal")
+
+	// The majority's partition-era blocks - heights laggedHeight+1..12, here
+	// 4..12 - sit ABOVE validator 0's frozen height, so every check scoped to
+	// the shared prefix or to the lowest common height never compared them
+	// with each other: a fork confined to the partition era would pass this
+	// scenario untouched. Cross-check the committing set {1,2,3} pairwise
+	// across that whole window instead.
+	assertSetAgreesThrough(t, n, "partition then heal (majority window)", []int{1, 2, 3}, laggedHeight+1, 12)
 }
 
 // 5. A Byzantine validator equivocates: every prevote it sends is duplicated, on
@@ -712,4 +721,12 @@ func TestScenarioRestartMidEpoch(t *testing.T) {
 		t.Fatalf("the committee disagreed after the restart: %v", err)
 	}
 	assertAgreedOnEverySharedHeight(t, n, "restart mid-epoch")
+
+	// Peer-window cross-check: validator 3 froze at height 5 ("stopped"), so
+	// the walk above stops there too, leaving the peer blocks 6..20 - what
+	// {0,1,2} committed while 3 was powered off, and after its re-wiring while
+	// it sat permanently behind - never compared with each other. A fork
+	// confined to that window must not slip through: cross-check {0,1,2}
+	// pairwise over the heights they share beyond the frozen validator.
+	assertSetAgreesThrough(t, n, "restart mid-epoch (peer window)", []int{0, 1, 2}, stopped+1, 20)
 }
