@@ -747,10 +747,12 @@ func TestClaimBalanceOverflowRejectsBeforeTheDebit(t *testing.T) {
 	}
 }
 
-// A block is attacker-chosen input. Because validating one faucet claim costs a full
-// Argon2id evaluation, a block carrying an unbounded number of them lets one proposer
-// force every validator to spend hours on a single block. A block over the bound must
-// therefore be INVALID, not merely slow.
+// A block is attacker-chosen input. Validating one faucet claim costs every validator a
+// full Argon2id evaluation before it can be accepted or rejected, so unbounded the cost
+// of deciding a block is its claim count alone - one malicious proposer could price a
+// block with thousands of puzzle evaluations on every validator. A block over the bound
+// must therefore be INVALID, not merely slow: the count is rejected before the first
+// puzzle is evaluated, so nothing above the bound is ever paid for.
 //
 // The tests below set the bound explicitly rather than inheriting any package
 // default, so the expectation is independent of the shipped genesis constants.

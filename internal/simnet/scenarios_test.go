@@ -629,6 +629,122 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 // constructed blocks are the blocks a real proposer would have produced.
 func parentTimestamp(n *Net) int64 { return n.ch[0].Head().Header.Timestamp }
 
+// 5b. The PRECOMMIT arm of scenario 5 - the case design spec section 9.1
+// actually states: "a validator equivocates (sends conflicting precommits):
+// detected, no conflicting commit". The equivocator the milestone shipped
+// forged conflicting PREVOTES only, so the spec-named case had never run; the
+// wrapper's forge now carries the wrapper's own vote type, and this arm drives
+// it: every non-nil precommit validator 3 broadcasts is duplicated as a
+// precommit for a different block ID, signed with its own committee key.
+//
+// One Byzantine of four is below the one-third bar, so the chain must still
+// advance, and the tally's one-vote-per-validator rule - type-agnostic, keyed
+// on the VALIDATOR - must collapse the conflicting precommit exactly as it
+// collapses a conflicting prevote.
+//
+// What is asserted is the scenario's shape, not merely that the chain moved:
+//
+//   - ON THE WIRE: validator 3's own tap carries BOTH halves of an equivocation
+//     at the same (height, round) - a verifying, committee-key-signed precommit
+//     for the round's real block AND a verifying precommit for the forged ID -
+//     and an honest validator received the forged half. A forge that never
+//     leaves the node, or reaches no peer, cannot stress the tally's dedup.
+//   - ON THE OUTCOME: no two validators commit conflicting blocks at one height
+//     (the per-height agreement walk, over the committed chains), and the
+//     forged block was committed NOWHERE.
+//
+// Killing mutant (F3 proof, final review): below the wire assertion, the forged
+// precommit is recorded by the wrapper but never broadcast (the forge-drop
+// mutant) - the wire assertion fails at "no forged precommit ever reached
+// validator 3's wire" before the outcome assertions can run at all.
+func TestScenarioByzantinePrecommitEquivocatorDoesNotFork(t *testing.T) {
+	n, err := New(4, Options{TempDir: t.TempDir(), Seed: 55, LatencyMS: 5, TimeoutBase: 200, TimeoutStep: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+
+	// Validator 3 turns Byzantine over precommits, exactly as section 9.1
+	// states it.
+	if err := n.MakePrecommitEquivocator(3); err != nil {
+		t.Fatalf("MakePrecommitEquivocator: %v", err)
+	}
+
+	// One Byzantine of four must not break safety OR stall liveness.
+	if _, err := n.RunBlocks(30); err != nil {
+		t.Fatalf("one Byzantine precommit equivocator stalled the chain: %v", err)
+	}
+
+	// --- On the wire, both halves of the equivocation, at one (height, round). ---
+	eq, ok := n.equivs[3]
+	if !ok {
+		t.Fatal("no equivocator was installed for validator 3")
+	}
+	type roundKey struct {
+		height uint64
+		round  uint32
+	}
+	honestFor, forgedFor := map[roundKey]bool{}, map[roundKey]bool{}
+	for _, raw := range n.taps[3].sent {
+		v, derr := consensus.DecodeVote(raw)
+		if derr != nil || v.Type != consensus.MsgPrecommit || v.IsNil() {
+			continue
+		}
+		if idx := n.cfg.IndexOf(v.Validator); idx != 3 {
+			t.Fatalf("precommit on the wire carries validator index %d, want 3", idx)
+		}
+		if verr := v.Verify(); verr != nil {
+			t.Fatalf("precommit on the wire does not verify as validator 3's own signature: %v", verr)
+		}
+		key := roundKey{v.Height, v.Round}
+		if v.BlockID == eq.forgeID {
+			forgedFor[key] = true
+		} else {
+			honestFor[key] = true
+		}
+	}
+	equivocated := 0
+	for k := range forgedFor {
+		if honestFor[k] {
+			equivocated++
+		}
+	}
+	if equivocated == 0 {
+		t.Fatal("no (height, round) carries both of validator 3's precommits: the forged one never met its honest twin on the wire, so no conflicting-precommit equivocation exists to test the tally against")
+	}
+
+	// And the forged half must reach an honest validator: the wrapper
+	// broadcasts it through the live network, so at least one peer's received
+	// log must hold it - a broadcast that arrives nowhere tallies nowhere.
+	delivered := 0
+	for _, raw := range n.taps[0].recv {
+		v, derr := consensus.DecodeVote(raw)
+		if derr == nil && v.Type == consensus.MsgPrecommit && v.BlockID == eq.forgeID && n.cfg.IndexOf(v.Validator) == 3 {
+			delivered++
+		}
+	}
+	if delivered == 0 {
+		t.Fatal("no honest validator received the forged precommit; a forgery that never arrives cannot stress the one-vote-per-validator tally")
+	}
+
+	// --- On the outcome: agreement at every shared height, and nowhere the
+	// forged block. A conflicting-commit fork needs two validators holding
+	// different blocks at one height; the walk below compares every height
+	// they all share, pairwise against validator 0.
+	if err := n.AssertSameChain(); err != nil {
+		t.Fatalf("a Byzantine precommit equivocator produced a conflicting commit: %v", err)
+	}
+	assertAgreedOnEverySharedHeight(t, n, "byzantine precommit equivocator")
+	for i, c := range n.ch {
+		for h := uint64(0); h <= c.Height(); h++ {
+			b, berr := c.BlockAt(h)
+			if berr == nil && b.ID() == eq.forgeID {
+				t.Fatalf("SAFETY VIOLATION: validator %d holds the FORGED block at height %d - the forged precommit assembled a commit from one vote's worth of weight", i, h)
+			}
+		}
+	}
+}
+
 // 6. Restart mid-epoch: a validator stops, the others advance, and it reopens
 // its chain from disk. Replay must re-derive the state root its peers computed,
 // and the restarted - now behind - chain must be a prefix of its peers' rather

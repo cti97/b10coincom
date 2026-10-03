@@ -241,10 +241,15 @@ is verified**, because of two facts it cannot escape:
   every validator one full Argon2id evaluation — the puzzle's worst case is
   what a validator pays for every block it checks.
 - **A block is attacker-chosen input.** `types.MaxTxsPerBlock` allows 10,000
-  transactions in a block, so without a bound one malicious proposer could
-  pack a block with claims and force every validator to evaluate ~10,000
-  puzzles for it — hours of work to validate one block, on every validator,
-  repeatedly, with consensus itself held hostage.
+  transactions in a block, and each claim's puzzle must be evaluated before
+  that claim can be accepted *or rejected*, so without a bound one malicious
+  proposer could pack a block with claims and set every validator's cost by
+  the claim count alone — ~10,000 full Argon2id evaluations, about 21 minutes
+  of Argon2id work at the testnet tuning, to decide one block. That block
+  cannot exist: carrying more than 8 claims makes it invalid, and
+  `state.ApplyBlock` rejects it on the count before the first puzzle is
+  evaluated, so every validator pays at most 8 evaluations for any block,
+  whatever a proposer packs into its bytes.
 
 The bound and the testnet puzzle tuning are derived together so the
 worst-case block fits inside a small multiple of the 2,000 ms block interval

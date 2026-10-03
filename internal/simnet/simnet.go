@@ -497,7 +497,7 @@ func (n *Net) TakeOffline(i int) {
 }
 
 // MakeEquivocator replaces validator i's transport with one that duplicates every
-// non-nil prevote it sends as a prevote for a DIFFERENT block ID, signed with the
+// non-nil PREVOTE it sends as a prevote for a DIFFERENT block ID, signed with the
 // key i genuinely owns.
 //
 // Signing with a REAL committee key is essential: a forged vote carrying a
@@ -523,7 +523,31 @@ func (n *Net) TakeOffline(i int) {
 // The call errors when i is out of range, and on an OFFLINE validator: the
 // rebuild re-registers a live receive callback, which would silently lift the
 // power-off cut - a powered-off machine cannot be Byzantine.
-func (n *Net) MakeEquivocator(i int) error {
+func (n *Net) MakeEquivocator(i int) error { return n.installEquivocator(i, consensus.MsgPrevote) }
+
+// MakePrecommitEquivocator installs the same equivocation seam over PRECOMMITS -
+// design spec section 9.1's Byzantine scenario, verbatim: "a validator
+// equivocates (sends conflicting precommits)". Every non-nil precommit
+// validator i broadcasts is duplicated as a PRECOMMIT for a different block ID,
+// signed with the key it genuinely owns, so peers see two equally valid,
+// mutually conflicting precommits from one committee member at the same
+// (height, round). The tally's one-vote-per-validator rule is type-agnostic -
+// the dedup keys the VALIDATOR, not the vote - so a conflicting precommit must
+// collapse exactly as a conflicting prevote does: no quorum anywhere for the
+// forged ID, and no conflicting commit. The scenario that drives it (the
+// precommit arm in scenarios_test.go) asserts that on the wire and on the
+// committed chains. The range and offline errors are MakeEquivocator's
+// verbatim: the rebuild is shared, and its contract is one contract.
+func (n *Net) MakePrecommitEquivocator(i int) error {
+	return n.installEquivocator(i, consensus.MsgPrecommit)
+}
+
+// installEquivocator is the rebuild both forged-vote seams share: it swaps
+// validator i's transport for an equivocating wrapper that duplicates every
+// non-nil vote of the given type as a vote for a DIFFERENT block ID, signed
+// with i's own key, and rebuilds i's driver over the wrapper through
+// transportFor (the tap stays wired - see its comment).
+func (n *Net) installEquivocator(i int, typ consensus.MsgType) error {
 	if i < 0 || i >= len(n.drv) {
 		return fmt.Errorf("simnet: MakeEquivocator: validator index %d out of range 0..%d", i, len(n.drv)-1)
 	}
@@ -533,6 +557,7 @@ func (n *Net) MakeEquivocator(i int) error {
 	eq := &equivocating{
 		inner:   n.transportFor(i),
 		priv:    n.keys[i].priv,
+		typ:     typ,
 		forgeID: crypto.HashParts([]byte("b10coin-forged-block")),
 	}
 	n.equivs[i] = eq
@@ -578,13 +603,19 @@ func (t *tap) OnMessage(fn func(transport.Message)) {
 func (t *tap) Peers() []transport.PeerID { return t.inner.Peers() }
 func (t *tap) Close() error              { return t.inner.Close() }
 
-// equivocating wraps a Transport and re-sends every prevote as a conflicting one.
+// equivocating wraps a Transport and re-sends every vote of its kind
+// (prevote or precommit, fixed by typ) as a conflicting one for the same
+// (height, round), signed with the same key. The forged vote carries the
+// wrapper's own VOTE TYPE, so the prevote seam manufactures conflicting
+// prevotes and the precommit seam - the type design spec section 9.1 names -
+// manufactures conflicting precommits.
 type equivocating struct {
 	inner   transport.Transport
 	priv    ed25519.PrivateKey
+	typ     consensus.MsgType
 	forgeID [32]byte
 
-	// forged records every conflicting prevote this wrapper sent, in send order.
+	// forged records every conflicting vote this wrapper sent, in send order.
 	// It is what a scenario (or a test) inspects to confirm the equivocation is
 	// real: signed by a committee key, for a block nobody proposed.
 	forged []*consensus.Vote
@@ -595,7 +626,7 @@ func (eq *equivocating) Broadcast(data []byte) error {
 		return err
 	}
 	v, err := consensus.DecodeVote(data)
-	if err != nil || v.Type != consensus.MsgPrevote || v.IsNil() {
+	if err != nil || v.Type != eq.typ || v.IsNil() {
 		return nil
 	}
 	if v.BlockID == eq.forgeID {
@@ -604,7 +635,7 @@ func (eq *equivocating) Broadcast(data []byte) error {
 		return nil
 	}
 	f := &consensus.Vote{
-		Type: consensus.MsgPrevote, Height: v.Height, Round: v.Round,
+		Type: v.Type, Height: v.Height, Round: v.Round,
 		BlockID: eq.forgeID, Validator: v.Validator,
 	}
 	h := f.SigningHash()

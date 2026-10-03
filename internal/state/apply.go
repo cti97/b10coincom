@@ -168,19 +168,25 @@ func (s *State) applyFaucetClaim(tx *types.Tx) error {
 // new State; the receiver is never modified. On failure it returns the error
 // and a nil State, leaving the receiver untouched.
 //
-// The claim bound is consensus, not policy. applyFaucetClaim must run a full
-// Argon2id evaluation before it can reject a claim, MaxTxsPerBlock allows
-// 10,000 transactions in a block, and a block is attacker-chosen input, so
-// without a checked-first count one malicious proposer makes every validator
-// pay ~10,000 Argon2id evaluations per block - at the testnet tuning, hours
-// of work to validate one block, on every validator, repeatedly. A block
-// over genesis's MaxClaimsPerBlock is therefore INVALID, and the count is
-// checked here, BEFORE any puzzle is verified: a bound enforced after the
-// expensive work bounds nothing - the attacker still gets the work out of
-// you, and only the verdict changes. The bound travels in state.Params (0
-// means not engaged) so the mempool's local courtesy bound and this consensus
-// rule cannot disagree: genesis pins both, and a genesis test asserts the
-// mempool constant equals it.
+// The claim bound is consensus, not policy. Validating one claim costs every
+// validator a FULL Argon2id evaluation: applyFaucetClaim has no cheap
+// pre-check - the puzzle must be evaluated before the claim can be accepted
+// OR rejected - so a validator's cost for a block is the block's claim count
+// times one puzzle. A block is attacker-chosen input, and MaxTxsPerBlock
+// allows 10,000 transactions in a block, so unbounded the count is an
+// amplifier: one malicious proposer prices every validator ~10,000 Argon2id
+// evaluations (about 21 minutes of Argon2id work at the testnet tuning) as
+// the cost of deciding ONE block. MaxClaimsPerBlock (travelled in
+// state.Params; 0 means not engaged) is what makes that impossible instead
+// of merely priced: the count is checked here, BEFORE any puzzle is
+// evaluated, so a block carrying more claims than the bound is INVALID and
+// never reaches applyFaucetClaim at all - nothing above the bound is paid
+// for, whatever its size. The check must sit ahead of the expensive work
+// because a bound enforced after it bounds nothing: the attacker still gets
+// the work out of you, and only the verdict changes. The bound travels in
+// state.Params so the mempool's local courtesy bound and this consensus rule
+// cannot disagree: genesis pins both, and a genesis test asserts the mempool
+// constant equals it.
 func (s *State) ApplyBlock(txs []types.Tx) (*State, error) {
 	// Counting claims costs one type comparison per transaction - nothing.
 	// Verifying even the FIRST claim costs a full Argon2id evaluation, so the
