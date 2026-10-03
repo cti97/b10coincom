@@ -21,10 +21,21 @@ type Message struct {
 // state transitions depend on the transport's internals. Queue instead.
 type Transport interface {
 	// Broadcast sends data to every connected peer except the sender.
+	//
+	// data is read-only: an implementation must not modify it, and must copy
+	// it before retaining it beyond the call, so a caller may reuse its
+	// buffer as soon as Broadcast returns.
 	Broadcast(data []byte) error
 	// OnMessage registers the callback invoked once per received message.
 	OnMessage(fn func(Message))
 	// Peers lists the currently connected peers.
+	//
+	// The returned slice MUST be deterministically ordered — same peer set,
+	// same order, every call, regardless of insertion or connect order — and
+	// implementations should sort by PeerID. Consensus iterates peers by
+	// position, so a map-ordered implementation would silently permute state
+	// transitions between runs and break replay: a run could no longer be
+	// reproduced from its recorded inputs.
 	Peers() []PeerID
 	// Close releases the transport's resources.
 	Close() error

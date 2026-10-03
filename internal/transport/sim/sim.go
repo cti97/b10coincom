@@ -26,11 +26,14 @@ type Message = transport.Message
 
 // Options configures the simulated network's failure behaviour.
 type Options struct {
-	Seed        int64         // the only source of randomness
-	Latency     time.Duration // base one-way delay
-	Jitter      time.Duration // uniform extra delay in [0, Jitter)
-	DropPercent int           // 0..100, applied per delivery
-	Reorder     bool          // if true, delivery order need not match send order
+	Seed    int64         // the only source of randomness
+	Latency time.Duration // base one-way delay
+	// Jitter is the uniform extra delay in [0, Jitter) added to each
+	// delivery. It is also the knob that REORDERS delivery: because each
+	// message's delay is an independent draw, arrivals need not match send
+	// order whenever Jitter > 0 — there is no separate reorder option.
+	Jitter      time.Duration
+	DropPercent int // 0..100, applied per delivery
 }
 
 // pending is one message waiting for its delivery time.
@@ -168,13 +171,6 @@ func (e *endpoint) Broadcast(data []byte) error {
 		e.net.seq++
 		e.net.queue = append(e.net.queue, pending{
 			at: at, seq: e.net.seq, to: id, from: e.id, data: append([]byte(nil), data...),
-		})
-	}
-	if e.net.opts.Reorder {
-		// Shuffle the queue deterministically so delivery order need not match
-		// send order; ordering is then pinned only by (at, seq) as usual.
-		e.net.rng.Shuffle(len(e.net.queue), func(i, j int) {
-			e.net.queue[i], e.net.queue[j] = e.net.queue[j], e.net.queue[i]
 		})
 	}
 	return nil
