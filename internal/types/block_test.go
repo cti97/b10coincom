@@ -124,3 +124,57 @@ func TestValidateStructureRejectsTooManyTxs(t *testing.T) {
 		t.Fatalf("expected ErrBlockTooLarge, got %v", err)
 	}
 }
+
+// A structurally clean block whose canonical ENCODING exceeds MaxBlockBytes
+// must also be rejected: the byte bound, not just the transaction-count
+// bound, is what keeps every block processable on a Raspberry Pi within one
+// block interval. The transactions stay under MaxTxsPerBlock so the failure
+// can only come from the byte guard.
+func TestValidateStructureRejectsOversizedCanonicalEncoding(t *testing.T) {
+	b := testBlock(t)
+	sig := make([]byte, 64) // filler: ValidateStructure checks no signature
+	for len(b.Encode()) <= MaxBlockBytes {
+		for i := 0; i < 256 && len(b.Txs) < MaxTxsPerBlock; i++ {
+			b.Txs = append(b.Txs, Tx{
+				Type:  TxTransfer,
+				Nonce: uint64(len(b.Txs)), // distinct nonce -> distinct ID, so the duplicate rule never fires first
+				Sig:   sig,
+			})
+		}
+		if len(b.Txs) == MaxTxsPerBlock {
+			break
+		}
+	}
+	b.Header.TxRoot = ComputeTxRoot(b.Txs)
+
+	if len(b.Txs) > MaxTxsPerBlock {
+		t.Fatalf("test setup: %d transactions would trip the count bound, not the byte bound", len(b.Txs))
+	}
+	if size := len(b.Encode()); size <= MaxBlockBytes {
+		t.Fatalf("test setup: canonical encoding is %d bytes, want > %d", size, MaxBlockBytes)
+	}
+	if err := b.ValidateStructure(); !errors.Is(err, ErrBlockTooLarge) {
+		t.Fatalf("expected ErrBlockTooLarge, got %v", err)
+	}
+}
+
+// A block that DECLARES more transactions than MaxTxsPerBlock is rejected at
+// the declared count, before a single transaction body is parsed: nothing
+// over the bound is ever decoded.
+func TestDecodeBlockRejectsTxCountOverTheLimit(t *testing.T) {
+	e := NewEncoder()
+	e.U64(1)
+	e.Fixed32([32]byte{}) // parent hash
+	e.Fixed32([32]byte{}) // state root
+	e.Fixed32([32]byte{}) // tx root
+	e.I64(1_700_000_100)
+	e.VarBytes(make([]byte, 32)) // proposer
+	e.Len(MaxTxsPerBlock + 1)    // the over-limit declared count
+	// The decoder bounds a declared count against the remaining buffer, so
+	// the bytes must exist for the MaxTxsPerBlock guard to be the thing that
+	// fires; they are never parsed as transactions.
+	e.Raw(make([]byte, MaxTxsPerBlock+1))
+	if _, err := DecodeBlock(e.Bytes()); !errors.Is(err, ErrBlockTooLarge) {
+		t.Fatalf("expected ErrBlockTooLarge, got %v", err)
+	}
+}

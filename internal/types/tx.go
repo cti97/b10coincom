@@ -18,8 +18,9 @@ var (
 	ErrAddressMismatch   = errors.New("types: pubkey does not match sender address")
 )
 
-// TxType discriminates the transaction union. Only TxTransfer is
-// implemented in M1; the rest are reserved so the encoding is stable.
+// TxType discriminates the transaction union. TxTransfer (M1) and
+// TxFaucetClaim (M2) are implemented; TxBond, TxUnbond and TxWithdraw are
+// reserved so the encoding is stable.
 type TxType uint8
 
 const (
@@ -45,6 +46,12 @@ type Tx struct {
 	To     Address
 	Amount uint64
 
+	// TxFaucetClaim only. The puzzle's parameters are genesis state, not carried
+	// on the wire: a claimant and a verifier must agree on them, and if they
+	// disagree the claim simply fails to verify.
+	Epoch    uint64
+	PowNonce uint64
+
 	// Sig is the Ed25519 signature over SigningHash().
 	Sig []byte
 }
@@ -59,6 +66,10 @@ func (tx *Tx) encodeBody() []byte {
 	if tx.Type == TxTransfer {
 		e.Raw(tx.To[:])
 		e.U64(tx.Amount)
+	}
+	if tx.Type == TxFaucetClaim {
+		e.U64(tx.Epoch)
+		e.U64(tx.PowNonce)
 	}
 	return e.Bytes()
 }
@@ -75,6 +86,11 @@ func (tx *Tx) ID() [32]byte {
 }
 
 // Encode returns the canonical wire encoding, signature included.
+//
+// Encoding is only meaningful for the implemented types (TxTransfer and
+// TxFaucetClaim): encodeBody emits a truncated body for a reserved type
+// (TxBond, TxUnbond, TxWithdraw), so DecodeTx(tx.Encode()) is not a round
+// trip for those — DecodeTx rejects reserved types outright.
 func (tx *Tx) Encode() []byte {
 	e := NewEncoder()
 	e.Raw(tx.encodeBody())
@@ -108,7 +124,7 @@ func DecodeTx(b []byte) (*Tx, error) {
 		return nil, err
 	}
 	tx := &Tx{Type: TxType(rawType)}
-	if tx.Type != TxTransfer {
+	if tx.Type != TxTransfer && tx.Type != TxFaucetClaim {
 		return nil, fmt.Errorf("%w: %d", ErrUnsupportedTxType, rawType)
 	}
 	if tx.From, err = d.Fixed20(); err != nil {
@@ -120,11 +136,21 @@ func DecodeTx(b []byte) (*Tx, error) {
 	if tx.Nonce, err = d.U64(); err != nil {
 		return nil, err
 	}
-	if tx.To, err = d.Fixed20(); err != nil {
-		return nil, err
-	}
-	if tx.Amount, err = d.U64(); err != nil {
-		return nil, err
+	switch tx.Type {
+	case TxTransfer:
+		if tx.To, err = d.Fixed20(); err != nil {
+			return nil, err
+		}
+		if tx.Amount, err = d.U64(); err != nil {
+			return nil, err
+		}
+	case TxFaucetClaim:
+		if tx.Epoch, err = d.U64(); err != nil {
+			return nil, err
+		}
+		if tx.PowNonce, err = d.U64(); err != nil {
+			return nil, err
+		}
 	}
 	if tx.Sig, err = d.VarBytes(); err != nil {
 		return nil, err
@@ -136,6 +162,11 @@ func DecodeTx(b []byte) (*Tx, error) {
 }
 
 // Equal reports whether two transactions are byte-identical when encoded.
+// A nil receiver or nil argument is never equal (and never panics): a nil
+// value is not a transaction, so it matches nothing.
 func (tx *Tx) Equal(other *Tx) bool {
+	if tx == nil || other == nil {
+		return false
+	}
 	return bytes.Equal(tx.Encode(), other.Encode())
 }

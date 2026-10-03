@@ -8,6 +8,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+      # -count=1 forces real test execution: without it cached results make a
+      # flaky test report green from a previous run.
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -count=1 ./...
+      - run: go test -race -count=1 ./...
       - run: go build ./...
+      # The milestone acceptance commands must keep printing OK with exit 0.
+      # The first is the default run — its --claims default makes it pay one
+      # claim and prove the same-epoch double claim refused — and the second
+      # runs the claim variant explicitly so the faucet path cannot degrade
+      # with the flag's default unnoticed.
+      - run: go run ./cmd/b10coin devnet --blocks 100
+      - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1

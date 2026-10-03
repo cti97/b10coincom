@@ -2456,7 +2456,9 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 
 // sharedParams are the values fixed by the design spec. The emission
 // relation InitialReward * HalvingInterval * 2 == TotalSupply must hold.
-func sharedParams(chainID string, committee int) Params {
+// EpochBlocks differs by chain — 1_000 on devnet, 10_000 on testnet — and is
+// unused in M0-M1, so nothing observes the difference yet.
+func sharedParams(chainID string, epochBlocks uint64, committee int) Params {
 	return Params{
 		ChainID:               chainID,
 		BlockTimeMS:           2000,
@@ -2465,7 +2467,7 @@ func sharedParams(chainID string, committee int) Params {
 		HalvingIntervalBlocks: 21_000_000,
 		ClaimAmountSparks:     100 * SparksPerB10,
 		MinStakeSparks:        1_000 * SparksPerB10,
-		EpochBlocks:           10_000,
+		EpochBlocks:           epochBlocks,
 		UnbondingEpochs:       2,
 		CommitteeSize:         committee,
 	}
@@ -2484,7 +2486,7 @@ func Devnet() *Genesis {
 			{PubKey: devPub, BalanceSparks: 1_000_000 * SparksPerB10},
 			{PubKey: dev2Pub, BalanceSparks: 0},
 		},
-		Params: sharedParams("b10coin-devnet-1", 1),
+		Params: sharedParams("b10coin-devnet-1", 1_000, 1),
 	}
 }
 
@@ -2496,7 +2498,7 @@ func Testnet() *Genesis {
 		Time:        1_700_000_000,
 		Validators:  []Validator{},
 		DevAccounts: nil, // no premine, ever
-		Params:      sharedParams("b10coin-testnet-1", 21),
+		Params:      sharedParams("b10coin-testnet-1", 10_000, 21),
 	}
 }
 
@@ -2547,7 +2549,7 @@ truth; these exist for review):
     "halving_interval_blocks": 21000000,
     "claim_amount_sparks": 10000000000,
     "min_stake_sparks": 100000000000,
-    "epoch_blocks": 10000,
+    "epoch_blocks": 1000,
     "unbonding_epochs": 2,
     "committee_size": 1
   }

@@ -31,25 +31,35 @@ claim in seconds — never a consensus mechanism.
 
 ## Quick start
 
-Requires Go 1.23+. The only direct external dependency is
-`lukechampine.com/blake3` (v1.4.1). From the repository root:
+Requires Go 1.23+. Two direct external dependencies:
+`lukechampine.com/blake3` (v1.4.1) and `golang.org/x/crypto` (v0.41.0, for
+Argon2id). From the repository root:
 
 ```sh
 make build                                # go build -o bin/b10coin ./cmd/b10coin
-make test                                 # go test ./...
+make test                                 # go test -count=1 ./...
 go run ./cmd/b10coin devnet --blocks 100  # the acceptance check
 ```
 
 `devnet --blocks 100` builds a fresh local chain in a temporary directory,
 signs and appends 100 blocks, includes one real transfer transaction, persists
 everything to append-only segment files, and reports a reproducible state root
-(verified as stable across repeated runs). It prints:
+(verified as stable across repeated runs). Since M2 the default run also
+exercises the faucet: it solves the Argon2id puzzle for an ephemeral claimant
+key and pays one claim from protocol emission, then immediately attempts a
+second claim from the same key in the same epoch, which is refused — the
+anti-farming rule, proven. Those two extra blocks put the chain at height 102.
+It prints:
 
 ```text
 chain        b10coin-devnet-1
-height       100
-state root   a86409159fd1afaa312e1e59dcb02edeaf44cbebf55f20b59fad01ed738b9c3e
-txs included 1
+height       102
+state root   54023d2de4548c1d222c372eaa1722045eadb83bdf61ae03dc2308325ec0c2bb
+txs included 2
+claims paid  1 of 1 attempts, 100000000 sparks each
+double claims refused 1 (one claim per key per epoch)
+claimant bal 100000000 sparks
+faucet bal   5050000000 sparks (emitted 5150000000 sparks in total)
 OK
 ```
 
@@ -57,17 +67,18 @@ and exits 0.
 
 ## The CLI
 
-`cmd/b10coin` implements four subcommands. With no subcommand, or with an
+`cmd/b10coin` implements five subcommands. With no subcommand, or with an
 unknown one, it prints the usage text and exits with code 2.
 
 ### `b10coin devnet`
 
-Builds and verifies a self-contained local chain — the single M0–M1 acceptance
-check, shared by the CLI and the test suite.
+Builds and verifies a self-contained local chain — the milestone acceptance
+check (M0–M2), shared by the CLI and the test suite.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--blocks N` | `100` | number of blocks to produce (must be > 0) |
+| `--claims N` | `1` | faucet-claim attempts after the block loop; each paid claim is followed by the same key's same-epoch double claim, which must be refused (a run that sees the double claim applied fails) |
 | `--dir PATH` | *fresh temporary directory* | data directory; a temporary one is deleted afterwards, an explicit path is kept |
 
 ### `b10coin node`
@@ -86,17 +97,103 @@ are valueless; the testnet genesis has no validator keys yet.
 
 Ctrl-C (or SIGTERM) stops block production and the HTTP server cleanly.
 
+### `b10coin claim`
+
+Solves the faucet puzzle locally and submits one claim to a running node (the
+`node` command's default HTTP address is the claim command's default target).
+The puzzle's parameters are genesis state, not carried on the wire: the claim
+command solves with the compiled-in devnet parameters an M2 node runs, and it
+bails out if the node it is talking to runs a different chain.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--node URL` | `http://127.0.0.1:8645` | HTTP RPC of the node to submit the claim to |
+| `--dir PATH` | `./b10coin-data` | accepted for uniformity with the other commands, and deliberately **never read**: the claim command reads nothing from disk and writes nothing |
+
+There is **no key file and no keystore**: `claim` signs with an ephemeral
+fresh key, and prints that key once — copy it out immediately if you plan a
+follow-up transfer, because it cannot be recovered later. The claim is only
+queued by this command; the node pays it when its next block applies it.
+
 ### `b10coin version` and `b10coin help`
 
 `version` prints the software version (`0.1.0`). `help`, `-h` and `--help`
 print the usage text.
 
+## The faucet
+
+M2 adds the faucet — a distribution mechanism — and keeps the promise about
+what that mechanism is worth. **This is still a valueless testnet: every coin
+the faucet pays is worthless test currency, and there is no sale and no
+mainnet.** The faucet itself is governed by the design's no-premine rule: it
+is an account derived from the genesis hash, so no private key can spend from
+it. Coins enter circulation only through the protocol's claim rule, paid out
+of protocol emission.
+
+### The puzzle
+
+A claim transaction carries `(pubkey, epoch, pow_nonce)` and is valid only if
+its proof-of-work digest — `Argon2id(pubkey ‖ epoch ‖ pow_nonce)` under the
+salt `"b10coin-faucet-pow"`, read big-endian — is strictly below the chain's
+32-byte difficulty target. Argon2id is memory-hard, so GPUs and ASICs buy
+almost nothing over commodity hardware; the difficulty is chosen so a
+Raspberry Pi 4 completes a puzzle in seconds rather than minutes.
+
+**PoW here is a rate limiter, not consensus.** No block is ever produced by
+mining: validators (a single federated signer until M3, staked rotation from
+M5) produce blocks without solving anything. The puzzle's only job is to
+throttle how fast one key can drain the faucet.
+
+The parameters are per-chain genesis parameters, recorded in
+`genesis/devnet.json` and `genesis/testnet.json`:
+
+| | Argon2id tuning | Difficulty target |
+|---|---|---|
+| devnet (fixture) | 64 KiB × 1 iteration × 1 lane | `0x7f` followed by 31 `0xff` bytes — a handful of attempts, so tests and CI stay fast |
+| testnet (spec) | 64 MiB × 3 iterations × 1 lane | `0x0f` followed by 31 `0xff` bytes — the spec's ≈3 s on a Pi 4; asserted from the spec, not measured on hardware, and to be re-tuned before any public testnet opens |
+
+### The emission schedule
+
+- The base unit is the **spark**; `1 b10 = 10⁸ sparks`.
+- The reward starts at **0.5 b10 per block** (50,000,000 sparks), paid into
+  the faucet account — height 0's genesis mint comes from the same formula.
+- It **halves every 21,000,000 blocks** (≈1.33 years at 2 s blocks) and
+  reaches zero at halving 26 — emission ends after ≈34.6 years of 2 s blocks,
+  and the chain then runs on fees only.
+- The **supply cap is 21,000,000 b10** (2.1 × 10¹⁵ sparks).
+- The **realized series lands at 20,999,997.48 b10** (2,099,999,748,000,000
+  sparks): each halving's shift truncates, losing 252,000,000 sparks (2.52 b10)
+  in total. The series therefore falls **2.52 b10 short of the cap** — and it
+  can **never exceed the cap**. The cap is a maximum, never a target; the
+  shortfall is integer truncation by design, not a bug, and no code path mints
+  the difference.
+
+### The anti-farming rule
+
+**One claim per key per epoch.** A paid claim commits an epoch marker
+(`ClaimedEpoch`) into the claimant's account as consensus state — it is part
+of the state root — and the rule refuses any claim whose marker is not
+strictly older than the claim's epoch. A second claim from the same key in the
+same epoch is refused even when it is solved and signed exactly like the
+first (the default `devnet` run proves this live; see the acceptance output
+above). Epochs are 1-based and last 1,000 blocks on devnet and 10,000 on
+testnet.
+
+The claim amount is a genesis parameter: the devnet fixture claims **1 b10**
+so a short devnet run can fund a claim from emission, and testnet keeps the
+spec's **100 b10** (see [Genesis configurations](#genesis-configurations)).
+The honest trade-off stands: a determined attacker with many keys is
+rate-limited by the puzzle, not prevented — that is what the spec accepted
+when it chose a faucet over a premine.
+
 ## Architecture
 
-Eleven Go packages under `internal/`, plus the CLI in `cmd/b10coin`.
+Twelve Go packages under `internal/`, plus the CLI in `cmd/b10coin`.
 Import direction is `cmd → devnet → {chain, rpc, node}` and
-`chain → {store, state, genesis, types, crypto}`; `types` never imports
-`state`, `state` never imports `chain`, `chain` never imports `rpc`.
+`chain → {store, state, genesis, types, crypto, faucet}`; `types` never imports
+`state`, `state` never imports `chain`, `chain` never imports `rpc`, and
+`internal/faucet` (the puzzle and emission arithmetic) sits under `state` and
+`chain` — it is imported by them and by `devnet` and `cmd`, never the reverse.
 
 | Package | Responsibility |
 |---|---|
@@ -104,14 +201,15 @@ Import direction is `cmd → devnet → {chain, rpc, node}` and
 | `internal/types` | Consensus structures (`Address`, `Tx`, `Header`, `Block`) and the canonical binary codec; the decoder rejects short buffers, trailing bytes, and non-minimal varints |
 | `internal/state` | Address → account state map; the transfer transition (signature, nonce, balance rules) applied atomically per block on a clone; sorted-leaf Merkle state root; zero-value accounts pruned |
 | `internal/genesis` | Protocol parameters, genesis hash and validation, the devnet and testnet configurations, deterministic public dev fixtures, and the keyless faucet address |
+| `internal/faucet` | The M2 faucet machinery: the Argon2id claim puzzle (`Solve`, digest construction, target comparison) and the emission schedule (`Reward`, `SeriesTotal`) |
 | `internal/store` | Append-only block segment files (1,000 blocks per segment), each record CRC32C-checksummed; a partial trailing record from a crash is truncated on open and a damaged record is reported, never silently dropped |
 | `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency |
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
 | `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size), `GET /block/{height}`, and `POST /tx` (hex-encoded canonical transaction bytes) |
-| `internal/devnet` | The in-process devnet driver used by both the CLI acceptance command and the tests, including replay verification |
+| `internal/devnet` | The in-process devnet driver used by both the CLI acceptance command and the tests: transfer, claim and double-claim-refusal scenario, plus replay verification |
 | `internal/version` | The semantic version constant (`0.1.0`) |
-| `cmd/b10coin` | CLI entrypoint: `devnet`, `node`, `version`, `help` |
+| `cmd/b10coin` | CLI entrypoint: `devnet`, `node`, `claim`, `version`, `help` |
 
 ## Key design decisions
 
@@ -130,20 +228,24 @@ Import direction is `cmd → devnet → {chain, rpc, node}` and
    through `crypto.HashParts`, which length-prefixes each part before hashing
    so different part boundaries can never collide, with separate domain labels
    for transactions, tx IDs, headers, blocks, accounts, genesis and the
-   faucet. BLAKE3 is the repository's single direct dependency.
+   faucet. There are two direct external dependencies: BLAKE3
+   (`lukechampine.com/blake3`) and Argon2id (`golang.org/x/crypto`).
 4. **A protocol faucet that has no private key.** The faucet address is
    derived as `BLAKE3("b10coin-faucet" ‖ genesis hash)[:20]`: its preimage is
    a chain-wide constant, not a public key, so no Ed25519 signature can ever
    be produced for it. Coins leave it only through the protocol's claim rule
    (M2). A test asserts it is not the address of any nameable public key —
    including the genesis hash reinterpreted as one.
-5. **Capped emission with arithmetic that closes exactly.** The base unit is
-   the spark; `1 b10 = 10^8 sparks`. Supply caps at 21,000,000 b10; the block
-   reward starts at 0.5 b10 and halves every 21,000,000 blocks, after which
-   the chain runs on fees only. `Genesis.Validate` requires
-   `InitialRewardSparks × HalvingIntervalBlocks × 2 == TotalSupplySparks`,
-   so the schedule sums exactly to the cap (2.1 × 10¹⁵ sparks, comfortably
-   inside `uint64`).
+5. **Capped emission whose realized total can never exceed the cap.** The
+   base unit is the spark; `1 b10 = 10^8 sparks`. Supply caps at
+   21,000,000 b10; the block reward starts at 0.5 b10 and halves every
+   21,000,000 blocks, after which the chain runs on fees only.
+   `Genesis.Validate` requires the idealized identity
+   `InitialRewardSparks × HalvingIntervalBlocks × 2 == TotalSupplySparks`
+   (2.1 × 10¹⁵ sparks, comfortably inside `uint64`); the realized series —
+   what the shift-truncated rewards actually sum to — totals
+   20,999,997.48 b10, 2.52 b10 below the cap, and
+   `TestEmissionNeverExceedsTheCap` keeps the cap a maximum, never a target.
 6. **Crash-tolerant, append-only block storage.** Blocks are written to
    segment files as length-prefixed, CRC32C-checksummed records. Opening the
    store truncates a partial trailing record — the crash-mid-write case — and
@@ -161,11 +263,17 @@ the JSON at runtime, so JSON never enters a hashed path. The JSON files are
 **checked records**: `TestGenesisJSONRecordsMatchTheGoConstructors` unmarshals
 each one and requires it to agree field-for-field with the corresponding
 constructor (`chain_id`, validator and dev-account counts, every `params`
-value), so either copy drifting from the other fails the suite. Both chains
-share the same monetary protocol constants: 2,000 ms
-block time, 21,000,000 b10 supply cap, 50,000,000 sparks (0.5 b10) initial
-reward, 21,000,000-block halving interval, 100 b10 per faucet claim, 1,000 b10
-minimum stake, 10,000-block epochs, 2 unbonding epochs.
+value including the faucet puzzle parameters and difficulty target), so either
+copy drifting from the other fails the suite. Both chains share the same
+monetary protocol constants: 2,000 ms block time, 21,000,000 b10 supply cap,
+50,000,000 sparks (0.5 b10) initial reward, 21,000,000-block halving interval,
+1,000 b10 minimum stake, and 2 unbonding epochs. The chains differ in these
+parameters: epoch length is **1,000-block epochs on devnet, 10,000-block
+epochs on testnet**, per the design's §6.3; the faucet claim amount is
+deliberately **1 b10 on devnet** (a fixture claim a short devnet run can fund)
+and **the spec's 100 b10 on testnet**; and the faucet puzzle is tuned per
+chain (fast on devnet, the spec's ≈3 s on testnet). The other differences are
+in the table below.
 
 | | `genesis/devnet.json` | `genesis/testnet.json` |
 |---|---|---|
@@ -173,6 +281,8 @@ minimum stake, 10,000-block epochs, 2 unbonding epochs.
 | Validators | 1, from a deterministic public test key | 0 (validator keys arrive with real networking, M4) |
 | Dev accounts | 1 funded account plus 1 zero-balance recipient, for transfers before the M2 faucet exists | **none** |
 | Committee size | 1 | 21 |
+| Faucet claim amount | 1 b10 (100,000,000 sparks) | 100 b10 (10,000,000,000 sparks) |
+| Faucet puzzle | Argon2id 64 KiB × 1 iteration × 1 lane, target `0x7f` + 31 × `0xff` | Argon2id 64 MiB × 3 iterations × 1 lane, target `0x0f` + 31 × `0xff` |
 
 The devnet fixture exists to exercise transfers and the CLI; the testnet
 configuration is where the no-premine promise lives:
@@ -181,37 +291,39 @@ configuration is where the no-premine promise lives:
 |---|---|
 | No premine on testnet | `TestTestnetGenesisHasNoPremine` rejects any funded account in the `genesis.Testnet` constructor — the Go source of truth the node runs from — and `TestGenesisJSONRecordsMatchTheGoConstructors` requires `genesis/testnet.json` to agree field-for-field with it, so a funded entry in the JSON record fails the suite too |
 | No key can spend from the faucet | the faucet address is hash-of-genesis, not hash-of-pubkey; the derivation is pinned by a test |
-| Emission closes exactly at the cap | `Genesis.Validate` enforces `InitialRewardSparks × HalvingIntervalBlocks × 2 == TotalSupplySparks`; `TestSupplyCapIsPinned` pins the absolute monetary values, so a proportional "renegotiation" cannot pass |
+| Emission never exceeds the cap (it lands 2.52 b10 short of it) | `Genesis.Validate` enforces the idealized identity `InitialRewardSparks × HalvingIntervalBlocks × 2 == TotalSupplySparks`, which pins the parameters; the realized truncated series — 20,999,997.48 b10 — is kept under the cap by `TestEmissionNeverExceedsTheCap`, and `TestSupplyCapIsPinned` pins the absolute monetary values, so a proportional "renegotiation" cannot pass |
 
 ## Checks
 
-`go test -count=1 ./...` and `go test -race ./...` are green across all eleven
+`go test -count=1 ./...` and `go test -race ./...` are green across all twelve
 test packages, and `go vet ./...` and `gofmt` are clean on this repository as
-committed. CI (`.github/workflows/ci.yml`) runs the same core three on every
-push and pull request, on Go 1.23:
+committed. CI (`.github/workflows/ci.yml`) runs the two acceptance commands on
+every push and pull request as well, on Go 1.23:
 
 | Check | Command |
 |---|---|
 | Static analysis | `go vet ./...` |
 | Test suite | `go test ./...` |
 | Build | `go build ./...` |
+| Acceptance check, default run | `go run ./cmd/b10coin devnet --blocks 100` |
+| Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
 
 Makefile targets: `make test`, `make build` (produces `bin/b10coin`), `make
 vet`, `make fmt`, and `make devnet` (build followed by the acceptance check).
 
 ## Status and roadmap
 
-Implemented — modules M0 and M1:
+Implemented — modules M0, M1 and M2:
 
 - **M0** — repository skeleton, canonical encoding, crypto wrappers, CI.
 - **M1** — single-node chain: account state machine, block production,
   durable persistence and replay, HTTP RPC, and the devnet acceptance check.
+- **M2** — faucet: claimable coins from the keyless protocol faucet, paid
+  from the capped emission schedule and rate-limited by the Argon2id puzzle
+  (one claim per key per epoch; consensus is unaffected).
 
 Pending:
 
-- **M2** — faucet: coins claimable from the protocol faucet at the fixed
-  claim amount, rate-limited by an Argon2id proof-of-work puzzle (memory-hard,
-  tuned to the order of seconds on a Pi; consensus is unaffected).
 - **M3** — Tendermint-style BFT consensus over a deterministic in-process
   simulated network, with safety verified under partitions and equivocation.
 - **M4** — real networking (TCP transport plus a small outbound relay so home
@@ -232,3 +344,6 @@ transport.
   non-goals, risks and the legal note.
 - `docs/plans/2026-10-02-m0-m1-foundation-single-node.md` — the M0–M1
   implementation plan: tasks, exact interfaces and the acceptance gate.
+- `docs/plans/2026-10-02-m2-faucet.md` — the M2 faucet implementation plan:
+  the puzzle, the emission schedule, the claim rule and this milestone's
+  acceptance gate.

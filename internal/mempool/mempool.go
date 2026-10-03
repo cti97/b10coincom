@@ -56,10 +56,14 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 	return errs
 }
 
-// Take removes and returns up to max transactions.
+// Take removes and returns up to max transactions. A non-positive max
+// removes nothing and returns an empty slice.
 func (m *Mempool) Take(max int) []types.Tx {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if max <= 0 {
+		return []types.Tx{}
+	}
 	if max > len(m.txs) {
 		max = len(m.txs)
 	}

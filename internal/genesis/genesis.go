@@ -6,13 +6,32 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"math/bits"
 
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
 // SparksPerB10 is the number of base units in one b10.
 const SparksPerB10 = 100_000_000
+
+// devnetChainID is the throwaway fixture chain's identifier, shared by
+// Devnet() and by Validate's one devnet-specific rule.
+const devnetChainID = "b10coin-devnet-1"
+
+// puzzleTarget builds the shipped puzzle targets: top byte `top`, every
+// remaining byte 0xFF. A claim's digest must be strictly below this value, so
+// the expected number of Argon2id runs is 2^(zero bits at the head of `top`)
+// — ~2 for the devnet's 0x7F, ~16 for the testnet's 0x0F placeholder.
+func puzzleTarget(top byte) [32]byte {
+	var t [32]byte
+	for i := range t {
+		t[i] = 0xFF
+	}
+	t[0] = top
+	return t
+}
 
 var (
 	ErrBadGenesis   = errors.New("genesis: invalid genesis")
@@ -20,7 +39,10 @@ var (
 	ErrEmissionMath = errors.New("genesis: emission schedule does not reach the supply cap exactly")
 )
 
-// Params are the protocol parameters fixed at genesis.
+// Params are the protocol parameters fixed at genesis. FaucetPowArgon2 and
+// FaucetPowTarget configure the faucet claim's proof-of-work (internal/faucet
+// implements it); they are genesis parameters so devnet and testnet ship
+// different tunings from the one source of truth.
 type Params struct {
 	ChainID               string
 	BlockTimeMS           uint64
@@ -32,6 +54,8 @@ type Params struct {
 	EpochBlocks           uint64
 	UnbondingEpochs       uint64
 	CommitteeSize         int
+	FaucetPowArgon2       faucet.Argon2Params
+	FaucetPowTarget       [32]byte
 }
 
 // Validator is a genesis validator with its initial voting power.
@@ -83,6 +107,10 @@ func (g *Genesis) Encode() []byte {
 	e.U64(g.Params.EpochBlocks)
 	e.U64(g.Params.UnbondingEpochs)
 	e.U64(uint64(g.Params.CommitteeSize))
+	e.U32(g.Params.FaucetPowArgon2.MemoryKiB)
+	e.U32(g.Params.FaucetPowArgon2.Iterations)
+	e.U8(g.Params.FaucetPowArgon2.Parallelism)
+	e.Fixed32(g.Params.FaucetPowTarget)
 	return e.Bytes()
 }
 
@@ -131,8 +159,43 @@ func (g *Genesis) Validate() error {
 		}
 	}
 	p := g.Params
-	if p.InitialRewardSparks*p.HalvingIntervalBlocks*2 != p.TotalSupplySparks {
+	// A zero factor cannot produce an emission schedule that reaches the
+	// supply cap: an all-zero parameter set must fail rather than satisfy
+	// 0*0*2 == 0.
+	if p.InitialRewardSparks == 0 || p.HalvingIntervalBlocks == 0 || p.TotalSupplySparks == 0 {
 		return ErrEmissionMath
+	}
+	// The relation is checked without overflow: raw uint64 multiplication
+	// could wrap and make a crafted pair pass, so Mul64 reports the carry
+	// bits and any product that does not fit in one uint64 — which cannot
+	// equal TotalSupplySparks — fails here.
+	hi, lo := bits.Mul64(p.InitialRewardSparks, p.HalvingIntervalBlocks)
+	if hi != 0 {
+		return ErrEmissionMath
+	}
+	hi, lo = bits.Mul64(lo, 2)
+	if hi != 0 {
+		return ErrEmissionMath
+	}
+	if lo != p.TotalSupplySparks {
+		return ErrEmissionMath
+	}
+	// A zero puzzle target is unsatisfiable: a claim verifies only if its
+	// Argon2id digest is strictly below the target, and no digest is strictly
+	// below zero, so every claim on such a chain would fail forever. Every
+	// chain except the devnet fixture must therefore ship a non-zero target.
+	// The devnet is exempt as a fixture; the shipped devnet still sets an easy
+	// non-zero target (pinned by TestArgon2TuningsArePinnedPerChain), so real
+	// devnet runs keep claims usable.
+	if g.ChainID != devnetChainID && p.FaucetPowTarget == ([32]byte{}) {
+		return fmt.Errorf("%w: a zero faucet puzzle target is unsatisfiable (every claim would fail)", ErrBadGenesis)
+	}
+	// The claim rule derives epochs as height/EpochBlocks + 1, so a zero here
+	// is a divide-by-zero panic reachable from a malformed genesis. The state
+	// machine's claim rule guards it too, but a genesis should never validate
+	// with it.
+	if p.EpochBlocks == 0 {
+		return fmt.Errorf("%w: EpochBlocks must not be zero (the claim rule divides by it)", ErrBadGenesis)
 	}
 	return nil
 }
@@ -209,6 +272,18 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 		return nil, err
 	}
 	g.Params.CommitteeSize = int(cs)
+	if g.Params.FaucetPowArgon2.MemoryKiB, err = d.U32(); err != nil {
+		return nil, err
+	}
+	if g.Params.FaucetPowArgon2.Iterations, err = d.U32(); err != nil {
+		return nil, err
+	}
+	if g.Params.FaucetPowArgon2.Parallelism, err = d.U8(); err != nil {
+		return nil, err
+	}
+	if g.Params.FaucetPowTarget, err = d.Fixed32(); err != nil {
+		return nil, err
+	}
 	if err := d.Done(); err != nil {
 		return nil, err
 	}
@@ -217,16 +292,28 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 
 // sharedParams are the values fixed by the design spec. The emission
 // relation InitialReward * HalvingInterval * 2 == TotalSupply must hold.
-func sharedParams(chainID string, committee int) Params {
+// EpochBlocks differs by chain — 1_000 on devnet, 10_000 on testnet — and is
+// the claim rule's epoch length: epoch(h) = h/EpochBlocks + 1. The faucet
+// puzzle's cost and target are set per chain by Devnet/Testnet, since they
+// are deliberately different fixture-vs-real tunings.
+//
+// claimAmountSparks is the third deliberate chain difference (after the epoch
+// length and the puzzle tuning). Emission is 0.5 b10 per block, so the spec's
+// 100-b10 claim is payable only after 200 blocks — a fixture-sized devnet
+// holds 10.0 b10 at 20 blocks and every claim would fail ErrFaucetEmpty. The
+// devnet claims 1 b10 (about two blocks of emission fund it); testnet keeps
+// the spec's 100 b10. THE TWO CHAINS DIFFER ON THIS DELIBERATELY: the devnet
+// is a fixture, not monetary policy, exactly as its shorter epochs are.
+func sharedParams(chainID string, epochBlocks, claimAmountSparks uint64, committee int) Params {
 	return Params{
 		ChainID:               chainID,
 		BlockTimeMS:           2000,
 		TotalSupplySparks:     21_000_000 * SparksPerB10,
 		InitialRewardSparks:   50_000_000, // 0.5 b10
 		HalvingIntervalBlocks: 21_000_000,
-		ClaimAmountSparks:     100 * SparksPerB10,
+		ClaimAmountSparks:     claimAmountSparks,
 		MinStakeSparks:        1_000 * SparksPerB10,
-		EpochBlocks:           10_000,
+		EpochBlocks:           epochBlocks,
 		UnbondingEpochs:       2,
 		CommitteeSize:         committee,
 	}
@@ -237,27 +324,46 @@ func Devnet() *Genesis {
 	pub, _, _ := deterministicKey("b10coin-devnet-validator-1")
 	devPub, _, _ := deterministicKey("b10coin-devnet-faucet-tester")
 	dev2Pub, _, _ := deterministicKey("b10coin-devnet-recipient")
+	params := sharedParams(devnetChainID, 1_000, 1*SparksPerB10, 1)
+	// The devnet puzzle is deliberately trivial: 64 KiB of Argon2id for a
+	// single pass, under a target of 0x7F followed by 31 0xFF bytes (about one
+	// digest in two qualifies, so a solve takes a few attempts). This is a
+	// fixture tuning to keep the test suite quick, not a difficulty claim.
+	params.FaucetPowArgon2 = faucet.Argon2Params{MemoryKiB: 64, Iterations: 1, Parallelism: 1}
+	params.FaucetPowTarget = puzzleTarget(0x7F)
 	return &Genesis{
-		ChainID:    "b10coin-devnet-1",
+		ChainID:    devnetChainID,
 		Time:       1_700_000_000,
 		Validators: []Validator{{PubKey: pub, Power: 1}},
 		DevAccounts: []DevAccount{
 			{PubKey: devPub, BalanceSparks: 1_000_000 * SparksPerB10},
 			{PubKey: dev2Pub, BalanceSparks: 0},
 		},
-		Params: sharedParams("b10coin-devnet-1", 1),
+		Params: params,
 	}
 }
 
 // Testnet is the real chain's configuration: federated validators, and
 // deliberately no funded accounts.
 func Testnet() *Genesis {
+	params := sharedParams("b10coin-testnet-1", 10_000, 100*SparksPerB10, 21)
+	// The spec's ≈3 s Argon2id tuning for a Raspberry Pi 4: 64 MiB of memory
+	// and three passes, as §8 of the design spec records. A target of 0x0F
+	// followed by 31 0xFF bytes is a PLACEHOLDER: it demands roughly sixteen
+	// qualifying runs per claim, so a testnet claim costs minutes at this
+	// tuning.
+	//
+	// This target MUST be re-tuned against real hardware (measured end-to-end
+	// on a Pi 4, including the solver's attempt policy) before any public
+	// testnet opens.
+	params.FaucetPowArgon2 = faucet.Argon2Params{MemoryKiB: 65536, Iterations: 3, Parallelism: 1}
+	params.FaucetPowTarget = puzzleTarget(0x0F)
 	return &Genesis{
 		ChainID:     "b10coin-testnet-1",
 		Time:        1_700_000_000,
 		Validators:  []Validator{},
 		DevAccounts: nil, // no premine, ever
-		Params:      sharedParams("b10coin-testnet-1", 21),
+		Params:      params,
 	}
 }
 
@@ -269,9 +375,14 @@ func DevValidatorKey() (ed25519.PublicKey, ed25519.PrivateKey) {
 	return pub, priv
 }
 
-// DevAccountKey returns the keypair for devnet dev account i (0 or 1).
+// DevAccountKey returns the keypair for devnet dev account i (0 or 1). It
+// panics with an explicit message rather than a bare index error on an
+// out-of-range i: callers pass a literal, so a bad index is always a bug.
 func DevAccountKey(i int) (ed25519.PublicKey, ed25519.PrivateKey) {
 	seeds := []string{"b10coin-devnet-faucet-tester", "b10coin-devnet-recipient"}
+	if i < 0 || i >= len(seeds) {
+		panic(fmt.Sprintf("genesis: DevAccountKey index %d out of range: valid indices are 0..%d", i, len(seeds)-1))
+	}
 	pub, priv, _ := deterministicKey(seeds[i])
 	return pub, priv
 }

@@ -149,6 +149,12 @@ on restart. **No key-value database until replay time actually hurts.**
 | `Unbond` | `amount, nonce, sig` | Move bonded → unbonding; set `unbond_at = height + UNBONDING_BLOCKS` |
 | `Withdraw` | `nonce, sig` | After `unbond_at`, move unbonding → balance |
 
+**Validity rule — a self-transfer (`from == to`) is rejected** (`ErrSelfTransfer`,
+`internal/state/apply.go`): a transfer debits and credits the same account, which
+would alias the two writes and corrupt the balance. Implemented since M1 and
+pinned there by `TestApplyTransferRejectsSelfTransfer`; recorded here so the M3
+consensus work cannot diverge on it.
+
 ### 6.3 Consensus — Tendermint-style BFT, stake-weighted
 
 Chosen over HotStuff deliberately: the lock/unlock rule is subtle, but reference
@@ -202,15 +208,20 @@ protocol's claim rule. There is no human key, no insider allocation, and no sale
 | Total supply cap | **21,000,000 b10** | Terminal; emission reaches zero |
 | Initial block reward | 0.5 b10 = 50,000,000 sparks | Paid into the faucet account |
 | Halving interval | every 21,000,000 blocks | ≈1.33 years at 2 s blocks |
-| Emission endpoint | ~20 halvings | Sum = `0.5 × 21,000,000 × 2` = 21,000,000 b10 ✓ |
-| `CLAIM_AMOUNT` | 100 b10 per key per epoch | Genesis-configurable |
+| Emission endpoint | 26 halvings — zero at height 546,000,000 | ≈34.6 years at 2 s blocks; sum = `0.5 × 21,000,000 × 2` = 21,000,000 b10 ✓ |
+| `CLAIM_AMOUNT` | 100 b10 per key per epoch (testnet) | Genesis-configurable; the devnet fixture claims 1 b10 so a short devnet run can pay one |
 | Faucet puzzle | Argon2id, tuned to ≈3 s on a Pi 4 | Memory-hard; ASICs do not help |
 | Claims allowed | one per key per epoch | The actual anti-farming rule |
 | After emission ends | **fees only** | No perpetual inflation |
 
 Emission arithmetic check: `R0 × HALVING_INTERVAL × 2 = 50,000,000 sparks ×
 21,000,000 × 2 = 2.1 × 10¹⁵ sparks = 21,000,000 b10`. Fits in `u64`
-(max ≈1.8 × 10¹⁹). ✓
+(max ≈1.8 × 10¹⁹). ✓ That product is the idealized identity the genesis
+validation enforces; because each halving's shift truncates, the realized
+series totals 20,999,997.48 b10 (2,099,999,748,000,000 sparks) — **2.52 b10
+short of the cap** — so the cap is a maximum the schedule can never exceed,
+never a target: the 252,000,000 sparks the truncation loses are simply never
+minted, by design rather than by bug.
 
 **Invariant:** a `FaucetClaim` is valid only if the faucet balance covers
 `CLAIM_AMOUNT`. If the faucet is empty, claims fail until more emission accrues.
@@ -358,15 +369,27 @@ Stored in `genesis/devnet.json` and `genesis/testnet.json`:
     "total_supply_sparks": 2100000000000000,
     "initial_reward_sparks": 50000000,
     "halving_interval_blocks": 21000000,
-    "claim_amount_sparks": 10000000000,
+    "claim_amount_sparks": 100000000,
     "min_stake_sparks": 100000000000,
-    "faucet_pow_argon2": { "m_kib": 65536, "t": 3, "p": 1 }
+    "faucet_pow_argon2": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+    "faucet_pow_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
   }
 }
 ```
 
 `faucet_pubkey` is `null` by design: the faucet account is derived
 deterministically from the genesis hash and has no corresponding private key.
+The difficulty target is recorded as the 64-character lowercase hex of its
+32-byte big-endian value: hex is byte-exact, where a decimal rendering could
+not preserve leading zero bytes.
+
+`claim_amount_sparks` is genesis-configurable and is set per chain. The devnet
+record above is a fixture — 1,000-block epochs, minutes of block production —
+so it claims **1 b10 (100,000,000 sparks)**: a short devnet run must be able to
+fund a claim from emission, which at 0.5 b10 per block arrives quickly. The
+testnet keeps the spec-level **100 b10** of §6.4. The shipped records in
+`genesis/`, which mirror the Go constructors field for field, carry both values
+and the per-chain puzzle tuning verbatim.
 
 ---
 
@@ -377,7 +400,7 @@ works."* **Two commands must exist and be green at every milestone:**
 
 ```
 go test ./...                                   # unit + property + simulation tests
-go run ./cmd/b10coin devnet --validators 4 --blocks 100   # end-to-end: 100 blocks finalize
+go run ./cmd/b10coin devnet --blocks N [--dir D]  # end-to-end: a fresh devnet, N blocks appended and verified
 ```
 
 ### 9.1 Deterministic simulation harness (the centrepiece)
@@ -420,7 +443,7 @@ implying otherwise.
 | | Deliverable | Acceptance criterion |
 |---|---|---|
 | **M0** | Repo skeleton, canonical encoding, crypto wrappers, CI | `go test ./...` green |
-| **M1** | Single-node chain: state machine, block production, persistence, RPC | `b10coin node --dev` produces and persists blocks; restart replays to the same root |
+| **M1** | Single-node chain: state machine, block production, persistence, RPC | `b10coin node --dir D [--http ADDR] [--block-time DUR]` produces and persists blocks; restart replays to the same root (the one-command end-to-end proof is `b10coin devnet --blocks 100`) |
 | **M2** | Faucet: Argon2id claim, emission schedule | Coins claimed on devnet; **replayed double-claim and insufficient-PoW claims both fail** |
 | **M3** | **BFT consensus** over `SimTransport` | All §9.1 scenarios pass deterministically; safety property holds under partition |
 | **M4** | Real networking: `TcpTransport` + relay | Cross-compiled ARM64 binary; **3 validators on real Raspberry Pis across separate networks finalize blocks** |

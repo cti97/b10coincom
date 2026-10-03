@@ -6,6 +6,8 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
@@ -26,9 +28,15 @@ func New(c *chain.Chain, proposer ed25519.PrivateKey, mp *mempool.Mempool) *Node
 }
 
 // RunOnce produces at most one block from the current mempool and appends
-// it. Every call appends exactly one block — empty when the mempool is
-// empty — so the chain advances once per tick regardless (the brief's test
-// requires a block at height 1 with an empty mempool).
+// it. On success every call appends exactly one block — empty when the
+// mempool is empty — so the chain advances once per tick regardless (the
+// brief's test requires a block at height 1 with an empty mempool).
+//
+// An error return without an append is also possible in principle: the
+// Probe branch below returns (nil, err) if the empty transition at head+1
+// fails. That transition is a clone, a height set and an emission credit
+// with no transactions to apply — none of which can fail — so the branch
+// is defensive and, as of M2, unreachable.
 //
 // A transaction that cannot apply is evicted ALONE: it must not discard its
 // valid siblings, and it must not leave them to fail with it in a later
@@ -42,8 +50,28 @@ func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 	// keep only the transactions that apply cleanly, in order, against a
 	// running copy of the state. One state-invalid transaction must not
 	// discard the valid ones beside it or wedge the node.
+	//
+	// The filter's base is Chain.Probe(nil) - the state a block at head+1
+	// with no transactions would produce: the SAME transition Build runs,
+	// height advanced and emission credited. Hand-cloning the head state
+	// (the old filter) probed a claim against the head's epoch and a
+	// pre-emission faucet balance, and silently evicted valid claims.
+	// Candidates then apply on top of the base cumulative - each accepted
+	// transaction is inside the running state the next probe starts from,
+	// so a candidate may chain onto its accepted siblings (transfers with
+	// nonces 0 and 1 both survive; probing each against the bare head state
+	// would evict the second). Equivalent-but-quadratic alternative: probing
+	// every candidate through Probe(accepted... + candidate) re-derives and
+	// re-verifies the accepted prefix's signatures per candidate, which on a
+	// full MaxTxsPerBlock mempool is hours of ed25519 per block - a DoS the
+	// one-base form avoids.
 	candidates := n.mempool.Take(types.MaxTxsPerBlock)
-	probe := n.chain.State().Clone()
+	probe, err := n.chain.Probe(nil)
+	if err != nil {
+		// Nothing applies at a state whose head+1 transition fails; park
+		// the candidates back in the mempool rather than lose them.
+		return nil, reAdd(n.mempool, candidates, err)
+	}
 	valid := make([]types.Tx, 0, len(candidates))
 	for i := range candidates {
 		next, err := probe.ApplyBlock([]types.Tx{candidates[i]})
@@ -56,15 +84,37 @@ func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 
 	b, err := n.chain.Build(n.proposer, valid, timestamp)
 	if err != nil {
-		// Do not silently lose valid work.
-		_ = n.mempool.Add(valid)
-		return nil, err
+		return nil, reAdd(n.mempool, valid, err)
 	}
 	if err := n.chain.Append(b); err != nil {
-		_ = n.mempool.Add(valid)
-		return nil, err
+		return nil, reAdd(n.mempool, valid, err)
 	}
 	return b, nil
+}
+
+// reAdd puts txs back into the mempool after a failed block attempt and
+// returns the block failure unchanged when nothing was stranded. If any
+// re-add fails beyond a duplicate, the transaction would be lost silently,
+// so the returned error is wrapped with the count and the re-add reasons.
+// An ErrDuplicate is NOT a loss — mempool.Add reports it when the
+// transaction is already present (for example a client re-submitted the same
+// transaction between Take and this re-add), and it remains eligible for a
+// later block — so only the other failures inflate the count. The caller
+// still sees the original cause first, and errors.Is against it keeps
+// working. No logging framework or new dependency is involved.
+func reAdd(mp *mempool.Mempool, txs []types.Tx, cause error) error {
+	errs := mp.Add(txs)
+	stranded := make([]error, 0, len(errs))
+	for i := range errs {
+		if errs[i] != nil && !errors.Is(errs[i], mempool.ErrDuplicate) {
+			stranded = append(stranded, errs[i])
+		}
+	}
+	if len(stranded) == 0 {
+		return cause
+	}
+	return fmt.Errorf("%w (in addition, %d of %d valid transactions could not be re-added to the mempool and are lost: %v)",
+		cause, len(stranded), len(txs), stranded)
 }
 
 // Run produces blocks every interval until ctx is cancelled.

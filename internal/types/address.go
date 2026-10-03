@@ -48,6 +48,13 @@ func (a Address) String() string {
 }
 
 // ParseAddress validates the prefix, base32 body and checksum of s.
+//
+// Case policy is deliberate: the "b10" PREFIX check is case-sensitive, so
+// "B10…" is rejected, while the base32 BODY is upper-cased before decoding,
+// so a lowercase body is accepted. This asymmetry is not a malleability
+// risk: an Address compares as its raw [20]byte value and String() always
+// re-renders it in lowercase, so every accepted spelling of an address
+// denotes exactly the same account.
 func ParseAddress(s string) (Address, error) {
 	var a Address
 	if !strings.HasPrefix(s, AddressPrefix) {

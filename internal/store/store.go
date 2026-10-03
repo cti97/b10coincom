@@ -166,19 +166,25 @@ func (s *Store) Append(height uint64, payload []byte) error {
 	}
 
 	// Roll to a new segment before writing across a boundary. Open the new
-	// segment before closing the old handle, and swap only on success, so a
-	// failed rollover leaves s.file on an open handle rather than a closed one.
+	// segment first, then move s.file to it BEFORE closing the old handle:
+	// close(2) can fail after the descriptor is really gone, and if s.file
+	// still named the old handle on that path, every later Append would
+	// re-enter rollover and Close a closed file — failing forever. With the
+	// swap first, even a failed Close leaves the store holding an open
+	// handle on the new segment, so the retrying Append re-enters rollover
+	// and recovers; the abandoned old descriptor is reclaimed by os.File's
+	// finalizer. The returned error is unchanged.
 	if s.have && segmentName(height) != segmentName(s.last) {
 		f, err := os.OpenFile(filepath.Join(s.dir, segmentName(height)),
 			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
 		}
-		if err := s.file.Close(); err != nil {
-			f.Close()
+		old := s.file
+		s.file = f
+		if err := old.Close(); err != nil {
 			return err
 		}
-		s.file = f
 	}
 
 	off, err := s.file.Seek(0, io.SeekEnd)
