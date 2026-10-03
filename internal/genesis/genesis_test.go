@@ -182,6 +182,28 @@ func TestSupplyCapIsPinned(t *testing.T) {
 	}
 }
 
+// The claim amount is a PER-CHAIN value, like the epoch length and the
+// puzzle tuning: emission is 0.5 b10 per block, so the spec's 100-b10 claim
+// is payable only after 200 blocks — a fixture-sized devnet could never pay
+// one, and every claim would fail ErrFaucetEmpty. The devnet therefore claims
+// 1 b10 (about two blocks of emission) and testnet keeps the spec's 100 b10.
+// The two chains differ on this DELIBERATELY (the devnet is a fixture, not
+// monetary policy); this pin is what stops one silently absorbing the other.
+func TestClaimAmountsArePinnedPerChain(t *testing.T) {
+	devnet, testnet := Devnet(), Testnet()
+	if devnet.Params.ClaimAmountSparks != 1*SparksPerB10 {
+		t.Fatalf("devnet ClaimAmountSparks = %d, want %d (a short devnet must be able to fund one claim)",
+			devnet.Params.ClaimAmountSparks, 1*SparksPerB10)
+	}
+	if testnet.Params.ClaimAmountSparks != 100*SparksPerB10 {
+		t.Fatalf("testnet ClaimAmountSparks = %d, want the spec's %d",
+			testnet.Params.ClaimAmountSparks, 100*SparksPerB10)
+	}
+	if devnet.Params.ClaimAmountSparks == testnet.Params.ClaimAmountSparks {
+		t.Fatal("devnet and testnet claim amounts coincide; they are meant to differ deliberately")
+	}
+}
+
 func TestGenesisRoundTripThroughEncoding(t *testing.T) {
 	g := Devnet()
 	enc := g.Encode()

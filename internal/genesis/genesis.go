@@ -296,14 +296,22 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 // the claim rule's epoch length: epoch(h) = h/EpochBlocks + 1. The faucet
 // puzzle's cost and target are set per chain by Devnet/Testnet, since they
 // are deliberately different fixture-vs-real tunings.
-func sharedParams(chainID string, epochBlocks uint64, committee int) Params {
+//
+// claimAmountSparks is the third deliberate chain difference (after the epoch
+// length and the puzzle tuning). Emission is 0.5 b10 per block, so the spec's
+// 100-b10 claim is payable only after 200 blocks — a fixture-sized devnet
+// holds 10.0 b10 at 20 blocks and every claim would fail ErrFaucetEmpty. The
+// devnet claims 1 b10 (about two blocks of emission fund it); testnet keeps
+// the spec's 100 b10. THE TWO CHAINS DIFFER ON THIS DELIBERATELY: the devnet
+// is a fixture, not monetary policy, exactly as its shorter epochs are.
+func sharedParams(chainID string, epochBlocks, claimAmountSparks uint64, committee int) Params {
 	return Params{
 		ChainID:               chainID,
 		BlockTimeMS:           2000,
 		TotalSupplySparks:     21_000_000 * SparksPerB10,
 		InitialRewardSparks:   50_000_000, // 0.5 b10
 		HalvingIntervalBlocks: 21_000_000,
-		ClaimAmountSparks:     100 * SparksPerB10,
+		ClaimAmountSparks:     claimAmountSparks,
 		MinStakeSparks:        1_000 * SparksPerB10,
 		EpochBlocks:           epochBlocks,
 		UnbondingEpochs:       2,
@@ -316,7 +324,7 @@ func Devnet() *Genesis {
 	pub, _, _ := deterministicKey("b10coin-devnet-validator-1")
 	devPub, _, _ := deterministicKey("b10coin-devnet-faucet-tester")
 	dev2Pub, _, _ := deterministicKey("b10coin-devnet-recipient")
-	params := sharedParams(devnetChainID, 1_000, 1)
+	params := sharedParams(devnetChainID, 1_000, 1*SparksPerB10, 1)
 	// The devnet puzzle is deliberately trivial: 64 KiB of Argon2id for a
 	// single pass, under a target of 0x7F followed by 31 0xFF bytes (about one
 	// digest in two qualifies, so a solve takes a few attempts). This is a
@@ -338,7 +346,7 @@ func Devnet() *Genesis {
 // Testnet is the real chain's configuration: federated validators, and
 // deliberately no funded accounts.
 func Testnet() *Genesis {
-	params := sharedParams("b10coin-testnet-1", 10_000, 21)
+	params := sharedParams("b10coin-testnet-1", 10_000, 100*SparksPerB10, 21)
 	// The spec's ≈3 s Argon2id tuning for a Raspberry Pi 4: 64 MiB of memory
 	// and three passes, as §8 of the design spec records. A target of 0x0F
 	// followed by 31 0xFF bytes is a PLACEHOLDER: it demands roughly sixteen
