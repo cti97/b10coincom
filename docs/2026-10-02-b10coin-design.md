@@ -149,6 +149,12 @@ on restart. **No key-value database until replay time actually hurts.**
 | `Unbond` | `amount, nonce, sig` | Move bonded → unbonding; set `unbond_at = height + UNBONDING_BLOCKS` |
 | `Withdraw` | `nonce, sig` | After `unbond_at`, move unbonding → balance |
 
+**Validity rule — a self-transfer (`from == to`) is rejected** (`ErrSelfTransfer`,
+`internal/state/apply.go`): a transfer debits and credits the same account, which
+would alias the two writes and corrupt the balance. Implemented since M1 and
+pinned there by `TestApplyTransferRejectsSelfTransfer`; recorded here so the M3
+consensus work cannot diverge on it.
+
 ### 6.3 Consensus — Tendermint-style BFT, stake-weighted
 
 Chosen over HotStuff deliberately: the lock/unlock rule is subtle, but reference
@@ -377,7 +383,7 @@ works."* **Two commands must exist and be green at every milestone:**
 
 ```
 go test ./...                                   # unit + property + simulation tests
-go run ./cmd/b10coin devnet --validators 4 --blocks 100   # end-to-end: 100 blocks finalize
+go run ./cmd/b10coin devnet --blocks N [--dir D]  # end-to-end: a fresh devnet, N blocks appended and verified
 ```
 
 ### 9.1 Deterministic simulation harness (the centrepiece)
@@ -420,7 +426,7 @@ implying otherwise.
 | | Deliverable | Acceptance criterion |
 |---|---|---|
 | **M0** | Repo skeleton, canonical encoding, crypto wrappers, CI | `go test ./...` green |
-| **M1** | Single-node chain: state machine, block production, persistence, RPC | `b10coin node --dev` produces and persists blocks; restart replays to the same root |
+| **M1** | Single-node chain: state machine, block production, persistence, RPC | `b10coin node --dir D [--http ADDR] [--block-time DUR]` produces and persists blocks; restart replays to the same root (the one-command end-to-end proof is `b10coin devnet --blocks 100`) |
 | **M2** | Faucet: Argon2id claim, emission schedule | Coins claimed on devnet; **replayed double-claim and insufficient-PoW claims both fail** |
 | **M3** | **BFT consensus** over `SimTransport` | All §9.1 scenarios pass deterministically; safety property holds under partition |
 | **M4** | Real networking: `TcpTransport` + relay | Cross-compiled ARM64 binary; **3 validators on real Raspberry Pis across separate networks finalize blocks** |
