@@ -223,26 +223,33 @@ func TestRootIsOrderIndependentAndSensitive(t *testing.T) {
 }
 
 // TestRootGoldenVector freezes the exact root for a fixed state. It is the
-// only test that pins the leaf encoding (balance then nonce), the Merkle
-// construction and the "b10coin-account" domain label: change any of them and
-// this value changes, which is precisely the point.
+// only test that pins the leaf encoding (balance, nonce, then claimed epoch),
+// the Merkle construction and the "b10coin-account" domain label: change any
+// of them and this value changes, which is precisely the point.
 //
 // To produce the expected value: write this test with a zero `want`, run it,
 // and paste the 32 bytes the failure reports. Then confirm the vector is
 // load-bearing by temporarily changing the domain label in state.go and
 // watching this test fail, before reverting that change.
+//
+// SUPERSEDED (M0-M1, two-field leaf): 69383ee3c1b92da50c46bca897476dc1deded1ec5b47086deec2a09e7d37295e
+// Re-derived in M2 because the account leaf gained ClaimedEpoch. This is a
+// deliberate format change, not a re-capture of an unexplained failure - the
+// do-not-recapture rule still holds for every other reason. The first account
+// also gained ClaimedEpoch: 1 so the pinned value commits a NON-ZERO marker:
+// zeroing the ClaimedEpoch field out of the leaf encoding must move this root.
 func TestRootGoldenVector(t *testing.T) {
 	s := New()
 	s.Set(types.Address{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}, Account{Balance: 1000, Nonce: 7})
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01}, Account{Balance: 1000, Nonce: 7, ClaimedEpoch: 1})
 	s.Set(types.Address{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02}, Account{Balance: 0, Nonce: 3})
 	s.Set(types.Address{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, Account{Balance: 18446744073709551615, Nonce: 0})
 
 	var want = [32]byte{
-		0x69, 0x38, 0x3e, 0xe3, 0xc1, 0xb9, 0x2d, 0xa5, 0x0c, 0x46, 0xbc, 0xa8, 0x97, 0x47, 0x6d, 0xc1,
-		0xde, 0xde, 0xd1, 0xec, 0x5b, 0x47, 0x08, 0x6d, 0xee, 0xc2, 0xa0, 0x9e, 0x7d, 0x37, 0x29, 0x5e,
+		0x08, 0x9d, 0x2f, 0x56, 0x8d, 0x54, 0x7c, 0x73, 0x56, 0x1a, 0xd5, 0x65, 0x3e, 0xe3, 0xca, 0xbe,
+		0x5e, 0x3b, 0x67, 0xfc, 0x50, 0x85, 0x64, 0x4c, 0x61, 0x2c, 0xe7, 0x31, 0xfe, 0xd1, 0x95, 0x9a,
 	}
 	if got := s.Root(); got != want {
 		t.Fatalf("golden root changed:\n got %x\nwant %x", got, want)
@@ -259,6 +266,13 @@ func TestRootGoldenVector(t *testing.T) {
 // NOT re-capture it from a fresh run to make a failing test pass — a changed
 // root is a consensus-encoding change and needs a deliberate look at what
 // moved, exactly as for the three-account vector above.
+//
+// SUPERSEDED (M0-M1, two-field leaf): d7c4156eb3c139ae215bfbdbc929854fb66210ce809a632ffb990d6b3fe643cd
+// Re-derived in M2 because the account leaf gained ClaimedEpoch. This is a
+// deliberate format change, not a re-capture of an unexplained failure - the
+// do-not-recapture rule still holds for every other reason. The last account
+// also gained ClaimedEpoch: 3 so the pinned value commits a NON-ZERO marker:
+// zeroing the ClaimedEpoch field out of the leaf encoding must move this root.
 func TestRootGoldenVectorFourAccounts(t *testing.T) {
 	s := New()
 	s.Set(types.Address{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -268,11 +282,11 @@ func TestRootGoldenVectorFourAccounts(t *testing.T) {
 	s.Set(types.Address{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x33}, Account{Balance: 7_777_777})
 	s.Set(types.Address{0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
-		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa}, Account{Balance: 123_456_789, Nonce: 5})
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa}, Account{Balance: 123_456_789, Nonce: 5, ClaimedEpoch: 3})
 
 	var want = [32]byte{
-		0xd7, 0xc4, 0x15, 0x6e, 0xb3, 0xc1, 0x39, 0xae, 0x21, 0x5b, 0xfb, 0xdb, 0xc9, 0x29, 0x85, 0x4f,
-		0xb6, 0x62, 0x10, 0xce, 0x80, 0x9a, 0x63, 0x2f, 0xfb, 0x99, 0x0d, 0x6b, 0x3f, 0xe6, 0x43, 0xcd,
+		0xd0, 0xda, 0x0f, 0x2d, 0xfa, 0xee, 0x53, 0xe2, 0x2a, 0x63, 0xf7, 0x96, 0x95, 0x8b, 0xe3, 0x52,
+		0xd5, 0xaa, 0x60, 0x4e, 0x7c, 0xc2, 0x81, 0xf3, 0xdc, 0x02, 0x9c, 0xcf, 0x6d, 0xa5, 0xb3, 0x72,
 	}
 	if got := s.Root(); got != want {
 		t.Fatalf("four-account golden root changed:\n got %x\nwant %x", got, want)
@@ -325,5 +339,19 @@ func TestZeroAccountsArePruned(t *testing.T) {
 	}
 	if s.Root() != (New()).Root() {
 		t.Fatal("zero account changed the root")
+	}
+}
+
+// An account that has claimed in epoch 0 has non-zero committed state and must
+// survive pruning, or the one-claim-per-epoch rule would reset on every prune.
+func TestClaimMarkerSurvivesPruning(t *testing.T) {
+	a, _, _ := keypair(t)
+	s := New()
+	s.Set(a, Account{ClaimedEpoch: 1})
+	if s.Len() != 1 {
+		t.Fatalf("an account holding only a claim marker was pruned: len=%d", s.Len())
+	}
+	if s.Root() == New().Root() {
+		t.Fatal("the claim marker is not committed into the state root")
 	}
 }

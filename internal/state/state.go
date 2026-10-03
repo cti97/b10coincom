@@ -12,14 +12,24 @@ import (
 	"github.com/cti97/b10coincom/internal/types"
 )
 
-// Account is a single account's balance and replay counter.
+// Account is a single account's balance, replay counter and faucet-claim
+// marker. ClaimedEpoch is the epoch of the account's most recent faucet claim
+// (0 means no claim was recorded, which is also how a claim made in epoch 0
+// looks, and the two behave identically). It is committed consensus state, not
+// local policy.
 type Account struct {
-	Balance uint64
-	Nonce   uint64
+	Balance      uint64
+	Nonce        uint64
+	ClaimedEpoch uint64
 }
 
 // isZero reports whether an account carries no information and may be pruned.
-func (a Account) isZero() bool { return a.Balance == 0 && a.Nonce == 0 }
+// A key that has claimed only retains its claim marker, so an account with a
+// non-zero ClaimedEpoch is live even with zero balance and nonce: pruning it
+// would reset the one-claim-per-epoch rule on every prune.
+func (a Account) isZero() bool {
+	return a.Balance == 0 && a.Nonce == 0 && a.ClaimedEpoch == 0
+}
 
 // State is a set of accounts. The zero value is not usable; call New.
 type State struct {
@@ -78,7 +88,9 @@ func (s *State) sortedAddresses() []types.Address {
 	return addrs
 }
 
-// Root commits to the entire account set.
+// Root commits to the entire account set. The leaf covers all three account
+// fields: a claim marker that was not committed would not be consensus, and the
+// one-claim-per-epoch rule would be unenforceable across nodes.
 func (s *State) Root() [32]byte {
 	addrs := s.sortedAddresses()
 	leaves := make([][32]byte, 0, len(addrs))
@@ -87,6 +99,7 @@ func (s *State) Root() [32]byte {
 		c := types.NewEncoder()
 		c.U64(acc.Balance)
 		c.U64(acc.Nonce)
+		c.U64(acc.ClaimedEpoch)
 		leaves = append(leaves, crypto.HashParts([]byte("b10coin-account"), a[:], c.Bytes()))
 	}
 	return crypto.MerkleRoot(leaves)
