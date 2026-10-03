@@ -43,16 +43,27 @@ func (l *lock) lockOn(round uint32, id [32]byte) {
 
 // canPrevote reports whether the validator may prevote id at round while holding
 // this lock. The rule, verbatim from the spec: a locked validator prevotes its
-// locked block, or a block proposed at a round STRICTLY GREATER than the one it is
+// locked block, or a block whose proposal carries a VERIFIED polka
+// (two-thirds of prevotes) from a round strictly greater than the one it is
 // locked on. Anything else is refused.
-func (l *lock) canPrevote(round uint32, id [32]byte) bool {
+//
+// The third argument is the proposal's VERIFIED ValidRound, not its proposing
+// round: the locking rule implemented literally - unlock on a newer proposing
+// round - does not prevent conflicting commits, because a malicious proposer can
+// offer a conflicting block at round r+1 with no polka behind it and every locked
+// validator would prevote it. Design Decision 11 holds the counterexample.
+func (l *lock) canPrevote(round uint32, id [32]byte, validRound int64) bool {
 	if l.lockedRound < 0 {
 		return true // not locked: anything goes
 	}
 	if id == l.lockedBlock {
 		return true // its own promise, at any round
 	}
-	return int64(round) > l.lockedRound // a strictly newer round, so the network has moved on
+	// Unlock ONLY on evidence: the proposal must carry a polka for id from a
+	// round strictly greater than this validator's lock. A bare round number is
+	// not evidence - see Design Decision 11 in
+	// docs/plans/2026-10-03-m3-bft-consensus.md for the counterexample.
+	return validRound > l.lockedRound
 }
 
 func (l *lock) locked() bool      { return l.lockedRound >= 0 }

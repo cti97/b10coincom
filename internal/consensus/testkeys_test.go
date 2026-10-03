@@ -42,3 +42,24 @@ func testSignRaw(t *testing.T, priv ed25519PrivateKey, h [32]byte) []byte {
 	t.Helper()
 	return ed25519Sign(priv, h[:])
 }
+
+// signProposal signs a proposal with its named validator's committee key.
+func signProposal(t *testing.T, cfg Config, p *Proposal) []byte {
+	t.Helper()
+	idx := cfg.IndexOf(p.Validator)
+	if idx < 0 {
+		t.Fatal("signProposal: proposer is not in the committee")
+	}
+	// SigningHash returns an array BY VALUE, which cannot be sliced in place; bind it first.
+	h := p.SigningHash()
+	return ed25519Sign(testCommitteeKey(idx), h[:])
+}
+
+// tryProposal decodes a proposal, or returns nil if the message is not one.
+func tryProposal(b []byte) *Proposal {
+	p, err := DecodeProposal(b)
+	if err != nil {
+		return nil
+	}
+	return p
+}

@@ -30,6 +30,13 @@ var (
 	ErrBadProposalSignature = errors.New("consensus: bad proposal signature")
 	ErrUnknownMsgType       = errors.New("consensus: unknown message type")
 	ErrBadValidatorKey      = errors.New("consensus: validator key cannot derive its address")
+	// ErrBadJustification reports a proposal whose claimed ValidRound is not
+	// backed by the prevotes it carries: no prevotes at all, prevotes that fail
+	// to decode or verify, prevotes for another (height, round), or prevotes
+	// that fall short of quorum for the proposal's own block. The engine treats
+	// such a proposal as unusable evidence and refuses to prevote it - see
+	// Design Decision 11 in docs/plans/2026-10-03-m3-bft-consensus.md.
+	ErrBadJustification = errors.New("consensus: proposal's justification does not prove its claimed polka")
 )
 
 // Vote is one validator's signed judgement about one (height, round).
@@ -121,9 +128,24 @@ func (v *Vote) Verify() error {
 // Proposal is a block offered for a (height, round) together with its proposer's
 // signature over the envelope fields and the block header.
 type Proposal struct {
-	Height    uint64
-	Round     uint32
-	Block     types.Block
+	Height uint64
+	Round  uint32
+	Block  types.Block
+
+	// ValidRound is the round at which this block reached a polka (2/3 prevotes), or
+	// -1 when the proposer knows of none. Justification carries the prevotes proving
+	// it. A locked validator prevotes a DIFFERING block only when ValidRound exceeds
+	// its own lock round - see Design Decision 11 for why a bare round number is not
+	// enough.
+	//
+	// The engine VERIFIES the evidence rather than trusting the field: an unverified
+	// justification would let a proposer assert an unlock that no quorum ever
+	// granted. A fresh proposal must set ValidRound to -1 explicitly - the int64
+	// zero value 0 CLAIMS a polka at round 0, which the engine would (correctly)
+	// refuse as unevidenced.
+	ValidRound    int64
+	Justification []byte
+
 	Validator []byte // the proposer's Ed25519 public key
 	Sig       []byte // over SigningHash(): envelope fields plus Block.Header.SigningHash()
 }
@@ -132,11 +154,17 @@ type Proposal struct {
 // valid proposal cannot be re-presented at a different height or round. Hashing
 // only the header would leave Height and Round unsigned - the same gap the vote
 // encoding closes field by field.
+//
+// ValidRound and Justification are signed with the rest: a proposer must not be
+// quotable as having claimed - or having furnished evidence of - a polka at a
+// round it never did.
 func (p *Proposal) SigningHash() [32]byte {
 	e := types.NewEncoder()
 	e.U64(p.Height)
 	e.U32(p.Round)
 	e.Fixed32(p.Block.Header.SigningHash())
+	e.I64(p.ValidRound)
+	e.VarBytes(p.Justification)
 	return crypto.HashParts([]byte("b10coin-proposal"), e.Bytes())
 }
 
@@ -162,6 +190,8 @@ func EncodeProposal(p *Proposal) []byte {
 	e.U64(p.Height)
 	e.U32(p.Round)
 	e.VarBytes(p.Block.Encode())
+	e.I64(p.ValidRound)
+	e.VarBytes(p.Justification)
 	e.VarBytes(p.Validator)
 	e.VarBytes(p.Sig)
 	return e.Bytes()
@@ -192,6 +222,12 @@ func DecodeProposal(b []byte) (*Proposal, error) {
 		return nil, err
 	}
 	p.Block = *blk
+	if p.ValidRound, err = d.I64(); err != nil {
+		return nil, err
+	}
+	if p.Justification, err = d.VarBytes(); err != nil {
+		return nil, err
+	}
 	if p.Validator, err = d.VarBytes(); err != nil {
 		return nil, err
 	}
@@ -202,4 +238,44 @@ func DecodeProposal(b []byte) (*Proposal, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// encodeJustification renders the prevotes that back a proposal's ValidRound as
+// a varint count followed by that many length-prefixed encoded votes. The count
+// prefix is what makes the sequence self-delimiting: the decoder cannot ask a
+// byte slice where it ends, so the element count closes the frame.
+//
+// It is unexported because only the consensus package currently builds
+// justifications: the engine makes fresh proposals (ValidRound -1, none), and a
+// future re-proposing engine assembles the polka through this same shape.
+func encodeJustification(votes []*Vote) []byte {
+	e := types.NewEncoder()
+	e.Len(len(votes))
+	for _, v := range votes {
+		e.VarBytes(EncodeVote(v))
+	}
+	return e.Bytes()
+}
+
+// decodeVotes reads encodeJustification's wire shape. A short, oversized, or
+// non-canonical frame decodes to nil, which verifyJustification then rejects by
+// finding no quorum.
+func decodeVotes(b []byte) [][]byte {
+	d := types.NewDecoder(b)
+	n, err := d.Len()
+	if err != nil {
+		return nil
+	}
+	out := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		raw, err := d.VarBytes()
+		if err != nil {
+			return nil
+		}
+		out = append(out, raw)
+	}
+	if err := d.Done(); err != nil {
+		return nil
+	}
+	return out
 }

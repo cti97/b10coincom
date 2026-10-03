@@ -127,7 +127,14 @@ func TestProposalRoundTrips(t *testing.T) {
 			Proposer:   pub,
 		},
 	}
-	p := &Proposal{Height: 9, Round: 4, Block: blk, Validator: pub}
+	p := &Proposal{Height: 9, Round: 4, Block: blk, Validator: pub,
+		// The justification rides the same envelope and the same signature as the
+		// rest of the envelope: it is evidence, so it must be tamper-evident too.
+		ValidRound: 2,
+		Justification: encodeJustification([]*Vote{
+			signedVote(t, MsgPrevote, 9, 2, blk.ID()),
+			signedVote(t, MsgPrevote, 9, 2, blk.ID()),
+		})}
 	sig := p.SigningHash()
 	p.Sig = crypto.Sign(priv, sig[:])
 
@@ -140,6 +147,12 @@ func TestProposalRoundTrips(t *testing.T) {
 	}
 	if got.Height != p.Height || got.Round != p.Round {
 		t.Fatalf("round trip lost envelope fields:\n got %+v\nwant %+v", got, p)
+	}
+	if got.ValidRound != p.ValidRound {
+		t.Fatalf("round trip lost ValidRound: got %d want %d", got.ValidRound, p.ValidRound)
+	}
+	if len(decodeVotes(got.Justification)) != 2 {
+		t.Fatalf("round trip lost the justification's %d prevotes", len(decodeVotes(p.Justification)))
 	}
 	if got.Block.ID() != p.Block.ID() {
 		t.Fatal("round trip lost the block")
@@ -162,6 +175,11 @@ func TestProposalRoundTrips(t *testing.T) {
 // proposer that signed an offer for round 4 at height 9 must not be quotable as
 // having offered the same block at another height or round. This is the same
 // gap TestVoteSignatureCoversEveryField closes for votes, one level up.
+//
+// ValidRound and Justification are in the signature with them (Task 6, Design
+// Decision 11): the locked/unlocked decision keys off ValidRound, so a proposer
+// must not be quotable as having claimed a polka - let alone furnished evidence
+// of one - at a round it never did.
 func TestProposalSignatureCoversHeightAndRound(t *testing.T) {
 	pub, priv := testKey(t)
 	blk := types.Block{
@@ -174,7 +192,10 @@ func TestProposalSignatureCoversHeightAndRound(t *testing.T) {
 			Proposer:   pub,
 		},
 	}
-	p := &Proposal{Height: 9, Round: 4, Block: blk, Validator: pub}
+	p := &Proposal{Height: 9, Round: 4, Block: blk, Validator: pub,
+		ValidRound:    2,
+		Justification: []byte{0x07},
+	}
 	sig := p.SigningHash()
 	p.Sig = crypto.Sign(priv, sig[:])
 	base := p.SigningHash()
@@ -185,6 +206,8 @@ func TestProposalSignatureCoversHeightAndRound(t *testing.T) {
 	}{
 		{"height", func(x *Proposal) { x.Height++ }},
 		{"round", func(x *Proposal) { x.Round++ }},
+		{"validRound", func(x *Proposal) { x.ValidRound++ }},
+		{"justification", func(x *Proposal) { x.Justification = []byte{0x08} }},
 	} {
 		c := *p // a COPY, so every other signed byte stays constant
 		tc.mutate(&c)
