@@ -105,17 +105,17 @@ func (s *State) applyFaucetClaim(tx *types.Tx) error {
 			ErrClaimTooSoon, claimant.ClaimedEpoch, tx.Epoch)
 	}
 
+	// The nonce rule, exactly as for a transfer: a claim spends the account's
+	// replay counter like any other transaction.
+	if claimant.Nonce != tx.Nonce {
+		return fmt.Errorf("%w: got %d, want %d", ErrBadNonce, tx.Nonce, claimant.Nonce)
+	}
+
 	// The signature only proved the CLAIMANT authorised this transaction - it
 	// says nothing about the work. Verify the puzzle against the parameters
 	// this state was constructed with.
 	if !faucet.MeetsTarget(faucet.PowDigest(tx.PubKey, tx.Epoch, tx.PowNonce, s.params.PowArgon2), s.params.PowTarget) {
 		return ErrBadProofOfWork
-	}
-
-	// The nonce rule, exactly as for a transfer: a claim spends the account's
-	// replay counter like any other transaction.
-	if claimant.Nonce != tx.Nonce {
-		return fmt.Errorf("%w: got %d, want %d", ErrBadNonce, tx.Nonce, claimant.Nonce)
 	}
 
 	faucetAcc := s.Get(s.params.FaucetAddress)

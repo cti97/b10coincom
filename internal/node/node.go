@@ -28,9 +28,15 @@ func New(c *chain.Chain, proposer ed25519.PrivateKey, mp *mempool.Mempool) *Node
 }
 
 // RunOnce produces at most one block from the current mempool and appends
-// it. Every call appends exactly one block — empty when the mempool is
-// empty — so the chain advances once per tick regardless (the brief's test
-// requires a block at height 1 with an empty mempool).
+// it. On success every call appends exactly one block — empty when the
+// mempool is empty — so the chain advances once per tick regardless (the
+// brief's test requires a block at height 1 with an empty mempool).
+//
+// An error return without an append is also possible in principle: the
+// Probe branch below returns (nil, err) if the empty transition at head+1
+// fails. That transition is a clone, a height set and an emission credit
+// with no transactions to apply — none of which can fail — so the branch
+// is defensive and, as of M2, unreachable.
 //
 // A transaction that cannot apply is evicted ALONE: it must not discard its
 // valid siblings, and it must not leave them to fail with it in a later

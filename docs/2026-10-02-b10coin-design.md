@@ -208,7 +208,7 @@ protocol's claim rule. There is no human key, no insider allocation, and no sale
 | Total supply cap | **21,000,000 b10** | Terminal; emission reaches zero |
 | Initial block reward | 0.5 b10 = 50,000,000 sparks | Paid into the faucet account |
 | Halving interval | every 21,000,000 blocks | ≈1.33 years at 2 s blocks |
-| Emission endpoint | ~20 halvings | Sum = `0.5 × 21,000,000 × 2` = 21,000,000 b10 ✓ |
+| Emission endpoint | 26 halvings — zero at height 546,000,000 | ≈34.6 years at 2 s blocks; sum = `0.5 × 21,000,000 × 2` = 21,000,000 b10 ✓ |
 | `CLAIM_AMOUNT` | 100 b10 per key per epoch (testnet) | Genesis-configurable; the devnet fixture claims 1 b10 so a short devnet run can pay one |
 | Faucet puzzle | Argon2id, tuned to ≈3 s on a Pi 4 | Memory-hard; ASICs do not help |
 | Claims allowed | one per key per epoch | The actual anti-farming rule |

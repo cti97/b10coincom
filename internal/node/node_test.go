@@ -139,10 +139,6 @@ func TestRunOnceEvictsOnlyInvalidTransactions(t *testing.T) {
 	}
 }
 
-// A client can re-submit a transaction between Take and a failed block's
-// re-add; Mempool.Add then reports ErrDuplicate. That transaction is not
-// lost — it is already queued for a later block — so it must not inflate
-// the lost count or appear in the lost list.
 // A VALID claim must survive the mempool probe and reach a block. The probe
 // must mirror the transition a block at head+1 runs: this claim is payable
 // ONLY once block 1's emission is credited (the faucet's genesis mint of 50M
@@ -231,6 +227,10 @@ func TestRunOnceProbeFeedsAcceptedTransactionsForward(t *testing.T) {
 	}
 }
 
+// A client can re-submit a transaction between Take and a failed block's
+// re-add; Mempool.Add then reports ErrDuplicate. That transaction is not
+// lost — it is already queued for a later block — so it must not inflate
+// the lost count or appear in the lost list.
 func TestReAddDoesNotCountDuplicatesAsLost(t *testing.T) {
 	mp := mempool.New(10)
 	tx := mkTransfer(t, 0)
