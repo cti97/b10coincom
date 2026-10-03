@@ -130,6 +130,48 @@ func TestDecodeTxRejectsTrailingBytes(t *testing.T) {
 	}
 }
 
+// The TxFaucetClaim decode paths need malformed-input coverage of their own:
+// TestDecodeTxRejectsTrailingBytes above exercises a transfer only. Each
+// subcase names its specific sentinel, and each fails if the guard it names
+// were removed (the bounds checks would panic on out-of-range slices, the
+// Done check would return a nil error).
+func TestDecodeTxFaucetClaimRejectsMalformedEncodings(t *testing.T) {
+	tx := signedClaim(t, 3, 9)
+
+	t.Run("truncated claim body", func(t *testing.T) {
+		// Built by hand rather than cut from Encode(): the trailing signature
+		// sits at the end of a full encoding, so truncating that would fail
+		// in the Sig read and never reach the TxFaucetClaim case. Here the
+		// header, pubkey and nonce decode cleanly and the FIRST claim-only
+		// field (Epoch) is the byte that is missing.
+		e := NewEncoder()
+		e.U8(uint8(TxFaucetClaim))
+		e.Raw(tx.From[:])
+		e.VarBytes(tx.PubKey)
+		e.U64(tx.Nonce)
+		if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrShortBuffer) {
+			t.Fatalf("expected ErrShortBuffer for a truncated claim body, got %v", err)
+		}
+	})
+
+	t.Run("trailing bytes", func(t *testing.T) {
+		if _, err := DecodeTx(append(tx.Encode(), 0xFF)); !errors.Is(err, ErrTrailingBytes) {
+			t.Fatalf("expected ErrTrailingBytes, got %v", err)
+		}
+	})
+
+	t.Run("over-long PubKey", func(t *testing.T) {
+		e := NewEncoder()
+		e.U8(uint8(TxFaucetClaim))
+		e.Raw(tx.From[:])
+		e.Len(1024) // claims a 1024-byte key that the buffer does not hold
+		e.Raw([]byte("short-body"))
+		if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrShortBuffer) {
+			t.Fatalf("expected ErrShortBuffer for an over-long PubKey, got %v", err)
+		}
+	})
+}
+
 // signedClaim builds a claim signed by a fresh key.
 func signedClaim(t *testing.T, epoch, powNonce uint64) *Tx {
 	t.Helper()

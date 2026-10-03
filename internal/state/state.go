@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -35,11 +36,50 @@ func (a Account) isZero() bool {
 // State is a set of accounts. The zero value is not usable; call New.
 type State struct {
 	accounts map[types.Address]Account
+
+	// params are the protocol values the claim rule verifies against. They
+	// are set once at construction rather than read from genesis, because the
+	// dependency runs genesis -> state, never back. Zero-valued params (New)
+	// mean claims are unusable, never a panic; applyFaucetClaim rejects them
+	// cleanly. Params are not part of the state root: they are protocol
+	// configuration every node already holds.
+	params Params
+
+	// height is the height of the block whose transactions apply next. It is
+	// EXECUTION CONTEXT, not committed state: the claim rule needs it to
+	// derive the current epoch, the block header already commits to the
+	// height, so Root() deliberately does not hash it. The chain sets it once
+	// per block, before applying that block's transactions.
+	height uint64
 }
 
-func New() *State {
-	return &State{accounts: make(map[types.Address]Account)}
+// Params are the protocol values the claim rule verifies against. They are set
+// once when the state is created rather than read from genesis, because the
+// dependency runs genesis -> state, never back.
+type Params struct {
+	FaucetAddress types.Address
+	ClaimAmount   uint64
+	EpochBlocks   uint64
+	PowArgon2     faucet.Argon2Params
+	PowTarget     [32]byte
 }
+
+// New returns a state with zero-valued params: the M0-M1 behaviour. Claims are
+// unusable there - applyFaucetClaim rejects them cleanly - and nothing panics.
+func New() *State { return NewWithParams(Params{}) }
+
+// NewWithParams returns a state parameterised for the claim rule: the faucet
+// account, the per-claim payout, the epoch length and the puzzle's cost and
+// target. The zero value of Params is legal but leaves claims unusable.
+func NewWithParams(p Params) *State {
+	return &State{accounts: make(map[types.Address]Account), params: p}
+}
+
+// SetHeight records the height of the block whose transactions apply next. It
+// is execution context only - never committed, never hashed into the state
+// root - so the caller sets it once per block, before that block's
+// transactions apply, rather than deriving it from any prior transition.
+func (s *State) SetHeight(h uint64) { s.height = h }
 
 // Get returns the account, or the zero Account if it does not exist.
 func (s *State) Get(a types.Address) Account { return s.accounts[a] }
@@ -55,9 +95,15 @@ func (s *State) Set(a types.Address, acc Account) {
 }
 
 // Clone returns a deep copy. ApplyBlock clones before mutating so a failure
-// cannot leave partial changes behind.
+// cannot leave partial changes behind. The params and the height are
+// execution context and configuration rather than account data, but a copy
+// without them would derive claim epochs from a wrong height, so both travel.
 func (s *State) Clone() *State {
-	out := &State{accounts: make(map[types.Address]Account, len(s.accounts))}
+	out := &State{
+		accounts: make(map[types.Address]Account, len(s.accounts)),
+		params:   s.params,
+		height:   s.height,
+	}
 	for k, v := range s.accounts {
 		out.accounts[k] = v
 	}

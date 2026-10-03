@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -354,5 +355,307 @@ func TestClaimMarkerSurvivesPruning(t *testing.T) {
 	}
 	if s.Root() == New().Root() {
 		t.Fatal("the claim marker is not committed into the state root")
+	}
+}
+
+// testParams mirrors the faucet package's test tuning: trivial Argon2 cost and
+// an easy target, so a solve takes a couple of attempts rather than seconds.
+func testParams(t *testing.T) Params {
+	t.Helper()
+	var target [32]byte
+	for i := range target {
+		target[i] = 0xFF
+	}
+	target[0] = 0x7F
+	return Params{
+		FaucetAddress: types.AddressFromPub([]byte("the-faucet-has-no-private-key")),
+		ClaimAmount:   100,
+		EpochBlocks:   10,
+		PowArgon2:     faucet.Argon2Params{MemoryKiB: 64, Iterations: 1, Parallelism: 1},
+		PowTarget:     target,
+	}
+}
+
+// solvedClaim builds a claim for a fresh key whose proof-of-work ACTUALLY meets
+// the target for the epoch it carries, so that a test using it can only fail on
+// the rule it names.
+func solvedClaim(t *testing.T, p Params, epoch, nonce uint64) *types.Tx {
+	t.Helper()
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pow, ok := faucet.Solve(pub, epoch, p.PowTarget, p.PowArgon2, 1_000_000)
+	if !ok {
+		t.Fatal("could not solve the test puzzle")
+	}
+	tx := &types.Tx{
+		Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: nonce, Epoch: epoch, PowNonce: pow,
+	}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+	return tx
+}
+
+func TestClaimCreditsClaimantAndDebitsFaucet(t *testing.T) {
+	p := testParams(t)
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: 1_000})
+
+	tx := solvedClaim(t, p, 1, 0)
+	claimant := tx.From
+
+	if err := s.ApplyTx(tx); err != nil {
+		t.Fatalf("ApplyTx: %v", err)
+	}
+	if got := s.Get(claimant).Balance; got != p.ClaimAmount {
+		t.Fatalf("claimant balance = %d, want %d", got, p.ClaimAmount)
+	}
+	if got := s.Get(p.FaucetAddress).Balance; got != 1_000-p.ClaimAmount {
+		t.Fatalf("faucet balance = %d, want %d", got, 1_000-p.ClaimAmount)
+	}
+	if got := s.Get(claimant).ClaimedEpoch; got != 1 {
+		t.Fatalf("claim marker = %d, want 1", got)
+	}
+}
+
+// Two solved claims from ONE key in the SAME epoch. The first advances the nonce
+// and sets the marker, so the second must be rejected by the EPOCH rule - which
+// is why its account nonce is deliberately 1, matching the account, and its
+// puzzle is genuinely solved for the epoch it carries, so neither the nonce
+// check nor the puzzle check can be what rejects it.
+func TestClaimRejectsSecondClaimInTheSameEpoch(t *testing.T) {
+	p := testParams(t)
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: 1_000})
+
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Solve WITH the epoch the claim carries (1): PowDigest binds the epoch into
+	// the preimage, so a nonce found for any other epoch fails the target check.
+	firstNonce, ok := faucet.Solve(pub, 1, p.PowTarget, p.PowArgon2, 1_000_000)
+	if !ok {
+		t.Fatal("could not solve the first test puzzle")
+	}
+	first := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 0, Epoch: 1, PowNonce: firstNonce}
+	firstHash := first.SigningHash()
+	first.Sig = crypto.Sign(priv, firstHash[:])
+	if err := s.ApplyTx(first); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+
+	secondNonce, ok := faucet.Solve(pub, 1, p.PowTarget, p.PowArgon2, 1_000_000)
+	if !ok {
+		t.Fatal("could not solve the second test puzzle")
+	}
+	second := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 1, Epoch: 1, PowNonce: secondNonce}
+	secondHash := second.SigningHash()
+	second.Sig = crypto.Sign(priv, secondHash[:])
+
+	before := s.Root()
+	if err := s.ApplyTx(second); !errors.Is(err, ErrClaimTooSoon) {
+		t.Fatalf("expected ErrClaimTooSoon, got %v", err)
+	}
+	// A rejected claim must leave the state EXACTLY as the first claim left it:
+	// the claimant's balance, nonce and marker, and the faucet's balance.
+	if s.Root() != before {
+		t.Fatal("a rejected claim changed the state")
+	}
+	if got := s.Get(types.AddressFromPub(pub)).Balance; got != p.ClaimAmount {
+		t.Fatalf("a rejected claim changed the balance: got %d, want %d", got, p.ClaimAmount)
+	}
+}
+
+// Find a nonce that does NOT meet the target, so that only the puzzle check can
+// reject an otherwise perfectly formed and correctly signed claim.
+func TestClaimRejectsBadProofOfWork(t *testing.T) {
+	p := testParams(t)
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: 1_000})
+
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var badNonce uint64
+	for k := uint64(0); ; k++ {
+		if !faucet.MeetsTarget(faucet.PowDigest(pub, 1, k, p.PowArgon2), p.PowTarget) {
+			badNonce = k
+			break
+		}
+	}
+	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 0, Epoch: 1, PowNonce: badNonce}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+
+	if err := s.ApplyTx(tx); !errors.Is(err, ErrBadProofOfWork) {
+		t.Fatalf("expected ErrBadProofOfWork, got %v", err)
+	}
+}
+
+// Fund the faucet with LESS than one claim, so only the balance rule can reject.
+func TestClaimRejectsWhenTheFaucetIsEmpty(t *testing.T) {
+	p := testParams(t)
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: p.ClaimAmount - 1})
+
+	tx := solvedClaim(t, p, 1, 0)
+	before := s.Root()
+	if err := s.ApplyTx(tx); !errors.Is(err, ErrFaucetEmpty) {
+		t.Fatalf("expected ErrFaucetEmpty, got %v", err)
+	}
+	if s.Root() != before {
+		t.Fatal("a rejected claim changed the state")
+	}
+	if got := s.Get(tx.From).Balance; got != 0 {
+		t.Fatalf("a rejected claim credited the claimant: %d", got)
+	}
+}
+
+// The faucet address is derived from the genesis hash, not from a public key, so
+// no private key exists for it and no signature can ever be produced. Paying a
+// claim therefore debits an account without its owner's signature - the single
+// such place in the codebase. This test pins that the debit needs no signature
+// from the faucet: the only signature on the transaction is the claimant's.
+func TestClaimDebitsTheFaucetWithoutItsSignature(t *testing.T) {
+	p := testParams(t)
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: 1_000})
+
+	tx := solvedClaim(t, p, 1, 0)
+	if tx.From == p.FaucetAddress {
+		t.Fatal("fixture error: the claimant is the faucet address")
+	}
+	sigHash := tx.SigningHash()
+	if !crypto.Verify(tx.PubKey, sigHash[:], tx.Sig) {
+		t.Fatal("fixture error: the claim is not validly signed by its claimant")
+	}
+	if err := s.ApplyTx(tx); err != nil {
+		t.Fatalf("ApplyTx: %v", err)
+	}
+	if got := s.Get(p.FaucetAddress).Balance; got != 1_000-p.ClaimAmount {
+		t.Fatalf("the faucet was not debited: %d", got)
+	}
+}
+
+// A zero-valued parameter set must fail the claim cleanly. argon2.IDKey PANICS on
+// zero rounds, and state.New() deliberately leaves claims unusable, so without this
+// guard an unparameterized state would crash the node instead of rejecting the claim.
+func TestClaimRejectsZeroValuedPuzzleParameters(t *testing.T) {
+	s := New() // no params: claims must be unusable, not fatal
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 0, Epoch: 1, PowNonce: 0}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("claiming against an unparameterized state panicked: %v", r)
+		}
+	}()
+	if err := s.ApplyTx(tx); !errors.Is(err, ErrBadProofOfWork) {
+		t.Fatalf("expected ErrBadProofOfWork, got %v", err)
+	}
+}
+
+// A zero EpochBlocks would make the epoch derivation DIVIDE BY ZERO - a
+// crashed node, not a clean rejection - so the parameter guard covers it like
+// the Argon2 fields. Shipped genesis values are 1_000 and 10_000, but a
+// malformed genesis (or any direct NewWithParams caller) must not be able to
+// panic the transition function either.
+func TestClaimRejectsAZeroEpochLength(t *testing.T) {
+	p := testParams(t)
+	p.EpochBlocks = 0
+	s := NewWithParams(p)
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 0, Epoch: 1, PowNonce: 0}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("claiming against a state with EpochBlocks == 0 panicked: %v", r)
+		}
+	}()
+	if err := s.ApplyTx(tx); !errors.Is(err, ErrBadProofOfWork) {
+		t.Fatalf("expected ErrBadProofOfWork, got %v", err)
+	}
+}
+
+// The claim must carry the CURRENT epoch: epoch(h) = h/EpochBlocks + 1, which is
+// 1-BASED. A solution solved for a later epoch cannot be spent early, and a
+// stale epoch cannot be spent late. Every puzzle here is genuinely solved for
+// the epoch its claim carries, so only the epoch rule can reject.
+func TestClaimRequiresTheCurrentEpoch(t *testing.T) {
+	p := testParams(t)
+	s := NewWithParams(p)
+	s.Set(p.FaucetAddress, Account{Balance: 1_000})
+
+	// Height 0 is in epoch 1 (0/10+1), so an epoch-2 claim is EARLY.
+	early := solvedClaim(t, p, 2, 0)
+	if err := s.ApplyTx(early); !errors.Is(err, ErrWrongEpoch) {
+		t.Fatalf("expected ErrWrongEpoch for an early claim, got %v", err)
+	}
+	if s.Get(early.From).Balance != 0 {
+		t.Fatal("a rejected early claim credited the claimant")
+	}
+
+	// Height 9 is the LAST block of epoch 1: 9/10+1 = 1. A solved epoch-1 claim
+	// succeeds there - this pins the 1-based boundary (a 0-based rule would
+	// derive epoch 0 at height 9 and refuse the claim).
+	s.SetHeight(9)
+	lastOfFirstEpoch := solvedClaim(t, p, 1, 0)
+	if err := s.ApplyTx(lastOfFirstEpoch); err != nil {
+		t.Fatalf("claim on the last block of epoch 1: %v", err)
+	}
+
+	// Height 10 is the FIRST block of epoch 2: 10/10+1 = 2.
+	s.SetHeight(10)
+	// A fresh key's STALE epoch-1 claim, still correctly signed and solved, and
+	// the same key's nonce at 0, so only the epoch rule can reject it.
+	stale := solvedClaim(t, p, 1, 0)
+	if err := s.ApplyTx(stale); !errors.Is(err, ErrWrongEpoch) {
+		t.Fatalf("expected ErrWrongEpoch for a stale-epoch claim, got %v", err)
+	}
+	current := solvedClaim(t, p, 2, 0)
+	if err := s.ApplyTx(current); err != nil {
+		t.Fatalf("claim on the first block of epoch 2: %v", err)
+	}
+	if got := s.Get(current.From).ClaimedEpoch; got != 2 {
+		t.Fatalf("claim marker = %d, want 2", got)
+	}
+}
+
+// The height is EXECUTION CONTEXT, never committed state: it must not enter the
+// state root (the block header already commits to it), and Clone must carry it,
+// or a cloned transition (ApplyBlock) would derive claim epochs from a height
+// that is not the block's.
+func TestHeightIsExecutionContextOnly(t *testing.T) {
+	a, _, _ := keypair(t)
+	s := New()
+	s.Set(a, Account{Balance: 5})
+
+	s.SetHeight(7)
+	withHeight7 := s.Root()
+	s.SetHeight(300)
+	if s.Root() != withHeight7 {
+		t.Fatal("the height is hashed into the state root")
+	}
+	if s.Clone().height != 300 {
+		t.Fatal("Clone did not carry the height")
 	}
 }
