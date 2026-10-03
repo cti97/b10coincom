@@ -4,6 +4,7 @@
 package chain
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -44,8 +45,10 @@ type Chain struct {
 	head  *types.Block
 }
 
-// genesisState builds the state that block 1 builds upon.
-func genesisState(g *genesis.Genesis) (*state.State, error) {
+// genesisState builds the state that block 1 builds upon. It cannot fail:
+// genesis validation has already checked every key length, so the error
+// return is omitted.
+func genesisState(g *genesis.Genesis) *state.State {
 	s := state.New()
 	for _, d := range g.DevAccounts {
 		addr := types.AddressFromPub(d.PubKey)
@@ -53,7 +56,7 @@ func genesisState(g *genesis.Genesis) (*state.State, error) {
 		acc.Balance += d.BalanceSparks
 		s.Set(addr, acc)
 	}
-	return s, nil
+	return s
 }
 
 func genesisBlock(g *genesis.Genesis, st *state.State) *types.Block {
@@ -75,10 +78,7 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 	if err := g.Validate(); err != nil {
 		return nil, err
 	}
-	st, err := genesisState(g)
-	if err != nil {
-		return nil, err
-	}
+	st := genesisState(g)
 	s, err := store.Open(dir)
 	if err != nil {
 		return nil, err
@@ -117,7 +117,8 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 		// chain would replay to the very roots the rewritten headers claim.
 		// The cheapest authentication of the stored bytes is to require each
 		// block to claim the position it sits at and to link exactly the
-		// block replayed before it (the synthesized genesis at height 1).
+		// block replayed before it (for replay position h = 1 that
+		// predecessor is the synthesized genesis, which lives at height 0).
 		if blk.Header.Height != h {
 			return nil, fmt.Errorf("%w at height %d: stored block claims height %d", ErrGenesisReplay, h, blk.Header.Height)
 		}
@@ -170,7 +171,7 @@ func (c *Chain) State() *state.State {
 // isValidator reports whether pub is in the genesis validator set.
 func (c *Chain) isValidator(pub []byte) bool {
 	for _, v := range c.gen.Validators {
-		if string(v.PubKey) == string(pub) {
+		if bytes.Equal(v.PubKey, pub) {
 			return true
 		}
 	}
@@ -292,10 +293,7 @@ func (c *Chain) BlockAt(height uint64) (*types.Block, error) {
 		return c.head, nil
 	}
 	if height == 0 {
-		st, err := genesisState(c.gen)
-		if err != nil {
-			return nil, err
-		}
+		st := genesisState(c.gen)
 		return genesisBlock(c.gen, st), nil
 	}
 	raw, err := c.store.Read(height)

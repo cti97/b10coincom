@@ -73,7 +73,10 @@ func Run(o Options) (Summary, error) {
 	}, nil
 }
 
-// Replay reopens an existing devnet directory and reports the replayed state.
+// Replay reopens an existing devnet directory and reports the replayed
+// state. TxsIncluded is recomputed from the stored blocks rather than left
+// at zero, because a hard zero would be indistinguishable from a chain that
+// genuinely included no transactions.
 func Replay(dir string) (Summary, error) {
 	g := genesis.Devnet()
 	c, err := chain.Open(g, dir)
@@ -81,10 +84,20 @@ func Replay(dir string) (Summary, error) {
 		return Summary{}, err
 	}
 	defer c.Close()
+
+	included := 0
+	for h := uint64(1); h <= c.Height(); h++ {
+		b, err := c.BlockAt(h)
+		if err != nil {
+			return Summary{}, err
+		}
+		included += len(b.Txs)
+	}
 	return Summary{
-		ChainID:   g.ChainID,
-		Height:    c.Height(),
-		StateRoot: c.State().Root(),
+		ChainID:     g.ChainID,
+		Height:      c.Height(),
+		StateRoot:   c.State().Root(),
+		TxsIncluded: included,
 	}, nil
 }
 

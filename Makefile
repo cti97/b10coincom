@@ -1,9 +1,14 @@
 GO ?= go
 
-.PHONY: test build vet fmt devnet
+.PHONY: test race build vet fmt devnet
 
+# -count=1 defeats the test result cache, so a flaky test cannot pass on
+# the strength of an earlier run.
 test:
-	$(GO) test ./...
+	$(GO) test -count=1 ./...
+
+race:
+	$(GO) test -race -count=1 ./...
 
 vet:
 	$(GO) vet ./...

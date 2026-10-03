@@ -6,6 +6,7 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
@@ -56,15 +57,33 @@ func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 
 	b, err := n.chain.Build(n.proposer, valid, timestamp)
 	if err != nil {
-		// Do not silently lose valid work.
-		_ = n.mempool.Add(valid)
-		return nil, err
+		return nil, reAdd(n.mempool, valid, err)
 	}
 	if err := n.chain.Append(b); err != nil {
-		_ = n.mempool.Add(valid)
-		return nil, err
+		return nil, reAdd(n.mempool, valid, err)
 	}
 	return b, nil
+}
+
+// reAdd puts txs back into the mempool after a failed block attempt and
+// returns the block failure unchanged when every transaction was accepted.
+// If any re-add fails, the work would be lost silently, so the returned
+// error is wrapped with the count and the re-add reasons — the caller still
+// sees the original cause first, and errors.Is against it keeps working. No
+// logging framework or new dependency is involved.
+func reAdd(mp *mempool.Mempool, txs []types.Tx, cause error) error {
+	errs := mp.Add(txs)
+	lost := 0
+	for i := range errs {
+		if errs[i] != nil {
+			lost++
+		}
+	}
+	if lost == 0 {
+		return cause
+	}
+	return fmt.Errorf("%w (in addition, %d of %d valid transactions could not be re-added to the mempool and are lost: %v)",
+		cause, lost, len(txs), errs)
 }
 
 // Run produces blocks every interval until ctx is cancelled.

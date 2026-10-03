@@ -75,6 +75,12 @@ func (tx *Tx) ID() [32]byte {
 }
 
 // Encode returns the canonical wire encoding, signature included.
+//
+// Encoding is only meaningful for the transaction types this milestone
+// implements (TxTransfer): encodeBody emits a truncated body for a reserved
+// type, so DecodeTx(tx.Encode()) is not a round trip for those. A later
+// milestone enabling TxFaucetClaim will extend encodeBody and DecodeTx
+// together, keeping the round trip for the types it enables.
 func (tx *Tx) Encode() []byte {
 	e := NewEncoder()
 	e.Raw(tx.encodeBody())
@@ -136,6 +142,11 @@ func DecodeTx(b []byte) (*Tx, error) {
 }
 
 // Equal reports whether two transactions are byte-identical when encoded.
+// A nil receiver or nil argument is never equal (and never panics): a nil
+// value is not a transaction, so it matches nothing.
 func (tx *Tx) Equal(other *Tx) bool {
+	if tx == nil || other == nil {
+		return false
+	}
 	return bytes.Equal(tx.Encode(), other.Encode())
 }

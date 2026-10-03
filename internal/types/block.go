@@ -107,8 +107,8 @@ func (b *Block) ValidateStructure() error {
 		}
 		seen[id] = struct{}{}
 	}
-	if len(b.Encode()) > MaxBlockBytes {
-		return fmt.Errorf("%w: %d bytes", ErrBlockTooLarge, len(b.Encode()))
+	if size := len(b.Encode()); size > MaxBlockBytes {
+		return fmt.Errorf("%w: %d bytes", ErrBlockTooLarge, size)
 	}
 	return nil
 }

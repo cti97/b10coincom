@@ -112,7 +112,18 @@ func cmdNode(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	httpSrv := &http.Server{Addr: *addr, Handler: srv.Handler()}
+	// Timeouts suit a local-node API serving small JSON bodies to trusted
+	// LAN clients: header reading is the untrusted window, reads and writes
+	// never take longer than a slow client, and idle keep-alives are
+	// reaped so a vanished peer cannot hold a connection forever.
+	httpSrv := &http.Server{
+		Addr:              *addr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		_ = httpSrv.Close()

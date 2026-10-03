@@ -10,7 +10,7 @@
     "halving_interval_blocks": 21000000,
     "claim_amount_sparks": 10000000000,
     "min_stake_sparks": 100000000000,
-    "epoch_blocks": 10000,
+    "epoch_blocks": 1000,
     "unbonding_epochs": 2,
     "committee_size": 1
   }

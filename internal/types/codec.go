@@ -24,6 +24,11 @@ var (
 	ErrNonCanonical  = errors.New("types: non-canonical encoding")
 )
 
+// HashSize is the length in bytes of a full hash field, the fixed-width
+// sibling of AddressSize: both named sizes back the fixed-width copy
+// accessors so neither accessor hardcodes its literal.
+const HashSize = 32
+
 // Encoder appends canonically-encoded fields to an internal buffer.
 type Encoder struct {
 	buf []byte
@@ -68,7 +73,7 @@ func (e *Encoder) VarBytes(b []byte) {
 
 func (e *Encoder) Raw(b []byte) { e.buf = append(e.buf, b...) }
 
-func (e *Encoder) Fixed32(v [32]byte) { e.buf = append(e.buf, v[:]...) }
+func (e *Encoder) Fixed32(v [HashSize]byte) { e.buf = append(e.buf, v[:]...) }
 
 // Decoder reads canonically-encoded fields. Every method is bounds-checked
 // and returns an error rather than panicking: this code parses untrusted
@@ -160,11 +165,11 @@ func (d *Decoder) VarBytes() ([]byte, error) {
 
 func (d *Decoder) Fixed32() ([32]byte, error) {
 	var v [32]byte
-	if d.remaining() < 32 {
+	if d.remaining() < HashSize {
 		return v, ErrShortBuffer
 	}
-	copy(v[:], d.buf[d.off:d.off+32])
-	d.off += 32
+	copy(v[:], d.buf[d.off:d.off+HashSize])
+	d.off += HashSize
 	return v, nil
 }
 

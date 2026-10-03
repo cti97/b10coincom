@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"math/bits"
 
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/types"
@@ -131,7 +132,25 @@ func (g *Genesis) Validate() error {
 		}
 	}
 	p := g.Params
-	if p.InitialRewardSparks*p.HalvingIntervalBlocks*2 != p.TotalSupplySparks {
+	// A zero factor cannot produce an emission schedule that reaches the
+	// supply cap: an all-zero parameter set must fail rather than satisfy
+	// 0*0*2 == 0.
+	if p.InitialRewardSparks == 0 || p.HalvingIntervalBlocks == 0 || p.TotalSupplySparks == 0 {
+		return ErrEmissionMath
+	}
+	// The relation is checked without overflow: raw uint64 multiplication
+	// could wrap and make a crafted pair pass, so Mul64 reports the carry
+	// bits and any product that does not fit in one uint64 — which cannot
+	// equal TotalSupplySparks — fails here.
+	hi, lo := bits.Mul64(p.InitialRewardSparks, p.HalvingIntervalBlocks)
+	if hi != 0 {
+		return ErrEmissionMath
+	}
+	hi, lo = bits.Mul64(lo, 2)
+	if hi != 0 {
+		return ErrEmissionMath
+	}
+	if lo != p.TotalSupplySparks {
 		return ErrEmissionMath
 	}
 	return nil
@@ -217,7 +236,9 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 
 // sharedParams are the values fixed by the design spec. The emission
 // relation InitialReward * HalvingInterval * 2 == TotalSupply must hold.
-func sharedParams(chainID string, committee int) Params {
+// EpochBlocks differs by chain — 1_000 on devnet, 10_000 on testnet — and is
+// unused in M0-M1, so nothing observes the difference yet.
+func sharedParams(chainID string, epochBlocks uint64, committee int) Params {
 	return Params{
 		ChainID:               chainID,
 		BlockTimeMS:           2000,
@@ -226,7 +247,7 @@ func sharedParams(chainID string, committee int) Params {
 		HalvingIntervalBlocks: 21_000_000,
 		ClaimAmountSparks:     100 * SparksPerB10,
 		MinStakeSparks:        1_000 * SparksPerB10,
-		EpochBlocks:           10_000,
+		EpochBlocks:           epochBlocks,
 		UnbondingEpochs:       2,
 		CommitteeSize:         committee,
 	}
@@ -245,7 +266,7 @@ func Devnet() *Genesis {
 			{PubKey: devPub, BalanceSparks: 1_000_000 * SparksPerB10},
 			{PubKey: dev2Pub, BalanceSparks: 0},
 		},
-		Params: sharedParams("b10coin-devnet-1", 1),
+		Params: sharedParams("b10coin-devnet-1", 1_000, 1),
 	}
 }
 
@@ -257,7 +278,7 @@ func Testnet() *Genesis {
 		Time:        1_700_000_000,
 		Validators:  []Validator{},
 		DevAccounts: nil, // no premine, ever
-		Params:      sharedParams("b10coin-testnet-1", 21),
+		Params:      sharedParams("b10coin-testnet-1", 10_000, 21),
 	}
 }
 
@@ -269,9 +290,14 @@ func DevValidatorKey() (ed25519.PublicKey, ed25519.PrivateKey) {
 	return pub, priv
 }
 
-// DevAccountKey returns the keypair for devnet dev account i (0 or 1).
+// DevAccountKey returns the keypair for devnet dev account i (0 or 1). It
+// panics with an explicit message rather than a bare index error on an
+// out-of-range i: callers pass a literal, so a bad index is always a bug.
 func DevAccountKey(i int) (ed25519.PublicKey, ed25519.PrivateKey) {
 	seeds := []string{"b10coin-devnet-faucet-tester", "b10coin-devnet-recipient"}
+	if i < 0 || i >= len(seeds) {
+		panic(fmt.Sprintf("genesis: DevAccountKey index %d out of range: valid indices are 0..%d", i, len(seeds)-1))
+	}
 	pub, priv, _ := deterministicKey(seeds[i])
 	return pub, priv
 }
