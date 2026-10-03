@@ -1,6 +1,28 @@
 package consensus
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// Add's sentinels. ErrWrongHeightRound lives here, not in message.go: the
+// height/round a vote belongs to is a property of the VoteSet it was offered
+// to, which a standalone Vote knows nothing about.
+var (
+	// ErrWrongHeightRound reports a correctly signed vote for a different
+	// (height, round) than this set. It is distinct from ErrBadVoteSignature so
+	// callers can tell a routing mistake from a corrupted or forged vote.
+	ErrWrongHeightRound = errors.New("consensus: vote is for another height or round")
+	// ErrNilVote reports Add(nil). Add becomes a network-facing entry point in
+	// M4, where malformed input must error, not panic.
+	ErrNilVote = errors.New("consensus: vote must not be nil")
+	// ErrMissingValidatorKey reports a vote with an empty validator key. There
+	// is no key against which any signature could verify, so this is malformed
+	// input, not a failed verification; it gets its own sentinel rather than
+	// collapsing into ErrBadVoteSignature. message.go is untouched: the tally
+	// guards the empty key itself so its callers can tell the two apart.
+	ErrMissingValidatorKey = errors.New("consensus: vote carries no validator key")
+)
 
 // VoteSet accumulates one kind of vote for one (height, round).
 //
@@ -37,16 +59,24 @@ func NewVoteSet(cfg Config, height uint64, round uint32, typ MsgType) *VoteSet {
 // corrupted in transit fails Verify() no matter where it claims to be for. With
 // the height/round check first, such a corrupted vote is misreported as a
 // placement error and a test asserting ErrBadVoteSignature can never name it.
+// A nil vote and a vote with no validator key are refused before Verify(), since
+// neither can carry a meaningful signature (and a nil one cannot be read).
 func (vs *VoteSet) Add(v *Vote) (bool, error) {
+	if v == nil {
+		return false, ErrNilVote
+	}
 	if v.Type != vs.typ {
 		return false, fmt.Errorf("consensus: vote type %d in a set for %d", v.Type, vs.typ)
+	}
+	if len(v.Validator) == 0 {
+		return false, ErrMissingValidatorKey
 	}
 	if err := v.Verify(); err != nil {
 		return false, err
 	}
 	if v.Height != vs.height || v.Round != vs.round {
-		return false, fmt.Errorf("consensus: vote for (%d,%d) in a set for (%d,%d)",
-			v.Height, v.Round, vs.height, vs.round)
+		return false, fmt.Errorf("%w: vote for (%d,%d) in a set for (%d,%d)",
+			ErrWrongHeightRound, v.Height, v.Round, vs.height, vs.round)
 	}
 	idx := vs.cfg.IndexOf(v.Validator)
 	if idx < 0 {

@@ -58,6 +58,36 @@ func TestTallyIgnoresAValidatorsSecondVote(t *testing.T) {
 	}
 }
 
+// A validator that equivocates - voting for two different blocks at one height and
+// round - must have its weight counted ONCE, not once per block. Keying the
+// duplicate check on the vote rather than the VOTER would let two colluding
+// validators manufacture a quorum the rest of the committee never gave, which is
+// the exact failure this type exists to prevent.
+func TestTallyCountsAnEquivocatingValidatorOnlyOnce(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	var a, b [32]byte
+	a[0], b[0] = 1, 2
+	vs := NewVoteSet(cfg, 1, 0, MsgPrevote)
+
+	// Validator 0 first prevotes block A, then equivocates with a prevote for
+	// block B. The first vote wins; B must receive nothing.
+	if _, err := vs.Add(voteFrom(t, cfg, 0, MsgPrevote, 1, 0, a)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vs.Add(voteFrom(t, cfg, 0, MsgPrevote, 1, 0, b)); err != nil {
+		t.Fatalf("an equivocating vote must be ignored, not rejected: %v", err)
+	}
+	if got := vs.PowerFor(a); got != 1 {
+		t.Fatalf("the equivocator's first vote was not counted: PowerFor(A) = %d, want 1", got)
+	}
+	if got := vs.PowerFor(b); got != 0 {
+		t.Fatalf("the equivocator's second vote was counted for B: PowerFor(B) = %d, want 0", got)
+	}
+	if vs.HasQuorum(b) {
+		t.Fatal("block B reached quorum that the committee never gave")
+	}
+}
+
 func TestTallyRejectsBadSignatureAndNonMembers(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	var id [32]byte
@@ -79,17 +109,44 @@ func TestTallyRejectsBadSignatureAndNonMembers(t *testing.T) {
 	}
 }
 
+// A vote with no validator key is malformed, not badly signed: there is no key
+// against which any signature could verify. It gets its own sentinel rather than
+// collapsing into ErrBadVoteSignature, so a caller can tell "this vote should
+// never have been constructed" from "this vote's signature failed".
+func TestTallyRejectsAVoteWithNoValidatorKey(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	var id [32]byte
+	id[0] = 1
+	vs := NewVoteSet(cfg, 1, 0, MsgPrevote)
+
+	v := &Vote{Type: MsgPrevote, Height: 1, Round: 0, BlockID: id}
+	if got, err := vs.Add(v); got || !errors.Is(err, ErrMissingValidatorKey) {
+		t.Fatalf("expected ErrMissingValidatorKey, got added=%v err=%v", got, err)
+	}
+}
+
+// Add becomes a network-facing entry point in M4; malformed input must error,
+// not panic.
+func TestTallyRejectsANilVote(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	vs := NewVoteSet(cfg, 1, 0, MsgPrevote)
+
+	if got, err := vs.Add(nil); got || !errors.Is(err, ErrNilVote) {
+		t.Fatalf("expected ErrNilVote, got added=%v err=%v", got, err)
+	}
+}
+
 func TestTallyRejectsVotesForAnotherHeightOrRound(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	var id [32]byte
 	id[0] = 1
 
 	vs := NewVoteSet(cfg, 5, 2, MsgPrevote)
-	if _, err := vs.Add(voteFrom(t, cfg, 0, MsgPrevote, 6, 2, id)); err == nil {
-		t.Fatal("a vote for another height must be rejected")
+	if _, err := vs.Add(voteFrom(t, cfg, 0, MsgPrevote, 6, 2, id)); !errors.Is(err, ErrWrongHeightRound) {
+		t.Fatalf("a vote for another height must fail with ErrWrongHeightRound, got %v", err)
 	}
-	if _, err := vs.Add(voteFrom(t, cfg, 0, MsgPrevote, 5, 3, id)); err == nil {
-		t.Fatal("a vote for another round must be rejected")
+	if _, err := vs.Add(voteFrom(t, cfg, 0, MsgPrevote, 5, 3, id)); !errors.Is(err, ErrWrongHeightRound) {
+		t.Fatalf("a vote for another round must fail with ErrWrongHeightRound, got %v", err)
 	}
 }
 
@@ -147,9 +204,7 @@ func TestAnyQuorumFindsTheBlockWithEnoughPower(t *testing.T) {
 // above 2*total/3), so a multi-quorum tally is only reachable through corrupt
 // or Byzantine state - which is exactly when a split committee must still agree
 // on ONE block. The pins are inserted directly (package-internal test); what is
-// pinned is the deterministic first-seen choice, plus its stability within a
-// single run, so map iteration order kills this test ~8/9 of every run instead
-// of never.
+// pinned is the deterministic first-seen choice.
 func TestAnyQuorumReturnsFirstSeenQuorumBlockEvenWhenSeveralHaveQuorum(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	var x, y, z [32]byte
@@ -160,12 +215,22 @@ func TestAnyQuorumReturnsFirstSeenQuorumBlockEvenWhenSeveralHaveQuorum(t *testin
 		vs.power[id] = cfg.Quorum()
 	}
 
-	got, ok := vs.AnyQuorum()
-	if !ok || got != x {
-		t.Fatalf("AnyQuorum returned %v (ok=%v), want the first-seen quorum block", got, ok)
+	first, ok := vs.AnyQuorum()
+	if !ok || first != x {
+		t.Fatalf("AnyQuorum returned %v (ok=%v), want the first-seen quorum block", first, ok)
 	}
-	again, _ := vs.AnyQuorum()
-	if again != got {
-		t.Fatalf("AnyQuorum is not stable within one run: %v then %v", got, again)
+	// Go randomizes map iteration per range statement, so a map-backed AnyQuorum
+	// varies WITHIN one process. Asserting constancy across many calls is therefore
+	// what catches it; a single pair of calls lets the mutant survive a majority of
+	// runs (measured: 56%), which is not a guard.
+	const trials = 100
+	for i := 0; i < trials; i++ {
+		got, ok := vs.AnyQuorum()
+		if !ok {
+			t.Fatalf("trial %d: expected a quorum for the first-seen block", i)
+		}
+		if got != first {
+			t.Fatalf("trial %d: AnyQuorum returned %x, want the first-seen %x - it is not iterating in first-seen order", i, got, first)
+		}
 	}
 }
