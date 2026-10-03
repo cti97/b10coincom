@@ -1,6 +1,8 @@
 package consensus
 
 import (
+	"errors"
+	"math/big"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -25,31 +27,27 @@ func evenCommittee(t *testing.T, n int, power uint64) Config {
 	return c
 }
 
-// testValidator derives validator idx's key the one way every consensus test
-// fixture must use. Task 4+ add testCommitteeKey with the IDENTICAL derivation;
-// TestFixtureKeyDerivationMatchesSharedHelper pins that the two never diverge
-// - a mismatch would make every tally test fail with a signature error instead
-// of testing what it names.
+// testValidator derives validator idx's key through the derivation every
+// test fixture in this package must use. testCommitteeKey (testkeys_test.go)
+// is the cross-task helper carrying that same derivation; the tripwire below
+// pins the two to each other, so a later task changing EITHER derivation
+// breaks this test here, instead of surfacing later as unexplained signature
+// failures in the tally tests.
 func testValidator(idx int, power uint64) genesis.Validator {
 	h := crypto.HashParts([]byte("b10coin-test-validator"), []byte{byte(idx)})
 	priv := ed25519FromSeed(h)
 	return genesis.Validator{PubKey: priv.Public().(ed25519PublicKey), Power: power}
 }
 
-// sharedDerivation writes out the shared derivation independently of
-// testValidator, so the tripwire test below has a second expression to differ
-// against.
-func sharedDerivation(idx int) ed25519PrivateKey {
-	h := crypto.HashParts([]byte("b10coin-test-validator"), []byte{byte(idx)})
-	return ed25519NewKeyFromSeed(h[:])
-}
-
+// The tripwire must face the real helper, not a copy of its expression: a
+// second literal in this file would keep passing while testCommitteeKey
+// drifted away underneath it.
 func TestFixtureKeyDerivationMatchesSharedHelper(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		got := string(testValidator(i, 1).PubKey)
-		want := string(sharedDerivation(i).Public().(ed25519PublicKey))
+		want := string(testCommitteeKey(i).Public().(ed25519PublicKey))
 		if got != want {
-			t.Fatalf("testValidator(%d) diverged from the shared derivation: tally tests would fail with signature errors instead of testing what they name", i)
+			t.Fatalf("testValidator(%d) diverged from testCommitteeKey; a task changed one of the two derivations - tally tests would fail with signature errors instead of testing what they name", i)
 		}
 	}
 }
@@ -67,6 +65,55 @@ func TestQuorumIsTwoThirdsPlusOne(t *testing.T) {
 	for _, tc := range cases {
 		if got := quorumFor(tc.total); got != tc.want {
 			t.Errorf("quorumFor(%d) = %d, want %d", tc.total, got, tc.want)
+		}
+	}
+}
+
+// The overflow-free quorumFor must return the EXACT threshold (smallest q
+// above 2*total/3) for every total. The formulation it replaced, 2*total/3+1,
+// wraps for total >= 2^63: nine equal validators of 3.7e18 power - a committee
+// genesis.Validate accepts - made 2*total wrap, and the resulting threshold
+// covered only ~11% of the true voting power, letting two of the nine commit
+// alone. The reference computes the same quantity in big.Int, where nothing
+// wraps.
+func TestQuorumForMatchesBigReferenceEverywhere(t *testing.T) {
+	three := big.NewInt(3)
+	ref := func(total uint64) uint64 {
+		q := new(big.Int).Lsh(new(big.Int).SetUint64(total), 1) // 2*total, exact
+		q.Div(q, three)
+		q.Add(q, big.NewInt(1)) // strictly above 2*total/3
+		if !q.IsUint64() {
+			t.Fatalf("reference quorum for total %d does not fit uint64", total)
+		}
+		return q.Uint64()
+	}
+
+	totals := map[uint64]bool{0: true, 1: true, 2: true, 3: true, 4: true, 21: true, 100: true}
+	totals[21_000_000*genesis.SparksPerB10] = true // the supply cap ≈ 2^51: the edge the shipped domain can reach
+	for i := uint64(0); i < 4; i++ {
+		totals[(1<<61)+i] = true
+		totals[(1<<62)+i] = true
+		totals[(1<<63)+i] = true
+		totals[(1<<63)-i] = true
+		totals[^uint64(0)-i] = true
+	}
+	// the total the reviewer's committee wraps to: TotalPower(9 x 3.7e18)
+	totals[14_853_255_926_290_448_384] = true
+
+	// every total up to 2000, plus a stride sweep over the whole uint64 range
+	// (odd stride, coprime with 3) so both residues of total mod 3 are hit at
+	// every magnitude - the q++ branch fires only for total%3 == 2.
+	for i := uint64(0); i <= 2000; i++ {
+		totals[i] = true
+	}
+	stride := ^uint64(0) / 500
+	for i := uint64(0); i <= 500; i++ {
+		totals[i*stride] = true
+	}
+
+	for total := range totals {
+		if got, want := quorumFor(total), ref(total); got != want {
+			t.Errorf("quorumFor(%d) = %d, big reference = %d", total, got, want)
 		}
 	}
 }
@@ -93,6 +140,124 @@ func TestValidateRejectsAnEmptyCommittee(t *testing.T) {
 	c := Config{TimeoutBase: 1, TimeoutStep: 1, PowerCapNum: 1, PowerCapDen: 4}
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected an empty committee to be rejected")
+	}
+}
+
+// The spec's ceiling is 1/4; a configured ratio above it makes the cap
+// decorative at the config layer and must be rejected - but only from four
+// validators up, where such a ratio can actually be enforced (see Validate's
+// doc).
+func TestValidateRejectsACapAboveTheQuarterCeiling(t *testing.T) {
+	// 1/4 itself passes on n=4 (evenCommittee already validated it).
+	pin := evenCommittee(t, 4, 1)
+
+	c := pin
+	c.PowerCapNum, c.PowerCapDen = 3, 4
+	if err := c.Validate(); !errors.Is(err, ErrBadConfig) {
+		t.Fatalf("cap 3/4 on a 4-validator committee: got %v, want ErrBadConfig", err)
+	}
+
+	// The ceiling cross-multiplication must be overflow-free: 4*2^62 wraps to
+	// 0 in uint64, so a naive `num*4 > den` would ACCEPT a cap of 2^62/3 - a
+	// ratio around 6e17:1, nowhere near 1/4.
+	c = pin
+	c.PowerCapNum, c.PowerCapDen = 1<<62, 3
+	if err := c.Validate(); !errors.Is(err, ErrBadConfig) {
+		t.Fatalf("overflowing ceiling product 2^62/3: got %v, want ErrBadConfig", err)
+	}
+}
+
+// Below four validators the ceiling cannot bind: the largest holder holds at
+// least total/3, so no ratio under 1/3 is satisfiable there and committees
+// with one or two validators must keep working with bigger caps.
+func TestPowerCapCeilingIsNotEnforcedBelowFourValidators(t *testing.T) {
+	// n=1: the single validator holds all the power; only caps reaching 1/1
+	// (the controller's single-validator fixtures) can hold.
+	one := Config{
+		Committee:   []genesis.Validator{testValidator(0, 1)},
+		TimeoutBase: 1, TimeoutStep: 1,
+		PowerCapNum: 1, PowerCapDen: 1,
+	}
+	if err := one.Validate(); err != nil {
+		t.Fatalf("n=1 committee with cap 1/1 rejected: %v", err)
+	}
+
+	// n=2: each validator holds exactly 1/2; the weighting fixture's 3/4 cap
+	// must survive the ceiling check.
+	two := Config{
+		Committee:   []genesis.Validator{testValidator(0, 3), testValidator(1, 1)},
+		TimeoutBase: 1, TimeoutStep: 1,
+		PowerCapNum: 3, PowerCapDen: 4,
+	}
+	if err := two.Validate(); err != nil {
+		t.Fatalf("n=2 committee with cap 3/4 rejected: %v - the ceiling must bind only from n=4", err)
+	}
+	// ...while the per-validator check still applies below n=4: a validator
+	// holding 3/4 of the power is above the configured cap of 1/2.
+	two.PowerCapNum, two.PowerCapDen = 1, 2
+	err := two.Validate()
+	if !errors.Is(err, ErrPowerCap) {
+		t.Fatalf("n=2 committee with a validator of 3/4 under cap 1/2: got %v, want ErrPowerCap", err)
+	}
+	if errors.Is(err, ErrBadConfig) {
+		t.Fatal("n=2 with cap 1/2 must fail the per-validator comparison, not the ceiling check")
+	}
+}
+
+func TestValidateRejectsTimeoutsThatDoNotGrow(t *testing.T) {
+	c := evenCommittee(t, 4, 1)
+	for _, tc := range []struct {
+		name       string
+		base, step int64
+	}{
+		{"zero base expires instantly every round", 0, 100},
+		{"negative base", -1, 100},
+		{"negative step shrinks each round", 100, -1},
+	} {
+		mut := c
+		mut.TimeoutBase, mut.TimeoutStep = tc.base, tc.step
+		if err := mut.Validate(); !errors.Is(err, ErrBadConfig) {
+			t.Errorf("%s: TimeoutBase=%d TimeoutStep=%d: got %v, want ErrBadConfig", tc.name, tc.base, tc.step, err)
+		}
+	}
+}
+
+func TestValidateRejectsAZeroPowerCapDenominator(t *testing.T) {
+	c := evenCommittee(t, 4, 1)
+	c.PowerCapDen = 0
+	if err := c.Validate(); !errors.Is(err, ErrBadConfig) {
+		t.Fatalf("zero power-cap denominator: got %v, want ErrBadConfig", err)
+	}
+}
+
+// A zero-power validator used to surface as ErrEmptyCommittee - the wrong
+// category: the committee is not empty, one of its entries is malformed.
+func TestValidateReportsAZeroPowerValidatorAsZeroPower(t *testing.T) {
+	c := evenCommittee(t, 8, 1) // 8x1: zeroing one leaves 1/7 per holder, under the 1/4 cap
+	c.Committee[7].Power = 0
+	err := c.Validate()
+	if !errors.Is(err, ErrZeroPower) {
+		t.Fatalf("zero-power validator reported as %v, want ErrZeroPower", err)
+	}
+	if errors.Is(err, ErrEmptyCommittee) {
+		t.Fatal("a zero-power validator in an 8-validator committee must not be reported as an empty committee")
+	}
+}
+
+// A committee whose powers sum past 2^64 must be refused outright: on the
+// wrapped sum the cap comparison, the quorum threshold and the proposer pick
+// are all computed from a lie. (genesis.Validate does not bound the power
+// sum, so this is the one guard against it.)
+func TestValidateRejectsATotalPowerSumThatWraps(t *testing.T) {
+	c := Config{
+		Committee: []genesis.Validator{
+			testValidator(0, 1<<63), testValidator(1, 1<<63), // sum = 2^64: wraps to 0
+		},
+		TimeoutBase: 1, TimeoutStep: 1,
+		PowerCapNum: 1, PowerCapDen: 1, // 1/1 is the only cap two validators can satisfy
+	}
+	if err := c.Validate(); !errors.Is(err, ErrPowerOverflow) {
+		t.Fatalf("power sum 2^64 (wraps) reported as %v, want ErrPowerOverflow", err)
 	}
 }
 
