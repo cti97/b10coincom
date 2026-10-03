@@ -119,16 +119,26 @@ func (v *Vote) Verify() error {
 }
 
 // Proposal is a block offered for a (height, round) together with its proposer's
-// signature over the header.
+// signature over the envelope fields and the block header.
 type Proposal struct {
 	Height    uint64
 	Round     uint32
 	Block     types.Block
 	Validator []byte // the proposer's Ed25519 public key
-	Sig       []byte // over Block.Header.SigningHash()
+	Sig       []byte // over SigningHash(): envelope fields plus Block.Header.SigningHash()
 }
 
-func (p *Proposal) SigningHash() [32]byte { return p.Block.Header.SigningHash() }
+// SigningHash covers the envelope's own fields as well as the block header, so a
+// valid proposal cannot be re-presented at a different height or round. Hashing
+// only the header would leave Height and Round unsigned - the same gap the vote
+// encoding closes field by field.
+func (p *Proposal) SigningHash() [32]byte {
+	e := types.NewEncoder()
+	e.U64(p.Height)
+	e.U32(p.Round)
+	e.Fixed32(p.Block.Header.SigningHash())
+	return crypto.HashParts([]byte("b10coin-proposal"), e.Bytes())
+}
 
 func (p *Proposal) Verify() error {
 	if len(p.Validator) == 0 {

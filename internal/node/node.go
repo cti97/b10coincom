@@ -40,16 +40,20 @@ func New(c *chain.Chain, proposer ed25519.PrivateKey, mp *mempool.Mempool) *Node
 //
 // A transaction that cannot apply is evicted ALONE: it must not discard its
 // valid siblings, and it must not leave them to fail with it in a later
-// batch (Take drains the mempool, so a transaction dropped here is gone for
-// good).
+// batch (Take removes everything it returned, so a transaction dropped here
+// is gone for good. Claims past MaxFaucetClaimsPerBlock are never returned -
+// they stay in the pool untouched, outside this eviction path entirely).
 func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 	if timestamp == 0 {
 		timestamp = n.now().Unix()
 	}
-	// Take drains the mempool, so anything dropped below is gone for good:
-	// keep only the transactions that apply cleanly, in order, against a
-	// running copy of the state. One state-invalid transaction must not
-	// discard the valid ones beside it or wedge the node.
+	// Take removes what it returns, but it does NOT drain the pool: claims
+	// past the per-block claim bound stay pending for a later block. What
+	// Take did return is gone once handed over, so anything dropped below
+	// is lost for good: keep only the transactions that apply cleanly, in
+	// order, against a running copy of the state. One state-invalid
+	// transaction must not discard the valid ones beside it or wedge the
+	// node.
 	//
 	// The filter's base is Chain.Probe(nil) - the state a block at head+1
 	// with no transactions would produce: the SAME transition Build runs,

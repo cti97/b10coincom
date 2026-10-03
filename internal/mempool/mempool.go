@@ -20,6 +20,13 @@ var (
 // bound a full pool of signature-valid claims with garbage proofs would stall
 // block production for hours. Ordinary transactions are not bounded here: they
 // are cheap to validate and the block size limits already cap them.
+//
+// The value 8 is a judgment call, not a derivation. At the testnet tuning it
+// still permits roughly 24 s of Argon2id work per block against the ~2 s target
+// block interval, so it caps the amplification a flooder can force rather than
+// restoring liveness under a sustained flood: a proposal can still be built
+// while the pool sits full of unproven claims, but building it stays slow for
+// as long as the flood lasts.
 const MaxFaucetClaimsPerBlock = 8
 
 // Mempool is a bounded, deduplicated set of pending transactions. It is
@@ -98,6 +105,11 @@ func (m *Mempool) Take(max int) []types.Tx {
 		delete(m.seen, out[i].ID())
 	}
 	m.txs = keep
+	// Preserve the pre-bounding contract: Take always returns a non-nil
+	// slice, empty when the pool is empty or nothing qualified.
+	if out == nil {
+		out = []types.Tx{}
+	}
 	return out
 }
 

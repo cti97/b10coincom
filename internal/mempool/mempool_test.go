@@ -110,6 +110,22 @@ func TestMempoolRemove(t *testing.T) {
 	}
 }
 
+// TestTakeBoundsFaucetClaimsPerBlock below asserts claimsTaken <=
+// MaxFaucetClaimsPerBlock - an inequality against the very constant it reads -
+// so raising the constant to 50 or even 10,000 leaves that suite green while
+// restoring the multi-hour stall the bound exists to prevent. The constant's
+// smallness IS the mitigation, so the value itself must be pinned here.
+// Why anything near 16 (or above) is not a bound: at the testnet tuning one
+// claim costs ~3 s of Argon2id to verify and a block is targeted every ~2 s,
+// so 8 claims already allow ~24 s of verification per block - a higher value
+// just scales the stall back up rather than capping it.
+func TestMaxFaucetClaimsPerBlockIsActuallyABound(t *testing.T) {
+	if MaxFaucetClaimsPerBlock > 16 {
+		t.Fatalf("MaxFaucetClaimsPerBlock = %d - at ~3 s of Argon2id per claim against a ~2 s block interval, a value this large no longer caps the per-block verification cost, which is the entire point of the bound",
+			MaxFaucetClaimsPerBlock)
+	}
+}
+
 // A mempool full of signature-valid faucet claims must not force the node to
 // evaluate an unbounded number of Argon2id puzzles per block. At the testnet
 // tuning one claim costs ~3 s of CPU, so ten thousand of them would stall block
@@ -154,6 +170,29 @@ func TestTakeBoundsFaucetClaimsPerBlock(t *testing.T) {
 	}
 	if transfersTaken != len(transfers) {
 		t.Fatalf("bounded %d cheap transfers out of %d - the bound must apply to claims only",
-			len(transfers), len(transfers))
+			transfersTaken, len(transfers))
+	}
+
+	// The claims beyond the bound must be left in the pool for a later block,
+	// not dropped: Take removes only what it returns, so the pool still holds
+	// the remainder (and nothing else - every transfer was handed over).
+	if want := len(claims) - claimsTaken; m.Len() != want {
+		t.Fatalf("pool holds %d txs after Take, want %d - the claims past the bound must stay pending, not be dropped",
+			m.Len(), want)
+	}
+	// Those held-back claims drain in insertion order at the bound's rate on
+	// the next call, so a flood cannot starve them or jump the queue.
+	again := m.Take(types.MaxTxsPerBlock)
+	for i := range again {
+		if again[i].Type != types.TxFaucetClaim {
+			t.Fatalf("second Take returned a non-claim at [%d] - the remainder must be claims only", i)
+		}
+	}
+	if len(again) != MaxFaucetClaimsPerBlock {
+		t.Fatalf("second Take returned %d claims, want %d - the counter is per call and the remainder drains in order",
+			len(again), MaxFaucetClaimsPerBlock)
+	}
+	if want := len(claims) - claimsTaken - MaxFaucetClaimsPerBlock; m.Len() != want {
+		t.Fatalf("pool holds %d txs after the second Take, want %d", m.Len(), want)
 	}
 }

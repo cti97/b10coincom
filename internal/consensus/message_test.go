@@ -107,8 +107,8 @@ func TestDecodeVoteRejectsMalformed(t *testing.T) {
 	if _, err := DecodeVote(enc[:len(enc)-1]); err == nil {
 		t.Fatal("a truncated encoding must be rejected")
 	}
-	if _, err := DecodeVote([]byte{0xFF}); err == nil {
-		t.Fatal("an unknown message type must be rejected")
+	if _, err := DecodeVote([]byte{0xFF}); !errors.Is(err, ErrUnknownMsgType) {
+		t.Fatalf("an unknown message type must fail with ErrUnknownMsgType, got %v", err)
 	}
 }
 
@@ -155,5 +155,41 @@ func TestProposalRoundTrips(t *testing.T) {
 	c.Block.Header.Height = 10
 	if err := c.Verify(); !errors.Is(err, ErrBadProposalSignature) {
 		t.Fatalf("expected ErrBadProposalSignature, got %v", err)
+	}
+}
+
+// The proposal envelope's own Height and Round must be inside the signature: a
+// proposer that signed an offer for round 4 at height 9 must not be quotable as
+// having offered the same block at another height or round. This is the same
+// gap TestVoteSignatureCoversEveryField closes for votes, one level up.
+func TestProposalSignatureCoversHeightAndRound(t *testing.T) {
+	pub, priv := testKey(t)
+	blk := types.Block{
+		Header: types.Header{
+			Height:     9,
+			ParentHash: [32]byte{1},
+			StateRoot:  [32]byte{2},
+			TxRoot:     types.ComputeTxRoot(nil),
+			Timestamp:  1_700_000_100,
+			Proposer:   pub,
+		},
+	}
+	p := &Proposal{Height: 9, Round: 4, Block: blk, Validator: pub}
+	sig := p.SigningHash()
+	p.Sig = crypto.Sign(priv, sig[:])
+	base := p.SigningHash()
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Proposal)
+	}{
+		{"height", func(x *Proposal) { x.Height++ }},
+		{"round", func(x *Proposal) { x.Round++ }},
+	} {
+		c := *p // a COPY, so every other signed byte stays constant
+		tc.mutate(&c)
+		if c.SigningHash() == base {
+			t.Errorf("SigningHash ignored the %s field", tc.name)
+		}
 	}
 }
