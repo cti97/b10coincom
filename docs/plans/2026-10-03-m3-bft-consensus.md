@@ -3023,6 +3023,7 @@ func TestScenarioRestartMidEpoch(t *testing.T) {
 
 Add to `internal/simnet/simnet.go` the genesis accessor the restart scenario reopens with, and the equivocator seam:
 
+```
 ```go
 // genesis returns the genesis every validator in this network was opened with. The
 // restart scenario needs it to reopen a stopped validator's chain from the same
