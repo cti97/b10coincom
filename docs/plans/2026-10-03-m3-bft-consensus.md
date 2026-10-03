@@ -1782,6 +1782,92 @@ git commit -m "feat: add the locking rule, isolated because it is safety-critica
 - Consumes: `Config`, `Vote`, `Proposal`, `VoteSet`, `lock`, `types.Block`
 - Produces: `consensus.Step` (`StepPropose`, `StepPrevote`, `StepPrecommit`, `StepCommit`); `consensus.Outbound`; `consensus.TimeoutEvent`; `consensus.Engine`; `NewEngine(cfg, height, parent, priv, propose func(...) (*types.Block, error)) *Engine`; `(*Engine).OnMessage([]byte) error`; `(*Engine).OnTimeout(TimeoutEvent)`; `(*Engine).Drain() []Outbound`; `(*Engine).Height/Round/Step/Locked/Committed`
 
+- [ ] **Step 0: Carry the justification, and VERIFY it**
+
+Design Decision 11 is the milestone's central safety mechanism: a locked validator
+unlocks only when shown that a supermajority moved on without it. That evidence must
+travel with the proposal and must be checked, not trusted.
+
+`Proposal` gains two fields:
+
+```go
+	// ValidRound is the round at which this block reached a polka (2/3 prevotes), or
+	// -1 when the proposer knows of none. Justification carries the prevotes proving
+	// it. A locked validator prevotes a DIFFERING block only when ValidRound exceeds
+	// its own lock round - see Design Decision 11 for why a bare round number is not
+	// enough.
+	ValidRound    int64
+	Justification []byte
+```
+
+Both go in the envelope's signing hash, exactly like `Height` and `Round`. Encode the
+justification as a length-prefixed sequence of encoded votes.
+
+Then a verification helper on the engine, because an unverified justification would be
+worse than none - it would let a proposer assert an unlock that never happened:
+
+```go
+// verifyJustification checks that the proposal's carried prevotes really do prove a
+// polka for the proposal's own block at its own ValidRound. It returns the round to
+// use for the lock comparison: ValidRound when the evidence checks out, and -1 when
+// the proposal carries none, which is the honest case for a fresh block.
+//
+// Verification is not optional. Trusting the field would let a Byzantine proposer
+// claim an unlock that no quorum ever granted, which is precisely the conflicting
+// commit the gate exists to prevent.
+func (e *Engine) verifyJustification(p *Proposal) (int64, error) {
+	if p.ValidRound < 0 {
+		if len(p.Justification) > 0 {
+			return 0, ErrBadJustification // evidence for a round it does not claim
+		}
+		return -1, nil
+	}
+	vs := NewVoteSet(e.cfg, e.height, uint32(p.ValidRound), MsgPrevote)
+	for _, raw := range decodeVotes(p.Justification) { // length-prefixed sequence
+		v, err := DecodeVote(raw)
+		if err != nil {
+			return 0, ErrBadJustification
+		}
+		if _, err := vs.Add(v); err != nil {
+			return 0, ErrBadJustification
+		}
+	}
+	if !vs.HasQuorum(p.Block.ID()) {
+		return 0, ErrBadJustification
+	}
+	return p.ValidRound, nil
+}
+```
+
+`DecodeVote` already rejects a vote whose own height or round is wrong for the set it is
+added to, so a justification cannot smuggle in votes from another height.
+
+Then `maybePrevote` must use the verified round rather than the proposal's round:
+
+```go
+	validRound, err := e.verifyJustification(<the proposal>)
+	if err != nil {
+		return // an unjustified proposal is not prevoted at all
+	}
+	if !e.lk.canPrevote(e.round, id, validRound) {
+		// The lock refuses this block. Prevote NIL rather than staying silent: a
+		// validator that emits nothing leaves its weight out of the nil tally, so the
+		// round can never end and the chain stalls on exactly the safety path this
+		// gate protects.
+		e.emitVote(MsgPrevote, [32]byte{})
+		e.step = StepPrevote
+		return
+	}
+```
+
+**Note the second half of that snippet.** It closes a liveness bug the controller found
+while auditing Task 5: when a validator HAS a proposal but the lock forbids prevoting it,
+returning silently means it emits neither a prevote for the block nor a nil vote, so the
+count never advances. The nil prevote is required.
+
+Also update `Proposal`'s tests: the envelope's signing hash must now cover `ValidRound` and
+`Justification`, and a test must fail if either is dropped.
+
 - [ ] **Step 1: Write the failing tests**
 
 Create `internal/consensus/engine_test.go`:
