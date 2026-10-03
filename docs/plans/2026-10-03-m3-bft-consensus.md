@@ -3395,3 +3395,70 @@ every validator to spend hours validating a single block. A block over the
 bound is now invalid, checked BEFORE any puzzle is evaluated. The testnet
 tuning is re-derived so the worst case fits the block interval."
 ```
+
+---
+
+## Task 12: Persist the lock, so a restart cannot re-vote
+
+**Why this exists.** The milestone's final review found the safety claim is stated unconditionally in the README while the code does not support it across a restart. `NewEngine` sets `lockedRound = -1`, and **neither `Driver`, `chain` nor `store` reads or writes lock state** - so a validator that precommitted `B` and then restarted re-enters **unlocked at the same height**, which is exactly the precondition Design Decision 11's counterexample needs. The reviewer demonstrated it: the locked engine emits only a nil prevote for a conflicting block, while a fresh engine at the same height prevotes it.
+
+The counting argument that closes DD11 has a hidden premise: that the `f+1` locked honest validators **stay** locked. Nothing persists that. Persisting `lockedRound`/`lockedBlock` per height is the standard Tendermint requirement, and without it the milestone's headline sentence is false for any validator that restarts.
+
+**Files:**
+- Modify: `internal/store/store.go` (+ test), `internal/consensus/driver.go` (+ test), `internal/chain/chain.go` (+ test if the store is reached through it), `README.md`
+
+**Interfaces:**
+- Produces: `store.LockRecord{Height uint64; Round uint32; BlockID [32]byte}`, `(*Store).PutLock/PutLocked`, `(*Store).LockAt(height)`; `consensus.Driver` persisting on lock and restoring on engine creation
+
+- [ ] **Step 1: Write the failing test**
+
+```go
+// The safety argument assumes a locked validator STAYS locked. Without persisting the
+// lock, a validator that precommits and then restarts re-enters unlocked at the same
+// height and will help commit a conflicting block - which is precisely the case the
+// locking rule exists to prevent.
+func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
+	// 1. bring up a validator, let it precommit B at height h (so it locks)
+	// 2. stop it, discarding the in-memory engine entirely
+	// 3. restart it from the same directory
+	// 4. hand the fresh engine a conflicting B' at height h with no justification
+	// 5. assert it does NOT prevote B', and DOES prevote a properly justified B'
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `go test ./internal/consensus/ -run TestRestartedValidatorRefusesToPrevoteAConflictingBlock -v`
+Expected: FAIL - the fresh engine prevotes the conflicting block.
+
+- [ ] **Step 3: Persist the lock**
+
+Add a lock record to the crash-tolerant store, written **whenever the lock moves** (i.e. in the driver's commit/precommit path, after `lockOn`) and read when an engine is created for a height. Use the store's existing CRC framing so a torn write is detected rather than silently read as a lock.
+
+Keep the record small and per-height, and make it survive replay: `Open` must reconstruct the lock for the chain's current height, not just the blocks.
+
+- [ ] **Step 4: Restore it on engine creation**
+
+`NewEngine` gains the persisted lock (or the driver sets it after construction). A restored lock must behave exactly like an in-memory one: it survives `enterRound`, and it refuses a differing block until a verified justification exceeds it.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `go test -count=1 ./... && go test -race -count=1 ./...`
+Expected: PASS, including every pre-existing test.
+
+- [ ] **Step 6: Correct the README, and record the remaining limits**
+
+The README's safety sentence may now stand **unconditionally** - but only once the test above passes. Also add to the milestone-limits note the three omissions the final review found: no scenario injects reordering; the justification gate's unlock path is unreachable from any shipped driver (refusal-only in production); and consensus blocks carry no transactions, so the claim bound's motivating threat never arises on the consensus path.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add internal/store internal/consensus internal/chain README.md
+git commit -m "feat: persist the lock so a restart cannot re-vote a conflicting block
+
+The locking rule's safety argument assumes a locked validator stays locked.
+Nothing persisted it: a validator that precommitted and then restarted
+re-entered unlocked at the same height and would help commit a conflicting
+block - the exact case the rule exists to prevent. The lock is now written to
+the crash-tolerant store whenever it moves and restored on engine creation."
+```
