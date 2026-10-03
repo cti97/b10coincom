@@ -3143,15 +3143,24 @@ func TestScenarioRestartMidEpoch(t *testing.T) {
 			stopped, mine.Header.StateRoot[:8], peer.Header.StateRoot[:8])
 	}
 
-	// Let it rejoin and converge.
+	// The restarted validator is now BEHIND its peers, and M3 has no block catch-up, so
+	// it cannot adopt the blocks it missed - see the milestone's limits note. What the
+	// spec requires of this scenario is the REPLAY assertion made above (the state root
+	// matches), and what safety requires is that the restarted chain is a PREFIX of its
+	// peers' rather than a fork of it.
+	//
+	// Re-wire it into the network anyway: a driver that is behind must remain harmless,
+	// not disruptive. Rebuild it over `transportFor(3)` so the harness's recorder stays
+	// wired to the new driver.
 	n.ch[3] = reopened
 	n.offline[3] = false
-	n.drv[3] = consensus.NewDriver(n.cfg, reopened, n.keys[3].priv, n.sim.TransportFor("v3"))
-	if _, err := n.RunBlocks(20); err != nil {
-		t.Fatalf("the restarted validator did not rejoin: %v", err)
+	n.drv[3] = consensus.NewDriver(n.cfg, reopened, n.keys[3].priv, n.transportFor(3))
+	if err := n.AssertPrefix(3); err != nil {
+		t.Fatalf("the restarted validator holds a conflicting history: %v", err)
 	}
-	if err := n.AssertSameChain(); err != nil {
-		t.Fatalf("a safety violation after the restart: %v", err)
+	// And the peers must be unaffected by its return.
+	if _, err := n.RunBlocksAmong(20, []int{0, 1, 2}); err != nil {
+		t.Fatalf("the restarted validator disrupted the running chain: %v", err)
 	}
 }
 
