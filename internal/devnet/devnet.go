@@ -123,6 +123,10 @@ func Run(o Options) (Summary, error) {
 		if err != nil {
 			return Summary{}, err
 		}
+		// TxsIncluded must count what the run's blocks actually carried, claims
+		// included, so Replay - which recounts from the stored blocks - reports
+		// the same number for this run.
+		included += len(b.Txs)
 		id := claim.ID()
 		for i := range b.Txs {
 			if b.Txs[i].ID() == id {

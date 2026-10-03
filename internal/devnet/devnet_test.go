@@ -45,14 +45,15 @@ func TestDevnetIsDeterministic(t *testing.T) {
 // the claimant keys are DERIVED, not random (Solve's upward nonce scan and
 // Ed25519 are deterministic), so two runs agree on everything a claim moved.
 func TestDevnetClaimRunIsReproducible(t *testing.T) {
-	run := func() Summary {
-		s, err := Run(Options{Dir: t.TempDir(), Blocks: 8, Claims: 3})
-		if err != nil {
-			t.Fatalf("Run: %v", err)
-		}
-		return s
+	aDir := t.TempDir()
+	a, err := Run(Options{Dir: aDir, Blocks: 8, Claims: 3})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	a, b := run(), run()
+	b, err := Run(Options{Dir: t.TempDir(), Blocks: 8, Claims: 3})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 	if a.Claimed != 3 {
 		t.Fatalf("fixture error: claimed = %d, want 3; the reproducibility comparison is vacuous", a.Claimed)
 	}
@@ -63,6 +64,27 @@ func TestDevnetClaimRunIsReproducible(t *testing.T) {
 		t.Fatalf("two claim runs disagree on the faucet ledgers:\n claimed %d, faucet %d, emitted %d\n claimed %d, faucet %d, emitted %d",
 			a.ClaimedBalance, a.FaucetBalance, a.EmittedTotal,
 			b.ClaimedBalance, b.FaucetBalance, b.EmittedTotal)
+	}
+	// A replayed RUN WITH CLAIMS must agree with what the run reported:
+	// roots, the claim count, and TxsIncluded (the claim txs belong to it in
+	// both, so a run that stopped counting claims or a replay that
+	// overcounted fail here, not silently).
+	replayed, err := Replay(aDir)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if replayed.StateRoot != a.StateRoot {
+		t.Fatal("replay of a claim run reached a different root")
+	}
+	if replayed.Claimed != a.Claimed {
+		t.Fatalf("replay claimed = %d, run reported %d", replayed.Claimed, a.Claimed)
+	}
+	if replayed.TxsIncluded != a.TxsIncluded {
+		t.Fatalf("replay TxsIncluded = %d, run reported %d (the claim txs must count in both)", replayed.TxsIncluded, a.TxsIncluded)
+	}
+	if replayed.FaucetBalance != a.FaucetBalance || replayed.EmittedTotal != a.EmittedTotal {
+		t.Fatalf("replay ledgers diverged:\n faucet %d, emitted %d\n faucet %d, emitted %d",
+			replayed.FaucetBalance, replayed.EmittedTotal, a.FaucetBalance, a.EmittedTotal)
 	}
 }
 
