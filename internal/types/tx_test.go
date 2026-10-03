@@ -89,18 +89,22 @@ func TestVerifySignatureRejectsMismatchedFrom(t *testing.T) {
 }
 
 func TestDecodeTxRejectsUnsupportedType(t *testing.T) {
-	e := NewEncoder()
-	e.U8(uint8(TxBond))
-	// AddressFromPub returns an array, which must be bound to a variable
-	// before it can be sliced (a call result is not addressable).
-	from := AddressFromPub([]byte("p"))
-	e.Raw(from[:])
-	e.VarBytes([]byte("pub"))
-	e.U64(0)
-	e.U64(0)
-	e.VarBytes([]byte("sig"))
-	if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrUnsupportedTxType) {
-		t.Fatalf("expected ErrUnsupportedTxType, got %v", err)
+	for _, reserved := range []TxType{TxBond, TxUnbond, TxWithdraw} {
+		e := NewEncoder()
+		e.U8(uint8(reserved))
+		// AddressFromPub returns an array, which must be bound to a variable
+		// before it can be sliced (a call result is not addressable).
+		from := AddressFromPub([]byte("p"))
+		e.Raw(from[:])
+		e.VarBytes([]byte("pub"))
+		e.U64(0)
+		e.U64(0)
+		e.VarBytes([]byte("sig"))
+		// The decoder rejects by type before reading anything else, so the
+		// remainder of the body above is deliberately not a valid anything.
+		if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrUnsupportedTxType) {
+			t.Fatalf("type %d: expected ErrUnsupportedTxType, got %v", reserved, err)
+		}
 	}
 }
 
@@ -123,5 +127,64 @@ func TestDecodeTxRejectsTrailingBytes(t *testing.T) {
 	_, err := DecodeTx(append(enc, 0xFF))
 	if !errors.Is(err, ErrTrailingBytes) {
 		t.Fatalf("expected ErrTrailingBytes, got %v", err)
+	}
+}
+
+// signedClaim builds a claim signed by a fresh key.
+func signedClaim(t *testing.T, epoch, powNonce uint64) *Tx {
+	t.Helper()
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &Tx{
+		Type:     TxFaucetClaim,
+		From:     AddressFromPub(pub),
+		PubKey:   pub,
+		Nonce:    0,
+		Epoch:    epoch,
+		PowNonce: powNonce,
+	}
+	sigHash := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sigHash[:])
+	return tx
+}
+
+func TestFaucetClaimRoundTrips(t *testing.T) {
+	tx := signedClaim(t, 7, 12345)
+	got, err := DecodeTx(tx.Encode())
+	if err != nil {
+		t.Fatalf("DecodeTx: %v", err)
+	}
+	if got.Type != TxFaucetClaim || got.Epoch != 7 || got.PowNonce != 12345 {
+		t.Fatalf("round trip lost the claim fields: %+v", got)
+	}
+	if got.ID() != tx.ID() {
+		t.Fatal("round trip changed the tx ID")
+	}
+}
+
+// The signature must cover the epoch and the nonce, or an attacker could take a
+// valid signed claim and re-aim it at a different epoch or swap in another
+// solution.
+func TestFaucetClaimSignatureCoversEpochAndNonce(t *testing.T) {
+	tx := signedClaim(t, 7, 12345)
+	base := tx.SigningHash()
+
+	// Each variant is a copy of the SAME signed transaction with one field
+	// changed, so every other byte of the signed body is held constant and the
+	// comparison isolates the field under test. (signedClaim generates a fresh
+	// random key on every call: a second signedClaim's hash differs by its key
+	// alone, which would let this test pass even if encodeBody ignored the
+	// field — the RED run demonstrated exactly that.)
+	other := *tx
+	other.Epoch = 8
+	if other.SigningHash() == base {
+		t.Fatal("SigningHash ignored the epoch")
+	}
+	third := *tx
+	third.PowNonce = 999
+	if third.SigningHash() == base {
+		t.Fatal("SigningHash ignored the proof-of-work nonce")
 	}
 }
