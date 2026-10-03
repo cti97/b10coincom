@@ -155,7 +155,28 @@ func TestTakeBoundsFaucetClaimsPerBlock(t *testing.T) {
 }
 ```
 
-`mkClaim` is a helper you add alongside `mkTx`: build a `types.TxFaucetClaim` with a fresh key, `Epoch: 1`, `PowNonce: 0` and a real signature. It needs no valid proof-of-work, because the mempool never checks that.
+`mkClaim` is a helper you add alongside `mkTx`:
+
+```go
+// mkClaim builds a faucet claim with a real signature but a garbage proof-of-work
+// nonce. The mempool checks only signatures, so this is exactly what a spammer can
+// produce for the cost of one Ed25519 signature - which is the asymmetry the bound
+// in this task exists to neutralise.
+func mkClaim(t *testing.T, nonce uint64) types.Tx {
+	t.Helper()
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &types.Tx{
+		Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: nonce, Epoch: 1, PowNonce: 0,
+	}
+	h := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, h[:])
+	return *tx
+}
+```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1973,7 +1994,9 @@ func signProposal(t *testing.T, cfg Config, p *Proposal) []byte {
 	if idx < 0 {
 		t.Fatal("signProposal: proposer is not in the committee")
 	}
-	return ed25519Sign(testCommitteeKey(idx), p.SigningHash()[:])
+	// SigningHash returns an array BY VALUE, which cannot be sliced in place; bind it first.
+	h := p.SigningHash()
+	return ed25519Sign(testCommitteeKey(idx), h[:])
 }
 ```
 
@@ -2600,11 +2623,11 @@ type Net struct {
 	cfg   consensus.Config
 	drv   []*consensus.Driver
 	ch    []*chain.Chain
-	keys  []ed25519Key
+	keys  []keyPair
 	offline map[int]bool
 }
 
-type ed25519Key struct{ priv []byte }
+type keyPair struct{ priv ed25519.PrivateKey }
 
 // simGenesis builds a genesis with n equal-power validators over deterministic
 // keys, so a failing run is reproducible. The production devnet has one validator
@@ -2652,7 +2675,7 @@ func New(n int, opts Options) (*Net, error) {
 		out.ch = append(out.ch, c)
 		h := crypto.HashParts([]byte("b10coin-simnet-validator"), []byte{byte(i)})
 		priv := ed25519NewKeyFromSeed(h[:])
-		out.keys = append(out.keys, ed25519Key{priv: priv})
+		out.keys = append(out.keys, keyPair{priv: priv})
 		out.drv = append(out.drv, consensus.NewDriver(out.cfg, c, priv, out.sim.TransportFor(id)))
 	}
 	return out, nil
@@ -2772,7 +2795,14 @@ Add the small clock helper to the package:
 func ms(n int64) time.Duration { return time.Duration(n) * time.Millisecond }
 ```
 
-and the same `ed25519` aliases the consensus tests use, so the fixture reads cleanly.
+`simnet` is NOT a test package, so it imports the real library rather than aliasing
+it: add `crypto/ed25519`, `time`, and `github.com/cti97/b10coincom/internal/transport`
+to its imports, and use `ed25519.PrivateKey` / `ed25519.PublicKey` / `ed25519.NewKeyFromSeed`
+directly wherever the code below writes the aliased spellings. The key store becomes:
+
+```go
+type keyPair struct{ priv ed25519.PrivateKey }
+```
 
 - [ ] **Step 4: Run the test to verify it passes**
 
