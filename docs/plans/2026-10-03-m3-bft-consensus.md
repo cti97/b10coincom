@@ -2377,7 +2377,11 @@ func TestDriverAppendsOnCommit(t *testing.T) {
 	}
 	defer ch.Close()
 
-	cfg := Config{Committee: g.Validators, TimeoutBase: 10, TimeoutStep: 10, PowerCapNum: 1, PowerCapDen: 4}
+		// A ONE-validator committee legitimately holds all the power, and the 1/4 cap is
+	// UNSATISFIABLE below four validators (the largest holder is at least total/3):
+	// Validate would reject this fixture before the test could run. The cap is a
+	// meaningful constraint only from n >= 4, which is where the spec's committee lives.
+	cfg := Config{Committee: g.Validators, TimeoutBase: 10, TimeoutStep: 10, PowerCapNum: 1, PowerCapDen: 1}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
