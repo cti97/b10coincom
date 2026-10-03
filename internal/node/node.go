@@ -44,8 +44,28 @@ func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 	// keep only the transactions that apply cleanly, in order, against a
 	// running copy of the state. One state-invalid transaction must not
 	// discard the valid ones beside it or wedge the node.
+	//
+	// The filter's base is Chain.Probe(nil) - the state a block at head+1
+	// with no transactions would produce: the SAME transition Build runs,
+	// height advanced and emission credited. Hand-cloning the head state
+	// (the old filter) probed a claim against the head's epoch and a
+	// pre-emission faucet balance, and silently evicted valid claims.
+	// Candidates then apply on top of the base cumulative - each accepted
+	// transaction is inside the running state the next probe starts from,
+	// so a candidate may chain onto its accepted siblings (transfers with
+	// nonces 0 and 1 both survive; probing each against the bare head state
+	// would evict the second). Equivalent-but-quadratic alternative: probing
+	// every candidate through Probe(accepted... + candidate) re-derives and
+	// re-verifies the accepted prefix's signatures per candidate, which on a
+	// full MaxTxsPerBlock mempool is hours of ed25519 per block - a DoS the
+	// one-base form avoids.
 	candidates := n.mempool.Take(types.MaxTxsPerBlock)
-	probe := n.chain.State().Clone()
+	probe, err := n.chain.Probe(nil)
+	if err != nil {
+		// Nothing applies at a state whose head+1 transition fails; park
+		// the candidates back in the mempool rather than lose them.
+		return nil, reAdd(n.mempool, candidates, err)
+	}
 	valid := make([]types.Tx, 0, len(candidates))
 	for i := range candidates {
 		next, err := probe.ApplyBlock([]types.Tx{candidates[i]})

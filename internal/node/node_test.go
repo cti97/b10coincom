@@ -7,6 +7,7 @@ import (
 
 	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/types"
@@ -142,6 +143,94 @@ func TestRunOnceEvictsOnlyInvalidTransactions(t *testing.T) {
 // re-add; Mempool.Add then reports ErrDuplicate. That transaction is not
 // lost — it is already queued for a later block — so it must not inflate
 // the lost count or appear in the lost list.
+// A VALID claim must survive the mempool probe and reach a block. The probe
+// must mirror the transition a block at head+1 runs: this claim is payable
+// ONLY once block 1's emission is credited (the faucet's genesis mint of 50M
+// is below the devnet's 100M claim amount), so the old clone-and-apply probe
+// that skipped the emission evicted it and the claim was silently dropped.
+func TestRunOnceKeepsAValidClaim(t *testing.T) {
+	c, err := chain.Open(genesis.Devnet(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, priv := genesis.DevValidatorKey()
+
+	pub, key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := c.Genesis().Params
+	pow, ok := faucet.Solve(pub, 1, p.FaucetPowTarget, p.FaucetPowArgon2, 1_000_000)
+	if !ok {
+		t.Fatal("could not solve the test puzzle")
+	}
+	claim := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+		Nonce: 0, Epoch: 1, PowNonce: pow}
+	sigHash := claim.SigningHash()
+	claim.Sig = crypto.Sign(key, sigHash[:])
+
+	// Fixture guard: the claim must NEED the block's own emission, so this
+	// test discriminates the mirrored probe from a pre-emission one.
+	faucet := c.Genesis().FaucetAddress()
+	if c.State().Get(faucet).Balance >= p.ClaimAmountSparks {
+		t.Fatalf("fixture error: the faucet already holds %d; the claim no longer needs block 1's emission", c.State().Get(faucet).Balance)
+	}
+
+	mp := mempool.New(100)
+	if err := mp.Add([]types.Tx{*claim})[0]; err != nil {
+		t.Fatalf("mempool.Add: %v", err)
+	}
+
+	n := New(c, priv, mp)
+	b, err := n.RunOnce(1_700_000_100)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(b.Txs) != 1 || b.Txs[0].ID() != claim.ID() {
+		t.Fatalf("the valid claim did not survive the probe: block carries %d txs (want the claim)", len(b.Txs))
+	}
+	if mp.Len() != 0 {
+		t.Fatalf("mempool length = %d, want 0", mp.Len())
+	}
+	if got := c.State().Get(types.AddressFromPub(pub)).Balance; got != p.ClaimAmountSparks {
+		t.Fatalf("claimant balance = %d, want %d - the claim was not paid", got, p.ClaimAmountSparks)
+	}
+}
+
+// The probe's filter is CUMULATIVE: each accepted transaction feeds the
+// running state the next probe starts from, so two transfers that only chain
+// onto each other (same account, nonces 0 and 1) are BOTH kept. Probing each
+// candidate against the bare head state would evict the second.
+func TestRunOnceProbeFeedsAcceptedTransactionsForward(t *testing.T) {
+	c, err := chain.Open(genesis.Devnet(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, priv := genesis.DevValidatorKey()
+	mp := mempool.New(100)
+
+	first, second := mkTransfer(t, 0), mkTransfer(t, 1)
+	for i, e := range mp.Add([]types.Tx{first, second}) {
+		if e != nil {
+			t.Fatalf("mempool.Add[%d]: %v", i, e)
+		}
+	}
+
+	n := New(c, priv, mp)
+	b, err := n.RunOnce(1_700_000_100)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(b.Txs) != 2 {
+		t.Fatalf("block contains %d transactions, want 2 (the chained pair)", len(b.Txs))
+	}
+	if mp.Len() != 0 {
+		t.Fatalf("mempool length = %d, want 0", mp.Len())
+	}
+}
+
 func TestReAddDoesNotCountDuplicatesAsLost(t *testing.T) {
 	mp := mempool.New(10)
 	tx := mkTransfer(t, 0)
