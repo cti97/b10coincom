@@ -290,14 +290,8 @@ func TestGenesisJSONRecordsMatchTheGoConstructors(t *testing.T) {
 				t.Fatalf("%s: params: %v", tc.file, err)
 			}
 		}
-		for _, key := range []string{
-			"block_time_ms", "total_supply_sparks", "initial_reward_sparks",
-			"halving_interval_blocks", "claim_amount_sparks", "min_stake_sparks",
-			"epoch_blocks", "unbonding_epochs", "committee_size",
-		} {
-			if _, ok := params[key]; !ok {
-				t.Errorf("%s: params missing required key %q", tc.file, key)
-			}
+		for _, key := range requiredParamsMissing(params) {
+			t.Errorf("%s: params missing required key %q", tc.file, key)
 		}
 
 		if j.ChainID != tc.g.ChainID {
@@ -333,5 +327,54 @@ func TestGenesisJSONRecordsMatchTheGoConstructors(t *testing.T) {
 			t.Errorf("%s: params.committee_size = %d, constructor says %d",
 				tc.file, q.CommitteeSize, p.CommitteeSize)
 		}
+	}
+}
+
+// requiredParamsMissing returns the params keys from the required list that
+// are absent from a raw JSON params object. It is factored out of
+// TestGenesisJSONRecordsMatchTheGoConstructors so the key-presence rule can be
+// exercised directly — every parameter in both shipped records is non-zero, so
+// the shipped files alone can never catch a deleted params key
+// (TestParamsKeyPresenceListDetectsAMissingKey does).
+func requiredParamsMissing(params map[string]json.RawMessage) []string {
+	var missing []string
+	for _, key := range []string{
+		"block_time_ms", "total_supply_sparks", "initial_reward_sparks",
+		"halving_interval_blocks", "claim_amount_sparks", "min_stake_sparks",
+		"epoch_blocks", "unbonding_epochs", "committee_size",
+	} {
+		if _, ok := params[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	return missing
+}
+
+// The params-level key-presence list is unexercised by the shipped records: no
+// parameter is zero, so the field-by-field comparisons cannot distinguish a
+// deleted params key from the constructor's value. This case calls the helper
+// directly on the devnet record's params object with epoch_blocks deleted and
+// asserts that key, and only that key, is reported missing.
+func TestParamsKeyPresenceListDetectsAMissingKey(t *testing.T) {
+	raw, err := os.ReadFile("../../genesis/devnet.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatal(err)
+	}
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(top["params"], &params); err != nil {
+		t.Fatalf("params: %v", err)
+	}
+	if _, ok := params["epoch_blocks"]; !ok {
+		t.Fatal("fixture error: devnet.json has no epoch_blocks under params")
+	}
+	delete(params, "epoch_blocks")
+
+	got := requiredParamsMissing(params)
+	if len(got) != 1 || got[0] != "epoch_blocks" {
+		t.Fatalf("requiredParamsMissing = %v, want exactly [epoch_blocks]", got)
 	}
 }

@@ -165,9 +165,10 @@ value), so either copy drifting from the other fails the suite. Both chains
 share the same monetary protocol constants: 2,000 ms
 block time, 21,000,000 b10 supply cap, 50,000,000 sparks (0.5 b10) initial
 reward, 21,000,000-block halving interval, 100 b10 per faucet claim, 1,000 b10
-minimum stake, and 2 unbonding epochs. Epoch length is the one point the
-chains differ on, per the design's §6.3: **1,000-block epochs on devnet,
-10,000-block epochs on testnet**.
+minimum stake, and 2 unbonding epochs. The chains differ in these parameters:
+epoch length is **1,000-block epochs on devnet, 10,000-block epochs on
+testnet**, per the design's §6.3; the other differences are in the table
+below.
 
 | | `genesis/devnet.json` | `genesis/testnet.json` |
 |---|---|---|

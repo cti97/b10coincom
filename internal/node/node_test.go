@@ -144,8 +144,15 @@ func TestRunOnceEvictsOnlyInvalidTransactions(t *testing.T) {
 // the lost count or appear in the lost list.
 func TestReAddDoesNotCountDuplicatesAsLost(t *testing.T) {
 	mp := mempool.New(10)
-	if err := mp.Add([]types.Tx{mkTransfer(t, 0)})[0]; err != nil {
+	tx := mkTransfer(t, 0)
+	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatalf("mempool.Add: %v", err)
+	}
+	// The scenario only exercises the duplicate path if the transaction is
+	// genuinely already present. Assert that, or this test decays into a
+	// no-op if mempool dedup ever changes.
+	if err := mp.Add([]types.Tx{tx})[0]; !errors.Is(err, mempool.ErrDuplicate) {
+		t.Fatalf("precondition: expected ErrDuplicate re-adding an already-present transaction, got %v", err)
 	}
 	// The same transaction again (deterministic devnet keys: identical ID).
 	cause := errors.New("block build failed: test cause")
