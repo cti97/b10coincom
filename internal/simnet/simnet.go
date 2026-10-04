@@ -601,6 +601,15 @@ func (t *tap) Broadcast(data []byte) error {
 	return t.inner.Broadcast(data)
 }
 
+// Send records the unicast and forwards it, mirroring Broadcast: a payload
+// the validator put on the wire belongs in the send log whichever primitive
+// carried it. Nothing in M3's scenarios unicasts yet, so recording Send
+// cannot shift an existing assertion; consistency is why it records.
+func (t *tap) Send(peer transport.PeerID, data []byte) error {
+	t.sent = append(t.sent, append([]byte(nil), data...))
+	return t.inner.Send(peer, data)
+}
+
 // OnMessage wraps the receive callback so a payload is counted as received
 // only when it actually reaches the driver.
 func (t *tap) OnMessage(fn func(transport.Message)) {
@@ -656,9 +665,18 @@ func (eq *equivocating) Broadcast(data []byte) error {
 
 // OnMessage must forward to the wrapped transport, else the driver under the
 // wrapper never receives anything and stalls for the wrong reason.
+//
+// Send forwards unchanged, like OnMessage: the equivocation machinery lives
+// in the broadcast path, where a vote reaches every validator (each of which
+// sees the conflict). A unicast vote would reach one validator only and fail
+// to manufacture a visible conflict, so equivocating must NOT re-send it —
+// forwarding keeps that property exactly.
 func (eq *equivocating) OnMessage(fn func(transport.Message)) { eq.inner.OnMessage(fn) }
-func (eq *equivocating) Peers() []transport.PeerID            { return eq.inner.Peers() }
-func (eq *equivocating) Close() error                         { return eq.inner.Close() }
+func (eq *equivocating) Send(p transport.PeerID, d []byte) error {
+	return eq.inner.Send(p, d)
+}
+func (eq *equivocating) Peers() []transport.PeerID { return eq.inner.Peers() }
+func (eq *equivocating) Close() error              { return eq.inner.Close() }
 
 func ids(is []int) []string {
 	out := make([]string, 0, len(is))

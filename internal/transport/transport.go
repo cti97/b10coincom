@@ -26,6 +26,21 @@ type Transport interface {
 	// it before retaining it beyond the call, so a caller may reuse its
 	// buffer as soon as Broadcast returns.
 	Broadcast(data []byte) error
+	// Send delivers data to exactly one peer.
+	//
+	// It exists because BLOCK_SYNC is a request/response between exactly two
+	// peers, not gossip: broadcasting a sync request would make every
+	// validator answer a question only one asked, N-1 of which would discard
+	// the answer. Unicast is the M4 ruling on the Transport interface
+	// (progress.md, ruling 1). Implementations must deliver to that peer
+	// only, and — like Broadcast — must neither block on a slow peer beyond
+	// their own queuing bound nor re-enter the caller mid-send.
+	//
+	// An unknown or disconnected peer is an error, never a silent success:
+	// the caller decides what a missing peer means (the syncer retries and
+	// may re-pull from another peer), so the transport must not decide for
+	// it.
+	Send(peer PeerID, data []byte) error
 	// OnMessage registers the callback invoked once per received message.
 	OnMessage(fn func(Message))
 	// Peers lists the currently connected peers.

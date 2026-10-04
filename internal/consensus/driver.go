@@ -311,12 +311,17 @@ func (d *Driver) OnMessage(m transport.Message) {
 // head that cannot move fails identically forever (see the field comment).
 func (d *Driver) flush() {
 	for _, o := range d.eng.Drain() {
-		// An empty To is a broadcast, and the Transport interface has no
-		// unicast method. The M3 engine emits only broadcasts; anything else
-		// has no way out and is dropped deliberately until the interface
-		// gains one.
+		// An empty To is a broadcast; a non-empty To is a unicast, which the
+		// Transport interface grew in M4. The M3 engine emits only
+		// broadcasts - emit() never sets To - but the seam now ROUTES rather
+		// than drops a To the engine ever does emit. An error (say a Send to
+		// a peer that disconnected mid-round) is dropped exactly as M3
+		// deliberately dropped everything non-empty: the engine's retransmit
+		// behaviour on the next tick, not the transport, owns recovery.
 		if o.To == "" {
 			_ = d.tp.Broadcast(o.Data)
+		} else {
+			_ = d.tp.Send(transport.PeerID(o.To), o.Data)
 		}
 	}
 	id, ok := d.eng.Committed()

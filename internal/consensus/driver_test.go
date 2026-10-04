@@ -653,6 +653,14 @@ func (s *stalledTransport) Broadcast(data []byte) error {
 	s.broadcasts = append(s.broadcasts, append([]byte(nil), data...))
 	return nil
 }
+
+// Send lands in the same record: the engine emits only broadcasts today, and
+// the driver routes a non-empty To through Send, so recording both keeps the
+// "everything the driver emitted is on record" property true of the seam.
+func (s *stalledTransport) Send(peer transport.PeerID, data []byte) error {
+	s.broadcasts = append(s.broadcasts, append([]byte(nil), data...))
+	return nil
+}
 func (s *stalledTransport) OnMessage(fn func(transport.Message)) {}
 func (s *stalledTransport) Peers() []transport.PeerID            { return []transport.PeerID{"v0", "v1"} }
 func (s *stalledTransport) Close() error                         { return nil }

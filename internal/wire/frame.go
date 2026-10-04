@@ -19,6 +19,30 @@ var (
 	ErrShortFrame    = errors.New("wire: frame ended before its declared length")
 )
 
+// FrameTooLarge is the structured face of ErrFrameTooLarge: it carries the
+// length the frame header DECLARED, so a stream reader that refuses an
+// oversized frame can skip exactly that many payload bytes and re-synchronise
+// on the next frame, instead of tearing the connection down. Skipping is exact
+// because the header is the whole contract of where that frame ends - which is
+// the same fact that makes the bound-before-allocation order below safe.
+//
+// errors.Is(err, ErrFrameTooLarge) keeps working through Unwrap, so existing
+// sentinel checks are unaffected; use errors.As to reach the size.
+type FrameTooLarge struct {
+	// Declared is the payload length the header claimed. It goes through
+	// int64, not int, for the same reason ReadFrame's comparison below does:
+	// on a 32-bit target a 4-GiB claim wraps int, and a negative skip would
+	// silently desynchronise the reader the skip exists to save.
+	Declared int64
+	Max      int
+}
+
+func (e *FrameTooLarge) Error() string {
+	return fmt.Sprintf("%s: %d bytes, maximum %d", ErrFrameTooLarge, e.Declared, e.Max)
+}
+
+func (e *FrameTooLarge) Unwrap() error { return ErrFrameTooLarge }
+
 // WriteFrame writes one length-prefixed payload.
 func WriteFrame(w io.Writer, payload []byte) error {
 	var hdr [4]byte
@@ -47,7 +71,7 @@ func ReadFrame(r io.Reader, max int) ([]byte, error) {
 	}
 	n := binary.BigEndian.Uint32(hdr[:])
 	if int64(n) > int64(max) {
-		return nil, fmt.Errorf("%w: %d bytes, maximum %d", ErrFrameTooLarge, n, max)
+		return nil, &FrameTooLarge{Declared: int64(n), Max: max}
 	}
 	if n == 0 {
 		return nil, fmt.Errorf("%w: zero-length frame", ErrShortFrame)

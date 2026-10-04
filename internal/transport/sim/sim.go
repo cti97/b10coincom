@@ -13,6 +13,7 @@
 package sim
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"time"
@@ -173,6 +174,40 @@ func (e *endpoint) Broadcast(data []byte) error {
 			at: at, seq: e.net.seq, to: id, from: e.id, data: append([]byte(nil), data...),
 		})
 	}
+	return nil
+}
+
+// Send delivers to exactly one peer. It lands in the SAME delivery queue as
+// Broadcast, stamped with virtual now and next sequence number, so its
+// delivery point is the next Advance and its arrival order is the total
+// (at, seq) order — deterministic like everything else here.
+//
+// The three things Send deliberately does NOT do, and why:
+//
+//   - no Latency, no Jitter: SYNC is a request/response a validator is
+//     already waiting on; a deterministic-uniform added delay would only
+//     stretch scenarios without modelling anything Broadcast does not. No
+//     rng draw is consumed, so adding Send nowhere changes any existing
+//     scenario's rng stream, replay for byte.
+//   - no DropPercent roll: the requester retries a lost sync; baking silent
+//     loss into unicast would leave the retry untestable at a fixed seed.
+//   - no synchronous re-entry: like Broadcast, delivery happens when the
+//     network advances, never inside the caller's send — the engine must
+//     not be re-entered mid-step regardless of which primitive carried it.
+//
+// A partitioned peer receives nothing, mirroring Broadcast: a partition is a
+// partition for the whole transport surface, not only for gossip.
+func (e *endpoint) Send(to transport.PeerID, data []byte) error {
+	if _, ok := e.net.peers[to]; !ok {
+		return fmt.Errorf("sim: unknown peer %q", to)
+	}
+	if e.net.group[to] != e.net.group[e.id] {
+		return fmt.Errorf("sim: peer %q is partitioned away", to)
+	}
+	e.net.seq++
+	e.net.queue = append(e.net.queue, pending{
+		at: e.net.now, seq: e.net.seq, to: to, from: e.id, data: append([]byte(nil), data...),
+	})
 	return nil
 }
 
