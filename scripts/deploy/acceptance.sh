@@ -85,9 +85,10 @@ $PROG — the b10coin M4 acceptance harness (three Pis finalising one chain).
 Usage:
   $PROG --pis HOST[,HOST...] [--relay RELAYHOST[:PORT]] [options]
 
-  --pis LIST        comma-separated validators (one entry is REFUSED: a
-                    single validator cannot reach a consensus verdict — the
-                    M4 criterion is three). In ssh mode (default) each entry
+  --pis LIST        comma-separated validators (FEWER THAN THREE is REFUSED:
+                    the M4 criterion is three validators finalising one chain,
+                    so one or two cannot produce the acceptance verdict even if
+                    they agree). In ssh mode (default) each entry
                     is [user@]host — a user@ prefix overrides --ssh-user —
                     and its RPC is read over SSH at
                     http://127.0.0.1:<http-port>/status (the RPC is
@@ -163,7 +164,7 @@ IFS=$OLDIFS
 # validators finalising ONE chain), and a one-entry --pis is almost always a
 # truncation or typo — a usage error, failed before any probing, not a verdict
 # that could look like evidence.
-[ ${#PIS[@]} -ge 2 ] || die_usage "--pis named only ONE validator — a single validator cannot reach a consensus verdict (the M4 criterion is three validators finalising one chain); is the list truncated?"
+[ ${#PIS[@]} -ge 3 ] || die_usage "--pis named ${#PIS[@]} validator(s) — the M4 criterion is THREE validators finalising one chain, so fewer cannot produce the acceptance verdict even if they agree; is the list truncated?"
 
 # ---- helpers ----------------------------------------------------------------
 
