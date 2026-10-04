@@ -205,7 +205,7 @@ func TestMakeEquivocatorForgesWithACommitteeKey(t *testing.T) {
 	// The forged prevote must reach the WIRE: it must appear among the
 	// equivocator's outgoing payloads, not just in the wrapper's local record.
 	onWire := 0
-	for _, raw := range n.taps[3].sent {
+	for _, raw := range n.taps[3].sentLog() {
 		v, err := consensus.DecodeVote(raw)
 		if err != nil || v.Type != consensus.MsgPrevote || v.BlockID != eq.forgeID {
 			continue
@@ -226,7 +226,7 @@ func TestMakeEquivocatorForgesWithACommitteeKey(t *testing.T) {
 	// consumed the forged bytes from the network.
 	delivered := false
 	for j := 0; j < 3; j++ {
-		for _, raw := range n.taps[j].recv {
+		for _, raw := range n.taps[j].recvLog() {
 			v, err := consensus.DecodeVote(raw)
 			if err != nil || v.Type != consensus.MsgPrevote || v.BlockID != eq.forgeID {
 				continue
@@ -282,11 +282,11 @@ func TestThreeOfFourValidatorsCommitWithOneOffline(t *testing.T) {
 	if got := n.ch[3].Height(); got != silentHeight {
 		t.Fatalf("OFFLINE validator 3 committed while offline: %d -> %d", silentHeight, got)
 	}
-	if len(n.taps[3].sent) != 0 {
-		t.Fatalf("OFFLINE validator 3 put %d messages on the wire; a powered-off machine sends nothing", len(n.taps[3].sent))
+	if n.taps[3].sentCount() != 0 {
+		t.Fatalf("OFFLINE validator 3 put %d messages on the wire; a powered-off machine sends nothing", n.taps[3].sentCount())
 	}
-	if len(n.taps[3].recv) != 0 {
-		t.Fatalf("OFFLINE validator 3's driver consumed %d messages; a powered-off machine receives nothing", len(n.taps[3].recv))
+	if n.taps[3].recvCount() != 0 {
+		t.Fatalf("OFFLINE validator 3's driver consumed %d messages; a powered-off machine receives nothing", n.taps[3].recvCount())
 	}
 }
 
@@ -330,11 +330,11 @@ func TestTwoOfflineValidatorsStall(t *testing.T) {
 			t.Fatalf("stalled run moved validator %d's height %d -> %d", i, before[uint64(i)], after[uint64(i)])
 		}
 	}
-	if len(n.taps[2].sent) != 0 || len(n.taps[3].sent) != 0 {
-		t.Fatalf("OFFLINE validators put messages on the wire: v2 sent %d, v3 sent %d", len(n.taps[2].sent), len(n.taps[3].sent))
+	if n.taps[2].sentCount() != 0 || n.taps[3].sentCount() != 0 {
+		t.Fatalf("OFFLINE validators put messages on the wire: v2 sent %d, v3 sent %d", n.taps[2].sentCount(), n.taps[3].sentCount())
 	}
-	if len(n.taps[2].recv) != 0 || len(n.taps[3].recv) != 0 {
-		t.Fatalf("OFFLINE validators' drivers consumed messages: v2 %d, v3 %d", len(n.taps[2].recv), len(n.taps[3].recv))
+	if n.taps[2].recvCount() != 0 || n.taps[3].recvCount() != 0 {
+		t.Fatalf("OFFLINE validators' drivers consumed messages: v2 %d, v3 %d", n.taps[2].recvCount(), n.taps[3].recvCount())
 	}
 }
 
@@ -357,21 +357,21 @@ func TestOfflineValidatorSendsAndReceivesNothingAfterTakeOffline(t *testing.T) {
 	}
 	n.TakeOffline(2)
 	n.TakeOffline(3)
-	sent2, got2 := len(n.taps[2].sent), len(n.taps[2].recv)
-	sent3, got3 := len(n.taps[3].sent), len(n.taps[3].recv)
+	sent2, got2 := n.taps[2].sentCount(), n.taps[2].recvCount()
+	sent3, got3 := n.taps[3].sentCount(), n.taps[3].recvCount()
 	height2, height3 := n.ch[2].Height(), n.ch[3].Height()
 
 	_, err = n.RunBlocks(8)
 	if err == nil {
 		t.Fatal("the chain kept committing after two of four validators were powered off")
 	}
-	if len(n.taps[2].sent) != sent2 || len(n.taps[3].sent) != sent3 {
+	if n.taps[2].sentCount() != sent2 || n.taps[3].sentCount() != sent3 {
 		t.Fatalf("OFFLINE validator kept SENDING after the cut: v2 %d -> %d, v3 %d -> %d",
-			sent2, len(n.taps[2].sent), sent3, len(n.taps[3].sent))
+			sent2, n.taps[2].sentCount(), sent3, n.taps[3].sentCount())
 	}
-	if len(n.taps[2].recv) != got2 || len(n.taps[3].recv) != got3 {
+	if n.taps[2].recvCount() != got2 || n.taps[3].recvCount() != got3 {
 		t.Fatalf("OFFLINE validator kept RECEIVING after the cut: v2 %d -> %d, v3 %d -> %d",
-			got2, len(n.taps[2].recv), got3, len(n.taps[3].recv))
+			got2, n.taps[2].recvCount(), got3, n.taps[3].recvCount())
 	}
 	if h := n.ch[2].Height(); h != height2 {
 		t.Fatalf("OFFLINE validator 2 committed while offline: %d -> %d", height2, h)

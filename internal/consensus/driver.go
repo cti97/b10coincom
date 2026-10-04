@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/cti97/b10coincom/internal/chain"
+	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/store"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/types"
@@ -19,12 +20,55 @@ import (
 // the chain. The engine never speculatively applies a block, so a stalled
 // height leaves the chain untouched and a node that disagrees with a proposal
 // simply reports a lower height than the peers that accepted it.
+//
+// When the driver is given a mempool it is also the transaction source for its
+// own proposals: it takes from the pool the way node.RunOnce does and filters
+// the batch through the SAME chain policy (Chain.SelectApplicable), so there
+// is one policy for which transactions a block carries across both block
+// producers. A nil pool is a node with no transaction path - it proposes
+// empty blocks, which is what the M3 simnet validators did and what a
+// validator running before its RPC or relay attaches a pool continues to do.
 type Driver struct {
 	cfg  Config
 	ch   *chain.Chain
+	pool *mempool.Mempool
 	priv ed25519.PrivateKey
 	tp   transport.Transport
 	eng  *Engine
+
+	// CommitWitness, when set, is called the moment a block is committed AND
+	// appended, with the precommit votes that committed it: the certificate a
+	// catch-up server serves to catching-up peers. It carries exactly the
+	// evidence the live commit used (`precommits.AnyQuorum()`), so the served
+	// certificate and the commit decision can never disagree. Nil is the
+	// unwired default: nothing else changes, the commit path is byte-identical
+	// with the witness absent. Like persistLock this is an injected seam -
+	// whoever builds the driver and knows the syncer to serve from wires it;
+	// the engine performs no I/O and reads no other component.
+	CommitWitness func(height uint64, round uint32, votes []*Vote)
+
+	// pending holds the transactions this driver has TAKEN from its mempool
+	// for the proposal at the current undecided height and that no committed
+	// block has carried yet. Take removes what it returns, so without this
+	// record the batch would evaporate the first time a proposal's round
+	// timed out: the pool no longer holds the transactions and nothing else
+	// does - they existed only inside an unsigned block nobody agreed on.
+	// reclaimPending puts an uncommitted batch back before the next build
+	// (this height's or the first build after a foreign commit), and flush
+	// clears it only when the block that appends is the very block pending
+	// was built into, so a batch is always findable until it lands: in the
+	// pool, in pending, or committed. Nil-pool drivers never set it.
+	pending []types.Tx
+
+	// pendingID is the ID of the block pending was built into. flush clears
+	// the batch only when the block that appends IS this one: a peer's
+	// proposal reaching quorum instead - this node's proposal timed out or
+	// was lost and a foreign one succeeded - must leave the batch pending,
+	// or Take's removal would have lost it from both the pool and the
+	// committed block. The next height's first build reclaims it, and
+	// SelectApplicable there evicts whichever of its transactions the
+	// foreign block already applied.
+	pendingID [32]byte
 
 	// now is the driver's clock reading in virtual milliseconds: the last
 	// value Tick was called with. The engine reads no clock; this one field
@@ -49,18 +93,38 @@ type Driver struct {
 
 // NewDriver starts a driver that will extend ch from its current head.
 //
+// pool is the driver's transaction source and may be nil: a validator with no
+// attached pool proposes empty blocks, exactly the M3 behaviour. A non-nil
+// pool is taken from at proposal time and nothing else in the driver writes
+// to it - transactions enter through the process's own submission paths, the
+// same pool an RPC server would fill.
+//
 // The engine begins at head+1 with the head as its parent, and its round 0 is
-// armed with exactly TimeoutBase: the first round a validator is in gets the
-// full configured window before any timeout can end it.
+// armed at the FIRST Tick with a full TimeoutBase before any timeout can end
+// it (see timeoutArmed below).
 //
 // The engine is not necessarily unlocked, even at round 0: if this validator
 // precommitted at head+1 and crashed before the height was decided, the lock
 // it persisted is restored here (newEngine) - a restart may not re-enter a
 // height the validator has already promised about.
-func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport) *Driver {
-	d := &Driver{cfg: cfg, ch: ch, priv: priv, tp: tp}
+func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) *Driver {
+	d := &Driver{cfg: cfg, ch: ch, pool: pool, priv: priv, tp: tp}
 	d.eng = d.newEngine(ch.Height()+1, ch.Head().ID())
-	d.timeoutAt = d.cfg.TimeoutBase
+	// timeoutAt is ARMED ON THE FIRST TICK, not at construction (the sentinel
+	// below). Anchoring it at construction means assuming the caller's clock
+	// starts at zero - true for a fresh simnet run, FALSE for every rebuild
+	// over a clock already running: Task 6's catch-up rebuild and the
+	// networked node's rebuildDriver re-create drivers mid-run, and an
+	// absolute TimeoutBase against a now of tens of thousands would fire an
+	// instant timeout on the rebuilt engine's first tick - emit a NIL prevote
+	// for round 0 - and the round the committee's actual proposal travels in
+	// is then already burned for this validator (its one prevote per round is
+	// spent): it parks at that height forever while the committee races on.
+	// Arming at the first real reading gives the fresh engine exactly the
+	// TimeoutBase window the fresh-run path always had; a fresh run's clock
+	// merely shifts its ladder by the first step's offset, and every
+	// scenario's assertions are property assertions, not schedule assertions.
+	d.timeoutAt = -1
 	tp.OnMessage(d.OnMessage)
 	return d
 }
@@ -115,6 +179,17 @@ func (d *Driver) persistLock(height uint64, round uint32, id [32]byte) {
 // chain validation cannot disagree about what a valid block is: whatever Build
 // signs, Append will accept.
 //
+// The block carries the mempool's transactions, selected by Chain.SelectApplicable
+// - the ONE policy node.RunOnce runs. Every peer will run the whole block back
+// through state.ApplyBlock at Append, all-or-nothing, so the filter is not a
+// convenience: a transaction that fails to apply anywhere in the committee
+// would otherwise ride a proposal to a quorum that cannot append it, and this
+// node would park at the undecided height forever (M3 has no adoption path),
+// or the committee's own Append refusals would strand every honest validator
+// behind a commit nobody can apply. One inapplicable transaction is evicted
+// ALONE - it must not discard its valid siblings (the same tolerance RunOnce
+// has) and it must not fail the proposal.
+//
 // The timestamp is the parent's plus one: deterministic (re-playable runs must
 // not vary by wall-clock) and always positive, which ValidateStructure
 // requires - a zero timestamp would fail chain.Build outright and no height
@@ -126,11 +201,82 @@ func (d *Driver) build(height uint64, round uint32, parent [32]byte) (types.Bloc
 		return types.Block{}, fmt.Errorf("consensus: refusing to propose: the engine judges (height %d, parent %x) but the chain head is (height %d, id %x)",
 			height, parent[:8], head.Header.Height, headID[:8])
 	}
-	b, err := d.ch.Build(d.priv, nil, head.Header.Timestamp+1)
+	txs := []types.Tx(nil)
+	if d.pool != nil {
+		// A batch left over from an earlier proposal goes back into the
+		// pool before this round's batch is taken: it is uncommitted -
+		// its proposal was abandoned (a timed-out round here, or this
+		// very height decided on a peer's block that did not carry the
+		// batch), and Take removed it. Proposing it again is sound - and
+		// if another validator's block for this or an earlier height
+		// carried any of it, SelectApplicable evicts it below against
+		// the state the chain already moved to.
+		d.reclaimPending()
+		candidates := d.pool.Take(types.MaxTxsPerBlock)
+		valid, err := d.ch.SelectApplicable(candidates)
+		if err != nil {
+			// The head+1 transition itself failed, so nothing applies:
+			// park the candidates back rather than lose them, and refuse
+			// to propose.
+			return types.Block{}, d.reAdd(candidates, err)
+		}
+		txs = valid
+	}
+	b, err := d.ch.Build(d.priv, txs, head.Header.Timestamp+1)
 	if err != nil {
+		// The block was never built, so the batch it would have carried is
+		// uncommitted: put it back. (The empty batch is a no-op.)
+		if len(txs) > 0 {
+			return types.Block{}, d.reAdd(txs, err)
+		}
 		return types.Block{}, err
 	}
+	// The batch now lives in the built proposal: it is either committed with
+	// it (flush clears pending only when THAT block - identified by
+	// pendingID - is the one that appends) or reclaimed by the next build at
+	// this height or the first build after a foreign commit, whichever
+	// comes first.
+	d.pending = txs
+	d.pendingID = b.ID()
 	return *b, nil
+}
+
+// reclaimPending puts this driver's uncommitted proposal batch back into its
+// mempool, at the start of a later build at the same height or the same
+// driver's first build at a later height. The pool is the only place a
+// transaction can wait for a future block, so the reclaim is what keeps a
+// timed-out round from evaporating transactions Take already removed.
+//
+// The re-add's errors are deliberately unchecked. A duplicate is the normal
+// benign outcome - the batch often re-enters the pool right before the Take
+// below collects it again, and a client resubmission between the two is
+// another route to the same already-present verdict. A non-duplicate failure
+// (a pool flooded to capacity in the window between Take and this re-add)
+// strands at most the batch already in hand; node's reAdd reports that case
+// because RunOnce returns an error to a caller, while this runs inside build,
+// whose only signal to the engine is the block itself - a stranded batch here
+// would surface as a transaction that never lands, never as a silent state
+// divergence, and the report notes it as a known exposure of this path.
+func (d *Driver) reclaimPending() {
+	if d.pool == nil || len(d.pending) == 0 {
+		return
+	}
+	_ = d.pool.Add(d.pending)
+	d.pending = nil
+	d.pendingID = [32]byte{}
+}
+
+// reAdd puts transactions back into the driver's mempool after a failed
+// proposal attempt and returns the cause unchanged: the engine wraps build's
+// error into ErrProposeFn and the driver's Tick discards that, so there is no
+// reader for the stranded-count wrapping node's reAdd carries - the value of
+// this helper is the re-add itself, and a stranded transaction's failure mode
+// is a transaction that never lands, not a divergent chain.
+func (d *Driver) reAdd(txs []types.Tx, cause error) error {
+	if d.pool != nil {
+		_ = d.pool.Add(txs)
+	}
+	return cause
 }
 
 // Height reports the chain height this driver has committed to. An undecided
@@ -157,7 +303,13 @@ func (d *Driver) Tick(nowMillis int64) {
 	// and no round would ever be left behind: the exact defect Task 6's
 	// review removed from the engine's caller. The test
 	// TestDriverEndsTheRoundItIsInOnTimeout pins it here.
-	if d.now >= d.timeoutAt {
+	if d.timeoutAt < 0 {
+		// First Tick (or first Tick of a rebuilt driver): arm the round-0
+		// deadline a full TimeoutBase from THIS reading, so a driver built
+		// over a clock that is already running gets the same window a fresh
+		// one does (see NewDriver).
+		d.timeoutAt = nowMillis + d.cfg.TimeoutBase
+	} else if d.now >= d.timeoutAt {
 		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
 		// The round the engine is in NOW, after OnTimeout advanced it, gets
 		// the base timeout plus its own step. Each round therefore runs
@@ -190,12 +342,17 @@ func (d *Driver) OnMessage(m transport.Message) {
 // head that cannot move fails identically forever (see the field comment).
 func (d *Driver) flush() {
 	for _, o := range d.eng.Drain() {
-		// An empty To is a broadcast, and the Transport interface has no
-		// unicast method. The M3 engine emits only broadcasts; anything else
-		// has no way out and is dropped deliberately until the interface
-		// gains one.
+		// An empty To is a broadcast; a non-empty To is a unicast, which the
+		// Transport interface grew in M4. The M3 engine emits only
+		// broadcasts - emit() never sets To - but the seam now ROUTES rather
+		// than drops a To the engine ever does emit. An error (say a Send to
+		// a peer that disconnected mid-round) is dropped exactly as M3
+		// deliberately dropped everything non-empty: the engine's retransmit
+		// behaviour on the next tick, not the transport, owns recovery.
 		if o.To == "" {
 			_ = d.tp.Broadcast(o.Data)
+		} else {
+			_ = d.tp.Send(transport.PeerID(o.To), o.Data)
 		}
 	}
 	id, ok := d.eng.Committed()
@@ -222,6 +379,41 @@ func (d *Driver) flush() {
 	if err := d.ch.Append(d.eng.proposal); err != nil {
 		d.appendRefused = true
 		return
+	}
+	// The commit certificate. The witness (if wired) receives the precommit
+	// votes THAT committed this very block: the engine tallied them through
+	// the ordinary VoteSet, so the certificate is the commit's own evidence,
+	// handed over at the only moment it is known complete. Votes for anything
+	// else (nil votes, a Byzantine validator's conflicting precommit) are not
+	// evidence for this block and do not travel.
+	if w := d.CommitWitness; w != nil {
+		id, _ := d.eng.Committed()
+		round := d.eng.round
+		cert := make([]*Vote, 0, len(d.eng.precommits.Votes()))
+		for _, v := range d.eng.precommits.Votes() {
+			if v.BlockID == id {
+				cert = append(cert, v)
+			}
+		}
+		w(d.ch.Height(), round, cert)
+	}
+	// The batch is committed only when the block that just committed is the
+	// very block pending was built into. A PEER's proposal can reach quorum
+	// at this height while this driver's own batch is still uncommitted (the
+	// ordinary M4 case: this node's proposal timed out or was lost, a later
+	// round's foreign proposal succeeded): that block need not carry the
+	// batch, so clearing pending here would orphan it - gone from the pool
+	// (Take removed it) and absent from the committed block. It stays
+	// pending instead, and the next height's first build reclaims it into
+	// the pool before that batch is taken; SelectApplicable there evicts
+	// whichever of its transactions the foreign block already applied, so
+	// the reclaim never puts an applied transaction up for a second ride.
+	// (A batch taken for a proposal that FAILED here belongs to the parked
+	// height; it is reclaimed by no build because this driver stops offering,
+	// which is the M3 refusal contract, and the report records the exposure.)
+	if d.pendingID == id {
+		d.pending = nil
+		d.pendingID = [32]byte{}
 	}
 	// The height is decided. Replace the engine: the next height starts the
 	// same way a fresh node would (its lock state is per-height, and any

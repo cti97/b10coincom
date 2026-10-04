@@ -1,0 +1,59 @@
+# b10coin validator NODE unit — deploy this on each RASPBERRY PI, not on the
+# VPS. The relay unit (b10coin-relay.service) goes on the VPS.
+#
+# Assumes the machine already has (see scripts/deploy/README.md §§2, 6):
+#   - the binary at /opt/b10coin/b10coin          (from scripts/deploy/build.sh, scp'd)
+#   - a system user and group "b10coin"
+#   - internet access OUTBOUND to the relay's TCP port 7001 (no port
+#     forwarding, no inbound rule: every connection a node makes is outbound)
+#   - /var/lib/b10coin created and owned by b10coin.b10coin, via StateDirectory
+#
+# The only line that MUST differ between the three Pis is B10COIN_INDEX —
+# two units left on the same index make two machines claim ONE validator
+# key, and the committee silently stops finalizing (README §8, failure 3).
+
+[Unit]
+Description=b10coin validator node (three-Pi testnet member)
+# network-online (not just network.target): the node dials the relay at
+# startup, and starting before the Pi has an address would only add a redial
+# delay to the very first boot.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=b10coin
+Group=b10coin
+WorkingDirectory=/var/lib/b10coin
+StateDirectory=b10coin
+
+# Everything a deployment edits lives here. Edit BEFORE the first enable:
+# B10COIN_RELAY to the VPS's public address, B10COIN_INDEX to this Pi's seat.
+Environment=B10COIN_DATA=/var/lib/b10coin
+Environment=B10COIN_HTTP=127.0.0.1:8645
+Environment=B10COIN_RELAY=changeme.example.com:7001
+Environment=B10COIN_VALIDATORS=3
+# This node's 0-based seat in the committee. Must be unique across the
+# committee: 0, 1 and 2 — one per Pi.
+Environment=B10COIN_INDEX=0
+
+ExecStart=/opt/b10coin/b10coin node \
+    --dir ${B10COIN_DATA} \
+    --http ${B10COIN_HTTP} \
+    --relay ${B10COIN_RELAY} \
+    --validators ${B10COIN_VALIDATORS} \
+    --index ${B10COIN_INDEX}
+
+Restart=always
+RestartSec=5
+
+# A validator holds keys; run it with the smallest practical sandbox. The
+# chain writes only under /var/lib/b10coin (ReadWritePaths pairs with
+# ProtectSystem=strict), RPC stays on 127.0.0.1:8645 by default.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/b10coin
+
+[Install]
+WantedBy=multi-user.target

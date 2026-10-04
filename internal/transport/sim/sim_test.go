@@ -235,3 +235,116 @@ func TestNowIsVirtualTimeOnly(t *testing.T) {
 		t.Fatalf("the message was not delivered within the Advance window: %v", *got)
 	}
 }
+
+// TestSendIsTheUnicastSyncNeeds: one named peer receives the payload, at the
+// very next Advance (stamped at virtual now, no latency window), everyone
+// else receives nothing, and an unknown or partitioned peer is an error
+// rather than a silently swallowed message.
+func TestSendIsTheUnicastSyncNeeds(t *testing.T) {
+	n := New(Options{Seed: 1, Latency: time.Millisecond, Jitter: 2 * time.Millisecond})
+	for _, id := range []string{"a", "b", "c"} {
+		n.AddPeer(id)
+	}
+	gotA, gotC := collect(n, "a"), collect(n, "c")
+
+	// Not synchronous: the same re-entry rule as Broadcast applies to Send,
+	// because the driver sends mid-step.
+	n.TransportFor("b").Send("a", []byte("uni"))
+	if len(*gotA) != 0 {
+		t.Fatal("Send delivered synchronously; it must queue")
+	}
+	n.Advance(50 * time.Millisecond)
+	if len(*gotA) != 1 || (*gotA)[0] != "uni" {
+		t.Fatalf("a did not receive the unicast: %v", *gotA)
+	}
+	if len(*gotC) != 0 {
+		t.Fatalf("unicast reached a bystander: %v", *gotC)
+	}
+
+	if err := n.TransportFor("a").Send("nobody", []byte("?")); err == nil {
+		t.Fatal("Send to an unknown peer must error, never silently succeed")
+	}
+
+	// The local endpoint is not a peer either - the TCP transport errors on
+	// Send to self (a validator never messages itself over the wire), so the
+	// sim must agree: the two transports have to be interchangeable.
+	if err := n.TransportFor("a").Send("a", []byte("?")); err == nil {
+		t.Fatal("Send to self must error, matching the TCP transport")
+	}
+
+	// A partition is a partition for Send too: b cannot sync from a peer on
+	// the far side of it.
+	n.Partition([]string{"c"}, []string{"a", "b"})
+	if err := n.TransportFor("b").Send("c", []byte("?")); err == nil {
+		t.Fatal("Send across a partition must error, not drop invisibly")
+	}
+	n.Advance(50 * time.Millisecond)
+	if len(*gotC) != 0 {
+		t.Fatalf("a unicast crossed a partition: %v", *gotC)
+	}
+}
+
+// TestSendConsumesNoRandomness pins the determinism promise the sim's Send
+// doc makes: a unicast consumes NO rng draw (no latency, no jitter, no loss),
+// so adding Sends to a scenario cannot shift any other delivery. The same
+// seed, one network with 50 Sends and one without: the broadcast's arrival
+// must be byte-identical, including its virtual delivery time.
+func TestSendConsumesNoRandomness(t *testing.T) {
+	type arrival struct {
+		at   time.Duration
+		data string
+	}
+	run := func(withSends bool) []arrival {
+		n := New(Options{Seed: 7, Latency: 10 * time.Millisecond, Jitter: 5 * time.Millisecond})
+		for _, id := range []string{"a", "b"} {
+			n.AddPeer(id)
+		}
+		var out []arrival
+		n.TransportFor("a").OnMessage(func(m Message) {
+			out = append(out, arrival{n.Now(), string(m.Data)})
+		})
+		if withSends {
+			for i := 0; i < 50; i++ {
+				if err := n.TransportFor("b").Send("a", []byte("u")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		n.TransportFor("b").Broadcast([]byte("m"))
+		n.Advance(time.Second)
+		return out
+	}
+	with, without := run(true), run(false)
+
+	// The broadcast arrives identically in both runs - same time, same order
+	// - despite 50 extra unicasts beforehand. Any rng consumption in Send
+	// would have shifted the broadcast's jitter draw and its arrival.
+	broadcastWith, broadcastWithout := ([]arrival)(nil), ([]arrival)(nil)
+	unicasts := 0
+	for _, ar := range with {
+		if ar.data == "m" {
+			broadcastWith = append(broadcastWith, ar)
+		} else {
+			unicasts++
+		}
+	}
+	for _, ar := range without {
+		if ar.data == "m" {
+			broadcastWithout = append(broadcastWithout, ar)
+		}
+	}
+	if unicasts != 50 {
+		t.Fatalf("want 50 unicast deliveries, got %d", unicasts)
+	}
+	if fmt.Sprint(broadcastWith) != fmt.Sprint(broadcastWithout) || len(broadcastWith) != 1 {
+		t.Fatalf("the broadcast's arrival changed when Sends were added: %v vs %v - Send consumed randomness", broadcastWith, broadcastWithout)
+	}
+	// The unicast is immediate: stamped at now (0), so every one delivers
+	// before the broadcast's latency+jitter window can.
+	if with[0].data != "u" || with[49].data != "u" || with[0].at != 0 || with[49].at != 0 {
+		t.Fatalf("unicasts did not deliver at virtual now in send order: %v then %v", with[0], with[49])
+	}
+	if with[50].data != "m" {
+		t.Fatalf("the broadcast did not follow the unicasts: %v", with[50])
+	}
+}

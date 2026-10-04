@@ -47,43 +47,17 @@ func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 	if timestamp == 0 {
 		timestamp = n.now().Unix()
 	}
-	// Take removes what it returns, but it does NOT drain the pool: claims
-	// past the per-block claim bound stay pending for a later block. What
-	// Take did return is gone once handed over, so anything dropped below
-	// is lost for good: keep only the transactions that apply cleanly, in
-	// order, against a running copy of the state. One state-invalid
-	// transaction must not discard the valid ones beside it or wedge the
-	// node.
-	//
-	// The filter's base is Chain.Probe(nil) - the state a block at head+1
-	// with no transactions would produce: the SAME transition Build runs,
-	// height advanced and emission credited. Hand-cloning the head state
-	// (the old filter) probed a claim against the head's epoch and a
-	// pre-emission faucet balance, and silently evicted valid claims.
-	// Candidates then apply on top of the base cumulative - each accepted
-	// transaction is inside the running state the next probe starts from,
-	// so a candidate may chain onto its accepted siblings (transfers with
-	// nonces 0 and 1 both survive; probing each against the bare head state
-	// would evict the second). Equivalent-but-quadratic alternative: probing
-	// every candidate through Probe(accepted... + candidate) re-derives and
-	// re-verifies the accepted prefix's signatures per candidate, which on a
-	// full MaxTxsPerBlock mempool is hours of ed25519 per block - a DoS the
-	// one-base form avoids.
+	// The filter's base and the one-at-a-time application live in
+	// Chain.SelectApplicable, WHICH IS THE POINT: the driver that proposes for
+	// consensus must select a block's transactions by exactly this policy, and
+	// a policy written twice here and there could drift into a fork. Only the
+	// bookkeeping around it is node's own.
 	candidates := n.mempool.Take(types.MaxTxsPerBlock)
-	probe, err := n.chain.Probe(nil)
+	valid, err := n.chain.SelectApplicable(candidates)
 	if err != nil {
 		// Nothing applies at a state whose head+1 transition fails; park
 		// the candidates back in the mempool rather than lose them.
 		return nil, reAdd(n.mempool, candidates, err)
-	}
-	valid := make([]types.Tx, 0, len(candidates))
-	for i := range candidates {
-		next, err := probe.ApplyBlock([]types.Tx{candidates[i]})
-		if err != nil {
-			continue // evict: it cannot apply at this state
-		}
-		probe = next
-		valid = append(valid, candidates[i])
 	}
 
 	b, err := n.chain.Build(n.proposer, valid, timestamp)

@@ -245,6 +245,61 @@ func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
 	return c.advanceLocked(c.head.Header.Height+1, txs)
 }
 
+// SelectApplicable filters candidates down to the transactions that apply, in
+// order, against the state a block at head+1 would be built on, and returns
+// them. This is THE one policy for which transactions a block carries: both
+// block producers run through it - node.RunOnce for the single-node path and
+// consensus.Driver.build for the consensus path - so what a proposer assembles
+// and what every validator's Append must accept are decided by the same code.
+// A block assembled one way and judged another is how a chain forks; sharing
+// this filter is what makes that impossible by construction rather than by
+// two implementations that must be kept in step by hand.
+//
+// The filter's base is Probe(nil) - the state a block at head+1 with no
+// transactions would produce: the SAME transition Build runs, height advanced
+// and emission credited. Hand-cloning the head state (the old filter) probed
+// a claim against the head's epoch and a pre-emission faucet balance, and
+// silently evicted valid claims. Candidates then apply on top of the base
+// cumulative - each accepted transaction is inside the running state the next
+// probe starts from, so a candidate may chain onto its accepted siblings
+// (transfers with nonces 0 and 1 both survive; probing each against the bare
+// head state would evict the second). Equivalent-but-quadratic alternative:
+// probing every candidate through Probe(accepted... + candidate) re-derives and
+// re-verifies the accepted prefix's signatures per candidate, which on a
+// full MaxTxsPerBlock mempool is hours of ed25519 per block - a DoS the
+// one-base form avoids.
+//
+// The per-block claim bound is deliberately NOT applied here and its callers
+// must not duplicate it: state.ApplyBlock enforces it before any Argon2id
+// evaluation, on the block as a whole, which is where the bound is consensus.
+// The mempool's local claim courtesy that bounds what each block producer
+// TAKES lives in mempool.Take. A filter that re-counted claims here would be
+// a second claim rule that could drift from the state machine's; the two
+// layers this side of ApplyBlock stay exactly where they are.
+//
+// A candidate that cannot apply is dropped ALONE: it does not discard its
+// valid siblings, and it is gone for good once the caller's Take does not see
+// it again - the caller owns what eviction means for its pool. An error
+// return means the empty head+1 transition itself failed, so nothing applies
+// and every candidate was lost by the caller's bookkeeping; the caller is
+// expected to return its candidates to wherever they came from.
+func (c *Chain) SelectApplicable(candidates []types.Tx) ([]types.Tx, error) {
+	base, err := c.Probe(nil)
+	if err != nil {
+		return nil, err
+	}
+	valid := make([]types.Tx, 0, len(candidates))
+	for i := range candidates {
+		next, err := base.ApplyBlock([]types.Tx{candidates[i]})
+		if err != nil {
+			continue // evict: it cannot apply at this state
+		}
+		base = next
+		valid = append(valid, candidates[i])
+	}
+	return valid, nil
+}
+
 // Build constructs and signs a candidate block. It does not mutate the
 // chain: the caller decides whether to Append.
 func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int64) (*types.Block, error) {

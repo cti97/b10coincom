@@ -167,7 +167,7 @@ func TestAssertPrefixCatchesADurableForkInARealNet(t *testing.T) {
 func proposerKey(t *testing.T, pub []byte) ed25519.PrivateKey {
 	t.Helper()
 	for i := 0; i < 255; i++ {
-		priv := simKey(i)
+		priv := ValidatorKey(i)
 		if owner, ok := priv.Public().(ed25519.PublicKey); ok && bytes.Equal([]byte(owner), pub) {
 			return priv
 		}

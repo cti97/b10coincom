@@ -1,0 +1,44 @@
+# b10coin RELAY unit — deploy this on the VPS only. The node units
+# (b10coin.service) go on the Raspberry Pis and dial THIS machine outbound.
+#
+# Assumes the machine already has (see scripts/deploy/README.md §§2, 6):
+#   - the binary at /opt/b10coin/b10coin-relay    (from scripts/deploy/build.sh, scp'd)
+#   - a system user and group "b10coin"
+#   - TCP port 7001 reachable from the internet: cloud/security-group rule,
+#     plus `ufw allow 7001/tcp` if a host firewall is in use
+#
+# The relay persists nothing and reads no config; everything in /opt is read
+# as a static binary, so ProtectSystem=strict is exact, not aspirational.
+
+[Unit]
+Description=b10coin relay (dumb frame forwarder for the home validators)
+# The relay binds a public port at startup; same network-online rationale as
+# the node unit.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=b10coin
+Group=b10coin
+WorkingDirectory=/opt/b10coin
+# The listen address. ":7001" is also the binary's own default; it is spelled
+# out here so the port the Pis dial and the port the relay binds are visibly
+# the same decision, in the same file. (NOTE: the relay's flag is --addr, not
+# --listen — --listen is the node command's optional direct-peer listener.)
+Environment=B10COIN_RELAY_ADDR=:7001
+
+ExecStart=/opt/b10coin/b10coin-relay --addr ${B10COIN_RELAY_ADDR}
+
+Restart=always
+RestartSec=5
+
+# The relay stores nothing anywhere: strict read-only filesystem, no home,
+# no temp files of its own beyond PrivateTmp's private scratch.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

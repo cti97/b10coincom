@@ -1,22 +1,37 @@
 package simnet
 
-// The six consensus scenarios design spec section 9.1 requires. This file IS the
-// milestone's evidence: the scenarios are the proof that the protocol is safe and
-// live under injected failure, so every assertion here pins a property the spec
-// names, and every scenario's killing mutation is recorded in the task report.
+// The six consensus scenarios design spec section 9.1 requires, plus the two
+// recovery scenarios M3 deferred to M4's networking. This file IS the
+// milestone's evidence: the scenarios are the proof that the protocol is safe
+// and live under injected failure, so every assertion here pins a property the
+// spec names, and every scenario's killing mutation is recorded in the task
+// report.
 //
-// What each scenario may honestly assert is scoped by two milestone limits
-// (docs/plans/2026-10-03-m3-bft-consensus.md, "Honest limits of the MILESTONE"):
+// What each scenario may honestly assert, then and now:
 //
-//   - M3 has NO block catch-up. Transport offers only Broadcast, so a validator
-//     that falls behind - partitioned away, or restarted mid-epoch - cannot adopt
-//     the blocks it missed. Scenarios 4 and 6 therefore assert that a lagging
-//     validator's history is a strict PREFIX of the longest chain (behind, never
-//     forked) and must NOT demand reconvergence; that is M4's block-sync work.
-//   - DropPercent cannot be used here. A validator whose quorum-committing
-//     proposal is lost holds no block bytes, cannot append, and parks at that
-//     height forever: there is no recovery path in M3. Every scenario below runs
-//     drop-free with latency only, so a stall means consensus, not a lost packet.
+//   - M3 had NO block catch-up, so scenarios 4 and 6 could only assert that a
+//     lagging validator's history was a strict PREFIX of the longest chain
+//     ("behind, never forked") and had to run drop-free. That is still their
+//     shape through their PARTITION/STOPPED phases - a validator cut away
+//     cannot commit what it cannot see, period.
+//   - M4 Task 4 added BLOCK_SYNC and Task 6 wired it into this harness
+//     (Net.CatchUp plus the per-validator syncer, router and commit witness),
+//     so scenarios 4 and 6 now continue PAST the cut: the lagging validator
+//     pulls the missed certified blocks, its driver is rebuilt over the
+//     adopted head, and the scenario asserts CONVERGENCE - the same height -
+//     where M3 could only assert a prefix.
+//   - M3's limits 2 (DropPercent parks a validator forever) and 3 (no
+//     scenario injects reordering) are RESOLVED by the same mechanism: with
+//     catch-up, a dropped proposal is recoverable, so the loss scenario
+//     finally runs with non-zero DropPercent and JitterMS - the claim the
+//     milestone goal has made since M3 and never once exercised. Where a
+//     scenario still cannot converge it says so below, and never weakens
+//     the assertion back to a bare prefix.
+//
+// AssertPrefix moved into simnet.go at review (F2): the plan's interface list
+// ships simnet.AssertPrefix(i), and a helper that lives only in a _test file is
+// invisible to every non-test caller. Behaviour is unchanged; the scenarios
+// below call the same method, now in the built package.
 //
 // AssertPrefix moved into simnet.go at review (F2): the plan's interface list
 // ships simnet.AssertPrefix(i), and a helper that lives only in a _test file is
@@ -236,11 +251,11 @@ func TestScenarioOneOfflineStillAdvances(t *testing.T) {
 	if got := n.ch[3].Height(); got != silentHeight {
 		t.Fatalf("OFFLINE validator 3 committed while offline: %d -> %d", silentHeight, got)
 	}
-	if len(n.taps[3].sent) != 0 {
-		t.Fatalf("OFFLINE validator 3 put %d messages on the wire; a powered-off machine sends nothing", len(n.taps[3].sent))
+	if n.taps[3].sentCount() != 0 {
+		t.Fatalf("OFFLINE validator 3 put %d messages on the wire; a powered-off machine sends nothing", n.taps[3].sentCount())
 	}
-	if len(n.taps[3].recv) != 0 {
-		t.Fatalf("OFFLINE validator 3's driver consumed %d messages; a powered-off machine receives nothing", len(n.taps[3].recv))
+	if n.taps[3].recvCount() != 0 {
+		t.Fatalf("OFFLINE validator 3's driver consumed %d messages; a powered-off machine receives nothing", n.taps[3].recvCount())
 	}
 }
 
@@ -301,8 +316,8 @@ func TestScenarioTwoOfflineStallsWithoutForks(t *testing.T) {
 		sentAtCut := make(map[int]int, len(offline))
 		recvAtCut := make(map[int]int, len(offline))
 		for _, i := range offline {
-			sentAtCut[i] = len(n.taps[i].sent)
-			recvAtCut[i] = len(n.taps[i].recv)
+			sentAtCut[i] = n.taps[i].sentCount()
+			recvAtCut[i] = n.taps[i].recvCount()
 		}
 
 		_, err = n.RunBlocks(6)
@@ -323,10 +338,10 @@ func TestScenarioTwoOfflineStallsWithoutForks(t *testing.T) {
 		// quietly", and the quorum arithmetic above would describe a network
 		// that no longer exists.
 		for _, i := range offline {
-			if got := len(n.taps[i].sent); got != sentAtCut[i] {
+			if got := n.taps[i].sentCount(); got != sentAtCut[i] {
 				t.Fatalf("OFFLINE validator %d sent %d messages after the cut; a powered-off machine sends nothing", i, got-sentAtCut[i])
 			}
-			if got := len(n.taps[i].recv); got != recvAtCut[i] {
+			if got := n.taps[i].recvCount(); got != recvAtCut[i] {
 				t.Fatalf("OFFLINE validator %d's driver consumed %d messages after the cut; a powered-off machine receives nothing", i, got-recvAtCut[i])
 			}
 		}
@@ -345,25 +360,31 @@ func TestScenarioTwoOfflineStallsWithoutForks(t *testing.T) {
 }
 
 // 4. Partition then heal: no safety violation while split, the majority proceeds
-// on its own, and the lagging validator ends up BEHIND the longest chain - a
-// strict prefix of it - rather than forked.
+// on its own, and the lagging validator CONVERGES once the network heals - the
+// same height, the same history - which M3 could only assert as a prefix.
 //
-// WHAT THIS SCENARIO CAN HONESTLY ASSERT, and what it cannot: M3 has NO block
-// catch-up, so after Heal() the isolated validator still cannot adopt the blocks
-// it missed (Transport has no unicast sync). "The chain resumes" is therefore
-// asserted about the majority, and the isolated validator's state is asserted as
-// lag-not-fork: its height frozen at the partition, its history a prefix of the
-// majority's chain (AssertPrefix), and no conflicting block anywhere. Demanding
-// reconvergence would need block sync, which is M4's networking work.
+// What each phase asserts, exactly:
 //
-// Killing mutant (M5): AssertPrefix's per-height divergence return is neutered
-// - the mutant anchors only on the ID comparison inside the prefix walk; the
-// index range guard and the stands-above-the-longest-chain guard still run.
-// The plain scenario survives that mutant (recorded honestly in the task
-// report): the freeze, the majority-progress assertions and the agreement
-// walks pin the same "behind, never forked" property through independent
-// paths, and the report's fork-injection demonstration shows the scenario
-// catching a real divergence with the helper neutered.
+//   - WHILE PARTITIONED (the M3 shape, unchanged): the isolated validator holds
+//     one vote against quorum 3 and commits nothing; its history is a prefix
+//     of the majority's.
+//   - AFTER HEAL (the M4 carry-forward, Task 6): BLOCK_SYNC is wired through
+//     this harness (CatchUp), so the isolated validator PULLS the missed
+//     certified blocks, its driver is rebuilt over the adopted head, and the
+//     committee runs on together. The scenario asserts the SAME HEIGHT - not
+//     merely "behind, not forked" - and, after the joint run, that every
+//     validator holds identical blocks at every height.
+//   - The majority's partition-era window (laggedHeight+1..12) is cross-checked
+//     THROUGH the adopted copy: validator 0 now HOLDS those blocks, so the
+//     window walk runs across all four - stronger than the committing-set-only
+//     walk M3 used, and the exact place a fork confined to the split era
+//     would live.
+//
+// Killing mutant (Task 6 report): CatchUp disabled - validator 0 stays at
+// laggedHeight, the convergence and joint-run assertions fail. The M3-era
+// mutant record (an AssertPrefix neutering, which the plain scenario
+// survived) still holds for the partitioned phase: the freeze and progress
+// assertions were independent paths then, as they are now.
 func TestScenarioPartitionThenHeal(t *testing.T) {
 	n, err := New(4, Options{TempDir: t.TempDir(), Seed: 4, LatencyMS: 5, TimeoutBase: 200, TimeoutStep: 100})
 	if err != nil {
@@ -391,30 +412,107 @@ func TestScenarioPartitionThenHeal(t *testing.T) {
 	if got := n.ch[0].Height(); got != laggedHeight {
 		t.Fatalf("partitioned validator 0 committed on its own: %d -> %d; a minority of one cannot reach quorum", laggedHeight, got)
 	}
+	// And it must not have forked while cut off.
+	if err := n.AssertPrefix(0); err != nil {
+		t.Fatalf("the partitioned validator diverged instead of merely lagging: %v", err)
+	}
 
 	n.Heal()
-	// Healing restores CONNECTIVITY, not catch-up: the majority resumes, and
-	// validator 0 stays behind it (see the milestone-limits comment above).
+	// Healing restores CONNECTIVITY; CATCH-UP is what restores the history.
 	if _, err := n.RunBlocksAmong(12, []int{1, 2, 3}); err != nil {
 		t.Fatalf("the chain did not resume after healing: %v", err)
 	}
 
-	// The lagging validator is behind, never forked.
-	if err := n.AssertPrefix(0); err != nil {
-		t.Fatalf("the partitioned validator diverged instead of merely lagging: %v", err)
+	// The M4 claim: validator 0 pulls the missed blocks and CONVERGES.
+	if err := n.CatchUp(0); err != nil {
+		t.Fatalf("validator 0's catch-up pull failed: %v", err)
 	}
+	if got := n.ch[0].Height(); got != 12 {
+		t.Fatalf("validator 0 ended the partition era at height %d, want the majority's 12: catch-up did not converge it", got)
+	}
+
+	// The healed committee runs together: validator 0's rebuilt engine
+	// rejoins the CURRENT height (its stale round state was discarded the
+	// way a restart's is), and all four commit onward.
+	if _, err := n.RunBlocksAmong(16, []int{0, 1, 2, 3}); err != nil {
+		t.Fatalf("the healed committee did not advance with its returning member: %v", err)
+	}
+	// The committee ends the scenario holding ONE history at ONE height:
+	// equalise by catch-up (nobody ticks during a pull, so heights do not
+	// run away) and require equality.
+	equaliseByCatchUp(t, n, "partition then heal")
+	hs := n.Heights()
+	for i, h := range hs {
+		if h != hs[0] {
+			t.Fatalf("the committee did not hold one height after convergence: validator %d at %d, validator 0 at %d", i, h, hs[0])
+		}
+	}
+
 	if err := n.AssertSameChain(); err != nil {
 		t.Fatalf("a safety violation across the partition: %v", err)
 	}
 	assertAgreedOnEverySharedHeight(t, n, "partition then heal")
 
 	// The majority's partition-era blocks - heights laggedHeight+1..12, here
-	// 4..12 - sit ABOVE validator 0's frozen height, so every check scoped to
-	// the shared prefix or to the lowest common height never compared them
-	// with each other: a fork confined to the partition era would pass this
-	// scenario untouched. Cross-check the committing set {1,2,3} pairwise
-	// across that whole window instead.
-	assertSetAgreesThrough(t, n, "partition then heal (majority window)", []int{1, 2, 3}, laggedHeight+1, 12)
+	// 4..12 - are the window any fork confined to the split era would occupy.
+	// Validator 0 now holds them too (adopted), so the cross-check runs across
+	// ALL FOUR, not only the committing set.
+	assertSetAgreesThrough(t, n, "partition then heal (majority window)", []int{0, 1, 2, 3}, laggedHeight+1, 12)
+}
+
+// equaliseByCatchUp pulls every validator below the tallest up to it, with a
+// hard bound on rounds: a catch-up that adopts nothing two rounds in a row is
+// reported, never looped on.
+func equaliseByCatchUp(t *testing.T, n *Net, where string) {
+	t.Helper()
+	const maxRounds = 8
+	for round := 0; round < maxRounds; round++ {
+		if n.convergedHeightsEqual() {
+			return
+		}
+		maxH := n.maxHeight()
+		moved := false
+		for i := 0; i < len(n.ch); i++ {
+			if n.ch[i].Height() >= maxH {
+				continue
+			}
+			before := n.ch[i].Height()
+			if err := n.CatchUp(i); err != nil {
+				t.Fatalf("%s: catch-up for validator %d failed: %v", where, i, err)
+			}
+			if n.ch[i].Height() > before {
+				moved = true
+			}
+		}
+		if !moved {
+			break
+		}
+	}
+	if !n.convergedHeightsEqual() {
+		t.Fatalf("%s: catch-up did not bring the committee to one height: heights %v", where, n.Heights())
+	}
+}
+
+// maxHeight reports the tallest committed height in the network.
+func (n *Net) maxHeight() uint64 {
+	maxH := uint64(0)
+	for _, c := range n.ch {
+		if c.Height() > maxH {
+			maxH = c.Height()
+		}
+	}
+	return maxH
+}
+
+// convergedHeightsEqual reports whether every validator stands at one height.
+func (n *Net) convergedHeightsEqual() bool {
+	first := n.ch[0].Height()
+	for _, c := range n.ch[1:] {
+		if c.Height() != first {
+			return false
+		}
+	}
+	return true
 }
 
 // 5. A Byzantine validator equivocates: every prevote it sends is duplicated, on
@@ -465,7 +563,7 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 		t.Fatal("no equivocator was installed for validator 3")
 	}
 	forgedOnWire := 0
-	for _, raw := range n.taps[3].sent {
+	for _, raw := range n.taps[3].sentLog() {
 		v, derr := consensus.DecodeVote(raw)
 		if derr != nil || v.Type != consensus.MsgPrevote || v.BlockID != eq.forgeID {
 			continue
@@ -482,7 +580,7 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 		t.Fatal("no forged prevote ever reached validator 3's wire: the equivocation stayed local and the Byzantine scenario would be vacuous")
 	}
 	delivered := 0
-	for _, raw := range n.taps[0].recv {
+	for _, raw := range n.taps[0].recvLog() {
 		v, derr := consensus.DecodeVote(raw)
 		if derr == nil && v.Type == consensus.MsgPrevote && v.BlockID == eq.forgeID && n.cfg.IndexOf(v.Validator) == 3 {
 			delivered++
@@ -685,7 +783,7 @@ func TestScenarioByzantinePrecommitEquivocatorDoesNotFork(t *testing.T) {
 		round  uint32
 	}
 	honestFor, forgedFor := map[roundKey]bool{}, map[roundKey]bool{}
-	for _, raw := range n.taps[3].sent {
+	for _, raw := range n.taps[3].sentLog() {
 		v, derr := consensus.DecodeVote(raw)
 		if derr != nil || v.Type != consensus.MsgPrecommit || v.IsNil() {
 			continue
@@ -717,7 +815,7 @@ func TestScenarioByzantinePrecommitEquivocatorDoesNotFork(t *testing.T) {
 	// broadcasts it through the live network, so at least one peer's received
 	// log must hold it - a broadcast that arrives nowhere tallies nowhere.
 	delivered := 0
-	for _, raw := range n.taps[0].recv {
+	for _, raw := range n.taps[0].recvLog() {
 		v, derr := consensus.DecodeVote(raw)
 		if derr == nil && v.Type == consensus.MsgPrecommit && v.BlockID == eq.forgeID && n.cfg.IndexOf(v.Validator) == 3 {
 			delivered++
@@ -746,20 +844,27 @@ func TestScenarioByzantinePrecommitEquivocatorDoesNotFork(t *testing.T) {
 }
 
 // 6. Restart mid-epoch: a validator stops, the others advance, and it reopens
-// its chain from disk. Replay must re-derive the state root its peers computed,
-// and the restarted - now behind - chain must be a prefix of its peers' rather
-// than a fork of it.
+// its chain from disk. Replay must re-derive the state root its peers computed;
+// the restarted chain is a prefix of its peers' - and, with M4's catch-up
+// wired (Task 6), it now CONVERGES: it pulls the missed certified blocks and
+// rejoins the committee at the peers' height, which M3's limits note recorded
+// as impossible.
 //
-// WHAT THIS SCENARIO CAN HONESTLY ASSERT: the spec requires the replay
-// assertion (the state root matches), and safety requires the restarted chain to
-// be a PREFIX of the peers' chain. The restarted validator is deliberately NOT
-// driven to reconverge: M3 has no block catch-up, so re-entering the committee
-// mid-stream would need block sync, which is M4's work. What is additionally
-// asserted is that a behind-forever validator is HARMLESS: the peers keep
-// committing with it re-wired into the network.
+// Phase order, each phase's assertion named:
 //
-// Killing mutant (M8): chain.Open's replay stops applying stored blocks; the
-// reopen itself fails the state-root check and the scenario never gets a chain.
+//   - REPLAY (the spec's assertion, unchanged): the reopened chain re-derives
+//     the same state root and the same block at the stopped height.
+//   - BACK-AND-HARMLESS (kept from M3, still true): between the reopen and
+//     the pull, behind-forever is harmless - the peers keep committing.
+//   - CONVERGENCE (the M4 carry-forward): CatchUp(3) pulls heights
+//     stopped+1..20 and the restarted validator rejoins at the CURRENT
+//     height; the equaliser brings the committee to ONE height and the
+//     per-height walks prove one history over every height the restart
+//     spanned.
+//
+// Killing mutants (Task 6 report): CatchUp disabled (no convergence, the
+// equality fails); and the M3-era mutant (chain.Open's replay stops applying
+// stored blocks) still kills at the reopen itself.
 func TestScenarioRestartMidEpoch(t *testing.T) {
 	n, err := New(4, Options{TempDir: t.TempDir(), Seed: 6, LatencyMS: 5, TimeoutBase: 200, TimeoutStep: 100})
 	if err != nil {
@@ -812,37 +917,151 @@ func TestScenarioRestartMidEpoch(t *testing.T) {
 		t.Fatalf("replayed block diverged at height %d: %x vs %x (state roots matched but the blocks did not)", stopped, id1[:8], id2[:8])
 	}
 
-	// Re-wire the restarted (and now permanently behind) validator: a driver
-	// that is behind must remain harmless, not disruptive. It is rebuilt over
-	// transportFor(3) so the harness's recorder stays wired to the new driver,
-	// and the rebuild's OnMessage registration is what lifts the power-off cut.
-	n.ch[3] = reopened
+	// Re-wire the restarted validator over the REOPENED chain: the reseat
+	// rebuilds the syncer and driver over it (the old syncer's chain pointer
+	// and certificate archive belonged to the closed chain), and the rebuild's
+	// OnMessage registration is what lifts the power-off cut. A restarted
+	// validator that is merely behind must remain harmless.
 	n.offline[3] = false
-	n.drv[3] = consensus.NewDriver(n.cfg, reopened, n.keys[3].priv, n.transportFor(3))
+	n.reseat(3, reopened)
 	if err := n.AssertPrefix(3); err != nil {
 		t.Fatalf("the restarted validator holds a conflicting history: %v", err)
 	}
 
-	// The peers must be unaffected by its return.
-	if _, err := n.RunBlocksAmong(20, []int{0, 1, 2}); err != nil {
-		t.Fatalf("the restarted validator disrupted the running chain: %v", err)
+	// The M3 limit that no longer holds: catch-up. The restarted validator
+	// pulls the blocks it missed - served from the peers' certificate
+	// archives (every height the peers committed live is archived) - and
+	// converges at the CURRENT height.
+	if err := n.CatchUp(3); err != nil {
+		t.Fatalf("the restarted validator's catch-up failed: %v", err)
 	}
-	if got := n.ch[3].Height(); got != stopped {
-		t.Fatalf("the restarted validator's height moved %d -> %d: with no catch-up it cannot advance, and anything else would be a fork", stopped, got)
+	if got := n.ch[3].Height(); got != 12 {
+		t.Fatalf("the restarted validator ended its rejoin at height %d, want the peers' 12: catch-up did not converge it", got)
 	}
-	if err := n.AssertPrefix(3); err != nil {
-		t.Fatalf("the restarted validator diverged while sitting behind the quorum: %v", err)
+
+	// And rejoin the committee's advance, not just its history.
+	if _, err := n.RunBlocksAmong(20, []int{0, 1, 2, 3}); err != nil {
+		t.Fatalf("the committee did not advance with its restarted member: %v", err)
 	}
+	equaliseByCatchUp(t, n, "restart mid-epoch")
+	if hs := n.Heights(); hs[3] != hs[0] {
+		t.Fatalf("the restarted validator did not converge to the committee's height: %v", hs)
+	}
+
 	if err := n.AssertSameChain(); err != nil {
 		t.Fatalf("the committee disagreed after the restart: %v", err)
 	}
 	assertAgreedOnEverySharedHeight(t, n, "restart mid-epoch")
 
-	// Peer-window cross-check: validator 3 froze at height 5 ("stopped"), so
-	// the walk above stops there too, leaving the peer blocks 6..20 - what
-	// {0,1,2} committed while 3 was powered off, and after its re-wiring while
-	// it sat permanently behind - never compared with each other. A fork
-	// confined to that window must not slip through: cross-check {0,1,2}
-	// pairwise over the heights they share beyond the frozen validator.
-	assertSetAgreesThrough(t, n, "restart mid-epoch (peer window)", []int{0, 1, 2}, stopped+1, 20)
+	// The restart-era window - heights stopped+1..20, committed by {0,1,2}
+	// while validator 3 was powered off, and now HELD BY IT via catch-up -
+	// cross-checked across all four. In M3 only the committing set could be
+	// compared (the restarted validator held nothing there); with the adopted
+	// history in place the walk covers every member.
+	assertSetAgreesThrough(t, n, "restart mid-epoch (peer window)", []int{0, 1, 2, 3}, stopped+1, 20)
+}
+
+// 7. Loss and reordering: non-zero DropPercent and JitterMS, and the committee
+// still finalises 20 blocks on one history.
+//
+// This is the claim the milestone goal has made since M3 and never once
+// exercised: M3's honest limits recorded that DropPercent could not drive a
+// liveness scenario - a validator whose quorum-committing proposal was dropped
+// held no block bytes, could not append, and parked at that height forever,
+// because M3 had no catch-up - and that no scenario injected reordering. With
+// BLOCK_SYNC wired into this harness (CatchUp), a dropped proposal is
+// RECOVERABLE: the parked validator pulls the missed certified heights, and
+// the drive resumes. M3's limits 2 and 3 stop being limits here.
+//
+// Shape: drive toward the target; whenever the wait set stalls, catch the
+// stalled ones up and resume. A stall under loss is EXPECTED here (it is what
+// a dropped commit-critical proposal looks like), so the loop treats the
+// harness's early no-progress error as the signal to pull, not as a failure.
+//
+// Evidence the loss was REAL and the recovery load-bearing, not asserted:
+//
+//   - the committee's routers must show at least one BLOCK_SYNC request
+//     served; a run whose every validator rode every commit unaided would
+//     have zero, and could not claim to test loss recovery at all;
+//   - the final heights must be EQUAL (the equaliser's catch-up adopted the
+//     missed tails), every committed height identical across validators, and
+//     every divergence-refusing prefix assertion held.
+//
+// Killing mutant (Task 6 report): CatchUp disabled - the same drops park a
+// validator the first time a commit-critical proposal is lost and the target
+// is never reached. At DropPercent 0 the same disabled catch-up passes,
+// because there is nothing to recover: the pair of runs is what pins the
+// claim to exactly this scenario.
+func TestScenarioLossAndReorderStillFinalises(t *testing.T) {
+	n, err := New(4, Options{
+		TempDir:     t.TempDir(),
+		Seed:        7,
+		LatencyMS:   5,
+		JitterMS:    20,
+		DropPercent: 15,
+		TimeoutBase: 200,
+		TimeoutStep: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+
+	const target = uint64(20)
+	const maxAttempts = 200
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		behind := make([]int, 0, 4)
+		lowest := uint64(1<<63 - 1)
+		for i := 0; i < len(n.ch); i++ {
+			if h := n.ch[i].Height(); h < target {
+				behind = append(behind, i)
+				if h < lowest {
+					lowest = h
+				}
+			}
+		}
+		if len(behind) == 0 {
+			break
+		}
+		// Give the round protocol its chance to take the behind set one
+		// block up. A stall error under loss is expected and handled below;
+		// the next attempts resume from the heights the committee reached.
+		_, _ = n.RunBlocksAmong(lowest+1, behind)
+		for _, i := range behind {
+			if n.ch[i].Height() < n.maxHeight() {
+				if err := n.CatchUp(i); err != nil {
+					t.Fatalf("attempt %d: catch-up for validator %d failed: %v", attempt+1, i, err)
+				}
+			}
+		}
+	}
+
+	// Finalised under loss and reorder.
+	hs := n.Heights()
+	for i, h := range hs {
+		if h < target {
+			t.Fatalf("validator %d finalised only %d of %d blocks under loss and reordering (catch-up did not converge the committee)", i, h, target)
+		}
+	}
+	// The loss was real: some validator missed a commit-critical delivery and
+	// had to be pulled, which is what a served BLOCK_SYNC request means.
+	served := uint64(0)
+	for _, rt := range n.rts {
+		served += rt.SyncRequestsServed()
+	}
+	if served == 0 {
+		t.Fatalf("no validator ever needed catch-up in %d attempts: the scenario asserted loss recovery that did not happen", maxAttempts)
+	}
+	// One history across loss and reorder: identical blocks at every shared
+	// height, and the equaliser's adoptions bring the committee to one height.
+	equaliseByCatchUp(t, n, "loss and reorder (final)")
+	if err := n.AssertSameChain(); err != nil {
+		t.Fatalf("a safety violation under loss and reordering: %v", err)
+	}
+	assertAgreedOnEverySharedHeight(t, n, "loss and reorder")
+	for i := 0; i < len(n.ch); i++ {
+		if err := n.AssertPrefix(i); err != nil {
+			t.Fatalf("validator %d diverged under loss: %v", i, err)
+		}
+	}
 }

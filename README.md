@@ -83,6 +83,61 @@ agreed       yes
 OK
 ```
 
+## Platforms and releases
+
+b10coin builds for **six targets, and its test suite compiles for all of
+them**: darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64
+and windows/arm64. The Raspberry Pi is M4's *acceptance* target (three Pis
+across separate networks finalize blocks — the deployment recipe below), not
+the only platform the software runs on: a contributor on a laptop builds and
+runs the same binaries, on macOS or Windows just as on Linux.
+
+```sh
+make release
+```
+
+builds **both binaries for every target** into `dist/` — no flags to get
+right, no per-platform incantations:
+
+```text
+dist/b10coin-0.1.0-darwin-amd64            dist/b10coin-relay-0.1.0-darwin-amd64
+dist/b10coin-0.1.0-darwin-arm64            dist/b10coin-relay-0.1.0-darwin-arm64
+dist/b10coin-0.1.0-linux-amd64             dist/b10coin-relay-0.1.0-linux-amd64
+dist/b10coin-0.1.0-linux-arm64             dist/b10coin-relay-0.1.0-linux-arm64
+dist/b10coin-0.1.0-windows-amd64.exe       dist/b10coin-relay-0.1.0-windows-amd64.exe
+dist/b10coin-0.1.0-windows-arm64.exe       dist/b10coin-relay-0.1.0-windows-arm64.exe
+dist/SHA256SUMS
+```
+
+Guarantees a release keeps (all enforced by `scripts/build-release.sh`, the
+one build story the Makefile, CI and the deployment wrapper share): the
+version comes from `internal/version` — the binary prints it, so file names
+cannot disagree with what a binary says; `dist/` starts empty every run and
+is swapped in only after everything succeeds — the builds, the architecture
+assertions AND the checksums — so a failure at any of those steps leaves no
+`dist/` at all to be mistaken for a release; the artifact count must equal
+the target count, so a build that silently produced only the host platform
+fails instead of shipping a hole; and every artifact is `file(1)`-checked to
+report its own architecture — its format and architecture tokens (`Mach-O`,
+`ELF` or `PE32+`, plus `x86_64`, `arm64`, `x86-64` or `aarch64`) must appear
+wherever they sit in `file`'s output, so the check holds for Apple's `file`
+word order ("Mach-O 64-bit executable arm64") and upstream libmagic's ("Mach-O
+64-bit arm64 executable", which the Linux CI runners emit) alike, and `Mach-O`
+/ `PE32+` names never appear except where they belong. On the target machine,
+verify what you copied:
+
+```sh
+( cd dist && sha256sum -c SHA256SUMS )    # or: shasum -a 256 -c SHA256SUMS
+```
+
+CI (`.github/workflows/ci.yml`) runs a matrix over all six targets on every
+push: each one is cross-compiled with `go build ./...` **and** `go vet
+./...` — vet, not the build, is what caught this milestone's one
+cross-platform defect (a Unix-only syscall in the relay's test code, which
+made `GOOS=windows go vet` fail while every build stayed green) — plus a
+release job that builds and asserts all twelve artifacts, so no platform can
+rot silently and none ships unverified.
+
 ## The CLI
 
 `cmd/b10coin` implements five subcommands. With no subcommand, or with an
@@ -124,7 +179,10 @@ are valueless; the testnet genesis has no validator keys yet.
 | `--http ADDR` | `127.0.0.1:8645` | HTTP RPC listen address |
 | `--block-time DURATION` | `2s` | target block interval |
 
-Ctrl-C (or SIGTERM) stops block production and the HTTP server cleanly.
+Ctrl-C (or, on Unix, SIGTERM) stops block production and the HTTP server
+cleanly. The graceful stop listens for both through one cancellation
+channel, so on Windows — where SIGTERM is a POSIX signal that is never
+delivered — Ctrl-C still reaches the same clean path.
 
 ### `b10coin claim`
 
@@ -143,6 +201,62 @@ There is **no key file and no keystore**: `claim` signs with an ephemeral
 fresh key, and prints that key once — copy it out immediately if you plan a
 follow-up transfer, because it cannot be recovered later. The claim is only
 queued by this command; the node pays it when its next block applies it.
+
+### `b10coin-relay`
+
+A separate binary (`cmd/b10coin-relay`) — the one component of the network a
+stranger can reach. It runs on a cheap public VPS; every home validator dials
+**outbound** to it, which is what makes the topology work with no port
+forwarding and nothing to do about CGNAT (inbound to a home Pi is blocked,
+outbound almost never is). The relay keeps a registry of connected peers and
+forwards every frame it receives to every **other** peer. It parses nothing
+beyond the frame's 4-byte length prefix — it does not know what a vote is,
+and that is the design, not a shortcut.
+
+The trust trade it rests on: every consensus message is signed with the
+sender's Ed25519 key, so **a malicious relay can censor or delay, but it
+cannot forge a vote or a proposal**. Consensus safety is never at risk from
+the relay; only liveness is (a relay that partitions the validator set stalls
+consensus, which the round protocol's rebroadcasts and the reconnection
+backoff pay for). If that ever stops being acceptable the answer is multiple
+relays and direct connections — never a smarter relay, because a relay that
+understood consensus would be a relay that could be wrong about it.
+
+Because it authenticates nothing, it binds everything a stranger controls: a
+frame whose declared length exceeds the bound is refused before any
+allocation and its connection is ended; dials past the connection bound are
+closed at accept; every connection buffers at most a bounded write queue, so
+a peer that stops reading cannot stall the relay for the others (dropped
+frames, never a blocked forwarder); and two socket-level timers bound how
+long a connection may *hold* what it has taken — nothing is parsed to enforce
+them. The per-frame read timeout (`--read-timeout`, default 120 seconds) is
+armed before each frame's 4-byte header and refreshed at every completed
+frame, so an actively sending peer is never cut off; when it expires — a
+connection that delivered no complete frame for the whole period — the
+connection is closed and its registry slot is released the same instant. So a
+stranger can pin at most `max-conns × max-frame-bytes` of memory and
+`max-conns` of slots, each for at most one read timeout, never forever. TCP
+keepalive (`--keepalive`, default 15 seconds) reaps a half-open connection —
+a peer that vanished without closing, e.g. a power cut — after the kernel's
+unanswered probes, again without the relay looking at any byte. In production
+the access policy does not
+live in the relay at all — run it behind the VPS firewall allowlisting the
+validator IPs. Validators reconnect to a restarted relay with exponential
+backoff. Bandwidth is kilobytes per second.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--addr ADDR` | `:7001` | listen address (all interfaces — validators must reach this one) |
+| `--max-frame-bytes N` | `1048576` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic) |
+| `--max-conns N` | `256` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
+| `--write-queue N` | `64` | per-connection buffered frames; a full queue drops new frames for that peer instead of blocking the relay |
+| `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |
+| `--keepalive SECONDS` | `15` | TCP keepalive probe period for every accepted connection; a half-open connection is reaped by the kernel after unanswered probes |
+
+Ctrl-C (or, on Unix, SIGTERM) stops the listener, closes every connection and
+joins every goroutine before the process exits. Same as the node command: one
+cancellation channel serves both signals, so Windows' Ctrl-C reaches the same
+graceful drain.
 
 ### `b10coin version` and `b10coin help`
 
@@ -455,6 +569,47 @@ configuration is where the no-premine promise lives:
 | No key can spend from the faucet | the faucet address is hash-of-genesis, not hash-of-pubkey; the derivation is pinned by a test |
 | Emission never exceeds the cap (it lands 2.52 b10 short of it) | `Genesis.Validate` enforces the idealized identity `InitialRewardSparks × HalvingIntervalBlocks × 2 == TotalSupplySparks`, which pins the parameters; the realized truncated series — 20,999,997.48 b10 — is kept under the cap by `TestEmissionNeverExceedsTheCap`, and `TestSupplyCapIsPinned` pins the absolute monetary values, so a proportional "renegotiation" cannot pass |
 
+## Deploying to Raspberry Pis
+
+M4's acceptance is real hardware, and the linux/arm64 release is where the
+full matrix meets it: `make release` produces the six targets above, of which
+`b10coin-*-linux-arm64` is the pair a 64-bit Raspberry Pi OS runs — and
+`scripts/deploy/build.sh` is the deployment-facing wrapper for exactly that
+pair: it runs the same release script with `--only linux/arm64` and copies
+the result into `bin/` under the names the recipe's scp lines use, so a
+version bump never breaks the recipe (and
+`scripts/deploy/build.sh linux/amd64` produces the relay an amd64 VPS wants —
+see its §2). CI (`.github/workflows/ci.yml`) runs the release build for every
+target and asserts every artifact on every push, so the Pi binary cannot rot
+silently. The version the binaries print comes from `internal/version`; no
+build-flag override adds a second source of truth. The Pi is the *acceptance*
+target of this milestone — the other five targets build, vet and release
+alongside it, per [Platforms and releases](#platforms-and-releases).
+
+The full recipe — three Pis on separate home networks plus one relay VPS,
+build → copy → shared genesis → first contact → systemd units → what output
+means success, then the three likeliest failures and how to tell them apart —
+lives in [`scripts/deploy/README.md`](scripts/deploy/README.md).
+
+After the Pis are running, the acceptance run itself becomes one command:
+
+```sh
+scripts/deploy/acceptance.sh --pis pi-a.local,pi-b.example.net,pi-c.example.net --relay relay.example.net
+```
+
+It reads each validator's loopback RPC over SSH, takes two `/status` readings
+15 s apart, and prints one pastable verdict with exit code. It fails — for a
+different, named reason and a different exit code — when a validator is
+**UNREACHABLE** (exit 1), when all are reachable but no height moved
+(**STALLED**, exit 2: relay down or no quorum), when they are advancing on
+**different chains or different blocks** (**DISAGREE**, exit 3: the chain-ID
+or shared-`--index` failures, never reported as a pass), or when the relay's
+TCP port alone is unreachable (**RELAY**, exit 4 — named as its own failure,
+with the caveat that the probe runs from the machine invoking the script).
+The rule it enforces: agreeing-by-hash while stalled proves nothing, so a
+PASS requires every height to have *increased* **and** all validators to name
+the identical block at one height. See `scripts/deploy/README.md` §7.
+
 ## Checks
 
 `go test -count=1 ./...` and `go test -race ./...` are green across the test
@@ -467,12 +622,17 @@ on every push and pull request as well, on Go 1.23:
 | Static analysis | `go vet ./...` |
 | Test suite | `go test ./...` |
 | Build | `go build ./...` |
+| Cross-platform, per target | `GOOS=<os> GOARCH=<arch> go build ./...` and `go vet ./...` for each of the six targets (the matrix job) |
+| Release, all six targets | `make release` (12 artifacts + `SHA256SUMS`, all asserted) |
 | Acceptance check, default run | `go run ./cmd/b10coin devnet --blocks 100` |
 | Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
 
-Makefile targets: `make test`, `make build` (produces `bin/b10coin`), `make
-vet`, `make fmt`, and `make devnet` (build followed by the acceptance check).
+Makefile targets: `make test`, `make race`, `make build` (produces
+`bin/b10coin`), `make release` (both binaries for all six targets into
+`dist/` with `SHA256SUMS` — [platforms](#platforms-and-releases)), `make
+vet`, `make fmt`, and `make devnet` (build followed by the acceptance
+check).
 
 ## Status and roadmap
 
@@ -498,10 +658,11 @@ Implemented — modules M0, M1, M2 and M3:
 Pending:
 
 - **M4** — real networking (TCP transport plus a small outbound relay so home
-  validators need no port forwarding), cross-compiled ARM64 binaries, and
-  validators on actual Raspberry Pis. Block catch-up — letting a validator
-  that fell behind adopt its peers' blocks — arrives with real networking
-  too.
+  validators need no port forwarding), release builds for all six OS/arch
+  targets (macOS, Linux and Windows — see
+  [Platforms and releases](#platforms-and-releases)), and validators on
+  actual Raspberry Pis. Block catch-up — letting a validator that fell behind
+  adopt its peers' blocks — arrives with real networking too.
 
 The design's milestone table defines further stages beyond M4 — staking and
 committee rotation (M5), and a wallet CLI with a minimal explorer and faucet
