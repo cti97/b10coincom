@@ -122,15 +122,21 @@ func FuzzDecodeBlockSyncReq(f *testing.F) {
 }
 
 func FuzzDecodeBlockSyncResp(f *testing.F) {
-	valid := EncodeBlockSyncResp(&BlockSyncResp{Blocks: [][]byte{{0xAA, 0xBB}, {}, {0xCC}}})
-	f.Add(valid)
+	// The new per-unit shape: block, the cert's round, and the encoded votes.
+	oneUnit := EncodeBlockSyncResp(&BlockSyncResp{Units: []BlockSyncUnit{
+		{Block: []byte{0xAA, 0xBB}, Round: 2, Votes: [][]byte{{0x01}, {0x02}}},
+	}})
+	emptyUnit := EncodeBlockSyncResp(&BlockSyncResp{Units: []BlockSyncUnit{{}}})
+	f.Add(oneUnit)
 	f.Add(EncodeBlockSyncResp(&BlockSyncResp{})) // the honest empty response
 	f.Add([]byte{})
 	f.Add([]byte{byte(MsgHello)})
-	f.Add(valid[:len(valid)-1])
-	padded := append([]byte{}, valid...)
+	f.Add(oneUnit[:len(oneUnit)-1])                   // truncated inside the votes
+	f.Add([]byte{byte(MsgBlockSyncResp), 0x01, 0x02}) // a unit whose block length lies
+	f.Add(emptyUnit[:len(emptyUnit)-1])
+	padded := append([]byte{}, emptyUnit...)
 	f.Add(append(padded, 0x00))
-	// A count claiming more blocks than the frame carries: the decoder must
+	// A count claiming more units than the frame carries: the decoder must
 	// hit the short-buffer error, not loop on - or allocate for - the count.
 	f.Add([]byte{byte(MsgBlockSyncResp), 0xFF, 0xFF, 0xFF, 0xFF, 0x0F})
 
@@ -138,18 +144,21 @@ func FuzzDecodeBlockSyncResp(f *testing.F) {
 		r, err := DecodeBlockSyncResp(b)
 		if err != nil {
 			if r != nil {
-				t.Fatalf("a failed decode must hand back nil, got %d blocks", len(r.Blocks))
+				t.Fatalf("a failed decode must hand back nil, got %d units", len(r.Units))
 			}
 			return
 		}
 		total := 0
-		for _, blk := range r.Blocks {
-			total += len(blk)
+		for _, u := range r.Units {
+			total += len(u.Block)
+			for _, v := range u.Votes {
+				total += len(v)
+			}
 		}
 		if total > len(b) {
-			t.Fatalf("the decoded blocks hold %d B, more than the %d B they were decoded from", total, len(b))
+			t.Fatalf("the decoded units hold %d B, more than the %d B they were decoded from", total, len(b))
 		}
-		// The nil-block round trip below is not vacuous: an encoder that
+		// The nil-field round trip below is not vacuous: an encoder that
 		// writes nil slices differently from empty ones would be caught here.
 		if re := EncodeBlockSyncResp(r); !bytes.Equal(re, b) {
 			t.Fatalf("an accepted frame is not canonical: %d B in, %d B back out", len(b), len(re))

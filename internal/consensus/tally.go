@@ -40,6 +40,12 @@ type VoteSet struct {
 	seen  map[string]int // validator key -> committee index, for one-vote-per-validator
 	power map[[32]byte]uint64
 	order [][32]byte // block IDs in first-seen order, so AnyQuorum is deterministic
+	// votes retains the added votes themselves. The tallies above are enough
+	// for the engine's decisions, but a commit certificate is made of the
+	// VOTES - the driver hands them, at commit time, to whoever archives
+	// certificates (the syncer serves them to catching-up peers). Retention
+	// is purely observational: no decision here reads it.
+	votes []*Vote
 }
 
 func NewVoteSet(cfg Config, height uint64, round uint32, typ MsgType) *VoteSet {
@@ -86,6 +92,7 @@ func (vs *VoteSet) Add(v *Vote) (bool, error) {
 		return false, nil
 	}
 	vs.seen[string(v.Validator)] = idx
+	vs.votes = append(vs.votes, v)
 
 	if _, known := vs.power[v.BlockID]; !known {
 		vs.order = append(vs.order, v.BlockID)
@@ -93,6 +100,12 @@ func (vs *VoteSet) Add(v *Vote) (bool, error) {
 	vs.power[v.BlockID] += vs.cfg.Committee[idx].Power
 	return true, nil
 }
+
+// Votes returns the votes this set ADDED (added=true), in add order - one per
+// validator, duplicates collapsed. It is what a commit certificate is built
+// from; a set never added to holds none. The returned slice is internal
+// storage: read, never write.
+func (vs *VoteSet) Votes() []*Vote { return vs.votes }
 
 // PowerFor is the weight accumulated behind a block ID. A nil ID tallies nil votes.
 func (vs *VoteSet) PowerFor(blockID [32]byte) uint64 { return vs.power[blockID] }

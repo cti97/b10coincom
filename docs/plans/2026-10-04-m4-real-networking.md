@@ -38,6 +38,8 @@
 
 **7. The ARM64 build is a CI-checked artifact, not a local command.** A cross-compile that only works on one machine is not a deliverable. `GOOS=linux GOARCH=arm64 go build` must be in CI, so the Pi binary cannot rot.
 
+**8. An adopted block carries a commit certificate, and the pull re-tallies it before Append.** Task 4's review demonstrated the hole Decision 4's wording alone leaves: `chain.Append` verifies AUTHORSHIP and STATE VALIDITY, not QUORUM COMMITMENT, so a single committee member could `Build` a state-valid block at head+1, sign it, and have it served and adopted with zero votes - pulling a catching-up node onto a one-validator fork no live engine would ever commit. BLOCK_SYNC responses therefore carry, alongside each block, its precommit votes and the round they were cast in. The puller rebuilds a `VoteSet` for that (height, round, precommit) and re-tallies the carried votes through the ordinary `VoteSet.Add` - the same path a live vote arrives through, so signature, membership, placement, and one-vote-per-validator all apply - and requires `HasQuorum(block.ID())` before `chain.Append` is ever offered: exactly the evidence the live engine's `precommits.AnyQuorum()` commit is made of, so one rule guards both paths. The serving side is bounded by the same rule: `Answer` refuses the whole range when any height in it lacks an archived certificate that still proves quorum for the block held there. Certificates are archived when a commit is witnessed (a driver hook) and when a pull adopts them - never persisted (a restart forgets the archive; a node cannot re-serve certificates for heights it committed before it restarted). The consequence, written down so it is read plainly: catch-up serves and adopts only committee-committed blocks; chains whose blocks were built outside the round protocol carry no certificates and cannot be synced at all.
+
 ## File structure
 
 | File | Responsibility |
@@ -62,7 +64,8 @@ wire.ReadFrame(r io.Reader, max int) ([]byte, error)
 wire.MsgType        MsgHello, MsgBlockSyncReq, MsgBlockSyncResp
 wire.Hello          { ChainID string; Validator []byte; Height uint64; Sig []byte }
 wire.BlockSyncReq   { From, To uint64; Requester []byte; Sig []byte }
-wire.BlockSyncResp  { Blocks [][]byte }
+wire.BlockSyncResp  { Units []BlockSyncUnit }
+wire.BlockSyncUnit  { Block []byte; Round uint32; Votes [][]byte }  // block + its commit certificate
 
 transport.Transport  gains  Send(peer PeerID, data []byte) error
 tcp.Options          { DialTimeout, BackoffBase, BackoffMax, MaxFrameBytes, Seed }
@@ -70,8 +73,9 @@ tcp.New, (*TcpTransport).Dial, .Listen, .AddPeer
 
 transport.Dedup      Seen(key VoteKey) bool,  Forget(below uint64)
 
-consensus.Syncer     answers BLOCK_SYNC requests from local blocks, and pulls/adopts
-                     missed blocks through the ordinary ApplyBlock path
+consensus.Syncer     answers BLOCK_SYNC requests (each block with its commit
+                     certificate), and pulls/adopts missed blocks through
+                     re-tallied certificates plus the ordinary ApplyBlock path
 
 CLI: b10coin node --peers ADDR,...  --relay ADDR
      b10coin-relay --listen ADDR
@@ -559,4 +563,4 @@ git commit -m "feat: add the acceptance harness for the three-Pi run"
 
 **The three things most likely to go wrong.** First, **a decoder that trusts its input** — the length prefix is the classic 4-GiB allocation bug, and Task 1 pins it before the allocation. Second, **catch-up that trusts its source**, which would be a remote path for installing unvalidated state; Task 4 routes every adopted block through the same `Append` that guards a live one. Third, **a test that passes without testing anything** — this project has shipped at least a dozen such tests across three milestones, so every task here names the one thing that must break for its test to fail, and the integration test runs over **sockets**, not a pipe, because the socket path is the deliverable.
 
-**Honest limits, stated up front.** The relay is a single point of failure and a censorship point: a relay that partitions the validator set stalls consensus. Safety is not at risk — every message is signed, so the worst a malicious relay can do is delay or drop — but liveness is, and a testnet acceptance run that depends on one VPS is not a decentralisation claim. Multiple relays, direct connections where NAT permits, and hole punching are M5+. And the ARM64 binary is cross-compiled and tested over loopback, **not on a Pi**: nothing in this milestone establishes performance on the target hardware, and the Argon2 tuning in particular was derived from a published Pi-4 figure that has never been measured on the actual device.
+**Honest limits, stated up front.** The relay is a single point of failure and a censorship point: a relay that partitions the validator set stalls consensus. Safety is not at risk — every message is signed, so the worst a malicious relay can do is delay or drop — but liveness is, and a testnet acceptance run that depends on one VPS is not a decentralisation claim. Multiple relays, direct connections where NAT permits, hole punching are M5+. And the ARM64 binary is cross-compiled and tested over loopback, **not on a Pi**: nothing in this milestone establishes performance on the target hardware, and the Argon2 tuning in particular was derived from a published Pi-4 figure that has never been measured on the actual device. Two more, added by Task 4's review (Design Decision 8): **catch-up serves and adopts only committee-committed blocks** — a chain whose blocks were built outside the round protocol (the single-node path) carries no certificates and cannot be synced — and **the certificate archive is in-memory**, so a restarted node cannot re-serve certificates for heights it committed before restarting, and the node layer (Task 6) must wire pulls, not assume a rejoining node can serve them the moment it is back.

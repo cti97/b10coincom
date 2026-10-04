@@ -146,22 +146,43 @@ func DecodeBlockSyncReq(b []byte) (*BlockSyncReq, error) {
 	return r, nil
 }
 
-// BlockSyncResp answers a request with the encoded blocks, the count prefix
-// closing the list the way the consensus messages frame a justification: the
-// decoder cannot ask a byte slice where it ends, so the count must.
+// BlockSyncUnit is one unit a BLOCK_SYNC response offers a catching-up node:
+// an encoded block, the round its commit certificate was cast in, and the
+// encoded precommit votes making that certificate up. A response that carries
+// a block with no certificate is decoded faithfully and refused LATER, at
+// verification - this struct only frames the bytes, it checks nothing.
+type BlockSyncUnit struct {
+	Block []byte
+	// Round is the round Votes were cast in: the (height, round) pair the
+	// puller re-tallies them through.
+	Round uint32
+	// Votes are the encoded precommit votes. Nil votes and duplicates belong
+	// to the consensus layer's judgement, not the decoder's.
+	Votes [][]byte
+}
+
+// BlockSyncResp answers a request with the encoded blocks and their commit
+// certificates, the count prefix closing the list the way the consensus
+// messages frame a justification: the decoder cannot ask a byte slice where it
+// ends, so the count must.
 type BlockSyncResp struct {
-	Blocks [][]byte
+	Units []BlockSyncUnit
 }
 
 // EncodeBlockSyncResp renders r canonically:
 //
-//	tag(1) | count | count x (len, block)
+//	tag(1) | count | count x (len block | round(4) | count votes | count x (len vote))
 func EncodeBlockSyncResp(r *BlockSyncResp) []byte {
 	e := types.NewEncoder()
 	e.U8(uint8(MsgBlockSyncResp))
-	e.Len(len(r.Blocks))
-	for _, blk := range r.Blocks {
-		e.VarBytes(blk)
+	e.Len(len(r.Units))
+	for _, u := range r.Units {
+		e.VarBytes(u.Block)
+		e.U32(u.Round)
+		e.Len(len(u.Votes))
+		for _, v := range u.Votes {
+			e.VarBytes(v)
+		}
 	}
 	return e.Bytes()
 }
@@ -180,13 +201,28 @@ func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.Blocks = make([][]byte, 0, count)
+	r.Units = make([]BlockSyncUnit, 0, count)
 	for i := 0; i < count; i++ {
-		blk, err := d.VarBytes()
+		u := BlockSyncUnit{}
+		if u.Block, err = d.VarBytes(); err != nil {
+			return nil, err
+		}
+		if u.Round, err = d.U32(); err != nil {
+			return nil, err
+		}
+		vn, err := d.Len()
 		if err != nil {
 			return nil, err
 		}
-		r.Blocks = append(r.Blocks, blk)
+		u.Votes = make([][]byte, 0, vn)
+		for j := 0; j < vn; j++ {
+			v, err := d.VarBytes()
+			if err != nil {
+				return nil, err
+			}
+			u.Votes = append(u.Votes, v)
+		}
+		r.Units = append(r.Units, u)
 	}
 	if err := d.Done(); err != nil {
 		return nil, err

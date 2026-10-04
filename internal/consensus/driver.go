@@ -36,6 +36,17 @@ type Driver struct {
 	tp   transport.Transport
 	eng  *Engine
 
+	// CommitWitness, when set, is called the moment a block is committed AND
+	// appended, with the precommit votes that committed it: the certificate a
+	// catch-up server serves to catching-up peers. It carries exactly the
+	// evidence the live commit used (`precommits.AnyQuorum()`), so the served
+	// certificate and the commit decision can never disagree. Nil is the
+	// unwired default: nothing else changes, the commit path is byte-identical
+	// with the witness absent. Like persistLock this is an injected seam -
+	// whoever builds the driver and knows the syncer to serve from wires it;
+	// the engine performs no I/O and reads no other component.
+	CommitWitness func(height uint64, round uint32, votes []*Vote)
+
 	// pending holds the transactions this driver has TAKEN from its mempool
 	// for the proposal at the current undecided height and that no committed
 	// block has carried yet. Take removes what it returns, so without this
@@ -348,6 +359,23 @@ func (d *Driver) flush() {
 	if err := d.ch.Append(d.eng.proposal); err != nil {
 		d.appendRefused = true
 		return
+	}
+	// The commit certificate. The witness (if wired) receives the precommit
+	// votes THAT committed this very block: the engine tallied them through
+	// the ordinary VoteSet, so the certificate is the commit's own evidence,
+	// handed over at the only moment it is known complete. Votes for anything
+	// else (nil votes, a Byzantine validator's conflicting precommit) are not
+	// evidence for this block and do not travel.
+	if w := d.CommitWitness; w != nil {
+		id, _ := d.eng.Committed()
+		round := d.eng.round
+		cert := make([]*Vote, 0, len(d.eng.precommits.Votes()))
+		for _, v := range d.eng.precommits.Votes() {
+			if v.BlockID == id {
+				cert = append(cert, v)
+			}
+		}
+		w(d.ch.Height(), round, cert)
 	}
 	// The batch is committed only when the block that just committed is the
 	// very block pending was built into. A PEER's proposal can reach quorum

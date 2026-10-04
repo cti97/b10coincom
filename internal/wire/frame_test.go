@@ -192,12 +192,18 @@ func TestBlockSyncReqRoundTrips(t *testing.T) {
 	}
 }
 
-// TestBlockSyncRespRoundTrips: the response's block list is self-delimiting -
-// a count, then that many length-prefixed encoded blocks - so a decoder can
-// never ask a byte slice where it ends. An empty list round-trips too: it is
-// an honest "I have nothing for you".
+// TestBlockSyncRespRoundTrips: the response's unit list is self-delimiting -
+// a count, then that many units, each a length-prefixed encoded block, the
+// round its certificate was cast in, and a count of length-prefixed encoded
+// precommit votes - so a decoder can never ask a byte slice where it ends. An
+// empty list round-trips too: it is an honest "I have nothing for you", and a
+// unit with no votes decodes (the puller, not the decoder, refuses it).
 func TestBlockSyncRespRoundTrips(t *testing.T) {
-	resp := &BlockSyncResp{Blocks: [][]byte{{0xAA, 0xBB}, {}, {0xCC}}}
+	resp := &BlockSyncResp{Units: []BlockSyncUnit{
+		{Block: []byte{0xAA, 0xBB}, Round: 4, Votes: [][]byte{{0x01, 0x02}, {0x03}}},
+		{}, // a fully empty unit still round-trips: the wire frames bytes, it refuses nothing
+		{Block: []byte{0xCC}, Round: 0},
+	}}
 	enc := EncodeBlockSyncResp(resp)
 	if len(enc) == 0 || MsgType(enc[0]) != MsgBlockSyncResp {
 		t.Fatalf("the encoded BLOCK_SYNC response must open with its tag byte, got %v", enc)
@@ -206,12 +212,23 @@ func TestBlockSyncRespRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(dec.Blocks) != len(resp.Blocks) {
-		t.Fatalf("want %d blocks, got %d", len(resp.Blocks), len(dec.Blocks))
+	if len(dec.Units) != len(resp.Units) {
+		t.Fatalf("want %d units, got %d", len(resp.Units), len(dec.Units))
 	}
-	for i, blk := range resp.Blocks {
-		if !bytes.Equal(dec.Blocks[i], blk) {
-			t.Fatalf("block %d: want %v, got %v", i, blk, dec.Blocks[i])
+	for i, u := range resp.Units {
+		if !bytes.Equal(dec.Units[i].Block, u.Block) {
+			t.Fatalf("unit %d: block want %v, got %v", i, u.Block, dec.Units[i].Block)
+		}
+		if dec.Units[i].Round != u.Round {
+			t.Fatalf("unit %d: round want %d, got %d", i, u.Round, dec.Units[i].Round)
+		}
+		if len(dec.Units[i].Votes) != len(u.Votes) {
+			t.Fatalf("unit %d: want %d votes, got %d", i, len(u.Votes), len(dec.Units[i].Votes))
+		}
+		for j, v := range u.Votes {
+			if !bytes.Equal(dec.Units[i].Votes[j], v) {
+				t.Fatalf("unit %d vote %d: want %v, got %v", i, j, v, dec.Units[i].Votes[j])
+			}
 		}
 	}
 	if re := EncodeBlockSyncResp(dec); !bytes.Equal(re, enc) {
@@ -242,7 +259,7 @@ func TestMessagesRejectForeignTags(t *testing.T) {
 	if _, err := DecodeBlockSyncReq(req); !errors.Is(err, ErrUnknownMsgType) {
 		t.Fatalf("DecodeBlockSyncReq must refuse a foreign tag with ErrUnknownMsgType, got %v", err)
 	}
-	resp := EncodeBlockSyncResp(&BlockSyncResp{Blocks: [][]byte{{0x01}}})
+	resp := EncodeBlockSyncResp(&BlockSyncResp{Units: []BlockSyncUnit{{Block: []byte{0x01}}}})
 	resp[0] = byte(MsgHello)
 	if _, err := DecodeBlockSyncResp(resp); !errors.Is(err, ErrUnknownMsgType) {
 		t.Fatalf("DecodeBlockSyncResp must refuse a foreign tag with ErrUnknownMsgType, got %v", err)
