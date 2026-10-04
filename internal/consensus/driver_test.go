@@ -1214,6 +1214,187 @@ func TestAnAbandonedRoundDoesNotEvaporateItsTransactions(t *testing.T) {
 	}
 }
 
+// stalledProposals decodes every proposal recorded on a stalledTransport -
+// countWire's recordingTransport twin, for the hand-played committee fixtures.
+func stalledProposals(t *testing.T, rec *stalledTransport) []*Proposal {
+	t.Helper()
+	props := make([]*Proposal, 0, 2)
+	for _, raw := range rec.broadcasts {
+		if c := decodeWire(t, raw); c.prop != nil {
+			props = append(props, c.prop)
+		}
+	}
+	return props
+}
+
+// A FOREIGN commit - a peer's proposal reaching quorum while this driver's own
+// batch is still uncommitted - must not evaporate the batch either.
+// TestAnAbandonedRoundDoesNotEvaporateItsTransactions pins the reclaim with an
+// unreachable quorum, so no commit ever happens there and it cannot exercise
+// the other half of the invariant: flush used to clear pending after ANY
+// successful append, so a peer's block that did not carry the batch deleted it
+// from the last place it existed - gone from the pool (Take removed it) and
+// absent from the committed block.
+//
+// The fixture plays the peer by hand with the committee's real keys, the way
+// the restart test does: v0 is the only driver, the transfer lives in ITS pool
+// alone, and the peer's committed block P2 is genuinely empty - so the batch's
+// fate rests on the driver's pending record, and a pass cannot come from the
+// foreign block carrying the transactions. The batch must survive the foreign
+// commit in pending, be reclaimed into the first later proposal, ride it into
+// a commit, and land.
+func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
+	priv0 := testCommitteeKey(0)
+	pub0 := priv0.Public().(ed25519.PublicKey)
+	priv1 := testCommitteeKey(1)
+	pub1 := priv1.Public().(ed25519.PublicKey)
+
+	g := genesis.Devnet()
+	g.Validators = []genesis.Validator{
+		{PubKey: pub0, Power: 1},
+		{PubKey: pub1, Power: 1},
+	}
+	g.Params.CommitteeSize = 2
+	cfg := Config{Committee: g.Validators, TimeoutBase: roundBase, TimeoutStep: roundStep, PowerCapNum: 1, PowerCapDen: 1}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	ch, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &stalledTransport{}
+	mp := mempool.New(1000)
+	d := NewDriver(cfg, ch, priv0, rec, mp)
+
+	parent := ch.Head().ID()
+
+	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	txID := tx.ID()
+	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
+		t.Fatal(err)
+	}
+
+	// A build holds a real pending batch: v0 is walked to its round (the walk
+	// emits the ordinary nil prevote of a proposal-less round), then the
+	// driver's own Tick proposes for real - the propose step runs at
+	// now=5, below the round timeout, so no timeout fires with it.
+	now := int64(5)
+	for r := 0; r < 64 && string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub0); r++ {
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+	}
+	if string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub0) {
+		t.Fatal("in 64 rounds the fixture never drew v0 as the proposer at height 1: no batch was ever built")
+	}
+	d.Tick(now)
+
+	props := stalledProposals(t, rec)
+	if len(props) == 0 {
+		t.Fatal("no proposal was broadcast: the build path never ran, so there is no pending batch to protect")
+	}
+	b1 := props[len(props)-1].Block
+	if !carriesTx(&b1, txID) {
+		t.Fatal("the driver's proposal does not carry the pool's transfer: the fixture did not set a pending batch up")
+	}
+	if len(d.pending) != 1 || d.pending[0].ID() != txID {
+		t.Fatal("the build did not leave the batch in the driver's pending record")
+	}
+
+	// The round runs out without any vote for the proposal: the engine enters
+	// the next round and drops it, and the batch now exists ONLY in pending.
+	d.Tick(roundBase + 1)
+	if d.eng.proposal != nil {
+		t.Fatal("the round did not end: the proposal was never abandoned")
+	}
+
+	// The peer proposes an EMPTY block at the same height, in a later round.
+	for r := 0; r < 64 && string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub1); r++ {
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+	}
+	if string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub1) {
+		t.Fatal("in 64 rounds the fixture never drew v1 as the proposer: no foreign commit could happen")
+	}
+	peerRound := d.eng.Round()
+	p2, err := ch.Build(priv1, nil, ch.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2Prop := &Proposal{Height: 1, Round: peerRound, Block: *p2, ValidRound: -1, Validator: pub1}
+	p2Prop.Sig = signProposal(t, cfg, p2Prop)
+	if p2.ID() == b1.ID() {
+		t.Fatal("the foreign block must be a different block at the same height")
+	}
+
+	// The committee reaches quorum on the peer's block: the driver's own
+	// prevote is self-tallied on receipt, and each injected peer vote
+	// completes the polka and then the precommit quorum of 2.
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeProposal(p2Prop)})
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeVote(voteFrom(t, cfg, 1, MsgPrevote, 1, peerRound, p2.ID()))})
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeVote(voteFrom(t, cfg, 1, MsgPrecommit, 1, peerRound, p2.ID()))})
+
+	if ch.Height() != 1 {
+		t.Fatalf("the chain sits at height %d: the peer's block never committed, so no foreign append ran", ch.Height())
+	}
+	if blk1 := committedBlock(t, ch, 1); blk1.ID() != p2.ID() {
+		t.Fatal("the committed block is not the peer's: the fixture did not exercise a foreign commit")
+	}
+	if carriesTx(committedBlock(t, ch, 1), txID) {
+		t.Fatal("the foreign block carries the transfer: the test could no longer tell a foreign commit from the driver's own")
+	}
+	// THE FIX, stated directly: the batch is still findable - in pending,
+	// from which the next build reclaims it. The old unconditional clear
+	// destroyed it exactly here.
+	if len(d.pending) != 1 || d.pending[0].ID() != txID {
+		t.Fatalf("the driver's uncommitted batch did not survive the foreign commit at height %d: it is in neither the pool (Take removed it) nor the committed peer block - lost", ch.Height())
+	}
+
+	// The next height's first build must reclaim the batch into the pool and
+	// propose it again. The walk to v0's round at height 2 does no Ticks, so
+	// the proposal happens at now=15, below timeoutAt=21 that the commit
+	// re-armed: the Tick proposes and nothing else.
+	parent2 := p2.ID()
+	for r := 0; r < 64 && string(cfg.Proposer(2, d.eng.Round(), parent2)) != string(pub0); r++ {
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+	}
+	if string(cfg.Proposer(2, d.eng.Round(), parent2)) != string(pub0) {
+		t.Fatal("in 64 rounds the fixture never drew v0 as the proposer at height 2: the reclaim had no proposal to ride")
+	}
+	d.Tick(15)
+	props2 := stalledProposals(t, rec)
+	var c1 *Proposal
+	for _, p := range props2 {
+		if p.Height == 2 {
+			c1 = p
+		}
+	}
+	if c1 == nil {
+		t.Fatal("no proposal was broadcast at height 2: the driver never built again")
+	}
+	if !carriesTx(&c1.Block, txID) {
+		t.Fatal("the height-2 proposal is empty: the batch reclaimed after the foreign commit did not make it back - the transaction is lost")
+	}
+
+	// And the rebuilt block commits, WITH the batch: not found in a proposal,
+	// not stranded in pending, but applied by the chain the committee agreed on.
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeVote(voteFrom(t, cfg, 1, MsgPrevote, 2, d.eng.Round(), c1.Block.ID()))})
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeVote(voteFrom(t, cfg, 1, MsgPrecommit, 2, d.eng.Round(), c1.Block.ID()))})
+
+	if ch.Height() != 2 {
+		t.Fatalf("height 2 never committed (chain at %d): the reclaimed batch could not land", ch.Height())
+	}
+	blk2 := committedBlock(t, ch, 2)
+	if !carriesTx(blk2, txID) {
+		t.Fatal("the block after the foreign commit does not carry the transfer: a batch orphaned by a peer's commit is unrecoverable")
+	}
+	toPub, _ := genesis.DevAccountKey(1)
+	if got := ch.State().Get(types.AddressFromPub(toPub)).Balance; got != 250*genesis.SparksPerB10 {
+		t.Fatalf("the recipient holds %d, want the transferred %d: the batch landed as carried bytes, not paid state", got, 250*genesis.SparksPerB10)
+	}
+	if len(d.pending) != 0 {
+		t.Fatalf("the driver still holds %d pending transaction(s) after its height-2 block committed: a committed batch must be off the books", len(d.pending))
+	}
+}
+
 // THE milestone integration, end to end: a block carrying a transfer AND a
 // faucet claim agreed on by MORE THAN ONE validator. Every live validator
 // holds the same two transactions in its own pool - each one's proposer takes

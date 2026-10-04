@@ -42,11 +42,22 @@ type Driver struct {
 	// record the batch would evaporate the first time a proposal's round
 	// timed out: the pool no longer holds the transactions and nothing else
 	// does - they existed only inside an unsigned block nobody agreed on.
-	// reclaimPending puts an uncommitted batch back before the next build at
-	// this height, and flush clears it the moment this driver's append
-	// commits, so a batch is always either in the pool, in a built proposal
-	// for a live height, or committed. Nil-pool drivers never set it.
+	// reclaimPending puts an uncommitted batch back before the next build
+	// (this height's or the first build after a foreign commit), and flush
+	// clears it only when the block that appends is the very block pending
+	// was built into, so a batch is always findable until it lands: in the
+	// pool, in pending, or committed. Nil-pool drivers never set it.
 	pending []types.Tx
+
+	// pendingID is the ID of the block pending was built into. flush clears
+	// the batch only when the block that appends IS this one: a peer's
+	// proposal reaching quorum instead - this node's proposal timed out or
+	// was lost and a foreign one succeeded - must leave the batch pending,
+	// or Take's removal would have lost it from both the pool and the
+	// committed block. The next height's first build reclaims it, and
+	// SelectApplicable there evicts whichever of its transactions the
+	// foreign block already applied.
+	pendingID [32]byte
 
 	// now is the driver's clock reading in virtual milliseconds: the last
 	// value Tick was called with. The engine reads no clock; this one field
@@ -167,13 +178,14 @@ func (d *Driver) build(height uint64, round uint32, parent [32]byte) (types.Bloc
 	}
 	txs := []types.Tx(nil)
 	if d.pool != nil {
-		// A batch left over from an earlier round at this height goes back
-		// into the pool before this round's batch is taken: its proposal was
-		// abandoned (the engine is still judging this very height, so nothing
-		// committed), and Take removed it. Proposing it again is sound - and
-		// if another validator's block for this or an earlier height carried
-		// any of it, SelectApplicable evicts it below against the state the
-		// chain already moved to.
+		// A batch left over from an earlier proposal goes back into the
+		// pool before this round's batch is taken: it is uncommitted -
+		// its proposal was abandoned (a timed-out round here, or this
+		// very height decided on a peer's block that did not carry the
+		// batch), and Take removed it. Proposing it again is sound - and
+		// if another validator's block for this or an earlier height
+		// carried any of it, SelectApplicable evicts it below against
+		// the state the chain already moved to.
 		d.reclaimPending()
 		candidates := d.pool.Take(types.MaxTxsPerBlock)
 		valid, err := d.ch.SelectApplicable(candidates)
@@ -195,9 +207,12 @@ func (d *Driver) build(height uint64, round uint32, parent [32]byte) (types.Bloc
 		return types.Block{}, err
 	}
 	// The batch now lives in the built proposal: it is either committed with
-	// it (flush clears pending on the append) or reclaimed by the next build
-	// at this height if the round never decides.
+	// it (flush clears pending only when THAT block - identified by
+	// pendingID - is the one that appends) or reclaimed by the next build at
+	// this height or the first build after a foreign commit, whichever
+	// comes first.
 	d.pending = txs
+	d.pendingID = b.ID()
 	return *b, nil
 }
 
@@ -223,6 +238,7 @@ func (d *Driver) reclaimPending() {
 	}
 	_ = d.pool.Add(d.pending)
 	d.pending = nil
+	d.pendingID = [32]byte{}
 }
 
 // reAdd puts transactions back into the driver's mempool after a failed
@@ -328,11 +344,24 @@ func (d *Driver) flush() {
 		d.appendRefused = true
 		return
 	}
-	// The proposal's transactions are committed with it: nothing is pending.
+	// The batch is committed only when the block that just committed is the
+	// very block pending was built into. A PEER's proposal can reach quorum
+	// at this height while this driver's own batch is still uncommitted (the
+	// ordinary M4 case: this node's proposal timed out or was lost, a later
+	// round's foreign proposal succeeded): that block need not carry the
+	// batch, so clearing pending here would orphan it - gone from the pool
+	// (Take removed it) and absent from the committed block. It stays
+	// pending instead, and the next height's first build reclaims it into
+	// the pool before that batch is taken; SelectApplicable there evicts
+	// whichever of its transactions the foreign block already applied, so
+	// the reclaim never puts an applied transaction up for a second ride.
 	// (A batch taken for a proposal that FAILED here belongs to the parked
 	// height; it is reclaimed by no build because this driver stops offering,
 	// which is the M3 refusal contract, and the report records the exposure.)
-	d.pending = nil
+	if d.pendingID == id {
+		d.pending = nil
+		d.pendingID = [32]byte{}
+	}
 	// The height is decided. Replace the engine: the next height starts the
 	// same way a fresh node would (its lock state is per-height, and any
 	// previously persisted lock for THIS height is restored - the restart
