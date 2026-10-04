@@ -18,9 +18,22 @@
 //   - a peer that stops reading does not stall the relay for everyone else
 //     (TestRelayASlowPeerDoesNotStallTheOtherPeers) - the same slow-reader
 //     property the transport needed, held at the one hop a stranger owns;
+//     and with the write queue actually at its BOUND, forwarding drops
+//     instead of blocking (TestRelayAQueueBoundDropsInsteadOfBlocking) - the
+//     small-queue variant, because a queue that never fills tests nothing;
+//   - a stranger's dials that send only a header and then stall do not hold
+//     resources forever: the per-frame read deadline ends them and both the
+//     slots and the memory come back (TestRelayStalledHeadersDoNotPinMemoryOrSlots);
+//   - accepted connections carry TCP keepalive
+//     (TestRelaySetsTCPKeepaliveOnAcceptedConnections), so a half-open
+//     connection is reaped by the socket;
 //   - a hostile frame length is refused, not allocated and not forwarded
 //     (TestRelayRefusesAHostileFrameLength);
 //   - connections are bounded (TestRelayRefusesConnectionsBeyondItsBound);
+//   - a repeated identical frame is forwarded TWICE - dedup is the receivers'
+//     business, spec §6.6 (TestRelayDoesNotDeduplicateARepeatedFrame);
+//   - the operator-facing defaults are the documented ones
+//     (TestRelayOptionDefaultsPinTheOperatorNumbers);
 //   - Close stops every goroutine it started
 //     (TestRelayCloseStopsServingAndCleansUp).
 package relay
@@ -28,9 +41,11 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math/rand"
 	"net"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -289,8 +304,12 @@ func TestRelayForwardsFramesItCannotParse(t *testing.T) {
 // The volume is not decoration: the first version of this test flooded 512 KiB
 // and its mutant (a synchronous forward, M3 in the report) SURVIVED - the
 // kernel's loopback buffers silently absorbed the entire wedge. 2 MiB of
-// undrained data is past anything a socket pair buffers, so a blocking
-// forward must block and be caught.
+// undrained data sits above the kill threshold measured on this host,
+// between 640 KiB and 768 KiB - a ~3x margin. It is a HOST-DEPENDENT margin:
+// a host whose loopback buffers auto-tune larger than 2 MiB could absorb this
+// flood too and let a synchronous mutant survive again. The volume was
+// chosen against the buffers that exist, and the honest bound of the margin
+// is stated rather than claimed away.
 func TestRelayASlowPeerDoesNotStallTheOtherPeers(t *testing.T) {
 	// The write queue is deliberately deep here (larger than the flood) so
 	// that neither A's nor C's queue can ever be the thing tested: the ONLY
@@ -436,4 +455,274 @@ func TestRelayCloseStopsServingAndCleansUp(t *testing.T) {
 	// Nothing lingers. (One slot of slack for the test binary's own noise; a
 	// missed teardown leaves multiples behind.)
 	waitGoroutines(t, baseline+1, "the relay left goroutines behind after Close")
+}
+
+// THE finding this test exists for (F1, Medium): the relay is the one
+// component a stranger can reach, and 100 dials that write only a 4-byte
+// header declaring 1 MiB and then SILENCE used to hold 100 reader goroutines,
+// 100 one-MiB frame buffers the GC could never reclaim (+100 MiB measured),
+// and 100 registry slots forever - at the defaults, one host holding 256
+// connections could pin ~256 MiB and every registry slot with 256 four-byte
+// writes and zero traffic. The fix is socket-level (the relay kept parsing
+// nothing): a per-frame read deadline armed before the header and refreshed
+// per frame, so on expiry the connection is ENDED and its slot is RELEASED -
+// exactly what this test pins: the connections are reaped, the goroutines
+// come back, and the memory is reclaimed.
+func TestRelayStalledHeadersDoNotPinMemoryOrSlots(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	runtime.GC()
+	var base runtime.MemStats
+	runtime.ReadMemStats(&base)
+
+	r := startRelay(t, Options{
+		MaxFrameBytes:  1 << 20, // the reviewer's scenario: frames declared at exactly the default bound
+		MaxConns:       256,
+		WriteQueueSize: 8,
+		ReadTimeout:    3 * time.Second, // the knob under test, shrunk from the 2-minute default for a fast expiry
+	})
+	addr := r.Addr().String()
+
+	const stalled = 100
+	clients := make([]net.Conn, 0, stalled)
+	for i := 0; i < stalled; i++ {
+		clients = append(clients, dial(t, addr))
+	}
+	// The whole attack per connection: a 4-byte header declaring exactly 1 MiB
+	// - so the frame-size bound PASSES it on - then silence forever.
+	hdr := []byte{0, 0x10, 0, 0}
+	for i, c := range clients {
+		if err := c.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("dial %d set write deadline: %v", i, err)
+		}
+		if _, err := c.Write(hdr); err != nil {
+			t.Fatalf("dial %d write stalled header: %v", i, err)
+		}
+	}
+	waitRegistered(t, r, stalled, "the stalled dials did not all reach the registry")
+
+	// Mid-stall: each reader checked its legal 1 MiB length, allocated the
+	// payload buffer and now blocks waiting for bytes that never come. The
+	// frame bound keeps this at exactly 1 MiB per connection - the point of
+	// the test is that it never becomes FOREVER-pinned (that would be the
+	// mutant), so the scenario is first REPRODUCED here: ~100 MiB of pinned
+	// heap. The pin forms asynchronously (a reader allocates when its header
+	// completes), so poll for it rather than racing one reading.
+	pin := int64(0)
+	pinFormed := time.Now().Add(30 * time.Second)
+	for {
+		runtime.GC()
+		var mid runtime.MemStats
+		runtime.ReadMemStats(&mid)
+		pin = int64(mid.HeapAlloc) - int64(base.HeapAlloc)
+		if pin >= 64<<20 || time.Now().After(pinFormed) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pin < 64<<20 {
+		t.Fatalf("mid-stall heap grew only %d MiB (want ≥ 64) - the stalled-header scenario did not reproduce, and this test would then assert nothing", pin>>20)
+	}
+
+	// After the deadline: every connection ended, every slot released. On
+	// failure the numbers are the before-proof for the report - the same
+	// +100 MiB pin the reviewer measured.
+	expiry := time.Now().Add(30 * time.Second)
+	for r.Stats().Conns != 0 && time.Now().Before(expiry) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st := r.Stats(); st.Conns != 0 {
+		var pinned runtime.MemStats
+		runtime.ReadMemStats(&pinned)
+		t.Fatalf("stalled-header connections were never reaped: %d of %d still registered 30s after the deadline, goroutines %d (baseline %d), heap pinned %d MiB (baseline %d MiB) - the read deadline is gone or toothless",
+			st.Conns, stalled, runtime.NumGoroutine(), baseline,
+			(pinned.HeapAlloc-base.HeapAlloc)>>20, base.HeapAlloc>>20)
+	}
+	// The client's own end: the relay closed the socket, so a read fails.
+	waitClosed(t, clients[0], "a stalled-header connection after its read deadline expired")
+
+	stats := r.Stats()
+	if stats.RefusedConns != 0 {
+		t.Fatalf("refused %d dials - the scenario must be the read deadline at work, not a connection-bound refusal", stats.RefusedConns)
+	}
+	if stats.Forwarded != 0 {
+		t.Fatalf("forwarded %d frames - a stalled header that never completed must not move anything", stats.Forwarded)
+	}
+	waitGoroutines(t, baseline+1,
+		"goroutines leaked behind the stalled-header connections (want accept loop only)")
+
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	reclaimed := int64(after.HeapAlloc) - int64(base.HeapAlloc)
+	t.Logf("after reaping: conns=%d, goroutines=%d (baseline %d), heap reclaimed to %+d MiB from a mid-stall pin of %d MiB (baseline %d MiB)",
+		stats.Conns, runtime.NumGoroutine(), baseline, reclaimed>>20, pin>>20, base.HeapAlloc>>20)
+	if reclaimed > 16<<20 {
+		t.Fatalf("memory still pinned after the connections were reaped: heap %d MiB above baseline (mid-stall pin was %d MiB) - the frame buffers were not reclaimed",
+			reclaimed>>20, pin>>20)
+	}
+}
+
+// Keepalive, the second half of F1: accepted connections carry TCP keepalive
+// so a HALF-OPEN connection - a peer vanished without closing (power cut,
+// wifi loss), its socket open but never answering - is reaped by the socket
+// itself in minutes, with no code watching and nothing parsed. The wiring is
+// pinned at the socket level (SO_KEEPALIVE read back from the accepted fd by
+// getsockopt): a mutant that disables or drops the setting fails here. The
+// reaping itself cannot be raced on a loopback in a unit test without kernel
+// manipulation - it is the OS's probe count at work - so this test pins the
+// guarantee being set, and its period is a documented, operator-visible knob
+// rather than an accident of the toolchain's default.
+func TestRelaySetsTCPKeepaliveOnAcceptedConnections(t *testing.T) {
+	r := startRelay(t, Options{MaxFrameBytes: 4096, MaxConns: 64, WriteQueueSize: 8})
+	dial(t, r.Addr().String())
+	waitRegistered(t, r, 1, "the dial completed while its connection sat unregistered")
+
+	r.mu.Lock()
+	conns := make([]*net.TCPConn, 0, 1)
+	for c := range r.conns {
+		tcp, ok := c.nc.(*net.TCPConn)
+		if !ok {
+			r.mu.Unlock()
+			t.Fatalf("accepted connection is not a TCP connection (%T) - keepalive could not apply", c.nc)
+		}
+		conns = append(conns, tcp)
+	}
+	r.mu.Unlock()
+
+	for _, tcp := range conns {
+		raw, err := tcp.SyscallConn()
+		if err != nil {
+			t.Fatalf("get raw fd: %v", err)
+		}
+		var sockErr error
+		if err := raw.Control(func(fd uintptr) {
+			// Enabled keepalive reads back non-zero (1 on Linux and Windows;
+			// the BSD stacks of darwin answer 8), disabled reads 0 - assert
+			// non-zero, never "equals 1", or the darwin hosts would fail a
+			// correct relay.
+			on, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE)
+			if err != nil {
+				sockErr = err
+			} else if on == 0 {
+				sockErr = fmt.Errorf("SO_KEEPALIVE = 0 (off) - a half-open connection would keep its slot forever")
+			}
+		}); err != nil {
+			sockErr = err
+		}
+		if sockErr != nil {
+			t.Fatalf("accepted connection does not carry TCP keepalive: %v", sockErr)
+		}
+	}
+}
+
+// The queue bound must bite as a NON-BLOCKING drop, not as a waiting send.
+// The deep-queue slow-reader test above cannot pin that: with the queue (4096)
+// larger than the flood (2048) the queue NEVER fills, so a mutant replacing
+// the non-blocking enqueue with a BLOCKING send compiles and passes - it
+// killed queue-bypass only. This variant makes the queue the thing being
+// tested: WriteQueueSize 4, and A deliberately wedged. A's kernel buffers
+// absorb roughly 640-768 KiB on this host (measured; see the deep-queue
+// test's comment for the same host-dependence), then A's writer wedges, A's
+// queue fills at frame 4, and every further frame must be DROPPED - never
+// waited on. The flood is PACED so the healthy peer C, whose queue is equally
+// small, can always drain it: under a real producer's finite rate the drops
+// must land ONLY on the wedged peer, and C still receives every frame in
+// sender order. (A fully bursty flood could legitimately drop to C as well;
+// burst absorption is the deep queue's property, pinned separately.)
+func TestRelayAQueueBoundDropsInsteadOfBlocking(t *testing.T) {
+	r := startRelay(t, Options{MaxFrameBytes: 4096, MaxConns: 64, WriteQueueSize: 4})
+	a := dial(t, r.Addr().String())
+	// Best effort, as in the deep-queue test: a small receive buffer makes
+	// A's wedge arrive at a predictable frame count instead of hiding in
+	// loopback's auto-tuned buffers.
+	if tc, ok := a.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(2048)
+	}
+	b := dial(t, r.Addr().String())
+	c := dial(t, r.Addr().String())
+	waitRegistered(t, r, 3, "a dial completed while its connection sat unregistered")
+
+	const frames = 2048
+	const frameSize = 1024
+
+	got := make([]int, 0, frames)
+	collected := make(chan struct{})
+	go func() {
+		defer close(collected)
+		deadline := time.Now().Add(15 * time.Second)
+		for len(got) < frames {
+			if err := c.SetReadDeadline(deadline); err != nil {
+				return
+			}
+			frame, err := wire.ReadFrame(c, 4096)
+			if err != nil {
+				return
+			}
+			got = append(got, int(binary.BigEndian.Uint16(frame[:2])))
+		}
+	}()
+
+	for i := 0; i < frames; i++ {
+		frame := make([]byte, frameSize)
+		binary.BigEndian.PutUint16(frame[:2], uint16(i))
+		writeFrame(t, b, frame)
+		time.Sleep(500 * time.Microsecond) // paced: C must always keep up
+	}
+
+	<-collected
+	if len(got) != frames {
+		t.Fatalf("c received %d of %d frames - the queue bound's drops fell on a healthy peer, not only on the wedged one", len(got), frames)
+	}
+	for i, seq := range got {
+		if seq != i {
+			t.Fatalf("frame %d arrived as %d - the relay reordered frames while applying the queue bound", i, seq)
+		}
+	}
+	if st := r.Stats(); st.Dropped == 0 {
+		t.Fatalf("Stats().Dropped == 0 with a wedged peer and a 4-frame queue - the bound never bit, so this test pinned nothing about the non-blocking drop")
+	}
+}
+
+// Dedup is NOT the relay's business (spec §6.6): a repeated identical frame is
+// the receivers' decision - a validator may deliberately resend, and a
+// middlebox that cannot parse is the last place to guess which repeat is a
+// retransmission. No earlier test fed one sender the same payload twice, so a
+// mutant that dropped repeats passed the whole suite. The third frame
+// distinguishes WHICH copy survived: a dedup that keeps the first (or the
+// second) repeats yields [X, Y] and the missing frame's read times out loudly.
+func TestRelayDoesNotDeduplicateARepeatedFrame(t *testing.T) {
+	r := startRelay(t, Options{MaxFrameBytes: 4096, MaxConns: 64, WriteQueueSize: 8})
+	a := dial(t, r.Addr().String())
+	b := dial(t, r.Addr().String())
+	waitRegistered(t, r, 2, "a dial completed while its connection sat unregistered")
+
+	x := []byte("the same frame twice - forwarding is not dedup's business")
+	y := []byte("a different frame, to name which copy survived")
+
+	writeFrame(t, a, x)
+	writeFrame(t, a, x)
+	writeFrame(t, a, y)
+
+	for i, want := range [][]byte{x, x, y} {
+		if got := readFrame(t, b, 4096); !bytes.Equal(got, want) {
+			t.Fatalf("read %d of 3: b got %q, want %q - the relay deduplicated a repeated frame", i+1, got, want)
+		}
+	}
+}
+
+// The defaults are operator-facing numbers (stated in --help and README), so
+// they are pinned exactly, not by accident: changing them should require
+// changing this test and the two documents together.
+func TestRelayOptionDefaultsPinTheOperatorNumbers(t *testing.T) {
+	got := New(Options{}).opts.withDefaults()
+	want := Options{
+		MaxFrameBytes:  1 << 20,
+		MaxConns:       256,
+		WriteQueueSize: 64,
+		ReadTimeout:    2 * time.Minute,
+		KeepAlive:      15 * time.Second,
+	}
+	if got != want {
+		t.Fatalf("relay defaults drifted from the documented operator numbers: got %+v, want %+v", got, want)
+	}
 }

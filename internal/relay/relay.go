@@ -24,7 +24,12 @@
 //     onto every OTHER connection's write queue;
 //   - one writer goroutine per connection: drain the queue onto the socket;
 //   - enqueue never blocks - a peer whose socket is wedged eats a dropped
-//     frame, never a stalled relay.
+//     frame, never a stalled relay;
+//   - every read runs under a per-frame read deadline and every accepted
+//     socket gets TCP keepalive: a stranger that dials and then stalls, and
+//     a peer that vanished without closing, both have their connection and
+//     registry slot reaped by the socket itself - the relay learns nothing
+//     about the traffic by doing it.
 //
 // Delivery semantics, stated once because they are the contract every caller
 // gets: the fan-out set is the registry AT FORWARDING TIME. A peer's
@@ -44,6 +49,7 @@
 package relay
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -93,6 +99,43 @@ const (
 	// machine. Honest validators drop nothing: relaying kilobytes per second
 	// never approaches 64 backlogged frames.
 	DefaultWriteQueueSize = 64
+	// DefaultReadTimeout is the per-frame READ DEADLINE: the socket-level
+	// bound on how long ONE frame (its 4-byte header plus its full payload)
+	// may take to arrive before the connection is ended and its registry
+	// slot released. This is the timer a stranger's silence runs against -
+	// a client that dials, writes a header and then stalls was previously
+	// able to pin exactly one reader goroutine, one frame buffer and one
+	// registry slot FOREVER (256 conns x 1 MiB is ~256 MiB the GC could not
+	// reclaim, held with nothing but four-byte writes).
+	//
+	// It parses nothing: the deadline is armed on the socket before the
+	// header read and refreshed on every completed frame, so the question it
+	// answers is only "has this connection stopped speaking ENTIRELY for
+	// this long?" - a peer actively sending is never cut off, and neither
+	// the payload nor the framing is inspected.
+	//
+	// 2 minutes sits well above anything an honest validator does: the node
+	// layer over a relay speaks at a cadence of milliseconds to seconds
+	// (ticks every 50 ms, round timeouts at 200 ms + 100 ms per escalation,
+	// wave rebroadcasts every 500 ms - internal/devnet/tcpnode.go). Silence
+	// of a full two minutes is a dead or wedged connection, not a
+	// participating one; when it expires the connection is ENDED and its
+	// slot is RELEASED the same instant (the reader's finish). A validator
+	// redials through its own outbound backoff.
+	DefaultReadTimeout = 2 * time.Minute
+	// DefaultKeepAlive is the TCP keepalive probe period set on every
+	// accepted connection, so a HALF-OPEN connection - a peer that vanished
+	// without closing (power cut, wifi loss), its socket open but never
+	// answering - is reaped by the socket itself, with no code watching. A
+	// peer that is alive answers every probe with a bare ACK; a dead one
+	// stops answering and the kernel tears the connection down after the
+	// OS's probe count. 15s also sits under common NAT-mapping idle
+	// timeouts (30-60s+), which a home validator's mapping needs refreshing
+	// during quiet periods. (Go's net package already enables keepalives
+	// with this value by default; declaring it here is the same guarantee
+	// made explicit and operator-tunable instead of an accident of the
+	// toolchain.)
+	DefaultKeepAlive = 15 * time.Second
 )
 
 // ErrClosed is returned by Listen after Close: a closed relay is closed, not
@@ -111,6 +154,15 @@ type Options struct {
 	// WriteQueueSize is the per-connection writer queue bound. Default
 	// DefaultWriteQueueSize.
 	WriteQueueSize int
+	// ReadTimeout is the per-frame read deadline: the longest a single frame
+	// (header plus full payload) may take to arrive before the connection is
+	// ended and its slot released. Armed on the socket before each header
+	// read, refreshed on every completed frame - no byte beyond the frame
+	// length is inspected. Default DefaultReadTimeout.
+	ReadTimeout time.Duration
+	// KeepAlive is the TCP keepalive probe period for accepted connections,
+	// how they shed half-open peers in minutes. Default DefaultKeepAlive.
+	KeepAlive time.Duration
 }
 
 func (o Options) withDefaults() Options {
@@ -122,6 +174,12 @@ func (o Options) withDefaults() Options {
 	}
 	if o.WriteQueueSize <= 0 {
 		o.WriteQueueSize = DefaultWriteQueueSize
+	}
+	if o.ReadTimeout <= 0 {
+		o.ReadTimeout = DefaultReadTimeout
+	}
+	if o.KeepAlive <= 0 {
+		o.KeepAlive = DefaultKeepAlive
 	}
 	return o
 }
@@ -219,7 +277,11 @@ func (r *Relay) Listen(addr string) error {
 	if r.lsn != nil {
 		return fmt.Errorf("relay: already listening on %s", r.lsn.Addr())
 	}
-	l, err := net.Listen("tcp", addr)
+	// TCP keepalive is set here, at listener construction, on every
+	// connection this listener ever accepts: the half-open reaping is
+	// socket-level (Option comment), never code watching a byte.
+	lc := net.ListenConfig{KeepAlive: r.opts.KeepAlive}
+	l, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return err
 	}
@@ -310,6 +372,19 @@ func (r *Relay) reader(c *conn) {
 	defer r.wg.Done()
 	defer r.finish(c)
 	for {
+		// The per-frame read deadline is armed BEFORE the header and refreshed
+		// for every frame, so it measures one frame's whole silence - from
+		// starting to read out a frame to having it completely - and never a
+		// connection's total age: a peer actively sending frames renews this
+		// timer at every frame and is never cut off. Both timers are socket
+		// level: they parse nothing, decide nothing about the payload - they
+		// only bound how long a stranger may hold a goroutine, a frame buffer
+		// and a registry slot without delivering a complete frame. On expiry
+		// the connection is ENDED and its slot is RELEASED, below, the same
+		// path any other framing failure takes.
+		if err := c.nc.SetReadDeadline(time.Now().Add(r.opts.ReadTimeout)); err != nil {
+			break // the socket itself is gone; the deferred finish cleans up
+		}
 		// ReadFrame checks the declared length against the bound BEFORE
 		// allocating, so the hostile four-byte header of an oversized frame
 		// is refused without ever materialising the buffer it promised.
@@ -330,10 +405,15 @@ func (r *Relay) reader(c *conn) {
 				// unguarded read loop.
 				break
 			}
-			// EOF, reset, truncation, a zero-length frame: framing is
-			// unsalvageable - there is no knowing where the next frame
-			// begins - so the connection ends. A validator redials through
-			// its own outbound backoff.
+			// Read errors beyond a declared-too-large frame: EOF, reset,
+			// truncation mid-payload, the read deadline expiring above -
+			// framing is unsalvageable: there is no knowing where the next
+			// frame begins, so the connection ends. (A zero-length frame
+			// would be perfectly delimited - its header says so - and is
+			// refused anyway because wire.ReadFrame folds n == 0 into
+			// ErrShortFrame beside real truncation, and the relay takes a
+			// frame error at face value. An empty frame is not a message.)
+			// A validator redials through its own outbound backoff.
 			break
 		}
 		r.forward(c, payload)

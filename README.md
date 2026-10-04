@@ -169,7 +169,19 @@ frame whose declared length exceeds the bound is refused before any
 allocation and its connection is ended; dials past the connection bound are
 closed at accept; every connection buffers at most a bounded write queue, so
 a peer that stops reading cannot stall the relay for the others (dropped
-frames, never a blocked forwarder). In production the access policy does not
+frames, never a blocked forwarder); and two socket-level timers bound how
+long a connection may *hold* what it has taken — nothing is parsed to enforce
+them. The per-frame read timeout (`--read-timeout`, default 120 seconds) is
+armed before each frame's 4-byte header and refreshed at every completed
+frame, so an actively sending peer is never cut off; when it expires — a
+connection that delivered no complete frame for the whole period — the
+connection is closed and its registry slot is released the same instant. So a
+stranger can pin at most `max-conns × max-frame-bytes` of memory and
+`max-conns` of slots, each for at most one read timeout, never forever. TCP
+keepalive (`--keepalive`, default 15 seconds) reaps a half-open connection —
+a peer that vanished without closing, e.g. a power cut — after the kernel's
+unanswered probes, again without the relay looking at any byte. In production
+the access policy does not
 live in the relay at all — run it behind the VPS firewall allowlisting the
 validator IPs. Validators reconnect to a restarted relay with exponential
 backoff. Bandwidth is kilobytes per second.
@@ -180,6 +192,8 @@ backoff. Bandwidth is kilobytes per second.
 | `--max-frame-bytes N` | `1048576` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic) |
 | `--max-conns N` | `256` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
 | `--write-queue N` | `64` | per-connection buffered frames; a full queue drops new frames for that peer instead of blocking the relay |
+| `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |
+| `--keepalive SECONDS` | `15` | TCP keepalive probe period for every accepted connection; a half-open connection is reaped by the kernel after unanswered probes |
 
 Ctrl-C (or SIGTERM) stops the listener, closes every connection and joins
 every goroutine before the process exits.
