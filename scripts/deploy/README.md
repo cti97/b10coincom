@@ -16,11 +16,14 @@ Pi 2 (home C) ──┘            │
                                  length prefix
 ```
 
-Scope note: this recipe and `make arm64` cover **one platform — Linux/ARM64**
-— because that is what a Pi runs. A later task generalizes the build into a
-multi-platform release matrix and will replace `make arm64` and
-`scripts/deploy/build.sh`; until then, treat this as the single supported
-target.
+Scope note: `make arm64` builds **one platform — Linux/ARM64 — because that
+is what a Pi runs**, and both Pi binaries come from it. The relay, however,
+runs on the **VPS, not on a Pi**, so §2 has one extra step that builds the
+relay for whatever architecture the VPS itself reports. A later task
+generalizes the build into a multi-platform release matrix and will replace
+`make arm64` and `scripts/deploy/build.sh`; until then, treat the ARM64 Pi
+pair as the single supported target and the VPS relay line as its one
+deliberate extra.
 
 ---
 
@@ -30,8 +33,8 @@ target.
 |---|---|---|
 | 3× Raspberry Pi | Pi 4 or Pi 5, 2 GB or more | the validators. Different homes/networks are the point: the milestone is "across separate networks" |
 | 3× microSD + PSU | 16 GB+, official PSU recommended | flash **64-bit Raspberry Pi OS Lite** — the standard 32-bit install **cannot** run the binary. Verify with `uname -m`: it must print `aarch64` |
-| 1× VPS | any Linux box, 1 core / 1 GB is plenty | runs the relay. ~€4/month tier from any provider is enough; bandwidth is kilobytes per second |
-| 1× build machine | laptop/desktop with Go 1.23+ | builds the binaries. Any OS works; it does not run the chain |
+| 1× VPS | any Linux box, 1 core / 1 GB is plenty | runs the relay. ~€4/month tier from any provider is enough; bandwidth is kilobytes per second. **Its CPU architecture is whatever the provider sold you** — §2 asks the machine (`uname -m`) and builds the relay for it |
+| 1× build machine | laptop/desktop with Go 1.23+ and `git` | builds the binaries. Any OS works; it does not run the chain |
 | SSH access | to all four machines | everything below happens over SSH |
 
 Why the VPS: a validator running at home sits behind NAT — or behind CGNAT,
@@ -45,18 +48,29 @@ cannot forge a vote — liveness is what depends on it, never safety. (`b10coin-
 
 ## 2. Build the binaries and copy them over
 
-On the build machine, from a checkout of `github.com/cti97/b10coincom`:
+On the build machine (any OS with Go 1.23+ and `git` installed), get the
+source and build inside it:
+
+```sh
+git clone -b m4-real-networking https://github.com/cti97/b10coincom
+cd b10coincom
+```
+
+(`-b` checks out the branch this recipe ships on — the deployment files and
+`make arm64` are not on `main` until the milestone merges.)
+
+Build the two Linux/ARM64 **Pi** binaries:
 
 ```sh
 make arm64                       # or: scripts/deploy/build.sh — builds AND asserts
 ```
 
-This produces exactly two Linux/ARM64 binaries in `bin/` (versions come from
-the source tree — `internal/version`, currently `0.1.0` — not from build
-flags):
+These two land in `bin/` (versions come from the source tree —
+`internal/version`, currently `0.1.0` — not from build flags):
 
 - `bin/b10coin-linux-arm64` — the node/validator binary (the Pis)
-- `bin/b10coin-relay-linux-arm64` — the relay (the VPS)
+- `bin/b10coin-relay-linux-arm64` — the relay (runs **on the VPS**; whether
+  this ARM64 copy is the right one for YOUR VPS is settled just below)
 
 Confirm on the build machine that both really are ARM (a build that quietly
 produced host binaries is the failure mode this check exists for):
@@ -67,13 +81,44 @@ file bin/*-linux-arm64
 # bin/b10coin-relay-linux-arm64:  ELF 64-bit LSB executable, ARM aarch64, ... statically linked
 ```
 
-Copy each binary to the machine that runs it, then install it on each (the
-static binaries need no runtime packages; current 64-bit Raspberry Pi OS and
-any current Debian/Ubuntu VPS run them as-is):
+The node binaries above are for the Pis. **The relay runs on the VPS, not on
+a Pi, so it must match the VPS's own architecture** — `make arm64` cannot
+know what that is. Ask the VPS before copying anything:
+
+```sh
+ssh vps@example.com uname -m
+```
+
+Two answers are likely:
+
+- **`x86_64`** — the standard amd64 VPS almost every provider hands you by
+  default. The ARM64 relay would fail here with `Exec format error` (§8,
+  failure 4), so build the relay for the VPS — one line, on the build
+  machine:
+
+  ```sh
+  GOOS=linux GOARCH=amd64 go build -o bin/b10coin-relay-linux-amd64 ./cmd/b10coin-relay
+  file bin/b10coin-relay-linux-amd64
+  # bin/b10coin-relay-linux-amd64:  ELF 64-bit LSB executable, x86-64, ... statically linked
+  ```
+
+  (`x86_64` and Go's `amd64` name the same architecture; the version comes
+  from the source tree exactly as it does in `make arm64`.) Copy **that**
+  file to the VPS below, not the `-arm64` one.
+
+- **`aarch64`** — an ARM64 VPS (some providers sell ARM tiers). The relay
+  `make arm64` already produced is the right one; nothing more to build.
+  Copy `bin/b10coin-relay-linux-arm64` below.
+
+Copy the binaries to the machine that runs each, then install (the static
+binaries need no runtime packages; current 64-bit Raspberry Pi OS and any
+current Debian/Ubuntu VPS run them as-is — the relay "as-is" only once it is
+the architecture-matched file from the branch above):
 
 ```sh
 # from the build machine — replace pi@ and vps@ with your real SSH targets
-scp bin/b10coin-relay-linux-arm64 vps@example.com:/tmp/
+scp bin/b10coin-relay-linux-amd64 vps@example.com:/tmp/    # x86_64 VPS (uname -m above)
+# scp bin/b10coin-relay-linux-arm64 vps@example.com:/tmp/  # aarch64 VPS: that line instead
 for p in 192.0.2.11 192.0.2.12 192.0.2.13; do
     scp bin/b10coin-linux-arm64 pi@$p:/tmp/
 done
@@ -84,7 +129,7 @@ On the VPS:
 ```sh
 sudo useradd --system --home-dir /var/lib/b10coin --shell /usr/sbin/nologin b10coin || true
 sudo mkdir -p /opt/b10coin
-sudo install -m 0755 /tmp/b10coin-relay-linux-arm64 /opt/b10coin/b10coin-relay
+sudo install -m 0755 /tmp/b10coin-relay-linux-amd64 /opt/b10coin/b10coin-relay   # -arm64 on an aarch64 VPS
 ```
 
 The same commands on **each** Pi (`useradd` reports the user exists on the
@@ -220,8 +265,8 @@ This directory ships two units. They go on **different machines**:
 Both units assume what §2 installed: the binary under `/opt/b10coin/` and a
 system user/group `b10coin`; the node unit additionally assumes outbound TCP
 to the relay and manages `/var/lib/b10coin` itself via `StateDirectory`;
-the relay unit assumes inbound TCP 7001 and writes nothing to disk. Copy,
-edit, start:
+the relay unit assumes inbound TCP 7001 and writes nothing to disk. From the
+**build machine** (the only place with the checkout) — copy, edit, start:
 
 ```sh
 # VPS
@@ -262,7 +307,9 @@ same build**, for the §3 reason.
 
 Success is **agreement — the same finalized history on all three Pis** — not
 reachability. Machines can be perfectly connected and still be on different
-chains (§8, failure 1 judges from reachability alone; do not).
+chains (§8, failure 1: every node answers RPC and looks fine while the
+committee never finalizes anything — judge it from the chain IDs and block
+hashes below, never from reachability).
 
 1. **The banner.** Each Pi's log (`journalctl -u b10coin`) shows, exactly:
 
@@ -285,50 +332,75 @@ chains (§8, failure 1 judges from reachability alone; do not).
    being produced and finalized (height only moves when the committee
    commits).
 
-3. **The bar: one history.** At one moment, all three Pis must report the
-   **same `head_hash` at the same `height`** — that hash names the identical
-   block, so equal hashes mean the committee finalized one shared chain.
-   From your laptop, over SSH in one loop:
+3. **The bar: one history.** All three Pis must name the **same block at
+   the same height** — equal hashes at one height mean the committee
+   finalized one shared chain. Do **not** compare the instantaneous
+   `height` from a loop of SSH visits: blocks commit fast (on the order of
+   a per second), and three sequential round trips usually land on
+   different heights **even on a perfectly healthy committee**. The
+   reliable manual check is the one `acceptance.sh` performs: pick one
+   **fixed height `H` that all three Pis have passed** — any height you
+   saw on every Pi, so after a few minutes any small number works — and
+   compare what each node reports for block `H`:
 
    ```sh
+   H=50   # must be behind every Pi: any height from the /status calls above
    for p in 192.0.2.11 192.0.2.12 192.0.2.13; do
-       ssh pi@$p curl -s http://127.0.0.1:8645/status
+       ssh pi@$p curl -s http://127.0.0.1:8645/block/$H
    done
    ```
 
-   Identical `chain_id`, `height` and `head_hash` across all three: **the
-   testnet works** — that is M4's acceptance criterion met on real hardware
-   across separate networks.
+   Three replies with the **identical `"hash":"…"`** (their `height` fields
+   all read `H` — a node asked before the committee reached `H` answers
+   `404 height not found`; wait a moment and retry): **the testnet
+   works** — that is M4's acceptance criterion met on real hardware across
+   separate networks. One more judgement rule, and it matters: a `height`
+   or `head_hash` that differs between Pis is **not a fault** as long as
+   the block at the fixed height hashes identically everywhere — only the
+   fixed-height hash is the verdict. Chain identity comes from the same
+   `/status` calls as in step 2: `chain_id` must be identical on all three
+   (§8, failure 1).
 
-   **This whole loop is one command:** `scripts/deploy/acceptance.sh` runs
-   the same checks for you — two readings, an *increased-height* requirement
-   (a stalled network that still agrees must not look healthy), agreement at
-   one common height, and a relay probe. Verdict labels map to the three
-   failures in §8; `--help` lists them with their exit codes:
+   **This whole check is one command:** `scripts/deploy/acceptance.sh`
+   runs §7 for you — two `/status` readings per Pi (reachability, then an
+   *increased-height* requirement, so a stalled network that still agrees
+   cannot look healthy), then agreement as the fixed-height block-hash
+   comparison above (at the committee's common height), plus a relay
+   probe. Verdict labels map to §8's failures 1–3 (failure 4 is an
+   install fault no running network can exhibit); `--help` lists them
+   with their exit codes:
 
    ```sh
    scripts/deploy/acceptance.sh --pis 192.0.2.11,192.0.2.12,192.0.2.13 --relay example.com
    ```
 
-## 8. When it does not work: the three failures
+## 8. When it does not work: the four failures
 
-All three look alike from the outside — a quiet node at height 0 — so judge
-them by these signatures, in this order.
+Failures 1–3 all look alike from the outside — a quiet node at height 0 —
+so judge them by these signatures, in this order. Failure 4 never gets that
+far: the binary itself refuses to run, so it announces itself the moment
+you start it.
 
 | # | Failure | Signature (how you tell) | Fix |
 |---|---|---|---|
 | 1 | **Chain-ID / genesis mismatch** — one node runs a different `--validators` (or an older binary) and derives a different chain | `journalctl -u b10coin \| grep listening` — the `chain …` part of the banner **differs** between Pis (e.g. `b10coin-simnet-3` vs `b10coin-simnet-4`). Nodes on different chains never object; they just ignore each other forever | Stop the odd node; start it from the **same binary build** with the same `--validators 3` as the others (§3). No other remedy exists |
 | 2 | **Relay unreachable** — relay not running, VPS address wrong, port 7001 closed in the cloud firewall or ufw | All chain IDs **match**, but from a Pi: `timeout 3 bash -c '</dev/tcp/example.com/7001' && echo open` prints nothing. On the VPS: `systemctl status b10coin-relay` and `ss -tlnp | grep 7001` tell you whether it listens at all | Start the relay (`systemctl enable --now b10coin-relay`), open TCP 7001 in the security group and `sudo ufw allow 7001/tcp`. Nodes redial with backoff; nothing to restart on the Pis |
 | 3 | **Wrong `--index`** — two Pis share a seat, i.e. one validator key used by two machines | Chain IDs all match, relay reachable, yet heights stall. `journalctl -u b10coin \| grep committee` shows **the same `seat N` on two Pis** (the three must read `seat 0`, `seat 1`, `seat 2` in some order) | Set a unique `B10COIN_INDEX` on one of the two duplicates (`/etc/systemd/system/b10coin.service`), then `sudo systemctl daemon-reload && sudo systemctl restart b10coin` |
+| 4 | **Wrong-architecture binary** — e.g. the ARM64 relay copied onto a standard amd64 (x86_64) VPS, or either binary onto a 32-bit OS | The binary refuses to start at all: running it directly prints `Exec format error` / `cannot execute binary file`, and systemd's log (`journalctl -u b10coin-relay`) shows the same with exit `status=203/EXEC`. Confirm with `file /opt/b10coin/b10coin-relay` — the architecture it names must match what `uname -m` prints on that machine | Rebuild for the machine's own architecture (§2's `uname -m` step: the VPS almost always wants `b10coin-relay-linux-amd64`, built with the one `GOARCH=amd64` line), reinstall with `install -m 0755`, and nothing on the Pis changes |
 
-Quick disambiguation: chain IDs differ → 1; chain IDs match and the relay
-port test fails → 2; chain IDs match, relay reachable, a `seat` repeats → 3.
+Quick disambiguation: the binary will not start (`Exec format error`) → 4;
+chain IDs differ → 1; chain IDs match and the relay port test fails → 2;
+chain IDs match, relay reachable, a `seat` repeats → 3. And a non-fault: Pis
+at slightly different heights whose fixed-height block hashes agree (§7.3)
+are healthy — do not chase it.
 If the table and logs genuinely cannot place the fault, reproduce the
 committee locally on one machine (`make devnet`) to confirm the build
 consensus-works, and treat the difference as network.
 
 ---
 
-One repeated rule, because it costs hours when ignored: **one binary build,
-one `--validators` value, and one `B10COIN_INDEX` per machine — from one
-`make arm64`.** Everything else in this recipe is plumbing around that.
+One repeated rule, because it costs hours when ignored: **one build for the
+three Pis (all three from one `make arm64`), one `--validators` value on
+all, and one `B10COIN_INDEX` per machine; the VPS relay only has to match
+the VPS's own architecture (§2), not the Pis'.** Everything else in this
+recipe is plumbing around that.

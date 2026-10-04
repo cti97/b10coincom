@@ -14,6 +14,16 @@ set -eu
 
 cd "$(dirname "$0")/../.."
 
+# Freshness: a leftover *-linux-arm64 from an earlier build must never stand
+# in for a build line that has silently stopped running (a stale node binary
+# beside a fresh relay would make the count read 2). Remove the ARM64 pair
+# first, so everything asserted below was produced by THIS run. Nothing else
+# is touched: bin/ may also hold host builds (make build) or the relay binary
+# the deploy recipe builds for a non-ARM VPS's own architecture — these
+# checks are scoped to the ARM64 Pi artifacts only.
+mkdir -p bin
+rm -f bin/*-linux-arm64
+
 make arm64
 
 # Artifact count: the committee and the forwarder. A missing binary ships a
