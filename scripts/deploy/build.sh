@@ -48,19 +48,26 @@ cp "$relay_src" "bin/b10coin-relay-$os-$arch$ext"
 
 # Belt: the copies must report the same architecture the release script just
 # asserted for the originals (same bytes — but here is the check a reader can
-# see without opening dist/).
+# see without opening dist/). Same TOKEN-BASED assertion as build-release.sh
+# (format + architecture token, any word order): Apple's file prints
+# "Mach-O 64-bit executable x86_64", upstream libmagic on Linux prints
+# "Mach-O 64-bit x86_64 executable", and one exact sentence would pin this
+# check to one vendor. Arch tokens match case-insensitively (arm64 vs
+# Aarch64/AArch64 differ between implementations).
 for f in "bin/b10coin-$os-$arch$ext" "bin/b10coin-relay-$os-$arch$ext"; do
     case "$os/$arch" in
-        darwin/amd64)  want="Mach-O 64-bit executable x86_64" ;;
-        darwin/arm64)  want="Mach-O 64-bit executable arm64" ;;
-        linux/amd64)   want="ELF 64-bit LSB.*x86-64" ;;
-        linux/arm64)   want="ELF 64-bit LSB.*ARM aarch64" ;;
-        windows/amd64) want="PE32+ executable.*x86-64" ;;
-        windows/arm64) want="PE32+ executable.*Aarch64" ;;
+        darwin/amd64)  fmt="Mach-O" tok="x86_64"  ;;
+        darwin/arm64)  fmt="Mach-O" tok="arm64"   ;;
+        linux/amd64)   fmt="ELF"    tok="x86-64"  ;;
+        linux/arm64)   fmt="ELF"    tok="aarch64" ;;
+        windows/amd64) fmt="PE32+"  tok="x86-64"  ;;
+        windows/arm64) fmt="PE32+"  tok="aarch64" ;;
     esac
-    if ! file "$f" | grep -q "$want"; then
-        echo "FAIL: $f is not the $osarch artifact it is named for:" >&2
-        file "$f" >&2 || true
+    got=$(file "$f" 2>&1)
+    if ! printf '%s\n' "$got" | grep -q -- "$fmt" ||
+       ! printf '%s\n' "$got" | grep -iq -- "$tok"; then
+        echo "FAIL: $f is not the $osarch artifact it is named for (wanted: $fmt + $tok):" >&2
+        echo "$got" >&2
         exit 1
     fi
 done

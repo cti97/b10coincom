@@ -18,7 +18,11 @@
 #   - The artifact count must equal the target count — a build that silently
 #     produced only the host platform fails here with a named target.
 #   - Every artifact is asserted with file(1) to report its own architecture,
-#     so "compiled" cannot mean "host build renamed".
+#     so "compiled" cannot mean "host build renamed". The assertion demands a
+#     FORMAT token and an ARCHITECTURE token in ANY ORDER, because file(1)
+#     implementations word the same binary differently: Apple's file prints
+#     "Mach-O 64-bit executable x86_64" while upstream libmagic (every Linux,
+#     i.e. the CI release job) prints "Mach-O 64-bit x86_64 executable".
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -107,6 +111,17 @@ done
 # file(1) — the same per-file discipline scripts/deploy/build.sh keeps. If
 # file(1) is unavailable the script fails: an unasserted release is not a
 # release.
+#
+# The assertion is TOKEN-BASED, not sentence-based. file(1) implementations
+# disagree on where the CPU goes (see the header note), so demanding a fixed
+# sentence only pins the check to one vendor's wording. Instead each target
+# requires a format token (Mach-O / ELF / PE32+) AND its architecture token
+# (x86_64, arm64, x86-64, aarch64), wherever they sit in the output. The
+# tokens are what varies per TARGET; the order is what varies per file(1)
+# IMPLEMENTATION — so this stays a real assertion (an x86_64 binary never
+# reports arm64, an ELF never reports Mach-O) while being portable across
+# vendors. Arch tokens are matched case-insensitively because implementations
+# capitalize the 64-bit ARM name differently (arm64/Aarch64/AArch64).
 command -v file >/dev/null 2>&1 ||
     fail "file(1) is required to assert the artifacts really match their targets"
 for t in $targets; do
@@ -115,19 +130,25 @@ for t in $targets; do
     suffix=""
     [ "$os" = "windows" ] && suffix=".exe"
     case "$os/$arch" in
-        darwin/amd64)  want="Mach-O 64-bit executable x86_64" ;;
-        darwin/arm64)  want="Mach-O 64-bit executable arm64" ;;
-        linux/amd64)   want="ELF 64-bit LSB.*x86-64" ;;
-        linux/arm64)   want="ELF 64-bit LSB.*ARM aarch64" ;;
-        windows/amd64) want="PE32+ executable.*x86-64" ;;
-        windows/arm64) want="PE32+ executable.*Aarch64" ;;
+        darwin/amd64)  fmt="Mach-O" tok="x86_64"  ;;
+        darwin/arm64)  fmt="Mach-O" tok="arm64"   ;;
+        linux/amd64)   fmt="ELF"    tok="x86-64"  ;;
+        linux/arm64)   fmt="ELF"    tok="aarch64" ;;
+        windows/amd64) fmt="PE32+"  tok="x86-64"  ;;
+        windows/arm64) fmt="PE32+"  tok="aarch64" ;;
         *)             fail "no arch assertion for $os/$arch" ;;
     esac
     for name in b10coin b10coin-relay; do
         f="$stage/$name-$version-$os-$arch$suffix"
-        if ! file "$f" | grep -q "$want"; then
-            echo "FAIL: $f does not report $os/$arch (wanted: $want):" >&2
-            file "$f" >&2 || true
+        got=$(file "$f" 2>&1)
+        if ! printf '%s\n' "$got" | grep -q -- "$fmt"; then
+            echo "FAIL: $f does not report the $fmt format its $os/$arch name claims:" >&2
+            echo "$got" >&2
+            exit 1
+        fi
+        if ! printf '%s\n' "$got" | grep -iq -- "$tok"; then
+            echo "FAIL: $f does not report the $tok architecture its $os/$arch name claims:" >&2
+            echo "$got" >&2
             exit 1
         fi
     done
@@ -135,6 +156,10 @@ done
 
 # Checksums over EVERY artifact, relative to dist/ so `shasum -a 256 -c`
 # (or `sha256sum -c`) verifies inside the directory with no flag gymnastics.
+# They are generated AND verified while everything still sits in the staging
+# directory: dist/ is installed only after the sums WRITE and VERIFY, so a
+# checksum failure leaves no dist/ at all (the swap-in-last rule above applies
+# to this step too, not only to the builds).
 if command -v sha256sum >/dev/null 2>&1; then
     sum="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then
@@ -142,12 +167,21 @@ elif command -v shasum >/dev/null 2>&1; then
 else
     fail "neither sha256sum nor shasum is available to write SHA256SUMS"
 fi
-mv "$stage" dist
-( cd dist && $sum b10coin-* > SHA256SUMS )
+( cd "$stage" && $sum b10coin-* > SHA256SUMS ) || fail "writing SHA256SUMS failed"
 
-lines=$(wc -l < dist/SHA256SUMS | tr -d ' ')
+lines=$(wc -l < "$stage/SHA256SUMS" | tr -d ' ')
 if [ "$lines" -ne "$expected" ]; then
     fail "SHA256SUMS covers $lines artifacts, want $expected"
 fi
+
+# Every line must VERIFY against the artifact it names — the sums file is the
+# release's contract with `sha256sum -c`, so it must actually hold for these
+# bytes before the directory is installed. (Still in staging; dist/ appears
+# only below.)
+( cd "$stage" && $sum -c SHA256SUMS >/dev/null ) ||
+    fail "SHA256SUMS does not verify against the artifacts it names"
+
+# Last step: install the staging directory as dist/. Nothing after this can fail.
+mv "$stage" dist
 
 echo "OK: $expected release artifacts for $ntargets target(s) in dist/ (version $version from internal/version), SHA256SUMS covers all"

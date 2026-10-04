@@ -34,7 +34,15 @@
 # its own verdict label and exit code:
 #
 #   UNREACHABLE (exit 1)  a validator gave no parseable /status — wrong
-#                         address, node not running, SSH blocked.
+#                         address, node not running, SSH blocked. A REACHED
+#                         validator whose answer is not a b10coin /status
+#                         (missing chain_id/height/head_hash — e.g. an older
+#                         binary or an unrelated listener on the RPC port) is
+#                         labeled SCHEMA MISMATCH within this same verdict
+#                         and exit code: fail-safe either way, but the
+#                         message points at what is LISTENING there, not at
+#                         the network, so the operator is not sent down §8's
+#                         connectivity steps for a deployed-binary problem.
 #   DISAGREE    (exit 3)  reachable and advancing but NOT one chain: differing
 #                         chain IDs (§8 failure 1) or differing block identity
 #                         at one height (a fork, or §8 failure 3 — two
@@ -56,7 +64,7 @@
 # with sed — no JSON parser, no jq, no python.
 #
 # Exit codes: 0 PASS, 1 UNREACHABLE, 2 STALLED, 3 DISAGREE, 4 RELAY,
-# 5 INCONCLUSIVE, 64 bad usage.
+# 5 INCONCLUSIVE, 64 bad usage, 70 could not create its temp dir.
 
 set -u
 
@@ -77,8 +85,11 @@ $PROG — the b10coin M4 acceptance harness (three Pis finalising one chain).
 Usage:
   $PROG --pis HOST[,HOST...] [--relay RELAYHOST[:PORT]] [options]
 
-  --pis LIST        comma-separated validators. In ssh mode (default) each
-                    entry is [user@]host and its RPC is read over SSH at
+  --pis LIST        comma-separated validators (one entry is REFUSED: a
+                    single validator cannot reach a consensus verdict — the
+                    M4 criterion is three). In ssh mode (default) each entry
+                    is [user@]host — a user@ prefix overrides --ssh-user —
+                    and its RPC is read over SSH at
                     http://127.0.0.1:<http-port>/status (the RPC is
                     loopback-only). In http mode each entry is host[:port],
                     queried directly — for direct-peer and loopback runs.
@@ -95,8 +106,10 @@ Options:
   --help            this text
 
 Environment: B10COIN_FETCH curl|wget forces the HTTP client (default: first
-of curl, wget found in PATH). Exit codes: 0 PASS, 1 UNREACHABLE, 2 STALLED,
-3 DISAGREE, 4 RELAY, 5 INCONCLUSIVE, 64 usage.
+of curl, wget found in PATH). Exit codes: 0 PASS, 1 UNREACHABLE (a SCHEMA
+MISMATCH — a reached validator whose reply is not a b10coin /status — fails
+here too), 2 STALLED, 3 DISAGREE, 4 RELAY, 5 INCONCLUSIVE, 64 usage,
+70 could not create its temp dir.
 EOF
 }
 
@@ -146,6 +159,11 @@ for raw in $PIS_ARG; do
 done
 IFS=$OLDIFS
 [ ${#PIS[@]} -ge 1 ] || die_usage "--pis named no validators"
+# One validator can never demonstrate the acceptance criterion (three
+# validators finalising ONE chain), and a one-entry --pis is almost always a
+# truncation or typo — a usage error, failed before any probing, not a verdict
+# that could look like evidence.
+[ ${#PIS[@]} -ge 2 ] || die_usage "--pis named only ONE validator — a single validator cannot reach a consensus verdict (the M4 criterion is three validators finalising one chain); is the list truncated?"
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -201,8 +219,10 @@ local_fetch() {
 }
 
 # get_rpc TARGET PATH — one RPC request in the configured mode; sets OUT_BODY.
-# ssh mode: [user@]host, and the request runs ON the validator against its
-# loopback RPC — exactly the manual check in deploy README §7 step 3.
+# ssh mode: [user@]host — a target with no user@ prefix is reached as
+# --ssh-user (an explicit user@ prefix overrides it); the request runs ON the
+# validator against its loopback RPC — exactly the manual check in deploy
+# README §7 step 3.
 get_rpc() {
     local target=$1 path=$2 body rc user host tgt url remote
     LAST_ERR=""; OUT_BODY=""
@@ -215,11 +235,10 @@ get_rpc() {
         return $?
     fi
     case $target in
-        *@*) user=${target%%@*}; host=${target#*@} ;;
-        *)   user=""; host=$target ;;
+        *@*) user=${target%%@*}; host=${target#*@} ;;  # explicit prefix WINS over --ssh-user
+        *)   user=$SSH_USER; host=$target ;;           # no prefix: --ssh-user applies (default pi, README §2)
     esac
-    tgt=$host
-    [ -n "$user" ] && tgt="$user@$host"
+    tgt="$user@$host"
     # curl first, wget second, on the Pi itself; accept-new avoids re-typing
     # host keys on first contact but still pins a CHANGED key (OpenSSH >= 7.6,
     # which every supported OS here ships).
@@ -276,13 +295,21 @@ tcp_probe() {
 
 trunc() { printf '%s' "$1" | head -c 12; }
 
+# verdict_label INDEX — "UNREACHABLE" when the node could not be read at all
+# (network/address path); "SCHEMA MISMATCH" when the node was reached but its
+# reply carries no b10coin /status fields (deployed-binary path). Same
+# fail-safe verdict either way; the wording points at the right fix.
+verdict_label() {
+    if [ "${SCHEMA[$1]}" = yes ]; then echo "SCHEMA MISMATCH"; else echo "UNREACHABLE"; fi
+}
+
 # ---- per-validator state (parallel arrays) ----------------------------------
 
 N=${#PIS[@]}
-CH=(); H1=(); H2=(); B1=(); B2=(); OK1=(); OK2=(); ERR=()
+CH=(); H1=(); H2=(); B1=(); B2=(); OK1=(); OK2=(); ERR=(); SCHEMA=()
 i=0
 while [ $i -lt $N ]; do
-    CH+=("?"); H1+=(""); H2+=(""); B1+=(""); B2+=(""); OK1+=("no"); OK2+=("no"); ERR+=("")
+    CH+=("?"); H1+=(""); H2+=(""); B1+=(""); B2+=(""); OK1+=("no"); OK2+=("no"); ERR+=(""); SCHEMA+=("no")
     i=$((i + 1))
 done
 
@@ -297,7 +324,13 @@ read_status() {
     h=$(jnum "$OUT_BODY" height)
     hh=$(jstr "$OUT_BODY" head_hash)
     if [ -z "$cid" ] || [ -z "$h" ] || [ -z "$hh" ]; then
-        ERR[$idx]="reply is not a b10coin /status (missing chain_id/height/head_hash)"
+        # The node was REACHED (it answered within the request bound) but the
+        # reply carries no b10coin /status fields: an older binary there, or an
+        # unrelated listener on the RPC port. Failure is fail-safe, but the
+        # wording must not send the operator to §8's connectivity steps — say
+        # schema mismatch, and mark it so the verdict line lists it as one.
+        ERR[$idx]="node replied, but the reply is not a b10coin /status (missing chain_id/height/head_hash) — schema/version mismatch, not a network fault"
+        SCHEMA[$idx]=yes
         return 1
     fi
     CH[$idx]=$cid
@@ -315,7 +348,6 @@ SECOND_RUN=no
 echo "=== b10coin M4 acceptance check ==="
 echo "time        $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "validators  $N: ${PIS[*]}"
-[ "$N" -ge 2 ] || echo "            NOTE: a single validator cannot demonstrate agreement across networks"
 if [ "$MODE" = ssh ]; then
     echo "mode        ssh — each validator's RPC is read on its own loopback (port $HTTP_PORT), as in deploy README §7"
 else
@@ -351,21 +383,25 @@ while [ $i -lt $N ]; do
     if read_status "$i" first; then
         echo "${PIS[$i]}  chain ${CH[$i]}  height ${H1[$i]}  head $(trunc "${B1[$i]}")..."
     else
-        echo "${PIS[$i]}  UNREACHABLE — ${ERR[$i]}"
+        echo "${PIS[$i]}  $(verdict_label "$i") — ${ERR[$i]}"
     fi
     i=$((i + 1))
 done
 
 ANY_UNREACH=no
+ANY_SCHEMA=no
 i=0
 while [ $i -lt $N ]; do
-    if [ "${OK1[$i]}" != yes ]; then ANY_UNREACH=yes; fi
+    if [ "${OK1[$i]}" != yes ]; then
+        ANY_UNREACH=yes
+        [ "${SCHEMA[$i]}" = yes ] && ANY_SCHEMA=yes
+    fi
     i=$((i + 1))
 done
 
 if [ "$ANY_UNREACH" = yes ]; then
     echo
-    echo "-- second reading skipped: with a validator unreachable, advancing and agreement cannot be judged --"
+    echo "-- second reading skipped: with a validator giving no usable /status (UNREACHABLE or SCHEMA MISMATCH), advancing and agreement cannot be judged --"
 else
     SECOND_RUN=yes
     echo "waiting ${ADVANCE_WAIT}s ..."
@@ -377,7 +413,8 @@ else
             echo "${PIS[$i]}  chain ${CH[$i]}  height ${H1[$i]} -> ${H2[$i]} (+$(( ${H2[$i]} - ${H1[$i]} )))  head $(trunc "${B2[$i]}")..."
         else
             ANY_UNREACH=yes
-            echo "${PIS[$i]}  UNREACHABLE at reading 2 — ${ERR[$i]}"
+            [ "${SCHEMA[$i]}" = yes ] && ANY_SCHEMA=yes
+            echo "${PIS[$i]}  $(verdict_label "$i") at reading 2 — ${ERR[$i]}"
         fi
         i=$((i + 1))
     done
@@ -482,9 +519,15 @@ CODE=0
 echo
 if [ "$REACHED_BOTH" != yes ]; then
     CODE=1
-    echo "agreement   not judged: at least one validator was unreachable"
+    ANY_NET=no
+    i=0
+    while [ $i -lt $N ]; do
+        if failed_validator "$i" && [ "${SCHEMA[$i]}" = no ]; then ANY_NET=yes; fi
+        i=$((i + 1))
+    done
+    echo "agreement   not judged: at least one validator gave no usable /status"
     echo
-    echo "VERDICT: FAIL — UNREACHABLE (exit 1): these validators gave no /status:$(i=0; while [ $i -lt $N ]; do if failed_validator "$i"; then printf ' %s' "${PIS[$i]}"; fi; i=$((i + 1)); done)"
+    echo "VERDICT: FAIL — UNREACHABLE (exit 1): these validators gave no usable /status:$(i=0; while [ $i -lt $N ]; do if failed_validator "$i"; then printf ' %s' "${PIS[$i]}"; fi; i=$((i + 1)); done)"
     i=0
     while [ $i -lt $N ]; do
         if failed_validator "$i"; then
@@ -495,7 +538,14 @@ if [ "$REACHED_BOTH" != yes ]; then
         i=$((i + 1))
     done
     [ "$RELAY_STATE" = UNREACHABLE ] && echo "  (relay $RELAY_HOST:$RELAY_PORT also UNREACHABLE — deploy README §8, failure 2)"
-    echo "  wrong address, node not running, or (ssh mode) SSH blocked — deploy README §8"
+    if [ "$ANY_SCHEMA" = yes ]; then
+        echo "  a SCHEMA MISMATCH validator above was REACHED — what answers on its RPC port $HTTP_PORT is not this build's /status (an older"
+        echo "  binary still running, or a wrong listener on that port). That is a deployed-binary problem, not §8's network faults;"
+        echo "  check 'journalctl -u b10coin' and the binary build on that machine (§8, failure 1's old-binary signature)."
+    fi
+    if [ "$ANY_NET" = yes ]; then
+        echo "  wrong address, node not running, or (ssh mode) SSH blocked — deploy README §8"
+    fi
 elif [ "$AGREE_STATE" = "CHAIN-ID MISMATCH" ]; then
     CODE=3
     echo "agreement   CHAIN-ID MISMATCH — $AGREE_DETAIL"

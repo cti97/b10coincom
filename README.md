@@ -113,12 +113,18 @@ Guarantees a release keeps (all enforced by `scripts/build-release.sh`, the
 one build story the Makefile, CI and the deployment wrapper share): the
 version comes from `internal/version` — the binary prints it, so file names
 cannot disagree with what a binary says; `dist/` starts empty every run and
-is only swapped in after everything succeeds, so a failing target leaves no
-partial `dist/` to be mistaken for a release; the artifact count must equal
+is swapped in only after everything succeeds — the builds, the architecture
+assertions AND the checksums — so a failure at any of those steps leaves no
+`dist/` at all to be mistaken for a release; the artifact count must equal
 the target count, so a build that silently produced only the host platform
 fails instead of shipping a hole; and every artifact is `file(1)`-checked to
-report its own architecture — `Mach-O` and `PE32+` names never appear except
-where they belong. On the target machine, verify what you copied:
+report its own architecture — its format and architecture tokens (`Mach-O`,
+`ELF` or `PE32+`, plus `x86_64`, `arm64`, `x86-64` or `aarch64`) must appear
+wherever they sit in `file`'s output, so the check holds for Apple's `file`
+word order ("Mach-O 64-bit executable arm64") and upstream libmagic's ("Mach-O
+64-bit arm64 executable", which the Linux CI runners emit) alike, and `Mach-O`
+/ `PE32+` names never appear except where they belong. On the target machine,
+verify what you copied:
 
 ```sh
 ( cd dist && sha256sum -c SHA256SUMS )    # or: shasum -a 256 -c SHA256SUMS
