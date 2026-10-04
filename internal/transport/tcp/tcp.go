@@ -232,11 +232,22 @@ type conn struct {
 
 // finish tears the connection down exactly once: unblock the maintainer, make
 // any blocked socket call error out, and remove the conn from the registry.
+//
+// The teardown is ONE critical section: close(dead), the socket close and the
+// registry exit hold the transport's mutex together. Splitting them leaves a
+// window - dead but still named in the registry - in which Send resolves a
+// corpse: the frame is enqueued, the call reports nil, and the writer (already
+// past its dead check) never writes it. A unicast lost that way is invisible
+// at every layer above (Send succeeded; the peer never saw a byte), which is
+// exactly the shape CI reported for the cross-dial: each side showed one
+// healthy connection, a's Send succeeded, and b decoded nothing. Atomicity
+// closes it by construction: a registry entry is either not-yet-dying (its
+// writer is running) or not-in-the-registry.
 func (t *TcpTransport) finish(c *conn) {
 	c.finishOnce.Do(func() {
+		t.mu.Lock()
 		close(c.dead)
 		_ = c.nc.Close()
-		t.mu.Lock()
 		if t.conns[c.remote] == c {
 			delete(t.conns, c.remote)
 		}
@@ -790,12 +801,33 @@ func (t *TcpTransport) Broadcast(data []byte) error {
 // request/response travels on. An unknown peer (or a full queue) is an error,
 // never a silent success - the syncer owns the retry, and it can only retry
 // what it knows failed.
+//
+// The whole Send happens under the transport's mutex - the same critical
+// section finish uses to close a connection and remove it from the registry -
+// so the lookup, the liveness check and the enqueue are ATOMIC. A nil return
+// means the frame was accepted into a connection whose writer was running at
+// enqueue time; there is no state in which Send resolves a connection the
+// transport has already torn down. What a nil return does NOT promise is the
+// frame's delivery THROUGH a link that dies moment later: that is TCP's
+// reality, and it is the caller's retry plus the one-maintainer-per-link
+// redial that recover from it (see maintain). Broadcast keeps its weaker
+// best-effort contract by design: gossip is redundant, a drop costs nothing.
 func (t *TcpTransport) Send(peer transport.PeerID, data []byte) error {
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	c := t.conns[peer]
-	t.mu.Unlock()
 	if c == nil {
 		return fmt.Errorf("%w: %q", ErrUnknownPeer, peer)
+	}
+	// Unreachable by construction - finish removes the registry entry in the
+	// same critical section that closes dead - but retained as the gate the
+	// invariant is READ through: a Send must refuse a torn-down connection
+	// rather than enqueue into it, whatever future edits do to finish's
+	// ordering.
+	select {
+	case <-c.dead:
+		return fmt.Errorf("%w: %q", ErrUnknownPeer, peer)
+	default:
 	}
 	if !c.enqueue(data) {
 		return fmt.Errorf("%w (%q)", ErrQueueFull, peer)

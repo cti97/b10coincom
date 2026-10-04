@@ -808,6 +808,20 @@ func TestBackoffGrowsExponentiallyWithSeededJitter(t *testing.T) {
 // both ends on the SAME surviving socket, so exactly one healthy connection
 // exists per side and the link carries traffic both ways. Every run here is
 // independent; the check is meaningless green-once, so it repeats itself.
+//
+// The sends wait for SETTLEMENT before firing. The two ends resolve their
+// duplicates independently and microseconds apart; a unicast issued while one
+// side's resolution is still in flight can be written into the very socket
+// that side's policy is about to discard - the peer's end of it already
+// closed - and the frame dies in flight while Send reports success. That was
+// the CI failure: a.Send nil, b receiving nothing, both registries
+// individually correct. The rank's fixed point is observable
+// deterministically, and once it is installed at both ends no further
+// registry transition can happen (both entries are unbeatable under
+// newcomerWins), so the sends target the settled link and the two waitFors
+// are proofs of delivery rather than bets on a scheduling accident. The gate
+// does not widen any timeout; it replaces a race the test could only win by
+// luck with a state the transport guarantees will arrive.
 func TestSymmetricBootBothAddPeerLeavesOneConnection(t *testing.T) {
 	for run := 0; run < 30; run++ {
 		t.Run(fmt.Sprint(run), func(t *testing.T) {
@@ -844,12 +858,13 @@ func TestSymmetricBootBothAddPeerLeavesOneConnection(t *testing.T) {
 				}
 			}
 
-			// Exactly one healthy connection on each side - never zero, the
-			// pre-fix symptom - and both sides agree on who the peer is.
-			waitPeersIs(t, a, "[b]")
-			waitPeersIs(t, b, "[a]")
-			if len(a.conns) != 1 || len(b.conns) != 1 {
-				t.Fatalf("after the cross-dial: a holds %d conns, b holds %d; want exactly one each", len(a.conns), len(b.conns))
+			// Deterministic settlement: exactly one connection each side, and
+			// the two entries are the SAME physical link (the smaller end's
+			// dial). The failure message names the socket each side kept.
+			ca, cb := crossPairSettledConn(t, a, b)
+			if ca == nil || cb == nil {
+				t.Fatalf("the cross-dial never settled one shared link: a keeps %s, b keeps %s; want the same two sockets, with a keeping its dial and b the accept of it",
+					heldConnDesc(a, "b"), heldConnDesc(b, "a"))
 			}
 
 			// The survivor is a working link, not a corpse in the registry:
@@ -870,6 +885,169 @@ func TestSymmetricBootBothAddPeerLeavesOneConnection(t *testing.T) {
 			})
 		})
 	}
+}
+
+// crossPairSettledConn waits until a's and b's duplicate resolutions for EACH
+// OTHER have both completed, and returns the two entries (a's conn for "b",
+// b's conn for "a") whose endpoint addresses name the same two sockets.
+//
+// Fixed point - all checkable under each transport's mutex:
+//   - each registry holds exactly ONE entry for the peer;
+//   - the two entries CROSS-MATCH: a.conn's LocalAddr == b.conn's RemoteAddr
+//     and a.conn's RemoteAddr == b.conn's LocalAddr, so a and b hold the two
+//     ends of one physical TCP connection - the cross-side identity the
+//     transport is judged on;
+//   - the direction is the rank's: a (the smaller id) keeps the conn it
+//     DIALLED, b keeps the accept of a's dial. This signature is what makes
+//     the wait HONEST: an intermediate state can already satisfy the
+//     count and the cross-match while a supersede is still pending elsewhere
+//     (e.g. both ends briefly converged on the pair a has not yet resolved
+//     away from), so the direction check separates the fixed point from a
+//     snapshot mid-churn. Every later arrival loses the rank against these
+//     two, so the pair cannot be unseated after it is observed.
+//
+// The gate runs in the CI test before any send; it fails (bounded timeout)
+// with the sockets each side kept NAMED if the churn ever fails to converge.
+func crossPairSettledConn(t *testing.T, a, b *TcpTransport) (cAB, cBA *conn) {
+	t.Helper()
+	waitFor(t, "the cross-dial settling on one shared link (a keeps its dial, b the accept of it)", 5*time.Second, func() bool {
+		ca, ok := crossPairSettled(a, "b", true)
+		if !ok {
+			return false
+		}
+		cb, ok := crossPairSettled(b, "a", false)
+		if !ok {
+			return false
+		}
+		// The two entries are the two ends of one physical connection:
+		// local/remote addresses cross-match.
+		if ca.nc.LocalAddr().String() != cb.nc.RemoteAddr().String() ||
+			ca.nc.RemoteAddr().String() != cb.nc.LocalAddr().String() {
+			return false
+		}
+		cAB, cBA = ca, cb
+		return true
+	})
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return cAB, cBA
+}
+
+// crossPairSettled reads one end of the settled pair under tp.mu: the
+// registry names exactly the peer, its single entry is the direction
+// wantDial demands (true: this end keeps its own dial; false: it keeps the
+// accept of the peer's dial), and its remote address is the peer's listener
+// - only the winning dial's socket names the listener; an accepted socket
+// dials from an ephemeral port.
+func crossPairSettled(tp *TcpTransport, peer transport.PeerID, wantDial bool) (*conn, bool) {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	// Exactly one live entry overall: a second conn to ANY peer means the
+	// duplicate churn is still mid-flight.
+	if len(tp.conns) != 1 {
+		return nil, false
+	}
+	c, ok := tp.conns[peer]
+	if !ok {
+		return nil, false
+	}
+	if c.dialled != wantDial {
+		return nil, false
+	}
+	return c, true
+}
+
+// heldConnDesc renders the single connection x holds for peer (locked), or a
+// summary of a empty registry, for failure messages that name the sockets
+// each side kept.
+func heldConnDesc(x *TcpTransport, peer transport.PeerID) string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	c, ok := x.conns[peer]
+	if !ok {
+		return fmt.Sprintf("%s: NOTHING (conns=%d)", x.opts.LocalID, len(x.conns))
+	}
+	return fmt.Sprintf("%s->%s (dialled=%v, superseded=%v)", c.nc.LocalAddr(), c.nc.RemoteAddr(), c.dialled, c.superseded)
+}
+
+// TestSendMustNotReportSuccessIntoATornDownConnection pins the Send side of
+// the registry's atomicity - the exact mechanism behind the cross-dial CI
+// failure's receive half. Its shape there: both registries held one healthy
+// looking connection, a's Send returned nil, and b decoded nothing - because
+// a's resolution was still in flight, so the unicast was written into the
+// socket b's OWN policy had already discarded, a link the two ends held
+// DISAGREEING copies of. Deterministically, that state is a connection whose
+// teardown has happened while the registry still names it: finish's registry
+// exit (the identity-checked delete) now shares one critical section with
+// close(dead), so the product cannot serve such a conn to Send; this test
+// builds it by hand - running teardown's first half through the same
+// sync.Once finish uses, deliberately stopping short of the registry exit -
+// and demands Send REFUSE it.
+//
+// On the pre-fix code (teardown split from the registry exit, Send's lookup
+// and enqueue outside the mutex across both) this Send reported nil: the
+// frame was accepted into a connection whose writer was already gone and can
+// never be written, with no error at any layer - the silent loss the CI run
+// hit. Under the fix, Send says so: ErrUnknownPeer, the caller's retry path.
+func TestSendMustNotReportSuccessIntoATornDownConnection(t *testing.T) {
+	tp := listen(t, Options{LocalID: "a"})
+
+	// A raw remote end announcing "b": a plain inbound connection, the ACCEPT
+	// direction, no maintainer anywhere - the shape a duplicate resolution's
+	// aftermath leaves behind (the losing directions have no maintainer by
+	// design; F2 releases them).
+	rc, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if err := wire.WriteFrame(rc, []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	// Both handshake sides write before reading, so the read here is the
+	// transport's greeting; the remote idles with its socket open.
+	rc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got, err := wire.ReadFrame(bufio.NewReader(rc), 4096)
+	if err != nil || string(got) != "a" {
+		t.Fatalf("the handshake was not answered with the transport's identity: got %q, err %v", got, err)
+	}
+	rc.SetReadDeadline(time.Time{})
+	waitPeersIs(t, tp, "[b]")
+
+	// Freeze the mid-teardown state: the dead-close and the socket close go
+	// through finish's own once, exactly as finish writes them - but WITHOUT
+	// the registry exit - which is the exact interleave the split teardown
+	// exposed to Send, held open deterministically instead of for a
+	// microsecond race.
+	tp.mu.Lock()
+	c := tp.conns["b"]
+	tp.mu.Unlock()
+	if c == nil {
+		t.Fatalf("the registry does not hold the peer")
+	}
+	c.finishOnce.Do(func() {
+		close(c.dead)
+		_ = c.nc.Close()
+		// The registry exit deliberately NOT here.
+	})
+
+	// The torn-down conn is still named in the registry. Send must refuse it
+	// rather than report success for a frame it can never write.
+	if err := tp.Send("b", []byte("probe")); err == nil {
+		kept := heldConnDesc(tp, "b")
+		t.Fatalf("Send reported success into a connection the transport has torn down (peer's end: closed; ours, still named in the registry: %s): the frame is silently lost with no error at any layer - a keeps believing a dead link is alive while b's side of it is gone: the two ends keep different sockets", kept)
+	} else if !errors.Is(err, ErrUnknownPeer) {
+		t.Fatalf("the torn-down connection was refused with %v, want an ErrUnknownPeer-shaped error the caller can retry against", err)
+	}
+
+	// No follow-up assertion about the registry here: the frozen state above
+	// is the test's own construction (it fires finish's once by hand), so the
+	// registry exit it simulates skipping is the test's, not the product's.
+	// The fix's atomic registry exit is what keeps this state UNREACHABLE in
+	// the product - see finish's doc; the Send refusal is the gate this test
+	// can hold still and read.
 }
 
 // isSocketClosed reports whether err is the close noise a connection call can
