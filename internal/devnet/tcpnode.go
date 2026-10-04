@@ -1,0 +1,534 @@
+package devnet
+
+// tcpnode.go is the networked validator of M4 Task 6: one process running the
+// real consensus stack over a real transport. The CLI's `--peers`/`--relay`
+// path and the in-process TCP integration test drive exactly this code, which
+// is the point of the boundary the M3/M4 milestones kept: the engine's round
+// protocol, the quorum rule and the certificate gate are untouched - the
+// NETWORK is.
+//
+// Structure of one validator:
+//
+//   - a tcp.TcpTransport (the shipped socket transport), its listener optional
+//     and its dial list given by the caller (the CLI joins --peers and
+//     --relay; the relay address dials exactly like a peer address, because a
+//     dumb forwarder is one from a socket's point of view);
+//   - a consensus.Syncer over that transport, doing both catch-up halves:
+//     ANSWERING (the router feeds it BLOCK_SYNC requests, it serves certified
+//     heights) and PULLING (the wave loop pulls from the tallest peer);
+//   - a consensus.MessageRouter splitting consensus frames from wire frames.
+//     The two message unions share the numeric range 1-3, so routing is by
+//     VERIFIED decode, never by a bare tag comparison (see the router's doc);
+//   - a consensus.Driver whose OnMessage the router hands consensus frames
+//     to, and whose commit witness archives every commit's certificate
+//     (Design Decision 8) so the chain this node holds is pullable by a peer;
+//   - two goroutines: the tick loop (the driver's clock at TickEvery) and the
+//     wave loop (HELLO heights out, catch-up pull in).
+//
+// Two concurrency rules keep the engine's single-threaded model intact over
+// sockets, which the in-process simulator never had to care about:
+//
+//   - ONE mutex (mu) serialises every driver operation - the tick loop's
+//     Tick and the reader goroutines' message dispatch through route. The
+//     socket transport may deliver from many readers; the engine must never
+//     be re-entered mid-step, or state transitions depend on goroutine
+//     scheduling rather than message order.
+//   - The pull NEVER holds mu. It touches only the chain (whose own lock
+//     serialises Append against the driver's) and the syncer (whose reply
+//     slot is the one pull's). The interleavings a commit and an adoption can
+//     form are all safe - a collision at one height fails the loser's Append
+//     against the chain, which is the gate, not a bug - with ONE consequence
+//     handled explicitly: after a pull adopts anything, the driver is
+//     REBUILT (rebuildDriver), because its engine still judges a height the
+//     chain has already decided. A stale engine keeps round-looping forever
+//     at a height nobody is at; the rebuild is the rejoin.
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/cti97/b10coincom/internal/chain"
+	"github.com/cti97/b10coincom/internal/consensus"
+	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/genesis"
+	"github.com/cti97/b10coincom/internal/mempool"
+	"github.com/cti97/b10coincom/internal/simnet"
+	"github.com/cti97/b10coincom/internal/transport"
+	"github.com/cti97/b10coincom/internal/transport/tcp"
+	"github.com/cti97/b10coincom/internal/types"
+	"github.com/cti97/b10coincom/internal/wire"
+)
+
+const (
+	// Round timeouts in WALL milliseconds - the same defaults every simnet
+	// scenario drives, now over sockets. A healthy commit completes in one
+	// round; escalation is the timeout ladder.
+	consensusTimeoutBaseMS = int64(200)
+	consensusTimeoutStepMS = int64(100)
+
+	// defaultTickEvery is the driver's tick cadence: well inside one round's
+	// timeout, so a proposal's propose phase runs before its timer fires.
+	defaultTickEvery = 50 * time.Millisecond
+	// defaultWaveEvery is the HELLO/catch-up cadence. Peer heights travel as
+	// signed hints; a node that falls behind learns within one wave and
+	// pulls, so this is the reconnect-to-consensus latency, not a
+	// correctness parameter.
+	defaultWaveEvery = 500 * time.Millisecond
+
+	// networkedMempoolCapacity is each networked validator's pool. The driver
+	// takes from it for proposals; the node's RPC fills it.
+	networkedMempoolCapacity = 1000
+)
+
+// ValidatorConfig configures one networked validator. There is no secret
+// anywhere in it: the committee (simnet.Committee) and seat keys
+// (simnet.ValidatorKey) are deterministic fixtures, which is what lets four
+// processes derive the same committee from one flag. Seats must be distinct -
+// two processes claiming one seat are refused each other's connections by the
+// transport's self-connection guard - and every member must name the same
+// committee size.
+type ValidatorConfig struct {
+	// Dir holds this validator's chain (its own directory; like simnet, one
+	// directory per member).
+	Dir string
+	// Index is this node's seat in the committee.
+	Index int
+	// Validators is the committee size.
+	Validators int
+	// Listen is the P2P listen address; empty means "dial only". A node
+	// behind NAT with a relay has no listener by design.
+	Listen string
+	// TickEvery is the driver's tick cadence (zero: defaultTickEvery).
+	TickEvery time.Duration
+	// WaveEvery is the HELLO/catch-up cadence (zero: defaultWaveEvery).
+	WaveEvery time.Duration
+}
+
+// Validator is one running networked validator.
+type Validator struct {
+	cfg   ValidatorConfig
+	g     *genesis.Genesis
+	ch    *chain.Chain
+	priv  ed25519.PrivateKey
+	pub   ed25519.PublicKey
+	pool  *mempool.Mempool
+	sy    *consensus.Syncer
+	rt    *consensus.MessageRouter
+	ttp   *tcp.TcpTransport
+	drvTP *driverTP
+	cfgC  consensus.Config
+	drv   *consensus.Driver
+
+	// mu serialises every driver operation (see the package-level rules above).
+	mu sync.Mutex
+
+	// peerH is the height each peer attested to in its HELLO, keyed by the
+	// transport-level name (forgeable; through a relay, the name is whatever
+	// frame first arrived). A signed hint only: it decides whether to pull
+	// and from whom - nothing else.
+	peerHMu sync.Mutex
+	peerH   map[transport.PeerID]uint64
+
+	// adopted counts blocks brought in by catch-up pulls: the observable a
+	// convergence test reads to prove the joiner ADOPTED rather than voted.
+	adopted atomic.Uint64
+
+	// closing gates the dispatch path: Close sets it (under mu, so a reader
+	// goroutine already inside a driver operation finishes first), and every
+	// route() afterwards refuses to touch the engine, the router or the
+	// chain. This is the ordering that keeps a shutdown from tearing the
+	// chain out from under a live dispatch - a socket transport's readers
+	// exit only when their sockets die, which is AFTER Close has begun, and
+	// the persisted-lock write a last dispatch would attempt against a
+	// closed chain store panics (the panic is the persistence rule's, not
+	// this bug's - the fix is to stop dispatching before closing).
+	closing atomic.Bool
+
+	// stop ends the loops; once closed, Close idempotence follows.
+	stop     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	closed   atomic.Bool
+}
+
+// driverTP is the Transport consensus.NewDriver registers over. Broadcast,
+// Send, Peers and Close forward to the router (and through it to the real
+// transport); OnMessage stores the driver's callback ATOMICALLY, because a
+// rebuild happens under the driver mutex while reader goroutines may be
+// mid-dispatch - the new callback and the frame in flight then pair up
+// whichever way the atoms land, and both pairings are sound (a frame may be
+// driven by the old engine for one message, exactly the stray vote a restart
+// also emits).
+type driverTP struct {
+	inner transport.Transport
+	msg   atomic.Pointer[func(transport.Message)]
+
+	// voteMu guards the outgoing-vote heights recorded by Broadcast: the
+	// observable a convergence test reads to tell "the returned member is
+	// voting at the committee's current height again" from "a passenger
+	// whose stale engine votes only at the height it parked at" - the
+	// rebuild-skip failure shape leaves the chain healthy through pulls and
+	// this node's vote-weight permanently out of the tally.
+	voteMu      sync.Mutex
+	voteHeights []uint64
+}
+
+func (l *driverTP) Broadcast(data []byte) error {
+	if v, err := consensus.DecodeVote(data); err == nil {
+		l.voteMu.Lock()
+		l.voteHeights = append(l.voteHeights, v.Height)
+		l.voteMu.Unlock()
+	}
+	return l.inner.Broadcast(data)
+}
+func (l *driverTP) Send(p transport.PeerID, d []byte) error { return l.inner.Send(p, d) }
+
+// VotedHeights copies the recorded outgoing-vote heights.
+func (l *driverTP) VotedHeights() []uint64 {
+	l.voteMu.Lock()
+	defer l.voteMu.Unlock()
+	return append([]uint64(nil), l.voteHeights...)
+}
+func (l *driverTP) Peers() []transport.PeerID            { return l.inner.Peers() }
+func (l *driverTP) Close() error                         { return l.inner.Close() }
+func (l *driverTP) OnMessage(fn func(transport.Message)) { l.msg.Store(&fn) }
+
+// StartValidator brings up one validator: opens its chain on the committee
+// genesis, builds the consensus stack over a real TCP transport, and starts
+// the tick and wave goroutines. It does NOT dial: call Connect once the
+// committee's addresses are known (the CLI does it right after; the mesh
+// tests collect every listener's port first).
+func StartValidator(cfg ValidatorConfig) (*Validator, error) {
+	if cfg.Validators < 1 || cfg.Validators > 255 {
+		return nil, fmt.Errorf("devnet: committee size must be 1..255, got %d", cfg.Validators)
+	}
+	if cfg.Index < 0 || cfg.Index >= cfg.Validators {
+		return nil, fmt.Errorf("devnet: committee index %d out of range 0..%d", cfg.Index, cfg.Validators-1)
+	}
+	if cfg.TickEvery <= 0 {
+		cfg.TickEvery = defaultTickEvery
+	}
+	if cfg.WaveEvery <= 0 {
+		cfg.WaveEvery = defaultWaveEvery
+	}
+
+	g := simnet.Committee(cfg.Validators)
+	priv := simnet.ValidatorKey(cfg.Index)
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	if string(g.Validators[cfg.Index].PubKey) != string(pub) {
+		return nil, fmt.Errorf("devnet: committee seat %d holds a key that is not this validator's", cfg.Index)
+	}
+
+	// The simnet committee's power cap: the spec's 1/4 for four or more
+	// members, 1/1 below (small fixtures cannot satisfy 1/4).
+	capNum, capDen := uint64(1), uint64(4)
+	if cfg.Validators < 4 {
+		capNum, capDen = 1, 1
+	}
+	ccfg := consensus.Config{
+		Committee:   g.Validators,
+		TimeoutBase: consensusTimeoutBaseMS,
+		TimeoutStep: consensusTimeoutStepMS,
+		PowerCapNum: capNum, PowerCapDen: capDen,
+	}
+	if err := ccfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	ch, err := chain.Open(g, cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	tp, err := tcp.New(tcp.Options{LocalID: transport.PeerID(fmt.Sprintf("v%d", cfg.Index))})
+	if err != nil {
+		_ = ch.Close()
+		return nil, err
+	}
+	if cfg.Listen != "" {
+		if err := tp.Listen(cfg.Listen); err != nil {
+			_ = tp.Close()
+			_ = ch.Close()
+			return nil, fmt.Errorf("devnet: P2P listen on %s: %w", cfg.Listen, err)
+		}
+	}
+
+	pool := mempool.New(networkedMempoolCapacity)
+	sy := consensus.NewSyncer(ch, tp, priv)
+	rt := consensus.NewMessageRouter(sy)
+	rt.SendReply = tp.Send
+	// The driver sees the DRIVER transport (sends go straight to tcp; the
+	// OnMessage registration is swallowed into the atomic slot route()
+	// invokes), never the raw transport, or NewDriver's registration would
+	// overwrite the router's.
+	dtp := &driverTP{inner: tp}
+	drv := consensus.NewDriver(ccfg, ch, priv, dtp, pool)
+	// CommitWitness: every commit this node makes is archived with its
+	// precommit votes, so the chain it holds is pullable by a catching-up
+	// peer (Design Decision 8). Without it, Answer refuses every range.
+	drv.CommitWitness = sy.RecordCommit
+
+	v := &Validator{
+		cfg:   cfg,
+		g:     g,
+		ch:    ch,
+		priv:  priv,
+		pub:   pub,
+		pool:  pool,
+		sy:    sy,
+		rt:    rt,
+		ttp:   tp,
+		drvTP: dtp,
+		cfgC:  ccfg,
+		drv:   drv,
+		peerH: make(map[transport.PeerID]uint64),
+		stop:  make(chan struct{}),
+	}
+	tp.OnMessage(v.route)
+	// The router's height observer: the wave loop pulls from what this sees.
+	rt.OnHello = v.observeHello
+	v.wg.Add(2)
+	go v.tickLoop()
+	go v.waveLoop()
+	return v, nil
+}
+
+// Connect adds addresses to this validator's permanent dial list. The maintainer
+// dials and redials with backoff, so a peer that is not up yet is waited for,
+// not failed.
+func (v *Validator) Connect(addrs ...string) error {
+	for _, a := range addrs {
+		if a == "" {
+			continue
+		}
+		if err := v.ttp.AddPeer(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Addr reports the P2P listener's address ("ip:port"), or "" when the
+// validator does not listen.
+func (v *Validator) Addr() string {
+	if a := v.ttp.Addr(); a != nil {
+		return a.String()
+	}
+	return ""
+}
+
+// Height reports this validator's chain height (committed blocks only).
+func (v *Validator) Height() uint64 { return v.ch.Height() }
+
+// Chain exposes the validator's chain for tests and the CLI's RPC server.
+func (v *Validator) Chain() *chain.Chain { return v.ch }
+
+// Pool exposes the validator's mempool for the CLI's RPC server.
+func (v *Validator) Pool() *mempool.Mempool { return v.pool }
+
+// BlocksAdopted counts blocks the catch-up pull brought in. A convergence
+// test reads it to distinguish "adopted the committee's blocks" from "voted
+// its way up", which an empty chain can never do.
+func (v *Validator) BlocksAdopted() uint64 { return v.adopted.Load() }
+
+// PeerCount reports the transport's current connection count (diagnostics;
+// the star-through-relay shape connects by ONE name that is not a validator).
+func (v *Validator) PeerCount() int { return len(v.ttp.Peers()) }
+
+// VotedHeights reports the heights of the consensus votes this validator has
+// put on the wire (its driver's own votes). A member that returned from
+// catch-up must vote at the committee's current height again; that is what
+// the returning-weight assertions read.
+func (v *Validator) VotedHeights() []uint64 { return v.drvTP.VotedHeights() }
+
+// route is the transport's OnMessage callback. It classifies by verified
+// decode and, for consensus frames, hands the message to the active driver
+// under mu - the serialisation that keeps the engine single-threaded across
+// the tick goroutine and every reader goroutine.
+func (v *Validator) route(m transport.Message) {
+	if v.closing.Load() {
+		return
+	}
+	if !v.rt.Route(m) {
+		return
+	}
+	if f := v.drvTP.msg.Load(); f != nil {
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		if v.closing.Load() {
+			return
+		}
+		(*f)(m)
+	}
+}
+
+// tickLoop is the driver's clock: TickEvery of REAL time per tick, the
+// monotonic counter the driver's virtual milliseconds read.
+func (v *Validator) tickLoop() {
+	defer v.wg.Done()
+	ticker := time.NewTicker(v.cfg.TickEvery)
+	defer ticker.Stop()
+	var now int64
+	for {
+		select {
+		case <-v.stop:
+			return
+		case <-ticker.C:
+			now += int64(v.cfg.TickEvery / time.Millisecond)
+			v.mu.Lock()
+			v.drv.Tick(now)
+			v.mu.Unlock()
+		}
+	}
+}
+
+// waveLoop is the catch-up heartbeat: announce this node's height, then pull
+// from the tallest peer known to be ahead of us.
+func (v *Validator) waveLoop() {
+	defer v.wg.Done()
+	ticker := time.NewTicker(v.cfg.WaveEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-v.stop:
+			return
+		case <-ticker.C:
+			v.broadcastHello()
+			v.maybeCatchUp()
+		}
+	}
+}
+
+// broadcastHello puts this node's signed height on the wire. The signature is
+// domain-separated and carried so a receiver can refuse unvouched height
+// announcements; full peer authentication is a later milestone's work.
+func (v *Validator) broadcastHello() {
+	h := &wire.Hello{
+		ChainID:   v.g.ChainID,
+		Validator: v.pub,
+		Height:    v.ch.Height(),
+	}
+	hh := helloHash(h)
+	h.Sig = crypto.Sign(v.priv, hh[:])
+	_ = v.ttp.Broadcast(wire.EncodeHello(h))
+}
+
+// helloHash is the HELLO signature's domain-separated hash, defined here (the
+// node layer owns the announcement policy; the wire layer only frames it).
+func helloHash(h *wire.Hello) [32]byte {
+	e := types.NewEncoder()
+	e.VarBytes([]byte(h.ChainID))
+	e.VarBytes(h.Validator)
+	e.U64(h.Height)
+	return crypto.HashParts([]byte("b10coin-hello"), e.Bytes())
+}
+
+// observeHello records a peer's attested height, refusing announcements from
+// another committee, non-member signatures, and unvouched heights. The only
+// decision a hello may influence is WHICH peer to pull from, and adoption
+// still runs the certificate gate - but a stranger inflating heights would
+// otherwise turn every wave into a ReplyWait of silence against a peer that
+// answers nothing.
+func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
+	if h.ChainID != v.g.ChainID {
+		return
+	}
+	member := false
+	for i := range v.g.Validators {
+		if bytes.Equal(v.g.Validators[i].PubKey, h.Validator) {
+			member = true
+			break
+		}
+	}
+	if !member {
+		return
+	}
+	hh := helloHash(h)
+	if !crypto.Verify(h.Validator, hh[:], h.Sig) {
+		return
+	}
+	v.recordHeight(from, h.Height)
+}
+
+// recordHeight keeps the tallest attestation per transport-level name.
+func (v *Validator) recordHeight(from transport.PeerID, height uint64) {
+	v.peerHMu.Lock()
+	defer v.peerHMu.Unlock()
+	if height > v.peerH[from] {
+		v.peerH[from] = height
+	}
+}
+
+// tallestPeer returns the named peer and its attested height.
+func (v *Validator) tallestPeer() (transport.PeerID, uint64) {
+	v.peerHMu.Lock()
+	defer v.peerHMu.Unlock()
+	var best transport.PeerID
+	var bestH uint64
+	for id, h := range v.peerH {
+		if h > bestH {
+			best, bestH = id, h
+		}
+	}
+	return best, bestH
+}
+
+// maybeCatchUp pulls from the tallest attested peer when it stands above our
+// head, and - the load-bearing half - rebuilds the driver over the adopted
+// head, because the engine still judges the pre-pull height and would park
+// there forever once the committee moved on (see this file's rules).
+func (v *Validator) maybeCatchUp() {
+	peer, peerH := v.tallestPeer()
+	mine := v.ch.Height()
+	if peer == "" || uint64(peerH) <= mine {
+		return
+	}
+	before := mine
+	v.sy.Peer = peer
+	if err := v.sy.PullAndAdopt(before + 1); err != nil {
+		// The pull stopped on a refused or unadoptable window. The chain
+		// took nothing this wave; waves are bounded, and the next one
+		// re-reads the head and re-pulls. Never adopt past a failure.
+		return
+	}
+	if after := v.ch.Height(); after > before {
+		v.rebuildDriver()
+		v.adopted.Add(after - before)
+	}
+}
+
+// rebuildDriver replaces the driver with one judging the chain's CURRENT head.
+// The old engine's volatile round state is discarded the way a restart's is;
+// its persisted locks (if any) are per-height and restored by the fresh
+// engine automatically when they still matter.
+func (v *Validator) rebuildDriver() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.drv = consensus.NewDriver(v.cfgC, v.ch, v.priv, v.drvTP, v.pool)
+	v.drv.CommitWitness = v.sy.RecordCommit
+}
+
+// Close stops the loops, closes the transport and the chain, and is
+// idempotent.
+func (v *Validator) Close() error {
+	// The ORDER is the safety story: the closing flag goes up first (under
+	// mu, so the one dispatch already in flight finishes before the flag is
+	// set); the wave loop is waited out - a catch-up pull in flight runs to
+	// its own deadline and its appends land BEFORE the chain closes - then
+	// the transport's sockets die (and the reader goroutines with them), and
+	// only then does the chain close, with no dispatch left that could
+	// still write.
+	v.mu.Lock()
+	v.closing.Store(true)
+	v.mu.Unlock()
+	v.stopOnce.Do(func() { close(v.stop) })
+	v.wg.Wait()
+	_ = v.ttp.Close()
+	if v.closed.Swap(true) {
+		return nil
+	}
+	return v.ch.Close()
+}

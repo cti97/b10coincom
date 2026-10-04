@@ -74,6 +74,17 @@ type Net struct {
 	drv  []*consensus.Driver
 	ch   []*chain.Chain
 	keys []keyPair
+	// syncs is each validator's BLOCK_SYNC syncer, built over the same tap
+	// its driver is built over: requests and answers travel the validator's
+	// own transport surface. Task 6's harness wiring: M4's catch-up made the
+	// convergence scenarios possible, and the answering half plus the commit
+	// witness (below) are what make a height PULLABLE by a peer.
+	syncs []*consensus.Syncer
+	// rts is each validator's frame router (consensus vs wire messages; the
+	// two message unions share the 1-3 tag range, so the tap routes by
+	// verified decode through it). Held on the Net so a reseat can re-bind
+	// the syncer a restarted chain needs.
+	rts []*consensus.MessageRouter
 	// taps is each validator's recording wrapper, sitting between its driver
 	// and the sim endpoint. Every scenario-injected driver (New, the restart
 	// scenario's rebuild, MakeEquivocator) must route through it (use
@@ -101,28 +112,39 @@ type Net struct {
 
 type keyPair struct{ priv ed25519.PrivateKey }
 
-// simKey derives validator i's key deterministically, so a failing run is
+// ValidatorKey derives validator i's key deterministically, so a failing run is
 // reproducible: the same seed always produces the same committee and the same
 // signatures. The index fits one byte, which caps n at 255 - enforced in New.
-func simKey(i int) ed25519.PrivateKey {
+//
+// Exported (Task 6) so the CLI's networked path and the in-process TCP
+// integration test open EXACTLY the committee the harness drives: one shared
+// fixture, one derivation, no second copy of the key schedule to drift.
+// These are fixture keys, like genesis's devnet keys: derived, not secret,
+// never used outside this committee.
+func ValidatorKey(i int) ed25519.PrivateKey {
 	h := crypto.HashParts([]byte("b10coin-simnet-validator"), []byte{byte(i)})
 	return ed25519.NewKeyFromSeed(h[:])
 }
 
-// simGenesis builds a genesis with n equal-power validators over deterministic
+// Committee builds a genesis with n equal-power validators over deterministic
 // keys, so a failing run is reproducible. The production devnet has one validator
 // because a single node needs no agreement; consensus needs a committee.
+// Exported for the networked path (Task 6): a node given --peers opens THIS
+// committee (chain ID "b10coin-simnet-<n>"), which is what lets four
+// `b10coin node` processes derive the same committee - and the same seats -
+// from one flag. Not secure: the seats are deterministic and so are the keys.
+// Authenticated joins are a later milestone's work.
 //
 // The simnet genesis reuses the devnet's parameters as a fixture but must carry
 // its OWN chain ID: chain.Open validates that Params.ChainID matches ChainID, and
 // leaving the devnet's ID here would describe one chain as two different ones.
-func simGenesis(n int) *genesis.Genesis {
+func Committee(n int) *genesis.Genesis {
 	g := genesis.Devnet()
 	g.ChainID = fmt.Sprintf("b10coin-simnet-%d", n)
 	g.Params.ChainID = g.ChainID
 	vals := make([]genesis.Validator, 0, n)
 	for i := 0; i < n; i++ {
-		priv := simKey(i)
+		priv := ValidatorKey(i)
 		vals = append(vals, genesis.Validator{PubKey: priv.Public().(ed25519.PublicKey), Power: 1})
 	}
 	g.Validators = vals
@@ -156,7 +178,7 @@ func New(n int, opts Options) (*Net, error) {
 		Seed: opts.Seed, Latency: ms(opts.LatencyMS), Jitter: ms(opts.JitterMS),
 		DropPercent: opts.DropPercent,
 	})
-	g := simGenesis(n)
+	g := Committee(n)
 	out.g = g
 	// The spec's power cap is 1/4, and it is enforced as written for committees
 	// of four or more. Below four validators a 1/4 cap is unsatisfiable - the
@@ -189,16 +211,44 @@ func New(n int, opts Options) (*Net, error) {
 			return nil, err
 		}
 		out.ch = append(out.ch, c)
-		priv := simKey(i)
+		priv := ValidatorKey(i)
 		out.keys = append(out.keys, keyPair{priv: priv})
 		// The driver sits over a tap, not over the raw endpoint: the tap is a
 		// transparent recorder (see tap), so the run's rng draws, delivery
 		// order and peer iteration are exactly the sim's own.
 		tp := &tap{inner: out.sim.TransportFor(id)}
 		out.taps = append(out.taps, tp)
-		out.drv = append(out.drv, consensus.NewDriver(out.cfg, c, priv, tp, mempool.New(mempoolCapacity)))
+		// The catch-up half: a syncer over the same surface, and the frame
+		// router that splits consensus traffic from BLOCK_SYNC frames (the
+		// two unions share the 1-3 tag range - Route decodes and VERIFIES).
+		// The driver's commit witness archives each commit's certificate, so
+		// the chain this harness drives is pullable by a catching-up peer
+		// (Design Decision 8): without it Answer would refuse every range.
+		sy := consensus.NewSyncer(c, tp, priv)
+		rt := consensus.NewMessageRouter(sy)
+		rt.SendReply = func(to transport.PeerID, frame []byte) error { return tp.Send(to, frame) }
+		tp.router = rt
+		out.syncs = append(out.syncs, sy)
+		out.rts = append(out.rts, rt)
+		out.drv = append(out.drv, out.newDriver(i, nil))
 	}
 	return out, nil
+}
+
+// newDriver builds validator i's driver over its own transport (or over a
+// scenario-provided wrapper when tpOverride is non-nil) and wires the commit
+// witness that archives certificates for catch-up. It is the harness's ONE
+// driver-build path - New, reseat, CatchUp and the equivocator all build
+// through it - so a rebuilt driver can never lose the witness or the sync
+// routing the first build wired.
+func (n *Net) newDriver(i int, tpOverride transport.Transport) *consensus.Driver {
+	tp := n.transportFor(i)
+	if tpOverride != nil {
+		tp = tpOverride
+	}
+	d := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity))
+	d.CommitWitness = n.syncs[i].RecordCommit
+	return d
 }
 
 // genesis returns the genesis every validator in this network was opened with. The
@@ -571,7 +621,7 @@ func (n *Net) installEquivocator(i int, typ consensus.MsgType) error {
 		forgeID: crypto.HashParts([]byte("b10coin-forged-block")),
 	}
 	n.equivs[i] = eq
-	n.drv[i] = consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, eq, mempool.New(mempoolCapacity))
+	n.drv[i] = n.newDriver(i, eq)
 	return nil
 }
 
@@ -585,6 +635,12 @@ func (n *Net) installEquivocator(i int, typ consensus.MsgType) error {
 // iteration are exactly the sim's own.
 type tap struct {
 	inner transport.Transport
+	// router splits consensus frames from wire (HELLO/BLOCK_SYNC) frames -
+	// the two message unions share the numeric tag range 1-3, so routing
+	// happens by what a frame VERIFIES as, through consensus.MessageRouter.
+	// Nil until New installs it; deliveries only start after New, so it is
+	// set before any frame can be routed.
+	router *consensus.MessageRouter
 	// sent holds a copy of every payload this validator broadcast, in send
 	// order. A partition can stop a broadcast from being delivered; it is on
 	// this validator's wire either way, which is the level this log reports.
@@ -593,7 +649,12 @@ type tap struct {
 	// order. TakeOffline replaces the endpoint's callback below this wrapper,
 	// so messages to a powered-off validator are dropped by the simulation and
 	// never appear here: recv measures what the validator's engine acted on.
+	// BLOCK_SYNC frames are NOT recorded here: the router consumes them for
+	// the syncer, nothing in the engine acts on them (the convergence
+	// scenarios assert engine behaviour, not sync plumbing).
 	recv [][]byte
+	// cons is the driver's OnMessage, set by NewDriver's registration.
+	cons func(transport.Message)
 }
 
 func (t *tap) Broadcast(data []byte) error {
@@ -603,19 +664,29 @@ func (t *tap) Broadcast(data []byte) error {
 
 // Send records the unicast and forwards it, mirroring Broadcast: a payload
 // the validator put on the wire belongs in the send log whichever primitive
-// carried it. Nothing in M3's scenarios unicasts yet, so recording Send
-// cannot shift an existing assertion; consistency is why it records.
+// carried it.
 func (t *tap) Send(peer transport.PeerID, data []byte) error {
 	t.sent = append(t.sent, append([]byte(nil), data...))
 	return t.inner.Send(peer, data)
 }
 
-// OnMessage wraps the receive callback so a payload is counted as received
-// only when it actually reaches the driver.
+// OnMessage wraps the receive callback. Every consensus frame is counted as
+// received (before the driver sees it) and passed to the driver; every
+// HELLO/BLOCK_SYNC frame is routed to the syncer instead - it never reaches
+// the driver, never enters the recv log, and a request is answered by the
+// router through this validator's own Send.
 func (t *tap) OnMessage(fn func(transport.Message)) {
+	t.cons = fn
 	t.inner.OnMessage(func(m transport.Message) {
+		if t.router != nil {
+			if !t.router.Route(m) {
+				return // consumed by the router (sync answered/filed, hello observed, garbage counted)
+			}
+		}
 		t.recv = append(t.recv, append([]byte(nil), m.Data...))
-		fn(m)
+		if t.cons != nil {
+			t.cons(m)
+		}
 	})
 }
 
@@ -692,6 +763,124 @@ func (n *Net) Close() {
 	for _, c := range n.ch {
 		_ = c.Close()
 	}
+}
+
+// catchUpStepBudget bounds the network advance a CatchUp drives while its
+// pull is in flight. A healthy window round-trips in a handful of steps
+// (the sim delivers on the next Advance); the budget is a ceiling for a
+// pull over many full windows, far past anything an honest committee needs.
+const catchUpStepBudget = 200_000
+
+// CatchUp drives validator i's BLOCK_SYNC pull from the tallest OTHER online
+// validator, advancing the network until the pull settles. It is the harness
+// half of the M3 carry-forward the scenarios now assert: a validator that
+// misses blocks adopts them - certificate-gated, through the ordinary
+// chain.Append - and its driver is rebuilt over the adopted head, so it
+// rejoins the committee instead of parking forever at an undecided height.
+//
+// Without the rebuild the rejoin is a trap: the OLD engine keeps round-looping
+// at its stale height (every one of its broadcasts matches nobody's current
+// height any more), so pulling the chain up without re-arming the engine
+// would converge the FILES and strand the validator. The rebuild is the
+// same re-entry a restart takes: the engine begins at head+1 with the head
+// as parent, and any lock it persisted for a still-undecided height is
+// restored from the store.
+//
+// The pull runs on its own goroutine because Syncer.PullAndAdopt BLOCKS on
+// its ReplyWait: deliveries must keep happening while it waits, which is why
+// the sim's Advance moved under an internal lock (semantics unchanged - see
+// sim's package comment). Everything here stays on the caller's goroutine
+// otherwise, and the pull is fully SETTLED (its goroutine has returned)
+// before CatchUp does. Offline validators are refused: a powered-off machine
+// cannot pull, and letting one pass would put sync traffic on the wire of a
+// validator whose scenarios assert frozen taps.
+func (n *Net) CatchUp(i int) error {
+	if i < 0 || i >= len(n.drv) {
+		return fmt.Errorf("simnet: CatchUp: validator index %d out of range 0..%d", i, len(n.drv)-1)
+	}
+	if n.offline[i] {
+		return fmt.Errorf("simnet: CatchUp: validator %d is offline; a powered-off machine cannot pull", i)
+	}
+	ref, refH := -1, uint64(0)
+	for j, c := range n.ch {
+		if j == i || n.offline[j] {
+			continue
+		}
+		if c.Height() > refH {
+			ref, refH = j, c.Height()
+		}
+	}
+	if ref < 0 {
+		return fmt.Errorf("simnet: CatchUp: no other online validator serves validator %d", i)
+	}
+	if refH <= n.ch[i].Height() {
+		return nil // nothing taller: already caught up
+	}
+	start := n.ch[i].Height()
+	n.syncs[i].Peer = transport.PeerID(fmt.Sprintf("v%d", ref))
+	done := make(chan error, 1)
+	go func() { done <- n.syncs[i].PullAndAdopt(start + 1) }()
+	for step := 0; ; step++ {
+		select {
+		case err := <-done:
+			// The pull's goroutine has RETURNED: no syncer or chain access
+			// on it survives this point, so everything below is the
+			// scenario's alone.
+			if err != nil {
+				return err
+			}
+			if n.ch[i].Height() > start {
+				n.rebuildDriver(i)
+			}
+			return nil
+		default:
+		}
+		if step >= catchUpStepBudget {
+			// The pull is (or should be) settled by its own ReplyWait
+			// deadline; wait for it to end rather than orphan a goroutine
+			// that still owns the syncer, then report the stall.
+			select {
+			case err := <-done:
+				if err != nil {
+					return err
+				}
+				if n.ch[i].Height() > start {
+					n.rebuildDriver(i)
+				}
+				return nil
+			case <-time.After(replacePullWait):
+				return fmt.Errorf("simnet: CatchUp: validator %d's pull did not settle within %d advanced steps (height %d, peers' head %d)",
+					i, catchUpStepBudget, n.ch[i].Height(), refH)
+			}
+		}
+		n.sim.Advance(ms(1))
+	}
+}
+
+// replacePullWait is the wall-clock grace a wedged pull gets to return after
+// the advance budget ran out before CatchUp reports it wedged.
+const replacePullWait = 10 * time.Second
+
+// reseat rebinds validator i to a reopened chain: the restart scenario closes
+// the old chain and reopens the same directory from disk. The syncer's chain
+// pointer and certificate archive both belonged to the OLD chain, and the
+// driver's engine judges a head that no longer exists - so the syncer and
+// the driver are rebuilt over the reopened one, exactly the wiring New did
+// for the first build.
+func (n *Net) reseat(i int, c *chain.Chain) {
+	n.ch[i] = c
+	n.syncs[i] = consensus.NewSyncer(c, n.transportFor(i), n.keys[i].priv)
+	n.rts[i].Sync = n.syncs[i]
+	n.rebuildDriver(i)
+}
+
+// rebuildDriver replaces validator i's driver with one judging the CURRENT
+// head - the rejoin a successful CatchUp takes, and the same shape the
+// restart scenario has always taken. The commit witness is re-wired so the
+// rebuilt driver keeps archiving certificates for the heights it commits.
+func (n *Net) rebuildDriver(i int) {
+	n.drv[i] = consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity))
+	n.drv[i].CommitWitness = n.syncs[i].RecordCommit
 }
 
 func ms(n int64) time.Duration { return time.Duration(n) * time.Millisecond }

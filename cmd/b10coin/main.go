@@ -62,8 +62,18 @@ func usage() {
 Usage:
   b10coin devnet --blocks N [--validators N] [--dir PATH] [--claims N]   Build and verify a local chain (or, with --validators given, a consensus devnet)
   b10coin node   --dir PATH [--http ADDR] [--block-time DURATION]
+                 [--peers ADDR,...] [--relay ADDR] [--listen ADDR] [--validators N] --index I
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
   b10coin version
+
+A node with --peers/--relay/--listen runs the M4 consensus committee over real
+TCP: --peers dials the other validators (or the relay), --relay dials the dumb
+forwarder every home validator reaches outbound, --listen accepts direct
+connections. The committee and this node's seat must be named explicitly with
+--validators N and --index I: every validator derives the same committee from
+the committee-size flag (chain b10coin-simnet-N) and claims the seat --index.
+Without any of those flags the node is the M1 producer: one chain, no round
+protocol.
 
 The claim command signs with an ephemeral key that is printed and never
 stored: there is no key file and no keystore.
@@ -331,8 +341,28 @@ func cmdNode(args []string) error {
 	dir := fs.String("dir", "./b10coin-data", "data directory")
 	addr := fs.String("http", "127.0.0.1:8645", "HTTP RPC listen address")
 	blockTime := fs.Duration("block-time", 2*time.Second, "target block interval")
+	// M4 networking. Giving ANY of these switches the node into the consensus
+	// committee over real TCP; none given means the M1 producer exactly as
+	// today, so every earlier acceptance run is untouched. --block-time is
+	// refused with networking: a committee's cadence is the round-timeout
+	// ladder, and a flag that was silently ignored would lie about the run.
+	peers := fs.String("peers", "", "comma-separated peer addresses to dial")
+	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
+	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
+	validators := fs.Int("validators", 0, "committee size (required for networking)")
+	index := fs.Int("index", 0, "this node's seat in the committee (required for networking)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	networked := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "peers", "relay", "listen", "validators", "index":
+			networked = true
+		}
+	})
+	if networked {
+		return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *validators, *index)
 	}
 
 	// M1 nodes run the devnet genesis. The testnet genesis has no validator
@@ -392,6 +422,110 @@ func cmdNode(args []string) error {
 	// the consequence of a failed listen, which must fail the process. The
 	// buffered serve error is guaranteed present in the latter case and
 	// absent in the former, so the read is non-blocking in both.
+	select {
+	case err := <-serveErr:
+		return err
+	default:
+		return nil
+	}
+}
+
+// runNetworkedNode is the M4 consensus path of the `node` command: one
+// validator of the deterministic committee (chain b10coin-simnet-N), running
+// the same consensus stack the in-process TCP integration test drives, over
+// the transport the flags describe - direct peers, the relay, or both. The
+// single-node body above is deliberately UNTOUCHED and reachable only with
+// none of the networking flags: the M3 acceptance runs must be byte-identical.
+//
+// --validators and --index are required explicitly. A silent default would
+// pick a committee (and a seat) the operator never chose; two nodes with
+// mismatched sizes derive different committees and can never commit, which
+// is the honest failure mode rather than a flag that lied. --block-time is
+// refused with networking: a committee's cadence is its round-timeout
+// ladder, and the flag only drives the single-node producer.
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay string, committee, seat int) error {
+	vSet, iSet, blockTimeSet := false, false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "validators":
+			vSet = true
+		case "index":
+			iSet = true
+		case "block-time":
+			blockTimeSet = true
+		}
+	})
+	if !vSet || !iSet {
+		return fmt.Errorf("networked nodes name their committee explicitly; give --validators N and --index I (this node's 0-based seat)")
+	}
+	if blockTimeSet {
+		return fmt.Errorf("--block-time drives the single-node block producer and does not apply to a consensus committee; drop it")
+	}
+
+	dial := make([]string, 0, 8)
+	if s := strings.TrimSpace(peers); s != "" {
+		for _, p := range strings.Split(s, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				dial = append(dial, p)
+			}
+		}
+	}
+	if r := strings.TrimSpace(relay); r != "" {
+		dial = append(dial, r)
+	}
+	if len(dial) == 0 && listen == "" && committee > 1 {
+		return fmt.Errorf("a committee of %d needs reachable peers: give --peers, --relay, or --listen for the others to dial", committee)
+	}
+
+	v, err := devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = v.Close() }()
+	if err := v.Connect(dial...); err != nil {
+		return err
+	}
+
+	srv := rpc.NewServer(v.Chain(), v.Pool())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// The same HTTP shape the single node runs (same timeouts, same failure
+	// plumbing) so a networked node's RPC behaves identically.
+	httpSrv := &http.Server{
+		Addr:              httpAddr,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		_ = httpSrv.Close()
+	}()
+
+	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
+		version.Version, httpAddr, v.Chain().Genesis().ChainID, v.Height())
+	dialDesc := "listening for inbound connections"
+	if len(dial) > 0 {
+		dialDesc = "dialled " + strings.Join(dial, " ")
+	}
+	fmt.Printf("consensus    committee of %d, seat %d, %s\n", committee, seat, dialDesc)
+
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintln(os.Stderr, "http:", err)
+			serveErr <- err
+			stop()
+		}
+	}()
+
+	<-ctx.Done()
+	// Same semantics as the single node: a clean SIGINT is success; a failed
+	// listen must fail the process.
 	select {
 	case err := <-serveErr:
 		return err

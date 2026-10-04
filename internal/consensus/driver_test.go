@@ -1310,7 +1310,11 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 
 	// The round runs out without any vote for the proposal: the engine enters
 	// the next round and drops it, and the batch now exists ONLY in pending.
-	d.Tick(roundBase + 1)
+	// The Tick lands past the deadline the driver armed at its first real
+	// tick (now=5 -> 5+roundBase): arming is relative to the clock the caller
+	// drives (Task 6), so the fixture walks to the deadline instead of
+	// assuming an absolute TimeoutBase.
+	d.Tick(5 + roundBase + 1)
 	if d.eng.proposal != nil {
 		t.Fatal("the round did not end: the proposal was never abandoned")
 	}
@@ -1358,8 +1362,8 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 
 	// The next height's first build must reclaim the batch into the pool and
 	// propose it again. The walk to v0's round at height 2 does no Ticks, so
-	// the proposal happens at now=15, below timeoutAt=21 that the commit
-	// re-armed: the Tick proposes and nothing else.
+	// the proposal happens at now=15, below the 26 (=16+roundBase) that the
+	// Tick(16) commit re-armed: the Tick proposes and nothing else.
 	parent2 := p2.ID()
 	for r := 0; r < 64 && string(cfg.Proposer(2, d.eng.Round(), parent2)) != string(pub0); r++ {
 		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
@@ -1481,4 +1485,82 @@ func TestThreeValidatorsAgreeOnABlockThatCarriesATransferAndAClaim(t *testing.T)
 			t.Fatalf("live validator %d computed a claimant balance of %d, want %d: the committee agreed on bytes but not on state", i, got, want)
 		}
 	}
+}
+
+// A driver REBUILT over a clock that is already running - the shape every
+// catch-up rejoin takes (simnet's CatchUp rebuild, the networked node's
+// rebuildDriver) - must arm its first round at a full TimeoutBase measured
+// FROM THAT FIRST TICK'S READING. Anchoring the deadline at construction
+// assumes the caller's clock starts at zero; against a now of hundreds of
+// thousands the first Tick would fire an instant timeout, whose nil prevote
+// burns the very round the committee's next proposal travels in - the
+// validator then parks at that height forever while the committee races on,
+// which is exactly the failure Task 6's converged scenarios exposed in M3's
+// partition shape (a post-Heal catch-up rebuild never committed again).
+//
+// Killing mutant (compiled): NewDriver sets timeoutAt = TimeoutBase instead
+// of the arm-on-first-tick sentinel. This fixture's seat 0 is not the
+// proposer of (1, round 0), so nothing at that first Tick is legitimate
+// output: the mutant emits the nil prevote and the fixture fails by name.
+func TestARebuiltDriverDoesNotBurnRoundZeroOnARunningClock(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	cfg.TimeoutBase, cfg.TimeoutStep = 200, 100
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	ch, err := chain.Open(fourValCommitteeGenesis(t, cfg.Committee), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ch.Close() })
+	parent := ch.Head().ID()
+
+	// Seat 0 judges (1, 0) and the fixture demands ANOTHER member proposes in
+	// round 0, so a legitimate first Tick emits nothing at all.
+	if string(cfg.Proposer(1, 0, parent)) == string(cfg.Committee[0].PubKey) {
+		t.Skip("fixture: seat 0 drew the height-1 round-0 proposition; the fixture needs a follower seat")
+	}
+	rec := &recordingTransport{Transport: silentTransport{}}
+	d := NewDriver(cfg, ch, testCommitteeKey(0), rec, nil)
+
+	// The rebuilder's clock is ALREADY running (the net's step counter is at
+	// six figures by the time a catch-up rebuild happens).
+	d.Tick(1_000_000)
+	if d.eng.Round() != 0 {
+		t.Fatalf("the rebuilt driver left round 0 on its FIRST tick (round %d): the timeout fired from an absolute deadline, not the first reading", d.eng.Round())
+	}
+	if len(rec.broadcasts) != 0 {
+		for _, raw := range rec.broadcasts {
+			c := decodeWire(t, raw)
+			if c.vote != nil {
+				t.Fatalf("the rebuilt driver emitted a vote on its first tick (a nil prevote burns round 0): v.Type=%d h=%d r=%d nil=%v, sig-holding=%v",
+					c.vote.Type, c.vote.Height, c.vote.Round, c.vote.IsNil(), len(c.vote.Sig) > 0)
+			}
+			if c.prop != nil {
+				t.Fatalf("the rebuilt driver emitted a proposal on its first tick for a round it does not propose")
+			}
+		}
+	}
+}
+
+// silentTransport is the throwaway inner transport for fixtures that only
+// observe recorded broadcasts (no delivery at all).
+type silentTransport struct{}
+
+func (silentTransport) Broadcast([]byte) error              { return nil }
+func (silentTransport) Send(transport.PeerID, []byte) error { return nil }
+func (silentTransport) OnMessage(func(transport.Message))   {}
+func (silentTransport) Peers() []transport.PeerID           { return nil }
+func (silentTransport) Close() error                        { return nil }
+
+// fourValCommitteeGenesis opens a chain on exactly the committee the config
+// names, equal power, so a driver fixture can start from a real chain.
+func fourValCommitteeGenesis(t *testing.T, vals []genesis.Validator) *genesis.Genesis {
+	t.Helper()
+	g := genesis.Devnet()
+	g.ChainID = "b10coin-driver-fixture-4"
+	g.Params.ChainID = g.ChainID
+	g.Validators = vals
+	g.Params.CommitteeSize = len(vals)
+	return g
 }

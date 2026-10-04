@@ -100,8 +100,8 @@ type Driver struct {
 // same pool an RPC server would fill.
 //
 // The engine begins at head+1 with the head as its parent, and its round 0 is
-// armed with exactly TimeoutBase: the first round a validator is in gets the
-// full configured window before any timeout can end it.
+// armed at the FIRST Tick with a full TimeoutBase before any timeout can end
+// it (see timeoutArmed below).
 //
 // The engine is not necessarily unlocked, even at round 0: if this validator
 // precommitted at head+1 and crashed before the height was decided, the lock
@@ -110,7 +110,21 @@ type Driver struct {
 func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) *Driver {
 	d := &Driver{cfg: cfg, ch: ch, pool: pool, priv: priv, tp: tp}
 	d.eng = d.newEngine(ch.Height()+1, ch.Head().ID())
-	d.timeoutAt = d.cfg.TimeoutBase
+	// timeoutAt is ARMED ON THE FIRST TICK, not at construction (the sentinel
+	// below). Anchoring it at construction means assuming the caller's clock
+	// starts at zero - true for a fresh simnet run, FALSE for every rebuild
+	// over a clock already running: Task 6's catch-up rebuild and the
+	// networked node's rebuildDriver re-create drivers mid-run, and an
+	// absolute TimeoutBase against a now of tens of thousands would fire an
+	// instant timeout on the rebuilt engine's first tick - emit a NIL prevote
+	// for round 0 - and the round the committee's actual proposal travels in
+	// is then already burned for this validator (its one prevote per round is
+	// spent): it parks at that height forever while the committee races on.
+	// Arming at the first real reading gives the fresh engine exactly the
+	// TimeoutBase window the fresh-run path always had; a fresh run's clock
+	// merely shifts its ladder by the first step's offset, and every
+	// scenario's assertions are property assertions, not schedule assertions.
+	d.timeoutAt = -1
 	tp.OnMessage(d.OnMessage)
 	return d
 }
@@ -289,7 +303,13 @@ func (d *Driver) Tick(nowMillis int64) {
 	// and no round would ever be left behind: the exact defect Task 6's
 	// review removed from the engine's caller. The test
 	// TestDriverEndsTheRoundItIsInOnTimeout pins it here.
-	if d.now >= d.timeoutAt {
+	if d.timeoutAt < 0 {
+		// First Tick (or first Tick of a rebuilt driver): arm the round-0
+		// deadline a full TimeoutBase from THIS reading, so a driver built
+		// over a clock that is already running gets the same window a fresh
+		// one does (see NewDriver).
+		d.timeoutAt = nowMillis + d.cfg.TimeoutBase
+	} else if d.now >= d.timeoutAt {
 		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
 		// The round the engine is in NOW, after OnTimeout advanced it, gets
 		// the base timeout plus its own step. Each round therefore runs
