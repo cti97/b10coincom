@@ -527,6 +527,25 @@ build → copy → shared genesis → first contact → systemd units → what o
 means success, then the three likeliest failures and how to tell them apart —
 lives in [`scripts/deploy/README.md`](scripts/deploy/README.md).
 
+After the Pis are running, the acceptance run itself becomes one command:
+
+```sh
+scripts/deploy/acceptance.sh --pis pi-a.local,pi-b.example.net,pi-c.example.net --relay relay.example.net
+```
+
+It reads each validator's loopback RPC over SSH, takes two `/status` readings
+15 s apart, and prints one pastable verdict with exit code. It fails — for a
+different, named reason and a different exit code — when a validator is
+**UNREACHABLE** (exit 1), when all are reachable but no height moved
+(**STALLED**, exit 2: relay down or no quorum), when they are advancing on
+**different chains or different blocks** (**DISAGREE**, exit 3: the chain-ID
+or shared-`--index` failures, never reported as a pass), or when the relay's
+TCP port alone is unreachable (**RELAY**, exit 4 — named as its own failure,
+with the caveat that the probe runs from the machine invoking the script).
+The rule it enforces: agreeing-by-hash while stalled proves nothing, so a
+PASS requires every height to have *increased* **and** all validators to name
+the identical block at one height. See `scripts/deploy/README.md` §7.
+
 ## Checks
 
 `go test -count=1 ./...` and `go test -race ./...` are green across the test

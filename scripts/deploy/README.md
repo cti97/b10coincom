@@ -300,6 +300,16 @@ chains (§8, failure 1 judges from reachability alone; do not).
    testnet works** — that is M4's acceptance criterion met on real hardware
    across separate networks.
 
+   **This whole loop is one command:** `scripts/deploy/acceptance.sh` runs
+   the same checks for you — two readings, an *increased-height* requirement
+   (a stalled network that still agrees must not look healthy), agreement at
+   one common height, and a relay probe. Verdict labels map to the three
+   failures in §8; `--help` lists them with their exit codes:
+
+   ```sh
+   scripts/deploy/acceptance.sh --pis 192.0.2.11,192.0.2.12,192.0.2.13 --relay example.com
+   ```
+
 ## 8. When it does not work: the three failures
 
 All three look alike from the outside — a quiet node at height 0 — so judge
