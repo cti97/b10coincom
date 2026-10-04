@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -630,14 +631,15 @@ func TestDeliveryIsSerialized(t *testing.T) {
 // TestCloseIsIdempotentAndStopsGoroutines runs under -count=20 to show it is
 // not a flaky race: Close twice returns cleanly, nothing escapes a closed
 // transport, and every goroutine the transport started (accept loop,
-// maintainers, one reader and one writer per connection) is gone afterwards.
-// The count is taken against a baseline measured before the transports
-// existed, with a small margin for unrelated runtime goroutines (GC workers);
-// a leaked maintainer or reader/writer pair exceeds it, because this test
-// closes EVERY transport it made before counting.
+// maintainers, tracked inbound handshakes, one reader and one writer per
+// connection) is gone afterwards. The leak check is a STACK SCAN, not a count
+// against a NumGoroutine baseline: the old baseline+2 allowance could not see
+// the exact leaks this test exists to catch (a leaked reader/writer pair lands
+// ON a +2 margin, a leaked maintainer on +1/+2), while unrelated runtime
+// goroutines (GC workers) made a tighter count noisy. A frame named
+// internal/transport/tcp. can belong to nothing but a still-running transport
+// goroutine, so ONE leaked goroutine is detected, whatever runs elsewhere.
 func TestCloseIsIdempotentAndStopsGoroutines(t *testing.T) {
-	baseline := runtime.NumGoroutine()
-
 	a := listen(t, Options{LocalID: "a", BackoffBase: 5 * time.Millisecond, BackoffMax: 20 * time.Millisecond})
 	b := listen(t, Options{LocalID: "b"})
 	// ONE direction of dialing: a.AddPeer alone connects the pair, because a
@@ -667,7 +669,7 @@ func TestCloseIsIdempotentAndStopsGoroutines(t *testing.T) {
 	if len(got.snapshot()) != 0 {
 		t.Fatal("a broadcast escaped a closed transport")
 	}
-	// Every transport this test made is closed before counting: a's
+	// Every transport this test made is closed before checking: a's
 	// maintainer exited through quit (Close is the only thing that ends a
 	// reconnection loop), and the per-connection readers/writers exited
 	// through their closed sockets.
@@ -676,16 +678,78 @@ func TestCloseIsIdempotentAndStopsGoroutines(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if runtime.NumGoroutine() <= baseline+2 {
+	for {
+		leaked := runningTransportGoroutines()
+		if leaked == 0 {
 			return
+		}
+		if time.Now().After(deadline) {
+			buf := make([]byte, 1<<16)
+			n := runtime.Stack(buf, true)
+			t.Fatalf("%d transport goroutine(s) still running after both transports closed:\n%s", leaked, buf[:n])
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	buf := make([]byte, 1<<16)
+}
+
+// runningTransportGoroutines counts goroutines with a frame inside this
+// package - i.e. transport work that is still running. Blocks belonging to the
+// CALLING test goroutine report themselves as tcp.Test* frames and are not
+// leaks; everything else matching is.
+func runningTransportGoroutines() int {
+	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
-	t.Fatalf("goroutines did not return to the baseline (%d -> %d after every transport closed)\n%s",
-		baseline, runtime.NumGoroutine(), buf[:n])
+	count := 0
+	for _, block := range strings.Split(string(buf[:n]), "\n\n") {
+		if strings.Contains(block, "internal/transport/tcp.") && !strings.Contains(block, "tcp.Test") {
+			count++
+		}
+	}
+	return count
+}
+
+// TestCloseWaitsForInFlightHandshakes pins what Close's doc claims about a
+// connection that connected but never finished its handshake: the adopt
+// goroutine and its socket are TRACKED, so Close waits for them instead of
+// leaving them alive for up to a HandshakeTimeout after close returned. The
+// wait is bounded by that same deadline - Close returns within it, and no
+// transport goroutine survives the return.
+func TestCloseWaitsForInFlightHandshakes(t *testing.T) {
+	tp := listen(t, Options{LocalID: "t", HandshakeTimeout: 300 * time.Millisecond})
+
+	raw, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatalf("raw dial: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	// It says NOTHING: once accepted, the inbound adopt goroutine sits in its
+	// deadline-bounded handshake read - exactly the goroutine that used to
+	// outlive Close untracked. Wait for it to actually BE there (stack scan),
+	// so the Close below waits on the tracked goroutine rather than racing
+	// the accept loop for a conn still sitting in the backlog.
+	waitFor(t, "the inbound adopt goroutine being in its handshake read", 5*time.Second, func() bool {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		return strings.Contains(string(buf[:n]), "tcp.(*TcpTransport).adopt(")
+	})
+
+	start := time.Now()
+	if err := tp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	elapsed := time.Since(start)
+	// Close cannot return before the tracked in-flight handshake ends (its
+	// read unblocks at the 300ms deadline), and must not return much later.
+	// Untracked, Close returns in microseconds - far below the 100ms floor.
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("Close returned after %v, while the inbound handshake was still in flight: the adopt goroutine (and its socket) outlives Close", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Close took %v against a 300ms handshake bound", elapsed)
+	}
+	if leaked := runningTransportGoroutines(); leaked != 0 {
+		t.Fatalf("%d transport goroutine(s) still running after Close waited", leaked)
+	}
 }
 
 // TestBackoffGrowsExponentiallyWithSeededJitter pins backoff.go with no
@@ -732,5 +796,313 @@ func TestBackoffGrowsExponentiallyWithSeededJitter(t *testing.T) {
 	// A nil rng has nothing to draw from: documented as the no-jitter case.
 	if d := NewBackoff(base, max, nil).Next(3); d != 0 {
 		t.Fatalf("nil rng delay = %v, want 0 (no jitter without a source)", d)
+	}
+}
+
+// TestSymmetricBootBothAddPeerLeavesOneConnection is the duplicate-policy
+// proof on its realistic trigger: two nodes whose static peer lists name each
+// other both AddPeer at boot, so both dial each other - a cross-dial. The old
+// duplicate path closed the incumbent AND the newcomer, leaving ZERO
+// connections and no maintainer anywhere: a silent permanent partition the
+// reviewer reproduced in 2 of 3 runs. The policy (newcomerWins) must converge
+// both ends on the SAME surviving socket, so exactly one healthy connection
+// exists per side and the link carries traffic both ways. Every run here is
+// independent; the check is meaningless green-once, so it repeats itself.
+func TestSymmetricBootBothAddPeerLeavesOneConnection(t *testing.T) {
+	for run := 0; run < 30; run++ {
+		t.Run(fmt.Sprint(run), func(t *testing.T) {
+			a := listen(t, Options{LocalID: "a"})
+			b := listen(t, Options{LocalID: "b"})
+			recA, recB := new(recorder), new(recorder)
+			a.OnMessage(recA.collect)
+			b.OnMessage(recB.collect)
+
+			// Boot burst: the two AddPeers race from a barrier, so the
+			// maintainers' cross-dials genuinely overlap instead of
+			// happening to serialize.
+			start := make(chan struct{})
+			var spawned sync.WaitGroup
+			errs := make(chan error, 2)
+			for _, add := range []func() error{
+				func() error { return a.AddPeer(b.Addr().String()) },
+				func() error { return b.AddPeer(a.Addr().String()) },
+			} {
+				add := add
+				spawned.Add(1)
+				go func() {
+					defer spawned.Done()
+					<-start
+					errs <- add()
+				}()
+			}
+			close(start)
+			spawned.Wait()
+			close(errs)
+			for err := range errs {
+				if err != nil && !isSocketClosed(err) {
+					t.Fatalf("AddPeer: %v", err)
+				}
+			}
+
+			// Exactly one healthy connection on each side - never zero, the
+			// pre-fix symptom - and both sides agree on who the peer is.
+			waitPeersIs(t, a, "[b]")
+			waitPeersIs(t, b, "[a]")
+			if len(a.conns) != 1 || len(b.conns) != 1 {
+				t.Fatalf("after the cross-dial: a holds %d conns, b holds %d; want exactly one each", len(a.conns), len(b.conns))
+			}
+
+			// The survivor is a working link, not a corpse in the registry:
+			// unicast must cross it in BOTH directions.
+			if err := a.Send("b", []byte("ab")); err != nil {
+				t.Fatalf("a Send over the surviving link: %v", err)
+			}
+			if err := b.Send("a", []byte("ba")); err != nil {
+				t.Fatalf("b Send over the surviving link: %v", err)
+			}
+			waitFor(t, "b receiving a's unicast", 5*time.Second, func() bool {
+				pl := recB.payloads()
+				return len(pl) == 1 && pl[0] == "ab"
+			})
+			waitFor(t, "a receiving b's unicast", 5*time.Second, func() bool {
+				pl := recA.payloads()
+				return len(pl) == 1 && pl[0] == "ba"
+			})
+		})
+	}
+}
+
+// isSocketClosed reports whether err is the close noise a connection call can
+// return when a racing Close tears the listener down - the only failure a
+// boot burst may legitimately produce on this loopback.
+func isSocketClosed(err error) bool {
+	var oe *net.OpError
+	return errors.As(err, &oe) && errors.Is(oe.Err, net.ErrClosed)
+}
+
+// TestConcurrentSameIDHandshakesLeaveOneConnection drives the duplicate path
+// the way the race detector found it: eight handshakes naming the SAME peer
+// id, arriving together on an empty registry. Assertions, all of which the
+// pre-fix code fails: exactly one connection survives (not zero), every loser
+// socket is closed cleanly (they read EOF, not hangs), the survivor carries
+// traffic (Send resolves, the probe is received exactly once) - and under
+// -race, no unsynchronised write to a superseded connection's flag anywhere
+// in the churn (the pre-fix write sat after t.mu.Unlock; this test is what
+// makes the race detector's verdict reproducible).
+func TestConcurrentSameIDHandshakesLeaveOneConnection(t *testing.T) {
+	for round := 0; round < 3; round++ {
+		t.Run(fmt.Sprint(round), func(t *testing.T) {
+			r := listen(t, Options{LocalID: "r"})
+
+			const dialers = 8
+			type fate struct {
+				eof   bool // socket was closed on us: this candidate lost
+				probe bool // received r's post-install probe: this one won
+			}
+			fates := make(chan fate, dialers)
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			for i := 0; i < dialers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					nc, err := net.Dial("tcp", r.Addr().String())
+					if err != nil {
+						return // a failed dial simply never reports a fate; counted below
+					}
+					defer nc.Close()
+					<-start
+					if err := wire.WriteFrame(nc, []byte("dup")); err != nil {
+						return
+					}
+					var f fate
+					br := bufio.NewReader(nc)
+					nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+					for {
+						frame, err := wire.ReadFrame(br, 4096)
+						if err != nil {
+							f.eof = true // EOF/reset: r closed this candidate
+							fates <- f
+							return
+						}
+						if string(frame) == "probe" {
+							f.probe = true // got r's unicast: the surviving one
+							fates <- f
+							return
+						}
+						// anything else is r's handshake greeting; keep reading
+					}
+				}()
+			}
+			close(start)
+
+			// Exactly one peer, and exactly one connection behind it.
+			waitPeersIs(t, r, "[dup]")
+			if n := len(r.conns); n != 1 {
+				t.Fatalf("registry holds %d connections for a single duplicated id; want exactly 1", n)
+			}
+
+			// Probe the survivor: exactly one of the eight sockets is still
+			// being served, so exactly one client can ever see this frame.
+			if err := r.Send("dup", []byte("probe")); err != nil {
+				t.Fatalf("Send to the surviving duplicate peer: %v", err)
+			}
+			wg.Wait()
+			close(fates)
+			var got []fate
+			for f := range fates {
+				got = append(got, f)
+			}
+			if len(got) != dialers {
+				t.Fatalf("only %d of %d candidates reported a fate (dials failed or handshakes stalled)", len(got), dialers)
+			}
+			wins, eofs := 0, 0
+			for _, f := range got {
+				if f.probe {
+					wins++
+				}
+				if f.eof {
+					eofs++
+				}
+			}
+			if wins != 1 {
+				t.Fatalf("%d candidates received the probe; every duplicate but ONE must be closed, one served", wins)
+			}
+			if eofs != dialers-1 {
+				t.Fatalf("%d loser sockets were closed cleanly, want %d", eofs, dialers-1)
+			}
+		})
+	}
+}
+
+// TestSupersededMaintainerReleasesItsRegistration pins F2: when a maintainer's
+// connection is superseded (here: the transport's own dial loses a duplicate
+// race to the peer's incoming dial, which the rank gives to the remote because
+// the remote's id is smaller), the maintainer must go dormant AND release its
+// address registration. The pre-fix code kept the stale entry, so Dial was
+// waved off as idempotent "nil" while nothing redialled - a peer set that
+// stayed empty forever. After the release, a fresh Dial must spawn a real
+// maintainer and reconnect.
+func TestSupersededMaintainerReleasesItsRegistration(t *testing.T) {
+	// A raw remote end, fully controlled: answers every handshake as "aaa"
+	// and holds its sockets open until closed or abandoned.
+	rl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rl.Close() })
+	go func() {
+		for {
+			nc, aerr := rl.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(nc net.Conn) {
+				defer nc.Close()
+				br := bufio.NewReader(nc)
+				nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+				id, rerr := wire.ReadFrame(br, 4096)
+				nc.SetReadDeadline(time.Time{})
+				if rerr != nil || string(id) != "zzz" {
+					return
+				}
+				if werr := wire.WriteFrame(nc, []byte("aaa")); werr != nil {
+					return
+				}
+				var sink [16]byte
+				for {
+					if _, rerr = nc.Read(sink[:]); rerr != nil {
+						return
+					}
+				}
+			}(nc)
+		}
+	}()
+	addr := rl.Addr().String()
+
+	// zzz > aaa, so per newcomerWins the peer's dial (the smaller id's dial
+	// wins the rank) supersedes this transport's own outbound - the
+	// maintainer's connection is the one replaced.
+	tp, err := New(Options{LocalID: "zzz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tp.Close() })
+	// It must also listen: the superseding duplicate arrives as an INBOUND
+	// connection on this transport's own listener.
+	if err := tp.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	if err := tp.Dial(addr); err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	waitPeersIs(t, tp, "[aaa]")
+
+	// The duplicate: an inbound connection announcing the same peer id. It
+	// outranks our outbound, so our maintainer's connection is superseded.
+	hc, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hc.Close() })
+	if err := wire.WriteFrame(hc, []byte("aaa")); err != nil {
+		t.Fatal(err)
+	}
+	waitPeersIs(t, tp, "[aaa]") // still exactly one connection - the winner's
+
+	// The registration must be RELEASED (the winner here has no local
+	// maintainer - the peer's own dial holds the link from ITS side - so
+	// release, not transfer, is what honest bookkeeping looks like). A stale
+	// entry here is precisely the lie that made Dial return nil forever.
+	waitFor(t, "the superseded maintainer's registration being released", 2*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		return len(tp.outbounds) == 0
+	})
+
+	// Kill the winner from the raw side. Nothing redials - the registration
+	// is gone, and pretending otherwise would be the lie above. The peer set
+	// drains to empty and STAYS empty until someone dials again.
+	hc.Close()
+	waitPeersIs(t, tp, "[]")
+
+	// Now Dial must spawn a FRESH maintainer: a maintainer exists again, and
+	// the reconnection the transport promises actually happens.
+	if err := tp.Dial(addr); err != nil {
+		t.Fatalf("Dial after the supersede released the registration: %v", err)
+	}
+	waitPeersIs(t, tp, "[aaa]")
+	if err := tp.Send("aaa", []byte("sync")); err != nil {
+		t.Fatalf("Send over the re-established link: %v", err)
+	}
+}
+
+// TestBackoffClampsAtMax pins the ceiling of the reconnection curve - clamped
+// at BackoffMax, including the overshoot: a base/max pair that is not a
+// power-of-two apart doubles PAST the max before the clamp pulls it back
+// (20ms -> 40ms against a 25ms ceiling), and a base larger than the max must
+// be pulled DOWN to it. Before this test existed the clamp was pinned by
+// nothing - deleting it left the whole suite green while the curve ignored
+// its ceiling.
+func TestBackoffClampsAtMax(t *testing.T) {
+	const base, max = 20 * time.Millisecond, 25 * time.Millisecond
+	b := NewBackoff(base, max, rand.New(rand.NewSource(1)))
+	for attempt := 1; attempt <= 50; attempt++ { // far past where the curve stops growing
+		d := b.Next(attempt)
+		if d >= max {
+			t.Fatalf("attempt %d delay %v is at or above the %v ceiling: the clamp is gone", attempt, d, max)
+		}
+		if attempt >= 2 && d < max/2 {
+			t.Fatalf("attempt %d delay %v below the clamped-curve jitter floor %v", attempt, d, max/2)
+		}
+	}
+
+	// Direct construction with base > max (Options clamps this; Backoff
+	// itself must still honour the ceiling, per its own doc).
+	b2 := NewBackoff(100*time.Millisecond, 20*time.Millisecond, rand.New(rand.NewSource(1)))
+	for attempt := 1; attempt <= 10; attempt++ {
+		if d := b2.Next(attempt); d >= 20*time.Millisecond {
+			t.Fatalf("attempt %d delay %v with base 100ms > max 20ms: the clamp did not pull the curve down", attempt, d)
+		}
 	}
 }

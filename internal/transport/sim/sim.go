@@ -201,6 +201,15 @@ func (e *endpoint) Send(to transport.PeerID, data []byte) error {
 	if _, ok := e.net.peers[to]; !ok {
 		return fmt.Errorf("sim: unknown peer %q", to)
 	}
+	if to == e.id {
+		// Same answer the TCP transport gives (its Send can never find the
+		// local ID in its registry because self connections are refused at
+		// the handshake): a node is never its own peer, and a validator
+		// messaging "itself" over the wire would double-count its own vote.
+		// Erroring here keeps the two transports interchangeable for the
+		// driver and the Task-4 syncer.
+		return fmt.Errorf("sim: %q is the local endpoint, not a peer", to)
+	}
 	if e.net.group[to] != e.net.group[e.id] {
 		return fmt.Errorf("sim: peer %q is partitioned away", to)
 	}

@@ -24,7 +24,11 @@
 // are USELESS: the local node's own ID (a validator must never be fed its own
 // messages back - it already holds its own votes, and re-feeding them would
 // double-count the one vote per validator the tally relies on), and a second
-// connection to a peer already connected.
+// connection to a peer already connected. Which of two connections to the same
+// peer survives is decided by a deterministic rank, stated at
+// newcomerWins/ErrDuplicatePeer and computed IDENTICALLY at both ends of the
+// pair - two nodes that list each other at boot otherwise race their cross
+// dials and can end, each side evicting the other's winner, with none.
 package tcp
 
 import (
@@ -53,9 +57,19 @@ const (
 	DefaultMaxFrameBytes = 1 << 20
 	// DefaultWriteQueueSize is the bound that keeps Broadcast from ever
 	// waiting on a slow peer: 128 frames is far beyond everything one round
-	// of consensus produces, so an honest peer never drops, while a wedged
-	// peer costs the sender at most this much buffered memory per
-	// connection.
+	// of consensus produces, so an honest peer never drops, and a wedged
+	// peer costs the sender buffered memory only.
+	//
+	// The worst case, spelled out with the arithmetic because the bound is
+	// in FRAMES, not bytes: 128 frames x (DefaultMaxFrameBytes 1 MiB
+	// payload + a frame header) = just over 128 MiB of bufferable memory PER
+	// WEDGED PEER CONNECTION, if every queued frame were at today's size
+	// limit. With current consensus traffic (hundreds of bytes per frame)
+	// the same 128-frame bound caps a wedged peer at tens of KiB. When Task
+	// 4 puts block-sized frames on the wire, this number - or a byte-level
+	// companion bound - must be revisited along with it; until then the
+	// frame bound is the one the drop policy and the slow-reader test
+	// assert. Shrinking it is always safe for the no-block property.
 	DefaultWriteQueueSize = 128
 	// DefaultHandshakeTimeout bounds how long a connection may take to
 	// introduce itself before it is closed. A socket that opens and then
@@ -98,9 +112,14 @@ var (
 	// this validator's votes.
 	ErrSelfConnection = errors.New("tcp: refusing a connection to the local node itself")
 	// ErrDuplicatePeer is returned when a connection's handshake names a peer
-	// that already has a live connection. The NEW connection is closed and
-	// its dialer goes dormant: one logical connection per peer, last one
-	// established wins the registry.
+	// that already has a live connection that outranks it, so the NEW
+	// connection is the one closed. Exactly one connection survives every
+	// duplicate - the policy is at newcomerWins, and it is computed
+	// identically at both ends of the pair, so a cross-dial (two nodes that
+	// list each other at boot) leaves one healthy link, not zero. The loser's
+	// registry entry is released: when the loser was the incumbent, its
+	// registration transfers to the winner's side, whose maintainer is the
+	// one keeping the link alive.
 	ErrDuplicatePeer = errors.New("tcp: a live connection to this peer already exists")
 )
 
@@ -180,6 +199,12 @@ type conn struct {
 	tq chan []byte
 	// addr is where an outbound connection came from, for logging context.
 	addr string
+	// dialled records whether the LOCAL end of this connection is the side
+	// that dialled (true) or the side that accepted (false). It is fixed at
+	// construction and is half of the duplicate-rank decision: see
+	// newcomerWins for why both ends must agree on which copy of a
+	// duplicated peer connection survives.
+	dialled bool
 	// dead is closed exactly once, by finish, when the connection is over.
 	// A connection's maintainer goroutine sleeps on it.
 	dead chan struct{}
@@ -191,12 +216,17 @@ type conn struct {
 	// tests read it; a metrics story would hang off it later.
 	dropped atomic.Uint64
 	// superseded is set under the transport's mutex, strictly BEFORE finish
-	// closes dead, when this conn was replaced in the registry by a newer
-	// connection to the same peer. The maintainer checks it after <-dead:
-	// a superseded conn must not be redialled, or the old and new
-	// connections would keep evicting each other forever (four goroutines,
-	// one socket, all churning). The happens-before edge is the channel
-	// close: the write precedes close(dead), the read follows <-dead.
+	// closes dead, when this conn was replaced in the registry by a
+	// higher-ranked connection to the same peer, and it is READ under the
+	// same mutex too. The mutex is the synchronisation, not the channel: the
+	// maintainer wakes on close(dead), but a dying loser's own reader can
+	// fire that close (its socket died of the same eviction) BEFORE the
+	// winner's adopt has written the flag - the race detector caught exactly
+	// that read racing the write - so the channel close is only the wake-up
+	// and every access to the flag is mutex-guarded. The maintainer checks
+	// it after <-dead: a superseded conn must not be redialled, or the old
+	// and new connections would keep evicting each other forever (four
+	// goroutines, one socket, all churning).
 	superseded bool
 }
 
@@ -352,12 +382,27 @@ func (t *TcpTransport) acceptLoop(l net.Listener) {
 		}
 		// adopt performs the handshake, which blocks on the remote speaking
 		// - it must never run on the accept loop itself, or one slow dialer
-		// would block every other inbound connection.
+		// would block every other inbound connection. The goroutine IS
+		// tracked on the same WaitGroup Close waits on (registered under the
+		// mutex, refused if Close already ran, mirroring registerOutbound),
+		// so an inbound handshake in flight can neither outlive Close nor
+		// slip past Close's wait - and Close's latency when one is in flight
+		// is bounded by the handshake deadline, not unbounded.
+		t.mu.Lock()
+		if t.closed.Load() {
+			t.mu.Unlock()
+			nc.Close()
+			continue
+		}
+		addr := nc.RemoteAddr().String()
+		t.wg.Add(1)
 		go func() {
+			defer t.wg.Done()
 			// An inbound failure is the dialer's problem by definition:
 			// there is no registered maintainer to redial a stranger.
-			_, _ = t.adopt(nc, nc.RemoteAddr().String())
+			_, _ = t.adopt(nc, addr, false)
 		}()
+		t.mu.Unlock()
 	}
 }
 
@@ -403,19 +448,33 @@ func (t *TcpTransport) registerOutbound(addr string, first chan<- error) (bool, 
 	if _, ok := t.outbounds[addr]; ok {
 		return false, nil
 	}
-	t.outbounds[addr] = &outbound{addr: addr}
+	ob := &outbound{addr: addr}
+	t.outbounds[addr] = ob
 	t.wg.Add(1)
-	go t.maintain(addr, first)
+	go t.maintain(ob, first)
 	return true, nil
 }
 
 // maintain is the reconnection loop for one address: dial, handshake, hold
 // until the connection dies, then redial after a growing, jittered delay.
-// Two findings end the loop: the transport closing (quit), or the peer
+// Three findings end the loop: the transport closing (quit); the peer
 // proving already-connected - duplicate or self - where redialling would
-// only re-create the connection the registry just refused.
-func (t *TcpTransport) maintain(addr string, first chan<- error) {
+// only re-create a connection the registry just refused (that link belongs
+// to whichever side's rank won it, and its maintainer is the one feeding
+// it); or the connection being superseded, which is the same case seen from
+// the losing maintainer's side of the handshake.
+//
+// EVERY one of those exits releases the address registration (the deferred
+// forgetOutbound): a maintainer that stops running while its registration
+// survives would leave Dial/AddPeer reporting a maintainer that does not
+// exist, and behind that lie, a peer set nothing ever refills.
+func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 	defer t.wg.Done()
+	addr := ob.addr
+	// The release is identity-checked, so a dying maintainer can never
+	// delete a registration a racing AddPeer just created for the same
+	// address - only exactly this maintainer's registration goes.
+	defer t.forgetOutbound(ob)
 	attempt := 0
 	report := func(err error) {
 		if first != nil {
@@ -429,24 +488,38 @@ func (t *TcpTransport) maintain(addr string, first chan<- error) {
 			report(err)
 		} else {
 			// adopt owns nc from here; on failure it closed it.
-			c, err := t.adopt(nc, addr)
+			c, err := t.adopt(nc, addr, true)
 			report(err)
 			if err == nil {
 				attempt = 0 // a live connection resets the curve: one success outranks every prior failure
 				select {
 				case <-c.dead:
-					if c.superseded {
-						return // replaced by a newer connection to this peer
+					// The flag is mutex-guarded on BOTH sides (see
+					// conn.superseded): close(dead) is only the wake-up -
+					// a concurrent socket death may have fired it before
+					// the winner's adopt even wrote the flag - so the read
+					// takes the same lock the write took.
+					t.mu.Lock()
+					wasSuperseded := c.superseded
+					t.mu.Unlock()
+					if wasSuperseded {
+						// Replaced by a higher-ranked connection to this
+						// peer. The winner keeps the link, so this side
+						// stops maintaining it - and the deferred release
+						// above makes the stop honest: the registration
+						// goes with the maintainer instead of masking the
+						// absence of any redial behind a claimed one.
+						return
 					}
 				case <-t.quit:
 					return
 				}
 			} else if errors.Is(err, ErrSelfConnection) || errors.Is(err, ErrDuplicatePeer) {
 				// Dormant, not failed: there is nothing to connect to that
-				// is not already connected. Redialling here would churn -
-				// each attempt opens a socket the registry immediately
-				// closes, forever.
-				t.forgetOutbound(addr)
+				// is not already connected by a higher-ranked connection,
+				// maintained on this side or the far one. Redialling here
+				// would churn - each attempt opens a socket the registry
+				// immediately refuses.
 				return
 			}
 		}
@@ -461,12 +534,16 @@ func (t *TcpTransport) maintain(addr string, first chan<- error) {
 	}
 }
 
-// forgetOutbound drops the address's registration when its maintainer goes
-// dormant, so an explicit later Dial of the same address can start fresh.
-func (t *TcpTransport) forgetOutbound(addr string) {
+// forgetOutbound releases ob's address registration when its maintainer exits
+// for good - dormant, superseded, or the transport closing - so a later
+// Dial/AddPeer of the same address is answered by a maintainer that exists
+// rather than waved off as idempotent by a stale entry.
+func (t *TcpTransport) forgetOutbound(ob *outbound) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.outbounds, addr)
+	if cur := t.outbounds[ob.addr]; cur == ob {
+		delete(t.outbounds, ob.addr)
+	}
 }
 
 // adopt performs the identity handshake and installs the connection.
@@ -476,7 +553,11 @@ func (t *TcpTransport) forgetOutbound(addr string) {
 // completes without any lockstep. The read carries the handshake deadline -
 // after it, the reader owns the socket and may block forever, because a live
 // connection is idle most of the time and that is not an error.
-func (t *TcpTransport) adopt(nc net.Conn, addr string) (*conn, error) {
+//
+// dialled says whether THIS end is the side that opened the connection (the
+// maintainer's dial) or the side that accepted it; it feeds the duplicate
+// rank, which needs the direction to stay decidable identically at both ends.
+func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled bool) (*conn, error) {
 	if err := nc.SetWriteDeadline(time.Now().Add(t.opts.HandshakeTimeout)); err != nil {
 		nc.Close()
 		return nil, err
@@ -512,11 +593,12 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string) (*conn, error) {
 	id := transport.PeerID(hello)
 
 	c := &conn{
-		remote: id,
-		nc:     nc,
-		tq:     make(chan []byte, t.opts.WriteQueueSize),
-		dead:   make(chan struct{}),
-		addr:   addr,
+		remote:  id,
+		nc:      nc,
+		tq:      make(chan []byte, t.opts.WriteQueueSize),
+		dead:    make(chan struct{}),
+		addr:    addr,
+		dialled: dialled,
 	}
 
 	t.mu.Lock()
@@ -530,22 +612,69 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string) (*conn, error) {
 		nc.Close()
 		return nil, fmt.Errorf("%w (%q on %s)", ErrSelfConnection, id, addr)
 	}
-	if existing := t.conns[id]; existing != nil {
-		// Last connection established wins the registry. The loser is closed
-		// AND marked, so - if it had a maintainer - that maintainer goes
-		// dormant instead of fighting the winner.
+	existing := t.conns[id]
+	if existing != nil && !newcomerWins(t.opts.LocalID, existing, c) {
+		// The incumbent outranks the newcomer: the newcomer loses, the
+		// incumbent stays EXACTLY as it was (still installed, still healthy,
+		// still maintained by whichever side holds it). This is the branch
+		// a maintainer's re-dial lands in when the peer's own dial won the
+		// link: its registration was released on exit, so the registry no
+		// longer claims what it did not keep.
 		t.mu.Unlock()
-		existing.superseded = true
-		t.finish(existing)
 		nc.Close()
 		return nil, fmt.Errorf("%w (%q on %s)", ErrDuplicatePeer, id, addr)
 	}
+	if existing != nil {
+		// The newcomer outranks the incumbent, so the newcomer WINS the
+		// registry and exactly one healthy connection exists afterwards:
+		// the loser is marked under this same critical section (F3: no
+		// unsynchronised write to superseded, ever), removed from the
+		// registry by THIS install, and only then closed by finish - whose
+		// registry delete is a no-op, because the entry now holds the
+		// winner. The loser's maintainer, if any, wakes on <-dead and reads
+		// superseded under the same mutex this write took, then goes
+		// dormant: the winner's side keeps the link, and
+		// this side's registration is released with it (see maintain).
+		existing.superseded = true
+	}
 	t.conns[id] = c
 	t.mu.Unlock()
+	if existing != nil {
+		t.finish(existing)
+	}
 
 	go t.writer(c)
 	go t.reader(c)
 	return c, nil
+}
+
+// newcomerWins decides which of two connections to the same peer keeps the
+// registry, and it must answer IDENTICALLY at both ends of the pair - that is
+// the whole point. Two nodes that list each other at boot cross-dial: each
+// end sees {its own dial, the peer's dial} for the same ID. If each end picked
+// a winner by arrival order, the picks would be independent coin flips; when
+// they disagree, each side evicts the other's winner, both sockets half-close,
+// and the pair sits with zero connections and no maintainer - a silent,
+// permanent partition on an ordinary startup. The rank below is a function of
+// facts both ends compute the same way:
+//
+//   - the endpoints' IDs and the DIRECTION of each connection: of a matched
+//     pair, the socket dialled by the lexicographically SMALLER peer ID wins.
+//     local<remote means our own dial outranks their dial; local>remote means
+//     their dial outranks ours. Whichever way it falls, both sides land on
+//     the SAME socket, and it is the smaller node's outbound - so the link
+//     always keeps a maintainer (the dialling side's);
+//   - same direction on both candidates (two of our own dials, or two of
+//     theirs): the incumbent wins. First established stays; re-dial races
+//     cannot churn the registry by re-running the same replacement.
+func newcomerWins(local transport.PeerID, existing, newcomer *conn) bool {
+	if existing.dialled != newcomer.dialled {
+		if local < existing.remote {
+			return newcomer.dialled // we are the smaller end: our dial wins
+		}
+		return !newcomer.dialled // we are the larger end: their dial wins
+	}
+	return false // same direction on both: the incumbent stays
 }
 
 // reader is the per-connection read goroutine: frame, dispatch, repeat, until
@@ -698,13 +827,18 @@ func (t *TcpTransport) Peers() []transport.PeerID {
 	return ids
 }
 
-// Close idempotently shuts the transport down: the listener, every live
-// connection, and the accept/maintainer goroutines (which it waits for). The
-// per-connection readers and writers are not waited for - nothing waits on a
-// goroutine that may be parked inside a user callback - but they are stopped:
-// their sockets are closed, every blocking call they are inside errors out,
-// and they exit. Once Close returns, the transport reports closed to every
-// method and new dials are refused.
+// Close idempotently shuts the transport down. What it STOPS and WAITS for:
+// the listener, every live connection, and every goroutine that can be blocked
+// on the wire - the accept loop, every maintainer, and any inbound connection
+// still mid-handshake (all counted on the same WaitGroup). What it stops but
+// does NOT wait for: the per-connection readers and writers - nothing waits on
+// a goroutine that may be parked inside a user callback - their sockets are
+// closed, every blocking call they are inside errors out, and they exit.
+// Consequences, stated plainly: Close's return can be held for up to about
+// HandshakeTimeout (an inbound handshake that is still reading) plus
+// DialTimeout (a maintainer mid-redial), never longer - every wait is deadline-
+// or quit-bounded. Once Close returns, the transport reports closed to every
+// method, new dials are refused, and the goroutines it waited for are gone.
 func (t *TcpTransport) Close() error {
 	t.closeOnce.Do(func() {
 		// The closed flag goes up BEFORE the snapshot+wait, so a Dial/AddPeer

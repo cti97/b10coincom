@@ -265,6 +265,13 @@ func TestSendIsTheUnicastSyncNeeds(t *testing.T) {
 		t.Fatal("Send to an unknown peer must error, never silently succeed")
 	}
 
+	// The local endpoint is not a peer either - the TCP transport errors on
+	// Send to self (a validator never messages itself over the wire), so the
+	// sim must agree: the two transports have to be interchangeable.
+	if err := n.TransportFor("a").Send("a", []byte("?")); err == nil {
+		t.Fatal("Send to self must error, matching the TCP transport")
+	}
+
 	// A partition is a partition for Send too: b cannot sync from a peer on
 	// the far side of it.
 	n.Partition([]string{"c"}, []string{"a", "b"})
