@@ -2,7 +2,7 @@
 # VPS. The relay unit (b10coin-relay.service) goes on the VPS.
 #
 # Assumes the machine already has (see scripts/deploy/README.md §§2, 6):
-#   - the binary at /opt/b10coin/b10coin          (from make arm64, scp'd)
+#   - the binary at /opt/b10coin/b10coin          (from scripts/deploy/build.sh, scp'd)
 #   - a system user and group "b10coin"
 #   - internet access OUTBOUND to the relay's TCP port 7001 (no port
 #     forwarding, no inbound rule: every connection a node makes is outbound)

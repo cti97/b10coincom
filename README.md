@@ -83,6 +83,55 @@ agreed       yes
 OK
 ```
 
+## Platforms and releases
+
+b10coin builds for **six targets, and its test suite compiles for all of
+them**: darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64
+and windows/arm64. The Raspberry Pi is M4's *acceptance* target (three Pis
+across separate networks finalize blocks — the deployment recipe below), not
+the only platform the software runs on: a contributor on a laptop builds and
+runs the same binaries, on macOS or Windows just as on Linux.
+
+```sh
+make release
+```
+
+builds **both binaries for every target** into `dist/` — no flags to get
+right, no per-platform incantations:
+
+```text
+dist/b10coin-0.1.0-darwin-amd64            dist/b10coin-relay-0.1.0-darwin-amd64
+dist/b10coin-0.1.0-darwin-arm64            dist/b10coin-relay-0.1.0-darwin-arm64
+dist/b10coin-0.1.0-linux-amd64             dist/b10coin-relay-0.1.0-linux-amd64
+dist/b10coin-0.1.0-linux-arm64             dist/b10coin-relay-0.1.0-linux-arm64
+dist/b10coin-0.1.0-windows-amd64.exe       dist/b10coin-relay-0.1.0-windows-amd64.exe
+dist/b10coin-0.1.0-windows-arm64.exe       dist/b10coin-relay-0.1.0-windows-arm64.exe
+dist/SHA256SUMS
+```
+
+Guarantees a release keeps (all enforced by `scripts/build-release.sh`, the
+one build story the Makefile, CI and the deployment wrapper share): the
+version comes from `internal/version` — the binary prints it, so file names
+cannot disagree with what a binary says; `dist/` starts empty every run and
+is only swapped in after everything succeeds, so a failing target leaves no
+partial `dist/` to be mistaken for a release; the artifact count must equal
+the target count, so a build that silently produced only the host platform
+fails instead of shipping a hole; and every artifact is `file(1)`-checked to
+report its own architecture — `Mach-O` and `PE32+` names never appear except
+where they belong. On the target machine, verify what you copied:
+
+```sh
+( cd dist && sha256sum -c SHA256SUMS )    # or: shasum -a 256 -c SHA256SUMS
+```
+
+CI (`.github/workflows/ci.yml`) runs a matrix over all six targets on every
+push: each one is cross-compiled with `go build ./...` **and** `go vet
+./...` — vet, not the build, is what caught this milestone's one
+cross-platform defect (a Unix-only syscall in the relay's test code, which
+made `GOOS=windows go vet` fail while every build stayed green) — plus a
+release job that builds and asserts all twelve artifacts, so no platform can
+rot silently and none ships unverified.
+
 ## The CLI
 
 `cmd/b10coin` implements five subcommands. With no subcommand, or with an
@@ -124,7 +173,10 @@ are valueless; the testnet genesis has no validator keys yet.
 | `--http ADDR` | `127.0.0.1:8645` | HTTP RPC listen address |
 | `--block-time DURATION` | `2s` | target block interval |
 
-Ctrl-C (or SIGTERM) stops block production and the HTTP server cleanly.
+Ctrl-C (or, on Unix, SIGTERM) stops block production and the HTTP server
+cleanly. The graceful stop listens for both through one cancellation
+channel, so on Windows — where SIGTERM is a POSIX signal that is never
+delivered — Ctrl-C still reaches the same clean path.
 
 ### `b10coin claim`
 
@@ -195,8 +247,10 @@ backoff. Bandwidth is kilobytes per second.
 | `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |
 | `--keepalive SECONDS` | `15` | TCP keepalive probe period for every accepted connection; a half-open connection is reaped by the kernel after unanswered probes |
 
-Ctrl-C (or SIGTERM) stops the listener, closes every connection and joins
-every goroutine before the process exits.
+Ctrl-C (or, on Unix, SIGTERM) stops the listener, closes every connection and
+joins every goroutine before the process exits. Same as the node command: one
+cancellation channel serves both signals, so Windows' Ctrl-C reaches the same
+graceful drain.
 
 ### `b10coin version` and `b10coin help`
 
@@ -511,16 +565,20 @@ configuration is where the no-premine promise lives:
 
 ## Deploying to Raspberry Pis
 
-M4's target is real hardware: `make arm64` cross-compiles **both** binaries
-for Linux/ARM64 (`bin/b10coin-linux-arm64`, `bin/b10coin-relay-linux-arm64`)
-— the binary a 64-bit Raspberry Pi OS runs — and CI (`.github/workflows/ci.yml`)
-builds and asserts those artifacts on every push, so the Pi build cannot rot
+M4's acceptance is real hardware, and the linux/arm64 release is where the
+full matrix meets it: `make release` produces the six targets above, of which
+`b10coin-*-linux-arm64` is the pair a 64-bit Raspberry Pi OS runs — and
+`scripts/deploy/build.sh` is the deployment-facing wrapper for exactly that
+pair: it runs the same release script with `--only linux/arm64` and copies
+the result into `bin/` under the names the recipe's scp lines use, so a
+version bump never breaks the recipe (and
+`scripts/deploy/build.sh linux/amd64` produces the relay an amd64 VPS wants —
+see its §2). CI (`.github/workflows/ci.yml`) runs the release build for every
+target and asserts every artifact on every push, so the Pi binary cannot rot
 silently. The version the binaries print comes from `internal/version`; no
-build-flag override adds a second source of truth. `scripts/deploy/build.sh`
-is the deployment-facing wrapper that also asserts the artifacts (exactly two
-binaries, each really an `ARM aarch64` ELF). One platform, deliberately: the
-broader multi-platform release matrix is a later task and will replace this
-single target.
+build-flag override adds a second source of truth. The Pi is the *acceptance*
+target of this milestone — the other five targets build, vet and release
+alongside it, per [Platforms and releases](#platforms-and-releases).
 
 The full recipe — three Pis on separate home networks plus one relay VPS,
 build → copy → shared genesis → first contact → systemd units → what output
@@ -558,13 +616,16 @@ on every push and pull request as well, on Go 1.23:
 | Static analysis | `go vet ./...` |
 | Test suite | `go test ./...` |
 | Build | `go build ./...` |
+| Cross-platform, per target | `GOOS=<os> GOARCH=<arch> go build ./...` and `go vet ./...` for each of the six targets (the matrix job) |
+| Release, all six targets | `make release` (12 artifacts + `SHA256SUMS`, all asserted) |
 | Acceptance check, default run | `go run ./cmd/b10coin devnet --blocks 100` |
 | Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
 
-Makefile targets: `make test`, `make build` (produces `bin/b10coin`), `make
-arm64` (both Linux/ARM64 binaries for the Pis — [deploying](#deploying-to-raspberry-pis)),
-`make vet`, `make fmt`, and `make devnet` (build followed by the acceptance
+Makefile targets: `make test`, `make race`, `make build` (produces
+`bin/b10coin`), `make release` (both binaries for all six targets into
+`dist/` with `SHA256SUMS` — [platforms](#platforms-and-releases)), `make
+vet`, `make fmt`, and `make devnet` (build followed by the acceptance
 check).
 
 ## Status and roadmap
@@ -591,10 +652,11 @@ Implemented — modules M0, M1, M2 and M3:
 Pending:
 
 - **M4** — real networking (TCP transport plus a small outbound relay so home
-  validators need no port forwarding), cross-compiled ARM64 binaries, and
-  validators on actual Raspberry Pis. Block catch-up — letting a validator
-  that fell behind adopt its peers' blocks — arrives with real networking
-  too.
+  validators need no port forwarding), release builds for all six OS/arch
+  targets (macOS, Linux and Windows — see
+  [Platforms and releases](#platforms-and-releases)), and validators on
+  actual Raspberry Pis. Block catch-up — letting a validator that fell behind
+  adopt its peers' blocks — arrives with real networking too.
 
 The design's milestone table defines further stages beyond M4 — staking and
 committee rotation (M5), and a wallet CLI with a minimal explorer and faucet

@@ -251,11 +251,11 @@ func TestScenarioOneOfflineStillAdvances(t *testing.T) {
 	if got := n.ch[3].Height(); got != silentHeight {
 		t.Fatalf("OFFLINE validator 3 committed while offline: %d -> %d", silentHeight, got)
 	}
-	if len(n.taps[3].sent) != 0 {
-		t.Fatalf("OFFLINE validator 3 put %d messages on the wire; a powered-off machine sends nothing", len(n.taps[3].sent))
+	if n.taps[3].sentCount() != 0 {
+		t.Fatalf("OFFLINE validator 3 put %d messages on the wire; a powered-off machine sends nothing", n.taps[3].sentCount())
 	}
-	if len(n.taps[3].recv) != 0 {
-		t.Fatalf("OFFLINE validator 3's driver consumed %d messages; a powered-off machine receives nothing", len(n.taps[3].recv))
+	if n.taps[3].recvCount() != 0 {
+		t.Fatalf("OFFLINE validator 3's driver consumed %d messages; a powered-off machine receives nothing", n.taps[3].recvCount())
 	}
 }
 
@@ -316,8 +316,8 @@ func TestScenarioTwoOfflineStallsWithoutForks(t *testing.T) {
 		sentAtCut := make(map[int]int, len(offline))
 		recvAtCut := make(map[int]int, len(offline))
 		for _, i := range offline {
-			sentAtCut[i] = len(n.taps[i].sent)
-			recvAtCut[i] = len(n.taps[i].recv)
+			sentAtCut[i] = n.taps[i].sentCount()
+			recvAtCut[i] = n.taps[i].recvCount()
 		}
 
 		_, err = n.RunBlocks(6)
@@ -338,10 +338,10 @@ func TestScenarioTwoOfflineStallsWithoutForks(t *testing.T) {
 		// quietly", and the quorum arithmetic above would describe a network
 		// that no longer exists.
 		for _, i := range offline {
-			if got := len(n.taps[i].sent); got != sentAtCut[i] {
+			if got := n.taps[i].sentCount(); got != sentAtCut[i] {
 				t.Fatalf("OFFLINE validator %d sent %d messages after the cut; a powered-off machine sends nothing", i, got-sentAtCut[i])
 			}
-			if got := len(n.taps[i].recv); got != recvAtCut[i] {
+			if got := n.taps[i].recvCount(); got != recvAtCut[i] {
 				t.Fatalf("OFFLINE validator %d's driver consumed %d messages after the cut; a powered-off machine receives nothing", i, got-recvAtCut[i])
 			}
 		}
@@ -563,7 +563,7 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 		t.Fatal("no equivocator was installed for validator 3")
 	}
 	forgedOnWire := 0
-	for _, raw := range n.taps[3].sent {
+	for _, raw := range n.taps[3].sentLog() {
 		v, derr := consensus.DecodeVote(raw)
 		if derr != nil || v.Type != consensus.MsgPrevote || v.BlockID != eq.forgeID {
 			continue
@@ -580,7 +580,7 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 		t.Fatal("no forged prevote ever reached validator 3's wire: the equivocation stayed local and the Byzantine scenario would be vacuous")
 	}
 	delivered := 0
-	for _, raw := range n.taps[0].recv {
+	for _, raw := range n.taps[0].recvLog() {
 		v, derr := consensus.DecodeVote(raw)
 		if derr == nil && v.Type == consensus.MsgPrevote && v.BlockID == eq.forgeID && n.cfg.IndexOf(v.Validator) == 3 {
 			delivered++
@@ -783,7 +783,7 @@ func TestScenarioByzantinePrecommitEquivocatorDoesNotFork(t *testing.T) {
 		round  uint32
 	}
 	honestFor, forgedFor := map[roundKey]bool{}, map[roundKey]bool{}
-	for _, raw := range n.taps[3].sent {
+	for _, raw := range n.taps[3].sentLog() {
 		v, derr := consensus.DecodeVote(raw)
 		if derr != nil || v.Type != consensus.MsgPrecommit || v.IsNil() {
 			continue
@@ -815,7 +815,7 @@ func TestScenarioByzantinePrecommitEquivocatorDoesNotFork(t *testing.T) {
 	// broadcasts it through the live network, so at least one peer's received
 	// log must hold it - a broadcast that arrives nowhere tallies nowhere.
 	delivered := 0
-	for _, raw := range n.taps[0].recv {
+	for _, raw := range n.taps[0].recvLog() {
 		v, derr := consensus.DecodeVote(raw)
 		if derr == nil && v.Type == consensus.MsgPrecommit && v.BlockID == eq.forgeID && n.cfg.IndexOf(v.Validator) == 3 {
 			delivered++

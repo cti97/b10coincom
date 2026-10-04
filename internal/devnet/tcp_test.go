@@ -322,45 +322,11 @@ func TestFourValidatorsFinaliseThroughTheRelayStar(t *testing.T) {
 	assertVotesAtOrAbove(t, late, uint64(h), 150*time.Second)
 }
 
-// A validator shutting down UNDER TRAFFIC must not tear the chain out from
-// under a dispatch that is mid-flight: a socket transport's reader goroutine
-// exits only when its sockets die, which is after Close began, and a last
-// persisted-lock write attempted against an already-closed chain store fails
-// (and panics, by the persistence rule). The closing gate is the fix; this
-// test is its regression pin: three rounds of committee traffic with one
-// member closing mid-traffic, its Close returning cleanly, the survivors
-// re-meshing afterwards.
-//
-// Killing mutant (compiled): the closing gate removed (route stops checking,
-// Close stops flagging) — the race re-opens; under -race with repeat runs the
-// panicking persistLock kills the test process, which IS the failure.
-func TestValidatorCloseUnderTrafficDoesNotTearTheChain(t *testing.T) {
-	for round := 0; round < 3; round++ {
-		vs := make([]*Validator, 4)
-		for i := range vs {
-			vs[i] = startListening(t, i, 4)
-		}
-		if err := connectMesh(vs); err != nil {
-			t.Fatal(err)
-		}
-		// Let real traffic hot up: some heights committed, votes flying.
-		waitAllReach(t, vs, 3, 60*time.Second)
-
-		// Close one member while the committee is committing.
-		if err := vs[2].Close(); err != nil {
-			t.Fatalf("round %d: the closing validator returned %v; a shutdown race would have panicked the process instead", round, err)
-		}
-		// Its chain must be closed and its height final.
-		finalHeight := vs[2].Height()
-		if finalHeight == 0 {
-			t.Fatalf("round %d: validator 2 closed with an empty chain; the test closed too early to be meaningful", round)
-		}
-		if h := vs[2].Height(); h != finalHeight {
-			t.Fatalf("round %d: validator 2's height moved %d -> %d after Close", round, finalHeight, h)
-		}
-		// The survivors must not care (their maintainer reconnects it; a
-		// dead peer is a dropped frame, and the committee carries on).
-		waitAllReach(t, []*Validator{vs[0], vs[1], vs[3]}, finalHeight+2, 90*time.Second)
-		closeAll(vs)
-	}
-}
+// The Close regression pin that used to live here —
+// TestValidatorCloseUnderTrafficDoesNotTearTheChain, three rounds of
+// committee traffic with one member closing mid-traffic — was replaced by the
+// deterministic shutdown-ordering test in tcp_close_order_test.go (Task 9;
+// Task 6 review carry-forward): the traffic race needed repeats under -race
+// to observe the tear at all, and the gate-removal mutant passed 31 of those
+// runs. The deterministic test pins the same production gate without any
+// scheduling dependence.

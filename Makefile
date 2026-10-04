@@ -1,10 +1,10 @@
 GO ?= go
-# Everything the build targets place on disk goes under BIN (the deploy
-# recipe and ci.yml both assert against $(BIN)/*-linux-arm64, so a change
-# here is visible in the artifact checks, not silent).
+# Everything the host build places on disk goes under BIN. The release build
+# (any target) always goes to dist/ instead — scripts/build-release.sh owns
+# that layout and its per-artifact assertions.
 BIN ?= bin
 
-.PHONY: test race build arm64 vet fmt devnet
+.PHONY: test race build release vet fmt devnet
 
 # -count=1 defeats the test result cache, so a flaky test cannot pass on
 # the strength of an earlier run.
@@ -20,17 +20,19 @@ vet:
 build:
 	$(GO) build -o $(BIN)/b10coin ./cmd/b10coin
 
-# The M4 Pi target: cross-compile BOTH binaries for linux/arm64 (64-bit
-# Raspberry Pi OS). This is deliberately the ONE target M4 needs — Task 9
-# replaces it with the six-platform release matrix; until then any new
-# platform gets its own narrow target here rather than flags added to it.
-# The version stays whatever internal/version declares (0.1.0); no -ldflags
-# injection here, so the binary cannot disagree with the source of truth.
-# Building this on a laptop is not enough to call it supported: ci.yml
-# builds these artifacts on every push, so the Pi binary cannot rot silently.
-arm64:
-	GOOS=linux GOARCH=arm64 $(GO) build -o $(BIN)/b10coin-linux-arm64 ./cmd/b10coin
-	GOOS=linux GOARCH=arm64 $(GO) build -o $(BIN)/b10coin-relay-linux-arm64 ./cmd/b10coin-relay
+# `make release` — BOTH binaries for ALL six supported targets
+# (darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64,
+# windows/arm64) into dist/ with a SHA256SUMS covering every artifact. All
+# build flags and all artifact assertions (count == target count, each
+# artifact really reports its own architecture, .exe on Windows) live in
+# scripts/build-release.sh, so there is ONE build story — this target
+# replaced M4's early single-target `make arm64`; the deploy recipe's
+# scripts/deploy/build.sh now routes through the same script. The version
+# stays whatever internal/version declares; no -ldflags injection here, so
+# the binary cannot disagree with the source of truth. CI runs this on every
+# push, so no platform's artifact can rot silently.
+release:
+	./scripts/build-release.sh
 
 fmt:
 	$(GO) fmt ./...

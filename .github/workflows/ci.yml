@@ -1,5 +1,13 @@
 name: ci
 on: [push, pull_request]
+
+# Bash everywhere: the linux/darwin cross entries and the windows entries run
+# the SAME `GOOS=... GOARCH=...` env-prefixed lines, and windows-latest
+# provides bash. One command text for all six targets, no per-OS forks.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -14,28 +22,6 @@ jobs:
       - run: go test -count=1 ./...
       - run: go test -race -count=1 ./...
       - run: go build ./...
-      # M4's Pi deliverable, CI-checked so the ARM64 cross-compile cannot rot
-      # silently on one developer's machine. (Task 9 replaces this single
-      # linux/arm64 build with the six-target release matrix.)
-      - run: make arm64
-      # Assert the ARTIFACTS, not the command's exit code: exactly two ARM64
-      # binaries, and EACH really is a static linux/aarch64 ELF. The arch
-      # check loops per file — the same loop scripts/deploy/build.sh runs —
-      # because one grep over the whole listing accepts a MIXED pair (a host
-      # Mach-O beside one ARM ELF) and would let a cross-compile that built
-      # only one of the two binaries pass. A build that silently produced
-      # host binaries or dropped one of the two binaries must fail here,
-      # not on a Pi that was flashed hours earlier.
-      - run: test "$(ls bin/*-linux-arm64 | wc -l)" -eq 2
-      - run: file bin/*-linux-arm64
-      - run: |
-          for f in bin/*-linux-arm64; do
-            if ! file "$f" | grep -q 'ELF 64-bit LSB.*ARM aarch64'; then
-              echo "FAIL: $f is not a 64-bit ARM aarch64 ELF:" >&2
-              file "$f" >&2
-              exit 1
-            fi
-          done
       # The milestone acceptance commands must keep printing OK with exit 0.
       # The first is the default run — its --claims default makes it pay one
       # claim and prove the same-epoch double claim refused — and the second
@@ -47,3 +33,53 @@ jobs:
       - run: go run ./cmd/b10coin devnet --blocks 100
       - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1
       - run: go run ./cmd/b10coin devnet --validators 4 --blocks 100
+
+  # The portability matrix: every supported target is COMPILED and, crucially,
+  # go-VETTED for that GOOS/GOARCH. Vet, not build, is what caught the real
+  # cross-platform defect of this milestone — a Unix-only syscall in the
+  # relay's TEST code that made `GOOS=windows go vet` fail while every build
+  # stayed green — so a build-only matrix would have shipped the hole. Each
+  # target cross-compiles from one runner; the pair (GOOS, GOARCH) is what
+  # the code must survive, not the runner it is compiled on.
+  cross:
+    runs-on: ${{ matrix.os }}
+    name: build + vet (${{ matrix.goos }}/${{ matrix.goarch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  goos: linux,   goarch: amd64 }
+          - { os: ubuntu-latest,  goos: linux,   goarch: arm64 }
+          - { os: macos-latest,   goos: darwin,  goarch: amd64 }
+          - { os: macos-latest,   goos: darwin,  goarch: arm64 }
+          - { os: windows-latest, goos: windows, goarch: amd64 }
+          - { os: windows-latest, goos: windows, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
+      - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go vet ./...
+
+  # The release: both binaries for all six targets in dist/ with SHA256SUMS.
+  # scripts/build-release.sh owns the build flags AND the artifact assertions
+  # (count == target count, every artifact file(1)-checked to report its own
+  # architecture, a failing target leaves no partial dist/), so this job
+  # simply runs the one build story — replacing the single linux/arm64 job
+  # this workflow carried since the Pi task. A regression that silently
+  # produced only the host platform's binaries, or dropped one of the pair,
+  # fails HERE and not on a Pi flashed hours later.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: make release
+      - run: file dist/*
+      # Belt over the script's internal assertion: 12 artifacts for 6 targets
+      # plus the checksum file, and every artifact line present in SHA256SUMS.
+      - run: test "$(ls dist | grep -vc SHA256SUMS)" -eq 12
+      - run: test "$(wc -l < dist/SHA256SUMS)" -eq 12

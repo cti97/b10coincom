@@ -12,6 +12,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
@@ -635,6 +636,16 @@ func (n *Net) installEquivocator(i int, typ consensus.MsgType) error {
 // iteration are exactly the sim's own.
 type tap struct {
 	inner transport.Transport
+	// mu guards the two recording logs below. Two writers can be live at the
+	// same time on ONE validator: the catch-up pull runs Syncer.PullAndAdopt
+	// on its own goroutine (its request goes out through tap.Send), and
+	// CatchUp's own goroutine keeps advancing the sim while it waits, whose
+	// deliveries drive the engine's broadcasts through tap.Broadcast (and
+	// inbound frames through the OnMessage append). The two appends — and the
+	// snapshots the scenarios read afterwards — must not run against each
+	// other; unlocked slices appended from two goroutines are a latent data
+	// race exactly hidden from scheduling (Task 6 review carry-forward, low).
+	mu sync.Mutex
 	// router splits consensus frames from wire (HELLO/BLOCK_SYNC) frames -
 	// the two message unions share the numeric tag range 1-3, so routing
 	// happens by what a frame VERIFIES as, through consensus.MessageRouter.
@@ -658,7 +669,7 @@ type tap struct {
 }
 
 func (t *tap) Broadcast(data []byte) error {
-	t.sent = append(t.sent, append([]byte(nil), data...))
+	t.keepSent(data)
 	return t.inner.Broadcast(data)
 }
 
@@ -666,8 +677,17 @@ func (t *tap) Broadcast(data []byte) error {
 // the validator put on the wire belongs in the send log whichever primitive
 // carried it.
 func (t *tap) Send(peer transport.PeerID, data []byte) error {
-	t.sent = append(t.sent, append([]byte(nil), data...))
+	t.keepSent(data)
 	return t.inner.Send(peer, data)
+}
+
+// keepSent appends a copy of the payload to the send log under the log's
+// mutex: Broadcast and Send can run on different goroutines (the pull and
+// the delivery path), and an unsynchronised append there is a data race.
+func (t *tap) keepSent(data []byte) {
+	t.mu.Lock()
+	t.sent = append(t.sent, append([]byte(nil), data...))
+	t.mu.Unlock()
 }
 
 // OnMessage wraps the receive callback. Every consensus frame is counted as
@@ -683,11 +703,49 @@ func (t *tap) OnMessage(fn func(transport.Message)) {
 				return // consumed by the router (sync answered/filed, hello observed, garbage counted)
 			}
 		}
-		t.recv = append(t.recv, append([]byte(nil), m.Data...))
+		t.keepRecv(m.Data)
 		if t.cons != nil {
 			t.cons(m)
 		}
 	})
+}
+
+// keepRecv appends a copy of the delivered frame to the receive log under
+// the same mutex as the send log — the OnMessage callback can run while the
+// pull goroutine's Send records, so the logs share one lock.
+func (t *tap) keepRecv(data []byte) {
+	t.mu.Lock()
+	t.recv = append(t.recv, append([]byte(nil), data...))
+	t.mu.Unlock()
+}
+
+// sentCount, sentLog, recvCount and recvLog return LOCKED snapshots of the
+// recording logs. The scenario assertions use them instead of reading the
+// slice fields, so a read cannot race the append (the same guard the appends
+// took) and a ranged assertion sees a consistent log even if it overlaps a
+// pull.
+func (t *tap) sentCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.sent)
+}
+
+func (t *tap) sentLog() [][]byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([][]byte(nil), t.sent...)
+}
+
+func (t *tap) recvCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.recv)
+}
+
+func (t *tap) recvLog() [][]byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([][]byte(nil), t.recv...)
 }
 
 func (t *tap) Peers() []transport.PeerID { return t.inner.Peers() }

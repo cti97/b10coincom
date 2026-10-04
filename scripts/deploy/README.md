@@ -16,14 +16,7 @@ Pi 2 (home C) ──┘            │
                                  length prefix
 ```
 
-Scope note: `make arm64` builds **one platform — Linux/ARM64 — because that
-is what a Pi runs**, and both Pi binaries come from it. The relay, however,
-runs on the **VPS, not on a Pi**, so §2 has one extra step that builds the
-relay for whatever architecture the VPS itself reports. A later task
-generalizes the build into a multi-platform release matrix and will replace
-`make arm64` and `scripts/deploy/build.sh`; until then, treat the ARM64 Pi
-pair as the single supported target and the VPS relay line as its one
-deliberate extra.
+Scope note: the project builds for **six targets** — darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64 and windows/arm64 — through the one release mechanism (`make release` → `scripts/build-release.sh`). This recipe uses it for the **Linux/ARM64 pair, because that is what a Pi runs**, and `scripts/deploy/build.sh linux/amd64` (or the machine's own architecture) for the **relay, which runs on the VPS, not on a Pi** — §2 asks the machine (`uname -m`) before choosing. The full six-target release is built and artifact-asserted by the same script; nothing here is a second build story.
 
 ---
 
@@ -56,13 +49,13 @@ git clone -b m4-real-networking https://github.com/cti97/b10coincom
 cd b10coincom
 ```
 
-(`-b` checks out the branch this recipe ships on — the deployment files and
-`make arm64` are not on `main` until the milestone merges.)
+(`-b` checks out the branch this recipe ships on — the deployment files are
+not on `main` until the milestone merges.)
 
 Build the two Linux/ARM64 **Pi** binaries:
 
 ```sh
-make arm64                       # or: scripts/deploy/build.sh — builds AND asserts
+scripts/deploy/build.sh          # builds AND asserts: runs scripts/build-release.sh --only linux/arm64 and copies the pair into bin/ under stable names
 ```
 
 These two land in `bin/` (versions come from the source tree —
@@ -82,7 +75,7 @@ file bin/*-linux-arm64
 ```
 
 The node binaries above are for the Pis. **The relay runs on the VPS, not on
-a Pi, so it must match the VPS's own architecture** — `make arm64` cannot
+a Pi, so it must match the VPS's own architecture** — the Pi pair cannot
 know what that is. Ask the VPS before copying anything:
 
 ```sh
@@ -97,18 +90,18 @@ Two answers are likely:
   machine:
 
   ```sh
-  GOOS=linux GOARCH=amd64 go build -o bin/b10coin-relay-linux-amd64 ./cmd/b10coin-relay
+  scripts/deploy/build.sh linux/amd64
   file bin/b10coin-relay-linux-amd64
   # bin/b10coin-relay-linux-amd64:  ELF 64-bit LSB executable, x86-64, ... statically linked
   ```
 
-  (`x86_64` and Go's `amd64` name the same architecture; the version comes
-  from the source tree exactly as it does in `make arm64`.) Copy **that**
-  file to the VPS below, not the `-arm64` one.
+  (`x86_64` and Go's `amd64` name the same architecture; the version and the
+  artifact assertions come from the same release script as the Pi pair.) Copy
+  **that** file to the VPS below, not the `-arm64` one.
 
 - **`aarch64`** — an ARM64 VPS (some providers sell ARM tiers). The relay
-  `make arm64` already produced is the right one; nothing more to build.
-  Copy `bin/b10coin-relay-linux-arm64` below.
+  pair the Pi build already produced is the right one; nothing more to
+  build. Copy `bin/b10coin-relay-linux-arm64` below.
 
 Copy the binaries to the machine that runs each, then install (the static
 binaries need no runtime packages; current 64-bit Raspberry Pi OS and any
@@ -159,7 +152,7 @@ committee size. `--validators 3` produces the chain `b10coin-simnet-3` and
 its three fixed validator keys, and `--index` selects which of those keys
 this machine claims. So sharing the chain takes exactly two conditions:
 
-1. **the same binary** on all three Pis (copy all three from one `make arm64`), and
+1. **the same binary** on all three Pis (copy all three from one `scripts/deploy/build.sh` run), and
 2. **the same `--validators` value on all three** — here `3`.
 
 Nothing you could misconfigure as a "genesis file" exists; the failure mode
@@ -386,7 +379,7 @@ you start it.
 | 1 | **Chain-ID / genesis mismatch** — one node runs a different `--validators` (or an older binary) and derives a different chain | `journalctl -u b10coin \| grep listening` — the `chain …` part of the banner **differs** between Pis (e.g. `b10coin-simnet-3` vs `b10coin-simnet-4`). Nodes on different chains never object; they just ignore each other forever | Stop the odd node; start it from the **same binary build** with the same `--validators 3` as the others (§3). No other remedy exists |
 | 2 | **Relay unreachable** — relay not running, VPS address wrong, port 7001 closed in the cloud firewall or ufw | All chain IDs **match**, but from a Pi: `timeout 3 bash -c '</dev/tcp/example.com/7001' && echo open` prints nothing. On the VPS: `systemctl status b10coin-relay` and `ss -tlnp | grep 7001` tell you whether it listens at all | Start the relay (`systemctl enable --now b10coin-relay`), open TCP 7001 in the security group and `sudo ufw allow 7001/tcp`. Nodes redial with backoff; nothing to restart on the Pis |
 | 3 | **Wrong `--index`** — two Pis share a seat, i.e. one validator key used by two machines | Chain IDs all match, relay reachable, yet heights stall. `journalctl -u b10coin \| grep committee` shows **the same `seat N` on two Pis** (the three must read `seat 0`, `seat 1`, `seat 2` in some order) | Set a unique `B10COIN_INDEX` on one of the two duplicates (`/etc/systemd/system/b10coin.service`), then `sudo systemctl daemon-reload && sudo systemctl restart b10coin` |
-| 4 | **Wrong-architecture binary** — e.g. the ARM64 relay copied onto a standard amd64 (x86_64) VPS, or either binary onto a 32-bit OS | The binary refuses to start at all: running it directly prints `Exec format error` / `cannot execute binary file`, and systemd's log (`journalctl -u b10coin-relay`) shows the same with exit `status=203/EXEC`. Confirm with `file /opt/b10coin/b10coin-relay` — the architecture it names must match what `uname -m` prints on that machine | Rebuild for the machine's own architecture (§2's `uname -m` step: the VPS almost always wants `b10coin-relay-linux-amd64`, built with the one `GOARCH=amd64` line), reinstall with `install -m 0755`, and nothing on the Pis changes |
+| 4 | **Wrong-architecture binary** — e.g. the ARM64 relay copied onto a standard amd64 (x86_64) VPS, or either binary onto a 32-bit OS | The binary refuses to start at all: running it directly prints `Exec format error` / `cannot execute binary file`, and systemd's log (`journalctl -u b10coin-relay`) shows the same with exit `status=203/EXEC`. Confirm with `file /opt/b10coin/b10coin-relay` — the architecture it names must match what `uname -m` prints on that machine | Rebuild for the machine's own architecture (§2's `uname -m` step: the VPS almost always wants `b10coin-relay-linux-amd64`, from `scripts/deploy/build.sh linux/amd64`), reinstall with `install -m 0755`, and nothing on the Pis changes |
 
 Quick disambiguation: the binary will not start (`Exec format error`) → 4;
 chain IDs differ → 1; chain IDs match and the relay port test fails → 2;
@@ -400,7 +393,7 @@ consensus-works, and treat the difference as network.
 ---
 
 One repeated rule, because it costs hours when ignored: **one build for the
-three Pis (all three from one `make arm64`), one `--validators` value on
+three Pis (all three from one `scripts/deploy/build.sh` run), one `--validators` value on
 all, and one `B10COIN_INDEX` per machine; the VPS relay only has to match
 the VPS's own architecture (§2), not the Pis'.** Everything else in this
 recipe is plumbing around that.

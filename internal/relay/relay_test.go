@@ -41,11 +41,9 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"math/rand"
 	"net"
 	"runtime"
-	"syscall"
 	"testing"
 	"time"
 
@@ -566,12 +564,13 @@ func TestRelayStalledHeadersDoNotPinMemoryOrSlots(t *testing.T) {
 // so a HALF-OPEN connection - a peer vanished without closing (power cut,
 // wifi loss), its socket open but never answering - is reaped by the socket
 // itself in minutes, with no code watching and nothing parsed. The wiring is
-// pinned at the socket level (SO_KEEPALIVE read back from the accepted fd by
-// getsockopt): a mutant that disables or drops the setting fails here. The
-// reaping itself cannot be raced on a loopback in a unit test without kernel
-// manipulation - it is the OS's probe count at work - so this test pins the
-// guarantee being set, and its period is a documented, operator-visible knob
-// rather than an accident of the toolchain's default.
+// pinned at the socket level (SO_KEEPALIVE read back from the accepted socket
+// by getsockopt, through sockoptKeepaliveOn): a mutant that disables or drops
+// the setting fails here. The reaping itself cannot be raced on a loopback in
+// a unit test without kernel manipulation - it is the OS's probe count at
+// work - so this test pins the guarantee being set, and its period is a
+// documented, operator-visible knob rather than an accident of the toolchain's
+// default.
 func TestRelaySetsTCPKeepaliveOnAcceptedConnections(t *testing.T) {
 	r := startRelay(t, Options{MaxFrameBytes: 4096, MaxConns: 64, WriteQueueSize: 8})
 	dial(t, r.Addr().String())
@@ -594,23 +593,8 @@ func TestRelaySetsTCPKeepaliveOnAcceptedConnections(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get raw fd: %v", err)
 		}
-		var sockErr error
-		if err := raw.Control(func(fd uintptr) {
-			// Enabled keepalive reads back non-zero (1 on Linux and Windows;
-			// the BSD stacks of darwin answer 8), disabled reads 0 - assert
-			// non-zero, never "equals 1", or the darwin hosts would fail a
-			// correct relay.
-			on, err := syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE)
-			if err != nil {
-				sockErr = err
-			} else if on == 0 {
-				sockErr = fmt.Errorf("SO_KEEPALIVE = 0 (off) - a half-open connection would keep its slot forever")
-			}
-		}); err != nil {
-			sockErr = err
-		}
-		if sockErr != nil {
-			t.Fatalf("accepted connection does not carry TCP keepalive: %v", sockErr)
+		if err := sockoptKeepaliveOn(raw); err != nil {
+			t.Fatalf("accepted connection does not carry TCP keepalive: %v", err)
 		}
 	}
 }

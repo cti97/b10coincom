@@ -2,7 +2,7 @@
 # (b10coin.service) go on the Raspberry Pis and dial THIS machine outbound.
 #
 # Assumes the machine already has (see scripts/deploy/README.md §§2, 6):
-#   - the binary at /opt/b10coin/b10coin-relay    (from make arm64, scp'd)
+#   - the binary at /opt/b10coin/b10coin-relay    (from scripts/deploy/build.sh, scp'd)
 #   - a system user and group "b10coin"
 #   - TCP port 7001 reachable from the internet: cloud/security-group rule,
 #     plus `ufw allow 7001/tcp` if a host firewall is in use
