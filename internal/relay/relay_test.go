@@ -18,9 +18,15 @@
 //   - a peer that stops reading does not stall the relay for everyone else
 //     (TestRelayASlowPeerDoesNotStallTheOtherPeers) - the same slow-reader
 //     property the transport needed, held at the one hop a stranger owns;
-//     and with the write queue actually at its BOUND, forwarding drops
-//     instead of blocking (TestRelayAQueueBoundDropsInsteadOfBlocking) - the
-//     small-queue variant, because a queue that never fills tests nothing;
+//   - with the write queue actually at its BOUND, forwarding DROPS instead of
+//     blocking (TestRelayAQueueBoundDropsInsteadOfBlocking) - pinned
+//     deterministically with NO socket at all, because the previous
+//     socket-flood shape of this test left whether the bound bit up to the
+//     kernel's loopback buffers and failed a correct relay on the Linux CI;
+//   - a sender still makes progress while a peer is genuinely wedged
+//     (TestRelayAWedgedPeerDoesNotDelayTheSenders) - the liveness half over a
+//     real socket, asserted as a duration against a stated budget, never as
+//     a counter;
 //   - a stranger's dials that send only a header and then stall do not hold
 //     resources forever: the per-frame read deadline ends them and both the
 //     slots and the memory come back (TestRelayStalledHeadersDoNotPinMemoryOrSlots);
@@ -155,6 +161,24 @@ func waitGoroutines(t *testing.T, want int, what string) {
 func waitRegistered(t *testing.T, r *Relay, want int, what string) {
 	t.Helper()
 	waitFor(t, func() bool { return r.Stats().Conns == want }, what)
+}
+
+// relaySideConn returns the relay-side half of a dialed connection. Both
+// halves of one TCP connection share a 4-tuple, so the relay's view of the
+// peer (the accepted socket's RemoteAddr) is the dialer's local address. Only
+// a test that pins per-connection queue state needs this handle; the keepalive
+// test reaches the conns map the same way.
+func relaySideConn(t *testing.T, r *Relay, peer net.Conn) *conn {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for c := range r.conns {
+		if c.nc.RemoteAddr().String() == peer.LocalAddr().String() {
+			return c
+		}
+	}
+	t.Fatalf("no relay-side connection for the peer at %s", peer.LocalAddr())
+	return nil
 }
 
 // The brief's first test: the relay forwards between two peers, in BOTH
@@ -599,26 +623,138 @@ func TestRelaySetsTCPKeepaliveOnAcceptedConnections(t *testing.T) {
 	}
 }
 
-// The queue bound must bite as a NON-BLOCKING drop, not as a waiting send.
-// The deep-queue slow-reader test above cannot pin that: with the queue (4096)
-// larger than the flood (2048) the queue NEVER fills, so a mutant replacing
-// the non-blocking enqueue with a BLOCKING send compiles and passes - it
-// killed queue-bypass only. This variant makes the queue the thing being
-// tested: WriteQueueSize 4, and A deliberately wedged. A's kernel buffers
-// absorb roughly 640-768 KiB on this host (measured; see the deep-queue
-// test's comment for the same host-dependence), then A's writer wedges, A's
-// queue fills at frame 4, and every further frame must be DROPPED - never
-// waited on. The flood is PACED so the healthy peer C, whose queue is equally
-// small, can always drain it: under a real producer's finite rate the drops
-// must land ONLY on the wedged peer, and C still receives every frame in
-// sender order. (A fully bursty flood could legitimately drop to C as well;
-// burst absorption is the deep queue's property, pinned separately.)
+// The queue bound must bite as a NON-BLOCKING drop, not as a waiting send -
+// and it must be tested in a way to which NO HOST GETS A VOTE. The previous
+// shape of this test wedged peer A over a real socket, flooded it with a fixed
+// 2048 frames, and asserted Stats().Dropped > 0 at the end: whether A's
+// 4-frame queue ever filled was the KERNEL's decision, the Linux CI's loopback
+// buffers absorbed the whole flood, the bound never bit, and the test failed a
+// CORRECT relay. That is the sixth time this milestone caught a test whose
+// outcome was a host property - a buffer size, a flood size, a queue size, a
+// schedule - rather than the code's behaviour, so the old test's two
+// conflated properties are now split, each held by the shape that makes it
+// host-independent:
+//
+//   - THE BOUND, in this test: driven directly at the enqueue with no socket
+//     at all. This file is in package relay, so the test registers two
+//     hand-built connections - no dial, no listener, no kernel buffer - and
+//     calls forward() itself. The queue's own state is then the ONLY input
+//     the enqueue path has: fill it to capacity by construction, and the next
+//     enqueue faces an exactly-full 4-slot queue on every host identically. A
+//     select/default over a full buffered channel with no receiver cannot
+//     block - the language runs the default branch immediately - so the
+//     assertions depend on nothing but Go's channel semantics. The watchdog
+//     exists only to turn a blocking-send mutant into a test failure in
+//     seconds instead of a stalled suite; the real call takes microseconds
+//     and is logged.
+//
+//   - THE LIVENESS, in TestRelayAWedgedPeerDoesNotDelayTheSenders: over a
+//     real socket, a genuinely wedged peer must not delay its senders -
+//     asserted there as a DURATION, because "blocked" and "not blocked" are
+//     orders of magnitude apart, while a drop counter observed over a socket
+//     is hostage to buffers this process does not control.
 func TestRelayAQueueBoundDropsInsteadOfBlocking(t *testing.T) {
+	const queueSize = 4
+	r := New(Options{MaxFrameBytes: 4096, MaxConns: 8, WriteQueueSize: queueSize})
+	// Deliberately never started and never closed: no Listen, so no accept
+	// loop and no goroutines; and these connections own no socket, so there
+	// is nothing for Close to finish either. The registry below is the only
+	// state forward reads.
+	sender := &conn{wq: make(chan []byte, queueSize), dead: make(chan struct{})}
+	wedged := &conn{wq: make(chan []byte, queueSize), dead: make(chan struct{})}
+	r.mu.Lock()
+	r.conns[sender] = struct{}{}
+	r.conns[wedged] = struct{}{}
+	r.mu.Unlock()
+
+	// Fill the wedged peer's queue to capacity through the REAL enqueue
+	// path. forward targets every connection except the sender, so each
+	// call enqueues exactly one frame on wedged.wq.
+	for i := 0; i < queueSize; i++ {
+		r.forward(sender, []byte("fill"))
+	}
+	if len(wedged.wq) != queueSize {
+		t.Fatalf("queue length is %d after %d accepted enqueues - the queue did not reach capacity, so the test's premise (an exactly-full queue) never formed", len(wedged.wq), queueSize)
+	}
+	if st := r.Stats(); st.Forwarded != queueSize || st.Dropped != 0 {
+		t.Fatalf("at capacity the counters read Forwarded=%d/Dropped=%d, want %d/0 - the accounting drifted before a drop was even possible", st.Forwarded, st.Dropped, queueSize)
+	}
+
+	// The overflow enqueue must DROP, not wait. The drop itself is the proof
+	// of non-blocking: a blocking send into this full channel could never
+	// reach the accounting, because a drop is only ever recorded on the
+	// non-blocking default branch. The watchdog below carries the mutant
+	// proof: replacing the select/default with a blocking send fails HERE,
+	// within the bound, instead of hanging the suite.
+	const nonBlockingBound = 5 * time.Second
+	done := make(chan struct{})
+	var enqueueDuration time.Duration
+	go func() {
+		defer close(done)
+		start := time.Now()
+		r.forward(sender, []byte("overflow"))
+		enqueueDuration = time.Since(start)
+	}()
+	select {
+	case <-done:
+	case <-time.After(nonBlockingBound):
+		t.Fatalf("the enqueue into a FULL %d-frame queue did not return within %v - it blocked instead of dropping", queueSize, nonBlockingBound)
+	}
+	t.Logf("the overflow enqueue returned in %s (bound %s)", enqueueDuration, nonBlockingBound)
+
+	if st := r.Stats(); st.Dropped != 1 {
+		t.Fatalf("Stats().Dropped == %d after one enqueue into a full queue, want exactly 1 - the drop was never reported", st.Dropped)
+	}
+	if st := r.Stats(); st.Forwarded != queueSize {
+		t.Fatalf("Stats().Forwarded == %d after the drop, want %d - the dropped frame was counted as delivered", st.Forwarded, queueSize)
+	}
+	if len(wedged.wq) != queueSize {
+		t.Fatalf("queue length is %d after the drop, want %d - the dropped enqueue disturbed the queue", len(wedged.wq), queueSize)
+	}
+}
+
+// The other half of the split - the liveness half, over a real socket because
+// reader, writer and queue machinery is exactly what a socket exercises and an
+// in-process call would hide. With peer A genuinely WEDGED, someone still
+// sending to the relay must make PROMPT progress: the relay's reader for B
+// keeps reading, and fresh frames reach the healthy peer C. Every assertion is
+// shaped so its result cannot depend on a host buffer, a flood size, or a
+// schedule:
+//
+//   - The wedge is established as a FACT, not hoped into existence. The failed
+//     shape hoped a fixed 2048-frame flood would outrun the kernel; this test
+//     hammers B until A's 4-slot queue reads FULL and STAYS full across a 50 ms
+//     gap with no production behind it - a queue that empties at memcpy speed
+//     cannot sit full with an unblocked writer, so two full readings with a
+//     quiet gap between them mean the writer is parked, on any host, whatever
+//     the kernel absorbed first. The hammer's end condition is the observed
+//     state itself, so it carries no host threshold; the budget bounds only a
+//     relay where the wedge NEVER forms, which is a failure either way.
+//
+//   - The promptness assertion is a DURATION: once the wedge is proven, one
+//     fresh frame from B must reach C within a 2 s budget. The pass case sends
+//     a single frame over an idle path - microseconds, whatever the buffer
+//     sizes, because buffer capacity changes bulk throughput, never whether
+//     one fresh frame flows. The failure it pins is a relay parked in a
+//     blocking enqueue, and a parked reader delivers nothing on any host.
+//     Pass and fail sit orders of magnitude either side of the budget, and
+//     neither depends on how much an earlier hammer flooded.
+//
+//   - The healthy-peer assertion is carried over from the failed test, and is
+//     portable by this run's own evidence (it passed on the CI host, whose
+//     kernel absorbed the flood): paced at a real producer's finite rate, C
+//     must receive EVERY tagged frame in sender order, so the drops at A's
+//     full queue land on nobody else. C's reads run under a deadline, so a
+//     parked relay is a timeout failure here too.
+//
+// No assertion in this test reads the drop counter: the counter at the bound
+// is the deterministic test's property, and one fact gets one owner.
+func TestRelayAWedgedPeerDoesNotDelayTheSenders(t *testing.T) {
 	r := startRelay(t, Options{MaxFrameBytes: 4096, MaxConns: 64, WriteQueueSize: 4})
 	a := dial(t, r.Addr().String())
-	// Best effort, as in the deep-queue test: a small receive buffer makes
-	// A's wedge arrive at a predictable frame count instead of hiding in
-	// loopback's auto-tuned buffers.
+	// Best effort, and NOT load-bearing: a small receive buffer only makes the
+	// wedge arrive after fewer hammered frames. The establishment loop's end
+	// condition does not care what the kernel absorbed.
 	if tc, ok := a.(*net.TCPConn); ok {
 		_ = tc.SetReadBuffer(2048)
 	}
@@ -626,44 +762,121 @@ func TestRelayAQueueBoundDropsInsteadOfBlocking(t *testing.T) {
 	c := dial(t, r.Addr().String())
 	waitRegistered(t, r, 3, "a dial completed while its connection sat unregistered")
 
-	const frames = 2048
-	const frameSize = 1024
+	wedged := relaySideConn(t, r, a)
+	healthy := relaySideConn(t, r, c)
 
-	got := make([]int, 0, frames)
+	const (
+		// Tags 0..hammerTagLimit-1 belong to the establishment hammer; from
+		// probeTag up, frames belong to the assertions. 9000 frames is 9 MiB
+		// of hammer: if a host buffered that much before the wedge formed,
+		// the failure below names the number honestly instead of the test
+		// creeping toward "just one more frame".
+		hammerTagLimit  = 9000
+		probeTag        = 10000
+		pacedFrames     = 2048
+		frameSize       = 1024
+		establishGap    = 50 * time.Millisecond
+		establishBudget = 30 * time.Second
+		probeBudget     = 2 * time.Second
+	)
+
+	frame := func(seq uint16) []byte {
+		f := make([]byte, frameSize)
+		binary.BigEndian.PutUint16(f[:2], seq)
+		return f
+	}
+
+	// The collector discards the hammer's traffic (tags below probeTag) and
+	// records the tagged frames. It exits on the COUNT, like every collector
+	// in this file, and `got` is only read after the collector has closed -
+	// the probe wait synchronizes through a channel instead of through the
+	// slice, so nothing here reads what a goroutine is still appending to.
+	got := make([]int, 0, pacedFrames+1)
+	probeArrived := make(chan struct{})
 	collected := make(chan struct{})
 	go func() {
 		defer close(collected)
 		deadline := time.Now().Add(15 * time.Second)
-		for len(got) < frames {
+		for len(got) < pacedFrames+1 {
 			if err := c.SetReadDeadline(deadline); err != nil {
 				return
 			}
-			frame, err := wire.ReadFrame(c, 4096)
+			f, err := wire.ReadFrame(c, 4096)
 			if err != nil {
 				return
 			}
-			got = append(got, int(binary.BigEndian.Uint16(frame[:2])))
+			seq := int(binary.BigEndian.Uint16(f[:2]))
+			if seq == probeTag {
+				probeArrived <- struct{}{}
+			}
+			if seq >= probeTag {
+				got = append(got, seq)
+			}
 		}
 	}()
 
-	for i := 0; i < frames; i++ {
-		frame := make([]byte, frameSize)
-		binary.BigEndian.PutUint16(frame[:2], uint16(i))
-		writeFrame(t, b, frame)
-		time.Sleep(500 * time.Microsecond) // paced: C must always keep up
+	// Establish the wedge: hammer until the queue reads full, then confirm it
+	// STAYS full across a quiet gap - the only state that means "parked
+	// writer" rather than "writer briefly behind".
+	establishDeadline := time.Now().Add(establishBudget)
+	fullOnce := false
+	var hammerSeq uint16
+	for {
+		if len(wedged.wq) == cap(wedged.wq) {
+			if fullOnce {
+				break
+			}
+			fullOnce = true
+			time.Sleep(establishGap)
+			continue
+		}
+		fullOnce = false
+		if int(hammerSeq) >= hammerTagLimit {
+			t.Fatalf("the wedged peer's write queue never read full after %d hammered frames (9 MiB of hammer) - the tag space is exhausted and this host buffered the hammer whole; the wedge scenario did not reproduce", hammerSeq)
+		}
+		if time.Now().After(establishDeadline) {
+			t.Fatalf("the wedged peer's write queue never filled within %s - the wedged-peer liveness scenario did not reproduce, so this test would assert nothing", establishBudget)
+		}
+		writeFrame(t, b, frame(hammerSeq))
+		hammerSeq++
+	}
+
+	// Nothing is produced during the gap, so the healthy peer's queue drains;
+	// wait for it so the probe cannot sit behind hammer leftovers waiting in
+	// the queue.
+	waitFor(t, func() bool { return len(healthy.wq) == 0 },
+		"the healthy peer's write queue did not drain after the hammer stopped")
+
+	// PROBE: with the wedge a proven fact, one fresh frame from B must reach
+	// C promptly. Pass is one frame over an idle loopback path (microseconds,
+	// logged below); fail is a relay parked on the wedged peer, which
+	// delivers nothing within any budget on any host.
+	probeSent := time.Now()
+	writeFrame(t, b, frame(probeTag))
+	select {
+	case <-probeArrived:
+	case <-time.After(probeBudget):
+		t.Fatalf("a fresh frame written after the wedge was proven did not reach the healthy peer within %s - the sender is waiting on the wedged peer", probeBudget)
+	}
+	t.Logf("with the wedge proven, the probe reached the healthy peer in %s (budget %s)",
+		time.Since(probeSent), probeBudget)
+
+	// HEALTHY PEER, carried over: at a real producer's pace, C receives every
+	// tagged frame in sender order - the drops at A's full queue fell on
+	// nobody else.
+	for i := 1; i <= pacedFrames; i++ {
+		writeFrame(t, b, frame(uint16(probeTag+i)))
+		time.Sleep(500 * time.Microsecond) // paced, exactly as the previous round
 	}
 
 	<-collected
-	if len(got) != frames {
-		t.Fatalf("c received %d of %d frames - the queue bound's drops fell on a healthy peer, not only on the wedged one", len(got), frames)
+	if len(got) != pacedFrames+1 {
+		t.Fatalf("c received %d of %d tagged frames - the queue bound's drops fell on a healthy peer, not only on the wedged one", len(got), pacedFrames+1)
 	}
 	for i, seq := range got {
-		if seq != i {
-			t.Fatalf("frame %d arrived as %d - the relay reordered frames while applying the queue bound", i, seq)
+		if seq != probeTag+i {
+			t.Fatalf("tagged frame %d arrived as %d - the relay reordered frames while applying the queue bound", i, seq)
 		}
-	}
-	if st := r.Stats(); st.Dropped == 0 {
-		t.Fatalf("Stats().Dropped == 0 with a wedged peer and a 4-frame queue - the bound never bit, so this test pinned nothing about the non-blocking drop")
 	}
 }
 
