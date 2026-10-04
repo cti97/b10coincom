@@ -14,6 +14,17 @@ jobs:
       - run: go test -count=1 ./...
       - run: go test -race -count=1 ./...
       - run: go build ./...
+      # M4's Pi deliverable, CI-checked so the ARM64 cross-compile cannot rot
+      # silently on one developer's machine. (Task 9 replaces this single
+      # linux/arm64 build with the six-target release matrix.)
+      - run: make arm64
+      # Assert the ARTIFACTS, not the command's exit code: exactly two ARM64
+      # binaries, and each really is a static linux/aarch64 ELF. A build that
+      # silently produced host binaries or dropped one of the two binaries
+      # must fail here, not on a Pi that was flashed hours earlier.
+      - run: test "$(ls bin/*-linux-arm64 | wc -l)" -eq 2
+      - run: file bin/*-linux-arm64
+      - run: file bin/*-linux-arm64 | grep -q 'ELF 64-bit LSB.*ARM aarch64'
       # The milestone acceptance commands must keep printing OK with exit 0.
       # The first is the default run — its --claims default makes it pay one
       # claim and prove the same-epoch double claim refused — and the second

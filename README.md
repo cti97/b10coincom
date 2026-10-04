@@ -509,6 +509,24 @@ configuration is where the no-premine promise lives:
 | No key can spend from the faucet | the faucet address is hash-of-genesis, not hash-of-pubkey; the derivation is pinned by a test |
 | Emission never exceeds the cap (it lands 2.52 b10 short of it) | `Genesis.Validate` enforces the idealized identity `InitialRewardSparks × HalvingIntervalBlocks × 2 == TotalSupplySparks`, which pins the parameters; the realized truncated series — 20,999,997.48 b10 — is kept under the cap by `TestEmissionNeverExceedsTheCap`, and `TestSupplyCapIsPinned` pins the absolute monetary values, so a proportional "renegotiation" cannot pass |
 
+## Deploying to Raspberry Pis
+
+M4's target is real hardware: `make arm64` cross-compiles **both** binaries
+for Linux/ARM64 (`bin/b10coin-linux-arm64`, `bin/b10coin-relay-linux-arm64`)
+— the binary a 64-bit Raspberry Pi OS runs — and CI (`.github/workflows/ci.yml`)
+builds and asserts those artifacts on every push, so the Pi build cannot rot
+silently. The version the binaries print comes from `internal/version`; no
+build-flag override adds a second source of truth. `scripts/deploy/build.sh`
+is the deployment-facing wrapper that also asserts the artifacts (exactly two
+binaries, each really an `ARM aarch64` ELF). One platform, deliberately: the
+broader multi-platform release matrix is a later task and will replace this
+single target.
+
+The full recipe — three Pis on separate home networks plus one relay VPS,
+build → copy → shared genesis → first contact → systemd units → what output
+means success, then the three likeliest failures and how to tell them apart —
+lives in [`scripts/deploy/README.md`](scripts/deploy/README.md).
+
 ## Checks
 
 `go test -count=1 ./...` and `go test -race ./...` are green across the test
@@ -526,7 +544,9 @@ on every push and pull request as well, on Go 1.23:
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
 
 Makefile targets: `make test`, `make build` (produces `bin/b10coin`), `make
-vet`, `make fmt`, and `make devnet` (build followed by the acceptance check).
+arm64` (both Linux/ARM64 binaries for the Pis — [deploying](#deploying-to-raspberry-pis)),
+`make vet`, `make fmt`, and `make devnet` (build followed by the acceptance
+check).
 
 ## Status and roadmap
 
