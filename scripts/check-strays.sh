@@ -13,7 +13,11 @@ set -uo pipefail
 root=${1:-.}
 
 # Same rule Go itself uses: skip dotted and underscored directories.
-all=$(find "$root" \
+# -mindepth 1 is essential: without it the START path itself matches the '.'
+# basename rule below and the whole tree is pruned, so the guard reports "no
+# strays" while strays exist. That bug shipped once and was caught by a reviewer,
+# not by the guard - which is the worst kind of guard.
+all=$(find "$root" -mindepth 1 \
   \( -name '.*' -o -name '_*' \) -type d -prune -o \
   -type f \( -name '* 2' -o -name '* 2.*' \) -print 2>/dev/null)
 
@@ -40,6 +44,6 @@ deleting or ignoring them:
   Q=../.icloud-duplicates-b10coin
   while IFS= read -r f; do
     mkdir -p "$Q/$(dirname "$f")" && mv "$f" "$Q/$f"
-  done < <(find "$root" \( -name '.*' -o -name '_*' \) -type d -prune -o -type f \( -name '* 2' -o -name '* 2.*' \) -print)
+  done < <(find "$root" -mindepth 1 \( -name '.*' -o -name '_*' \) -type d -prune -o -type f \( -name '* 2' -o -name '* 2.*' \) -print)
 HOWTO
 exit $status
