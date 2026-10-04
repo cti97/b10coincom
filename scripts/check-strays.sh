@@ -40,6 +40,6 @@ deleting or ignoring them:
   Q=../.icloud-duplicates-b10coin
   while IFS= read -r f; do
     mkdir -p "$Q/$(dirname "$f")" && mv "$f" "$Q/$f"
-  done < <(find . \( -name '.*' -o -name '_*' \) -type d -prune -o -type f \( -name '* 2' -o -name '* 2.*' \) -print)
+  done < <(find "$root" \( -name '.*' -o -name '_*' \) -type d -prune -o -type f \( -name '* 2' -o -name '* 2.*' \) -print)
 HOWTO
 exit $status
