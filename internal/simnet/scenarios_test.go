@@ -32,6 +32,7 @@ import (
 	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/consensus"
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -818,7 +819,9 @@ func TestScenarioRestartMidEpoch(t *testing.T) {
 	// and the rebuild's OnMessage registration is what lifts the power-off cut.
 	n.ch[3] = reopened
 	n.offline[3] = false
-	n.drv[3] = consensus.NewDriver(n.cfg, reopened, n.keys[3].priv, n.transportFor(3))
+	// The rebuilt driver gets the same fresh, empty pool every harness driver
+	// gets: the restarted validator ran with no transaction path anyway.
+	n.drv[3] = consensus.NewDriver(n.cfg, reopened, n.keys[3].priv, n.transportFor(3), mempool.New(mempoolCapacity))
 	if err := n.AssertPrefix(3); err != nil {
 		t.Fatalf("the restarted validator holds a conflicting history: %v", err)
 	}

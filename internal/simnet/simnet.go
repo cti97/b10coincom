@@ -18,6 +18,7 @@ import (
 	"github.com/cti97/b10coincom/internal/consensus"
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/genesis"
+	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/transport/sim"
 )
@@ -129,6 +130,15 @@ func simGenesis(n int) *genesis.Genesis {
 	return g
 }
 
+// mempoolCapacity is the per-validator pool size the harness attaches to each
+// driver. Nothing in the M3 scenarios submits a transaction, so every
+// validator proposes empty blocks exactly as it did before consensus gained a
+// transaction source; the pools exist so each validator's proposals run the
+// real take-and-select path (Take returns nothing, block stays empty) rather
+// than a nil-pool shortcut. M4's later wire tasks submit transactions through
+// these same pools.
+const mempoolCapacity = 1000
+
 // New brings up n validators over one simulated network, each with its own chain
 // in its own directory.
 func New(n int, opts Options) (*Net, error) {
@@ -186,7 +196,7 @@ func New(n int, opts Options) (*Net, error) {
 		// order and peer iteration are exactly the sim's own.
 		tp := &tap{inner: out.sim.TransportFor(id)}
 		out.taps = append(out.taps, tp)
-		out.drv = append(out.drv, consensus.NewDriver(out.cfg, c, priv, tp))
+		out.drv = append(out.drv, consensus.NewDriver(out.cfg, c, priv, tp, mempool.New(mempoolCapacity)))
 	}
 	return out, nil
 }
@@ -561,7 +571,7 @@ func (n *Net) installEquivocator(i int, typ consensus.MsgType) error {
 		forgeID: crypto.HashParts([]byte("b10coin-forged-block")),
 	}
 	n.equivs[i] = eq
-	n.drv[i] = consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, eq)
+	n.drv[i] = consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, eq, mempool.New(mempoolCapacity))
 	return nil
 }
 

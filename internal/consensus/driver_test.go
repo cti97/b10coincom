@@ -3,12 +3,15 @@ package consensus
 import (
 	"crypto/ed25519"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
+	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/store"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/transport/sim"
@@ -117,13 +120,19 @@ func drive(t *testing.T, d *Driver, net *sim.Net, iterations int, until func() b
 // precommit -> commit path with nothing but the driver's Broadcast between
 // them - the fixture no longer masks, with test-only traffic, a tally the
 // network would not really perform.
-func oneValidatorFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *recordingTransport, net *sim.Net, pub ed25519.PublicKey, priv ed25519.PrivateKey, g *genesis.Genesis, dir string) {
+func oneValidatorFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *recordingTransport, net *sim.Net, pub ed25519.PublicKey, priv ed25519.PrivateKey, g *genesis.Genesis, dir string, mp *mempool.Mempool) {
+	return oneValidatorFixtureOnGenesis(t, genesis.Devnet())
+}
+
+// oneValidatorFixtureOnGenesis is oneValidatorFixture over a caller-supplied
+// genesis: the claim tests need genesis overrides (claim amount, per-block
+// bound) and nothing else about the fixture may change with them.
+func oneValidatorFixtureOnGenesis(t *testing.T, g *genesis.Genesis) (d *Driver, ch *chain.Chain, rec *recordingTransport, net *sim.Net, pub ed25519.PublicKey, priv ed25519.PrivateKey, gOut *genesis.Genesis, dir string, mp *mempool.Mempool) {
 	t.Helper()
 	pub, priv, err := crypto.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	g = genesis.Devnet()
 	g.Validators = []genesis.Validator{{PubKey: pub, Power: 1}}
 	g.Params.CommitteeSize = 1
 
@@ -141,8 +150,12 @@ func oneValidatorFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *recordi
 	net = sim.New(sim.Options{Seed: 1, Latency: 1})
 	net.AddPeer("v0")
 	rec = &recordingTransport{Transport: net.TransportFor("v0")}
-	d = NewDriver(cfg, ch, priv, rec)
-	return d, ch, rec, net, pub, priv, g, dir
+	// The fixture's mempool is returned precisely so tests can fill it: an
+	// empty pool proposes empty blocks, the behaviour every pre-existing
+	// driver test ran under before transactions had a source.
+	mp = mempool.New(1000)
+	d = NewDriver(cfg, ch, priv, rec, mp)
+	return d, ch, rec, net, pub, priv, g, dir, mp
 }
 
 // blockedQuorumFixture is a two-validator committee with only one driver: with
@@ -150,7 +163,7 @@ func oneValidatorFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *recordi
 // rounds churn. Its peer is a live transport destination that never replies.
 // This is the fixture Design Decision 8 needs: a height that cannot be decided
 // must leave the chain exactly where it started.
-func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *recordingTransport, net *sim.Net, pub ed25519.PublicKey) {
+func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *recordingTransport, net *sim.Net, pub ed25519.PublicKey, mp *mempool.Mempool) {
 	t.Helper()
 	priv := testCommitteeKey(0)
 	peer := testCommitteeKey(1)
@@ -178,8 +191,9 @@ func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *record
 	net.AddPeer("v0")
 	net.AddPeer("ghost") // listens, never sends: the absent second validator
 	rec = &recordingTransport{Transport: net.TransportFor("v0")}
-	d = NewDriver(cfg, ch, priv, rec)
-	return d, ch, rec, net, pub
+	mp = mempool.New(1000)
+	d = NewDriver(cfg, ch, priv, rec, mp)
+	return d, ch, rec, net, pub, mp
 }
 
 // A one-validator committee has a quorum of 1, so it can drive itself all the
@@ -191,7 +205,7 @@ func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *record
 // driver test, leaving Design Decision 8's "then advances to the next height"
 // pinned by nothing.
 func TestDriverAppendsOnCommit(t *testing.T) {
-	d, ch, rec, net, _, _, g, dir := oneValidatorFixture(t)
+	d, ch, rec, net, _, _, g, dir, _ := oneValidatorFixture(t)
 
 	before := ch.Height()
 	if before != 0 {
@@ -274,7 +288,7 @@ func TestDriverAppendsOnCommit(t *testing.T) {
 // own lock moves to be in the store: if the swap lost its restore/persist
 // wiring, nothing reaches the lock log after height 1 and this fails.
 func TestDriverPostCommitSwapStillCarriesTheLock(t *testing.T) {
-	d, ch, rec, net, _, _, _, _ := oneValidatorFixture(t)
+	d, ch, rec, net, _, _, _, _, _ := oneValidatorFixture(t)
 
 	// Three commits: heights 1, 2 and 3. The first engine is NewDriver's
 	// creation; every engine after it comes from flush's post-commit swap,
@@ -309,7 +323,7 @@ func TestDriverPostCommitSwapStillCarriesTheLock(t *testing.T) {
 // not move by a single block: not at proposal receipt, not at precommit, not
 // ever.
 func TestDriverLeavesChainUntouchedWithoutQuorum(t *testing.T) {
-	d, ch, rec, net, _ := blockedQuorumFixture(t)
+	d, ch, rec, net, _, _ := blockedQuorumFixture(t)
 
 	parentID := ch.Head().ID()
 	drive(t, d, net, 300, func() bool {
@@ -357,7 +371,7 @@ func TestDriverLeavesChainUntouchedWithoutQuorum(t *testing.T) {
 // decided for THIS node, and silently moving on would diverge it from every
 // peer that did accept the block.
 func TestDriverRejectedAppendStaysAtSameHeight(t *testing.T) {
-	d, ch, _, net, pub, priv, _, _ := oneValidatorFixture(t)
+	d, ch, _, net, pub, priv, _, _, _ := oneValidatorFixture(t)
 
 	// A proposal whose state root is a lie. It passes every engine-level check
 	// (envelope signature, membership, justification) because the engine owns
@@ -420,7 +434,7 @@ func TestDriverRejectedAppendStaysAtSameHeight(t *testing.T) {
 // commits the other tests observe are only possible because these messages
 // really left the driver, so this test names the seam directly.
 func TestDriverForwardsDrainedMessagesToTransport(t *testing.T) {
-	d, ch, rec, net, pub, _, _, _ := oneValidatorFixture(t)
+	d, ch, rec, net, pub, _, _, _, _ := oneValidatorFixture(t)
 
 	drive(t, d, net, 200, func() bool { return ch.Height() > 0 })
 	if ch.Height() != 1 {
@@ -480,7 +494,7 @@ func TestDriverForwardsDrainedMessagesToTransport(t *testing.T) {
 // behind. This exact defect was removed from the engine's caller by Task 6's
 // review.
 func TestDriverEndsTheRoundItIsInOnTimeout(t *testing.T) {
-	d, ch, rec, net, _ := blockedQuorumFixture(t)
+	d, ch, rec, net, _, _ := blockedQuorumFixture(t)
 
 	drive(t, d, net, 300, func() bool {
 		if ch.Height() != 0 {
@@ -513,7 +527,7 @@ func TestDriverEndsTheRoundItIsInOnTimeout(t *testing.T) {
 // the network but has no driver, no engine and no chain - it listens and never
 // emits. That is the review's High finding (F1) measured end to end: three live
 // validators against a quorum of 3 of TOTAL power, which must still commit.
-func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Chain, net *sim.Net) {
+func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Chain, net *sim.Net, pools []*mempool.Mempool) {
 	t.Helper()
 	vals := make([]genesis.Validator, 0, 4)
 	for i := 0; i < 4; i++ {
@@ -540,13 +554,17 @@ func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Ch
 		if err != nil {
 			t.Fatal(err)
 		}
-		d := NewDriver(cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)))
-		ds = append(ds, d)
+		// The pools are handed back so tests can fill them: filling a
+		// validator's pool is what M4's relay tasks will do, and a scenario
+		// that wants transactions on the wire puts them here.
+		pool := mempool.New(1000)
+		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)), pool))
 		chs = append(chs, ch)
+		pools = append(pools, pool)
 	}
 	// v3 gets no driver: the sim drops deliveries to a handler-less endpoint,
 	// which is exactly what a silent validator is.
-	return ds, chs, net
+	return ds, chs, net, pools
 }
 
 // A validator's own vote must count toward its own tally, or a validator's
@@ -565,7 +583,7 @@ func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Ch
 // virtual time and requires not merely SOME progress but CONSENSUS: the three
 // live chains must agree, block for block.
 func TestFourValidatorsOneSilentStillCommitHeights(t *testing.T) {
-	ds, chs, net := fourValidatorsOneSilentFixture(t)
+	ds, chs, net, _ := fourValidatorsOneSilentFixture(t)
 	defer func() {
 		for _, ch := range chs {
 			_ = ch.Close()
@@ -707,8 +725,8 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	}
 	parent := ch1.Head().ID()
 	tp1 := &stalledTransport{}
-	d1 := NewDriver(cfg, ch1, priv0, tp1)
-	d1Engine := d1.eng // kept only to prove the restart built a different engine
+	d1 := NewDriver(cfg, ch1, priv0, tp1, nil) // no pool: this test wires no transaction source
+	d1Engine := d1.eng                         // kept only to prove the restart built a different engine
 
 	// Walk the rounds until this validator is drawn as proposer at (1, r),
 	// then play the rest of the committee with one signed prevote for the
@@ -778,7 +796,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 		t.Fatalf("the replayed chain sits at height %d; the restart must re-judge the undecided height 1", ch2.Height())
 	}
 	tp2 := &stalledTransport{}
-	d2 := NewDriver(cfg, ch2, priv0, tp2)
+	d2 := NewDriver(cfg, ch2, priv0, tp2, nil) // no pool: this test wires no transaction source
 
 	// The restored lock, checked the instant the engine exists - before the
 	// engine has seen one message or one tick, i.e. before anything in run 2
@@ -891,5 +909,387 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	}
 	if d2.eng.lk.blockID() != lockID {
 		t.Fatal("prevoting the justified block must not itself move the lock")
+	}
+}
+
+// ---- Task 0: consensus blocks carry transactions ----
+//
+// M3's driver proposed nil, so the chain that pays faucet claims (the M2
+// single-node path) and the committee that agrees (the M3 consensus path) had
+// never run together: a block paying a claim had never been agreed on by more
+// than one validator. These tests drive the driver over the same virtual-time
+// sim fixtures the other driver tests use, with the driver's mempool filled
+// the way a real submission path would fill it.
+
+// transferTx builds a signed transfer from devnet dev account from to dev
+// account to at the given nonce and amount. Account 0 holds one million b10 on
+// a fresh chain, so transfers out of it apply.
+func transferTx(from, to int, nonce, amount uint64) types.Tx {
+	fromPub, fromPriv := genesis.DevAccountKey(from)
+	toPub, _ := genesis.DevAccountKey(to)
+	tx := &types.Tx{
+		Type:   types.TxTransfer,
+		From:   types.AddressFromPub(fromPub),
+		PubKey: fromPub,
+		Nonce:  nonce,
+		To:     types.AddressFromPub(toPub),
+		Amount: amount,
+	}
+	sig := tx.SigningHash()
+	tx.Sig = crypto.Sign(fromPriv, sig[:])
+	return *tx
+}
+
+// claimTx builds a SOLVED, signed faucet claim for the deterministic test
+// claimant index i at epoch. The puzzle is genuinely mined under the genesis
+// parameters, so the claim is payable - the tests below assert application,
+// and a claim that could not apply would only prove the test's own blindness.
+func claimTx(t *testing.T, g *genesis.Genesis, index int, epoch uint64) types.Tx {
+	t.Helper()
+	h := crypto.HashParts([]byte("b10coin-driver-test-claimant"), []byte(strconv.Itoa(index)))
+	priv := ed25519.NewKeyFromSeed(h[:])
+	pub := priv.Public().(ed25519.PublicKey)
+	pow, ok := faucet.Solve(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1_000_000)
+	if !ok {
+		t.Fatalf("test claimant %d did not solve the fixture puzzle in 1,000,000 attempts", index)
+	}
+	tx := &types.Tx{
+		Type:     types.TxFaucetClaim,
+		From:     types.AddressFromPub(pub),
+		PubKey:   pub,
+		Nonce:    0,
+		Epoch:    epoch,
+		PowNonce: pow,
+	}
+	sig := tx.SigningHash()
+	tx.Sig = crypto.Sign(priv, sig[:])
+	return *tx
+}
+
+// carriesTx reports whether blk holds a transaction with the given ID.
+func carriesTx(blk *types.Block, id [32]byte) bool {
+	for i := range blk.Txs {
+		if blk.Txs[i].ID() == id {
+			return true
+		}
+	}
+	return false
+}
+
+// committedBlock fetches the stored block at height.
+func committedBlock(t *testing.T, ch *chain.Chain, height uint64) *types.Block {
+	t.Helper()
+	blk, err := ch.BlockAt(height)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return blk
+}
+
+// A committed consensus block must carry the transactions the mempool held.
+// Until M4 the driver proposed an empty list, so the committed block was empty
+// by construction no matter what the pool held.
+func TestAConsensusBlockCarriesMempoolTransactions(t *testing.T) {
+	d, ch, rec, net, _, _, _, _, mp := oneValidatorFixture(t)
+
+	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	txID := tx.ID()
+	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
+		t.Fatal(err)
+	}
+
+	drive(t, d, net, 200, func() bool { return ch.Height() >= 1 })
+	if ch.Height() < 1 {
+		t.Fatalf("the committee never committed after 200 drive iterations (%d messages): no committed block to inspect", len(rec.broadcasts))
+	}
+	// The committed batch must be off the driver's books the moment the
+	// append succeeded: a batch still held as pending would be reclaimed and
+	// re-evicted by every later height's proposal.
+	if len(d.pending) != 0 {
+		t.Fatalf("the driver still holds %d pending transaction(s) after appending its own commit: committed transactions must not be reclaimed for a second ride", len(d.pending))
+	}
+	blk := committedBlock(t, ch, 1)
+	if len(blk.Txs) == 0 {
+		t.Fatal("the committed block carries NO transactions: the driver is still proposing an empty list")
+	}
+	if !carriesTx(blk, txID) {
+		t.Fatalf("the committed block carries %d transaction(s) but not the mempool's transfer %x: it proposed something else", len(blk.Txs), txID[:8])
+	}
+	// The transfer must have been APPLIED, not merely carried: account 0's
+	// balance dropped by the amount and its nonce advanced, account 1 was
+	// credited, and the state root Append verified is the one that says so.
+	fromPub, _ := genesis.DevAccountKey(0)
+	toPub, _ := genesis.DevAccountKey(1)
+	if got := ch.State().Get(types.AddressFromPub(toPub)).Balance; got != 250*genesis.SparksPerB10 {
+		t.Fatalf("the recipient holds %d, want the transferred %d: the block carried bytes, it did not pay", got, 250*genesis.SparksPerB10)
+	}
+	if got := ch.State().Get(types.AddressFromPub(fromPub)); got.Balance != 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10 || got.Nonce != 1 {
+		t.Fatalf("the sender holds (balance %d, nonce %d), want (balance %d, nonce 1): the debit side did not run", got.Balance, got.Nonce, 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10)
+	}
+}
+
+// A committed consensus block carries a faucet CLAIM if one is in the pool -
+// the integration that has never been exercised. Presence in the byte string
+// is not the proof: the claimant must have been PAID (credited exactly one
+// claim amount) and the faucet DEBITED, through the commit the committee
+// reached.
+func TestAConsensusBlockPaysAFaucetClaimThroughConsensus(t *testing.T) {
+	d, ch, rec, net, _, _, g, _, mp := oneValidatorFixture(t)
+
+	// Epoch 1 is what a claim applied at height 1 must carry (epoch(h) =
+	// h/EpochBlocks + 1, and the fixture's EpochBlocks is 1000). The devnet
+	// claim amount (1 b10) is funded by the genesis mint plus height 1's
+	// emission and by nothing else, so a paid claim also proves the probe and
+	// the commit saw the emission the same way.
+	claim := claimTx(t, g, 0, 1)
+	claimID := claim.ID()
+	claimant, faucetAddr := claim.From, g.FaucetAddress()
+	faucetBefore := ch.State().Get(faucetAddr).Balance
+	emission1 := faucet.Reward(1, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks)
+	if faucetBefore+emission1 < g.Params.ClaimAmountSparks {
+		t.Fatal("fixture is starved: the faucet cannot pay one claim, so the test would prove nothing")
+	}
+	if err := mp.Add([]types.Tx{claim})[0]; err != nil {
+		t.Fatal(err)
+	}
+
+	drive(t, d, net, 200, func() bool { return ch.Height() >= 1 })
+	if ch.Height() < 1 {
+		t.Fatalf("the committee never committed after 200 drive iterations (%d messages): no committed block to inspect", len(rec.broadcasts))
+	}
+	blk := committedBlock(t, ch, 1)
+	if !carriesTx(blk, claimID) {
+		t.Fatalf("the committed block carries no faucet claim: the faucet path and the consensus path still never met (%d messages broadcast)", len(rec.broadcasts))
+	}
+	// Paid, not carried: the claimant started at zero and holds exactly the
+	// claim amount; the faucet moved by exactly height-1 emission minus one
+	// claim. Any drift shows up here as arithmetic, not as a vague absence.
+	if got := ch.State().Get(claimant).Balance; got != g.Params.ClaimAmountSparks {
+		t.Fatalf("the claimant holds %d after the committed block, want the claim amount %d: the claim was carried but not paid", got, g.Params.ClaimAmountSparks)
+	}
+	if got := ch.State().Get(faucetAddr).Balance; got != faucetBefore+emission1-g.Params.ClaimAmountSparks {
+		t.Fatalf("the faucet holds %d after the committed block, want %d (genesis %d + height-1 emission %d - one claim %d): the claim's debit side did not run under consensus",
+			got, faucetBefore+emission1-g.Params.ClaimAmountSparks, faucetBefore, emission1, g.Params.ClaimAmountSparks)
+	}
+}
+
+// A transaction that cannot apply must be excluded from the proposal, not
+// fatal to it: one state-invalid transaction must not discard its valid
+// siblings and must not wedge the height - the same tolerance node.RunOnce
+// already has. A proposer that shipped unfiltered batches instead would hand
+// the committee a block every peer's all-or-nothing ApplyBlock refuses.
+func TestInapplicableTransactionsAreExcludedNotFatal(t *testing.T) {
+	d, ch, _, net, _, _, _, _, mp := oneValidatorFixture(t)
+
+	good := transferTx(0, 1, 0, 250*genesis.SparksPerB10)               // applies: dev 0's nonce is 0
+	badNonce := transferTx(0, 1, 7, 100*genesis.SparksPerB10)           // nonce 7, dev 0 is at 0
+	insufficient := transferTx(0, 1, 1, 2_000_000*genesis.SparksPerB10) // after `good`, dev 0 cannot cover two million b10
+	txs := []types.Tx{good, badNonce, insufficient}
+	if errs := mp.Add(txs); errs[0] != nil || errs[1] != nil || errs[2] != nil {
+		t.Fatalf("the fixture's transactions failed the pool's signature checks: %v", errs)
+	}
+
+	// Two heights, not one: the inapplicable pair must not even delay the
+	// second block.
+	drive(t, d, net, 200, func() bool { return ch.Height() >= 2 })
+	if ch.Height() < 2 {
+		t.Fatalf("the chain stalled at height %d: an inapplicable transaction became fatal instead of being evicted alone", ch.Height())
+	}
+	blk := committedBlock(t, ch, 1)
+	if !carriesTx(blk, good.ID()) {
+		t.Fatalf("the valid transfer was discarded with its inapplicable siblings: block 1 carries %d transaction(s)", len(blk.Txs))
+	}
+	if carriesTx(blk, badNonce.ID()) || carriesTx(blk, insufficient.ID()) {
+		t.Fatalf("a transaction that cannot apply rode the proposal at height %d: every peer's ApplyBlock would refuse the whole block", blk.Header.Height)
+	}
+}
+
+// The claim bound still bounds on the consensus path. The pool holds one more
+// claim than the bound; the committed block must carry no more than the bound,
+// and the surplus must SURVIVE in the pool for a later block - dropped claims
+// would be eviction dressed up as bounding.
+//
+// The fixture's claim amount is lowered to 0.1 b10 so the faucet funds all of
+// the submissions: with the shipped devnet amount, faucet poverty (not the
+// bound) would cap the block, and the test would pass for the wrong reason.
+func TestClaimBoundStillBoundsOnTheConsensusPath(t *testing.T) {
+	g := genesis.Devnet()
+	g.Params.ClaimAmountSparks = 10_000_000
+	d, ch, _, net, _, _, _, _, mp := oneValidatorFixtureOnGenesis(t, g)
+
+	if g.Params.MaxClaimsPerBlock != mempool.MaxFaucetClaimsPerBlock {
+		t.Fatalf("the fixture's genesis bound (%d) and the pool's (%d) disagree: the test could not tell which layer bounded", g.Params.MaxClaimsPerBlock, mempool.MaxFaucetClaimsPerBlock)
+	}
+	submitted := make([]types.Tx, 0, int(mempool.MaxFaucetClaimsPerBlock)+1) // one past the bound
+	for i := 0; i < int(mempool.MaxFaucetClaimsPerBlock)+1; i++ {
+		submitted = append(submitted, claimTx(t, g, i, 1))
+	}
+	errs := mp.Add(submitted)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("submitted claim %d was refused by the pool: %v", i, err)
+		}
+	}
+
+	drive(t, d, net, 400, func() bool { return ch.Height() >= 2 })
+	if ch.Height() < 2 {
+		t.Fatalf("the committee never reached two blocks with a pool holding one claim past the bound: the bound turned into a stall (height %d)", ch.Height())
+	}
+	b1 := committedBlock(t, ch, 1)
+	claims1 := countFaucetClaims(b1)
+	if claims1 != int(g.Params.MaxClaimsPerBlock) {
+		t.Fatalf("height 1 carries %d claims, want exactly the bound %d: the pool handed the block a claim count only the state bound could have rejected", claims1, g.Params.MaxClaimsPerBlock)
+	}
+	b2 := committedBlock(t, ch, 2)
+	if got := countFaucetClaims(b2); got != 1 {
+		t.Fatalf("height 2 carries %d claim(s), want the one the bound kept in the pool: a surplus claim was evicted or stranded instead of deferred to the next block", got)
+	}
+	// Applied, not carried: the first carried claim's claimant was actually
+	// paid.
+	var firstClaim types.Tx
+	for i := range b1.Txs {
+		if b1.Txs[i].Type == types.TxFaucetClaim {
+			firstClaim = b1.Txs[i]
+			break
+		}
+	}
+	if got := ch.State().Get(firstClaim.From).Balance; got != g.Params.ClaimAmountSparks {
+		t.Fatalf("the first claim's claimant holds %d, want the claim amount %d: the bound test cannot rest on unapplied claims", got, g.Params.ClaimAmountSparks)
+	}
+}
+
+func countFaucetClaims(blk *types.Block) int {
+	n := 0
+	for i := range blk.Txs {
+		if blk.Txs[i].Type == types.TxFaucetClaim {
+			n++
+		}
+	}
+	return n
+}
+
+// A proposal whose round never decides must not evaporate the transactions it
+// took: Take removed them from the pool, the engine still judges the height,
+// and the only thing that can put them back is the driver's reclaim of its
+// uncommitted batch. Two proposals from two different rounds must both carry
+// the transaction.
+func TestAnAbandonedRoundDoesNotEvaporateItsTransactions(t *testing.T) {
+	d, ch, rec, net, _, mp := blockedQuorumFixture(t)
+
+	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	txID := tx.ID()
+	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
+		t.Fatal(err)
+	}
+
+	// The quorum of 2 is unreachable: heights never commit, rounds churn, and
+	// this validator proposes in every round it is drawn for.
+	drive(t, d, net, 300, nil)
+	if ch.Height() != 0 {
+		t.Fatalf("the chain moved to height %d in a fixture that cannot commit: the assertion below would be vacuous", ch.Height())
+	}
+
+	rounds := map[uint32]bool{}
+	proposals := 0
+	for _, raw := range rec.broadcasts {
+		c := decodeWire(t, raw)
+		if c.prop == nil {
+			continue
+		}
+		proposals++
+		if carriesTx(&c.prop.Block, txID) {
+			rounds[c.prop.Round] = true
+		}
+	}
+	if proposals < 2 {
+		t.Fatalf("the fixture produced only %d proposal(s): it never re-entered proposing, so it cannot test a reclaim", proposals)
+	}
+	if len(rounds) < 2 {
+		t.Fatalf("the transfer appears in the proposals of only %d round(s) %v out of %d: a timed-out round's proposal swallowed the transactions Take had removed - the next proposal proposed an EMPTY block", len(rounds), keysOf(rounds), proposals)
+	}
+	// The batch is still held exactly once, not multiplied across rounds: the
+	// driver's pending record is the reclaim's source of truth.
+	if len(d.pending) != 1 || d.pending[0].ID() != txID {
+		t.Fatalf("the driver's pending batch is %d transaction(s), want exactly the one uncommitted transfer", len(d.pending))
+	}
+}
+
+// THE milestone integration, end to end: a block carrying a transfer AND a
+// faucet claim agreed on by MORE THAN ONE validator. Every live validator
+// holds the same two transactions in its own pool - each one's proposer takes
+// them - so whatever the eventual commit is, it carries them once, every peer
+// applies them at its own Append, and the three live chains must hold one
+// history that pays both.
+func TestThreeValidatorsAgreeOnABlockThatCarriesATransferAndAClaim(t *testing.T) {
+	ds, chs, net, pools := fourValidatorsOneSilentFixture(t)
+	defer func() {
+		for _, ch := range chs {
+			_ = ch.Close()
+		}
+	}()
+	g := chs[0].Genesis()
+
+	claim := claimTx(t, g, 900, 1) // epoch 1, applied at height 1; index 900 stays clear of the bound test's keys
+	transfer := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	claimID, transferID := claim.ID(), transfer.ID()
+	for _, mp := range pools {
+		if errs := mp.Add([]types.Tx{transfer, claim}); errs[0] != nil || errs[1] != nil {
+			t.Fatalf("the fixture could not fill a validator's pool: %v", errs)
+		}
+	}
+
+	const iterations = 600 // 6000 virtual ms: dozens of rounds
+	for i := 0; i < iterations; i++ {
+		now := int64(i) * driveStep
+		for _, d := range ds {
+			d.Tick(now)
+		}
+		net.Advance(netStep)
+		for _, d := range ds {
+			d.Tick(now + driveStep/2)
+		}
+	}
+
+	if chs[0].Height() < 1 {
+		t.Fatalf("the committee reached only height %d: a transaction-carrying proposal never reached the quorum of 3", chs[0].Height())
+	}
+	// One history: every height the SLOWEST live validator committed must be
+	// byte-identical across all three.
+	minH := chs[0].Height()
+	for _, ch := range chs[1:] {
+		if ch.Height() < minH {
+			minH = ch.Height()
+		}
+	}
+	carriers := 0
+	var agreedBlock *types.Block
+	for h := uint64(1); h <= minH; h++ {
+		ref := committedBlock(t, chs[0], h)
+		for i, ch := range chs[1:] {
+			other := committedBlock(t, ch, h)
+			if other.ID() != ref.ID() {
+				t.Fatalf("live validator %d holds a different block at height %d: the committee disagreed about a block that carries transactions", i+1, h)
+			}
+		}
+		if carriesTx(ref, transferID) || carriesTx(ref, claimID) {
+			carriers++
+			agreedBlock = ref
+		}
+	}
+	if carriers != 1 {
+		t.Fatalf("%d committed block(s) carry the pool's transactions, want exactly one: a transaction committed twice through consensus would be a double-pay", carriers)
+	}
+	if agreedBlock == nil {
+		t.Fatalf("no committed block carries the pool's transactions inside the %d shared heights: the consensus path still drops transactions", minH)
+	}
+	if !carriesTx(agreedBlock, transferID) || !carriesTx(agreedBlock, claimID) {
+		t.Fatalf("the agreed block at height %d carries only part of the pool: transfer=%v claim=%v", agreedBlock.Header.Height, carriesTx(agreedBlock, transferID), carriesTx(agreedBlock, claimID))
+	}
+	// The claim really was PAID, on every live chain.
+	want := g.Params.ClaimAmountSparks
+	for i, ch := range chs {
+		if got := ch.State().Get(claim.From).Balance; got != want {
+			t.Fatalf("live validator %d computed a claimant balance of %d, want %d: the committee agreed on bytes but not on state", i, got, want)
+		}
 	}
 }
