@@ -144,6 +144,46 @@ fresh key, and prints that key once — copy it out immediately if you plan a
 follow-up transfer, because it cannot be recovered later. The claim is only
 queued by this command; the node pays it when its next block applies it.
 
+### `b10coin-relay`
+
+A separate binary (`cmd/b10coin-relay`) — the one component of the network a
+stranger can reach. It runs on a cheap public VPS; every home validator dials
+**outbound** to it, which is what makes the topology work with no port
+forwarding and nothing to do about CGNAT (inbound to a home Pi is blocked,
+outbound almost never is). The relay keeps a registry of connected peers and
+forwards every frame it receives to every **other** peer. It parses nothing
+beyond the frame's 4-byte length prefix — it does not know what a vote is,
+and that is the design, not a shortcut.
+
+The trust trade it rests on: every consensus message is signed with the
+sender's Ed25519 key, so **a malicious relay can censor or delay, but it
+cannot forge a vote or a proposal**. Consensus safety is never at risk from
+the relay; only liveness is (a relay that partitions the validator set stalls
+consensus, which the round protocol's rebroadcasts and the reconnection
+backoff pay for). If that ever stops being acceptable the answer is multiple
+relays and direct connections — never a smarter relay, because a relay that
+understood consensus would be a relay that could be wrong about it.
+
+Because it authenticates nothing, it binds everything a stranger controls: a
+frame whose declared length exceeds the bound is refused before any
+allocation and its connection is ended; dials past the connection bound are
+closed at accept; every connection buffers at most a bounded write queue, so
+a peer that stops reading cannot stall the relay for the others (dropped
+frames, never a blocked forwarder). In production the access policy does not
+live in the relay at all — run it behind the VPS firewall allowlisting the
+validator IPs. Validators reconnect to a restarted relay with exponential
+backoff. Bandwidth is kilobytes per second.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--addr ADDR` | `:7001` | listen address (all interfaces — validators must reach this one) |
+| `--max-frame-bytes N` | `1048576` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic) |
+| `--max-conns N` | `256` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
+| `--write-queue N` | `64` | per-connection buffered frames; a full queue drops new frames for that peer instead of blocking the relay |
+
+Ctrl-C (or SIGTERM) stops the listener, closes every connection and joins
+every goroutine before the process exits.
+
 ### `b10coin version` and `b10coin help`
 
 `version` prints the software version (`0.1.0`). `help`, `-h` and `--help`
