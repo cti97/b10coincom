@@ -6,7 +6,12 @@
 // the faucet, a solved puzzle buys a claim, and the claimant is paid. Each
 // PAID claim is immediately followed by a second, solved claim from the same
 // key in the same epoch, so one call also proves the anti-farming rule: that
-// attempt must be refused, or the run fails.
+// attempt must be refused, or the run fails. M3 adds RunMulti: a committee of
+// consensus validators over the simnet harness, reporting each validator's
+// final height and whether the committee holds one history — the acceptance
+// check `devnet --validators 4 --blocks 100` the design's section 9 named
+// back when a single node could not honour it, because one node needs no
+// agreement.
 package devnet
 
 import (
@@ -21,10 +26,25 @@ import (
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/node"
+	"github.com/cti97/b10coincom/internal/simnet"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
-var ErrNoBlocks = errors.New("devnet: Blocks must be greater than zero")
+var (
+	ErrNoBlocks = errors.New("devnet: Blocks must be greater than zero")
+	// ErrNoValidators rejects RunMulti(Options{Validators: 0}). RunMulti is
+	// the consensus path: a committee of zero has nothing to run, and
+	// silently running the single-node loop instead would make --validators
+	// a flag that lies.
+	ErrNoValidators = errors.New("devnet: RunMulti needs Validators of at least one")
+	// ErrClaimsAreMultiUnsupported refuses a RunMulti with claims. The claim
+	// scenario solves puzzles and drives transactions through one node's own
+	// mempool and RunOnce; the simnet committee's Transport offers only
+	// consensus messages, so there is no way to submit a claim to it. A run
+	// that dropped o.Claims on the floor would print claims paid = 0 and
+	// look like a broken faucet — refuse loudly instead.
+	ErrClaimsAreMultiUnsupported = errors.New("devnet: the faucet-claim scenario runs on the single-node path only; a multi-validator run carries no transaction path")
+)
 
 // maxPuzzleAttempts bounds one claim's solve. The devnet's easy target needs
 // about two attempts, so a failure here means the fixture tuning broke, not
@@ -45,6 +65,26 @@ type Options struct {
 	// applied double claim fails the run) and which takes one further empty
 	// block per paid claim.
 	Claims uint64
+
+	// Validators sizes the committee RunMulti drives. Zero means "not a
+	// multi-validator run": the single-node Run/Replay paths ignore it, and
+	// RunMulti requires at least one — silently falling back to the
+	// single-node loop for zero would make the flag lie. The simnet harness
+	// caps committees at 255 and its error propagates for anything larger.
+	Validators uint64
+
+	// OfflineValidators names committee indices RunMulti powers off before
+	// the run: those validators tick and receive nothing for the whole run,
+	// exactly like simnet's TakeOffline — a powered-off machine, not a
+	// validator-set change, so they keep their seats and the
+	// two-thirds-of-TOTAL-power bar is unmoved. It is the devnet surface's
+	// liveness dial: with Validators 4 and one validator offline, the three
+	// online validators hold exactly the bar and the chain must still
+	// advance. An offline validator has no catch-up path in M3, so its
+	// height stays frozen wherever it stood when the run began; its frozen
+	// history must remain a strict prefix of the longest chain. Run/Replay
+	// ignore it.
+	OfflineValidators []int
 }
 
 // Summary reports what a run produced.
@@ -77,6 +117,38 @@ type Summary struct {
 	ClaimedBalance      uint64
 	FaucetBalance       uint64
 	EmittedTotal        uint64
+
+	// The multi-validator run's fields, set by RunMulti and left zero by the
+	// single-node Run and Replay.
+	//
+	// Validators is the committee size requested AND driven: a run whose
+	// harness drove a different committee size than the options asked for
+	// fails rather than reporting the request.
+	//
+	// ValidatorHeights is each validator's final chain height by committee
+	// index. Height, for a multi run, is the longest of them; StateRoot is
+	// zero and means NOT REPORTED, not "empty state" — the harness exposes
+	// no state-root reader, and each validator's own chain on disk carries
+	// its own root. The same honesty applies to TxsIncluded and every faucet
+	// field: RunMulti injects no transaction anywhere (the committee's
+	// Transport carries only consensus messages — there is no claim path
+	// into it), so there is genuinely nothing to report.
+	//
+	// Agreed reports whether the validators hold ONE history: every
+	// validator's committed blocks, height by height up to its own head, are
+	// byte-identical to the longest chain's blocks at the same heights, so
+	// shorter validators are strict prefixes of the longest chain and no two
+	// validators ever committed conflicting blocks at one height. A run in
+	// which the validators disagree FAILS: RunMulti returns an error naming
+	// the divergence, and the Summary returned with that error reports
+	// Agreed == false. For a committee of one, Agreed is vacuously true —
+	// one validator's history trivially is the one history, and the
+	// per-validator prefix check degenerates to a self-comparison. That
+	// case's overlap with the single-node Run is deliberate, not accidental;
+	// see RunMulti.
+	Validators       uint64
+	ValidatorHeights map[int]uint64
+	Agreed           bool
 }
 
 // Run creates a fresh devnet and drives it to o.Blocks. One transfer is
@@ -221,6 +293,171 @@ func Run(o Options) (Summary, error) {
 		FaucetBalance:       c.State().Get(g.FaucetAddress()).Balance,
 		EmittedTotal:        emitted,
 	}, nil
+}
+
+// The multi-validator run is a deterministic fixture like every other part of
+// the devnet: one fixed seed and one fixed latency, so the same command reaches
+// the same committee, the same draws and the same chain on every invocation.
+// Seed 1 with 5 ms latency is happy-path scenario 1's shape.
+const (
+	runMultiSeed      = 1
+	runMultiLatencyMS = 5
+)
+
+// RunMulti brings up a committee of o.Validators consensus validators over the
+// simnet harness — each with its own chain under o.Dir/v<index> — and drives
+// every online validator to o.Blocks. It is the multi-validator half of the
+// acceptance check: a single node building blocks proves nothing about
+// consensus, so the run ends by asking whether the validators hold one history
+// (Summary.Agreed) and fails if they do not.
+//
+// Options.OfflineValidators powers validators off before the run; the online
+// rest must still reach o.Blocks whenever they hold two thirds of TOTAL voting
+// power or more (three of four is exactly the bar). Offline validators keep
+// their committee seats, so the bar never drops.
+//
+// RunMulti deliberately shares NOTHING with the single-node Run at run time —
+// they are different code paths over different genesis. Run drives the devnet
+// fixture: one signer, no round protocol, a transaction and claim path.
+// RunMulti drives real consensus even for one validator, so a one-validator
+// committee is its own chain (b10coin-simnet-1) rather than a fallback that
+// would quietly re-enter the single-node loop and make --validators a flag
+// that lies. The overlap is the Summary shape and the acceptance-command
+// surface, nothing deeper. Claims have no meaning here — the committee's
+// Transport carries only consensus messages — and are refused.
+//
+// A run stops early with the harness's stall error if the online validators
+// cannot reach o.Blocks (below two thirds of total power, for instance), and
+// with a divergence error if any validator's history is not a prefix of the
+// longest chain; both return the Summary of whatever the run did produce,
+// heights included, so a failed acceptance check can be diagnosed, not merely
+// observed.
+func RunMulti(o Options) (Summary, error) {
+	if o.Blocks == 0 {
+		return Summary{}, ErrNoBlocks
+	}
+	if o.Validators == 0 {
+		return Summary{}, ErrNoValidators
+	}
+	if o.Claims > 0 {
+		return Summary{}, ErrClaimsAreMultiUnsupported
+	}
+	net, err := simnet.New(int(o.Validators), simnet.Options{
+		TempDir:   o.Dir,
+		Seed:      runMultiSeed,
+		LatencyMS: runMultiLatencyMS,
+		// DropPercent stays 0 on purpose: a validator whose quorum-committing
+		// proposal is dropped holds no block bytes and parks at that height
+		// forever (M3 has no catch-up), so any run asserting "the chain
+		// advanced" must be drop-free. Latency alone is the honest fixture.
+	})
+	if err != nil {
+		return Summary{}, err
+	}
+	defer net.Close()
+
+	for _, i := range o.OfflineValidators {
+		if i < 0 || i >= int(o.Validators) {
+			return Summary{}, fmt.Errorf("devnet: OfflineValidators names validator %d in a committee of %d", i, o.Validators)
+		}
+		net.TakeOffline(i)
+	}
+
+	return drive(net, o)
+}
+
+// multiNet is the part of the harness RunMulti's driver consumes. It is an
+// interface for one reason: honest validators never disagree — one history is
+// precisely the safety property the protocol guarantees — so a test of the
+// disagreement path cannot build the disagreement out of the real harness.
+// The disagreement test injects a multiNet backed by genuinely forked chains
+// instead, through the same per-validator comparison contract the real Net
+// serves.
+type multiNet interface {
+	RunBlocks(target uint64) (map[uint64]uint64, error)
+	AssertPrefix(i int) error
+}
+
+// drive runs one committee to o.Blocks and reports the committee's outcome.
+// It is the whole of RunMulti minus construction: heights, agreement, and the
+// two ways a run can fail without a single line of consensus code being wrong
+// on paper — a committee other than the one requested, and validators that do
+// not hold one history.
+func drive(net multiNet, o Options) (Summary, error) {
+	heights, runErr := net.RunBlocks(o.Blocks)
+
+	s := Summary{
+		ChainID:          committeeChainID(o.Validators),
+		Validators:       o.Validators,
+		ValidatorHeights: make(map[int]uint64, len(heights)),
+	}
+	for i, h := range heights {
+		s.ValidatorHeights[int(i)] = h
+		if h > s.Height {
+			s.Height = h
+		}
+	}
+
+	// The committee the harness DROVE must be the committee the options
+	// requested: RunBlocks' heights carry exactly one entry per validator
+	// that was built, so a run that reported the requested size while
+	// silently driving fewer (or more) validators — every validator after the
+	// missing ones unchecked, the agreement claim quietly covering a smaller
+	// committee — would otherwise pass as the requested run. This guard makes
+	// "asked for four, ran two, said four" impossible to report as success.
+	if uint64(len(s.ValidatorHeights)) != o.Validators {
+		return s, fmt.Errorf("devnet: the harness drove %d validators, %d were requested", len(s.ValidatorHeights), o.Validators)
+	}
+
+	// Agreement is computed from a real cross-comparison, not asserted:
+	// oneHistory walks every validator's full history against the longest
+	// chain. A disagreement fails the run and is reported, never papered over.
+	agreeErr := oneHistory(net, int(o.Validators))
+	s.Agreed = agreeErr == nil
+
+	// The stall is reported first: a run that could not reach o.Blocks is the
+	// primary failure, and any divergence is diagnosis on top of it.
+	if runErr != nil {
+		return s, runErr
+	}
+	if agreeErr != nil {
+		return s, agreeErr
+	}
+	return s, nil
+}
+
+// oneHistory reports whether the committee holds ONE history: every
+// validator's committed blocks — height by height, up to its own head — must
+// be byte-identical to the network's longest chain, so a shorter validator is
+// a strict prefix of the longest chain and two validators can never have
+// committed conflicting blocks at one height.
+//
+// It is computed through the harness's per-validator prefix comparison rather
+// than a single sampled head, because heads at different heights say nothing
+// about the blocks in between and a fork confined to unshared heights would
+// hide behind unequal heads. The comparison is complete: for any two
+// validators diverging at a height they both reached, at least one of them
+// differs from the longest chain at that height, and its prefix walk fails.
+// A committee of one passes vacuously — its history trivially is the one
+// history, and the walk degenerates to a self-comparison — which is why
+// Agreed's honest reading for Validators: 1 is documented, not derived.
+func oneHistory(net multiNet, validators int) error {
+	for i := 0; i < validators; i++ {
+		if err := net.AssertPrefix(i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// committeeChainID mirrors the chain ID the harness derives for its committee
+// (simnet's simGenesis: "b10coin-simnet-<n>"). The harness exports no genesis
+// accessor, so the driver derives the value the harness mints; the literal is
+// pinned by TestRunMultiWithFourValidatorsAgrees asserting the exact string,
+// so a format change on either side fails there instead of reporting a stale
+// chain ID.
+func committeeChainID(validators uint64) string {
+	return fmt.Sprintf("b10coin-simnet-%d", validators)
 }
 
 // Replay reopens an existing devnet directory and reports the replayed

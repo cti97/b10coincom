@@ -20,6 +20,10 @@ var (
 	ErrClaimTooSoon      = errors.New("state: this key has already claimed in this epoch")
 	ErrBadProofOfWork    = errors.New("state: proof of work does not meet the target")
 	ErrFaucetEmpty       = errors.New("state: the faucet account cannot cover a claim")
+	// ErrTooManyClaims rejects a whole BLOCK, not a single claim: a block is
+	// attacker-chosen input, and the count is the only thing that can be
+	// checked without paying for it. See ApplyBlock.
+	ErrTooManyClaims = errors.New("state: block carries too many faucet claims")
 )
 
 // ApplyTx applies one transaction, mutating the receiver. Every validation
@@ -163,7 +167,43 @@ func (s *State) applyFaucetClaim(tx *types.Tx) error {
 // ApplyBlock applies every transaction atomically. On success it returns a
 // new State; the receiver is never modified. On failure it returns the error
 // and a nil State, leaving the receiver untouched.
+//
+// The claim bound is consensus, not policy. Validating one claim costs every
+// validator a FULL Argon2id evaluation: applyFaucetClaim has no cheap
+// pre-check - the puzzle must be evaluated before the claim can be accepted
+// OR rejected - so a validator's cost for a block is the block's claim count
+// times one puzzle. A block is attacker-chosen input, and MaxTxsPerBlock
+// allows 10,000 transactions in a block, so unbounded the count is an
+// amplifier: one malicious proposer prices every validator ~10,000 Argon2id
+// evaluations (about 21 minutes of Argon2id work at the testnet tuning) as
+// the cost of deciding ONE block. MaxClaimsPerBlock (travelled in
+// state.Params; 0 means not engaged) is what makes that impossible instead
+// of merely priced: the count is checked here, BEFORE any puzzle is
+// evaluated, so a block carrying more claims than the bound is INVALID and
+// never reaches applyFaucetClaim at all - nothing above the bound is paid
+// for, whatever its size. The check must sit ahead of the expensive work
+// because a bound enforced after it bounds nothing: the attacker still gets
+// the work out of you, and only the verdict changes. The bound travels in
+// state.Params so the mempool's local courtesy bound and this consensus rule
+// cannot disagree: genesis pins both, and a genesis test asserts the mempool
+// constant equals it.
 func (s *State) ApplyBlock(txs []types.Tx) (*State, error) {
+	// Counting claims costs one type comparison per transaction - nothing.
+	// Verifying even the FIRST claim costs a full Argon2id evaluation, so the
+	// count must run here, ahead of the loop and of the clone below. The
+	// whole block is rejected: accepting the cheap prefix would still let a
+	// proposer meter validators' work one block at a time.
+	if bound := s.params.MaxClaimsPerBlock; bound > 0 {
+		claims := uint64(0)
+		for i := range txs {
+			if txs[i].Type == types.TxFaucetClaim {
+				claims++
+			}
+		}
+		if claims > bound {
+			return nil, fmt.Errorf("%w: %d claims, bound is %d", ErrTooManyClaims, claims, bound)
+		}
+	}
 	next := s.Clone()
 	for i := range txs {
 		if err := next.ApplyTx(&txs[i]); err != nil {

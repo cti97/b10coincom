@@ -64,6 +64,11 @@ func genesisState(g *genesis.Genesis) *state.State {
 		EpochBlocks:   g.Params.EpochBlocks,
 		PowArgon2:     g.Params.FaucetPowArgon2,
 		PowTarget:     g.Params.FaucetPowTarget,
+		// The per-block claim bound is consensus state-machine behaviour
+		// parameterised by genesis, exactly like the epoch length: without
+		// wiring it here the bound would exist only in states that tests
+		// construct by hand, and no real chain would enforce it.
+		MaxClaimsPerBlock: g.Params.MaxClaimsPerBlock,
 	})
 	for _, d := range g.DevAccounts {
 		addr := types.AddressFromPub(d.PubKey)
@@ -363,6 +368,29 @@ func (c *Chain) BlockAt(height uint64) (*types.Block, error) {
 		return nil, err
 	}
 	return types.DecodeBlock(raw)
+}
+
+// PutLock durably records a validator's lock: that it precommitted
+// rec.BlockID at rec.Height in round rec.Round. The chain exposes the
+// store's lock log because the lock must survive a restart, and the store is
+// only reachable through the chain - it is the same crash-tolerant directory
+// the blocks replay from, so the promise is read back in the same Open that
+// rebuilds the chain. Write-locked: it mutates the store (append + fsync +
+// index update) and must not interleave with readers.
+func (c *Chain) PutLock(rec store.LockRecord) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.PutLock(rec)
+}
+
+// LockAt returns the newest lock recorded for height, and whether one
+// exists. This is how a restarted validator picks its promise back up: the
+// replayed blocks say where the chain stands, the lock log says what it
+// promised at the height it is about to judge.
+func (c *Chain) LockAt(height uint64) (store.LockRecord, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.store.LockAt(height)
 }
 
 func (c *Chain) Close() error {

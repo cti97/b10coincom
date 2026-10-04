@@ -9,6 +9,7 @@
     "initial_reward_sparks": 50000000,
     "halving_interval_blocks": 21000000,
     "claim_amount_sparks": 100000000,
+    "max_claims_per_block": 8,
     "min_stake_sparks": 100000000000,
     "epoch_blocks": 1000,
     "unbonding_epochs": 2,
