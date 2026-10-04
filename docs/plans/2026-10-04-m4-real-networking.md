@@ -564,3 +564,117 @@ git commit -m "feat: add the acceptance harness for the three-Pi run"
 **The three things most likely to go wrong.** First, **a decoder that trusts its input** — the length prefix is the classic 4-GiB allocation bug, and Task 1 pins it before the allocation. Second, **catch-up that trusts its source**, which would be a remote path for installing unvalidated state; Task 4 routes every adopted block through the same `Append` that guards a live one. Third, **a test that passes without testing anything** — this project has shipped at least a dozen such tests across three milestones, so every task here names the one thing that must break for its test to fail, and the integration test runs over **sockets**, not a pipe, because the socket path is the deliverable.
 
 **Honest limits, stated up front.** The relay is a single point of failure and a censorship point: a relay that partitions the validator set stalls consensus. Safety is not at risk — every message is signed, so the worst a malicious relay can do is delay or drop — but liveness is, and a testnet acceptance run that depends on one VPS is not a decentralisation claim. Multiple relays, direct connections where NAT permits, hole punching are M5+. And the ARM64 binary is cross-compiled and tested over loopback, **not on a Pi**: nothing in this milestone establishes performance on the target hardware, and the Argon2 tuning in particular was derived from a published Pi-4 figure that has never been measured on the actual device. Two more, added by Task 4's review (Design Decision 8): **catch-up serves and adopts only committee-committed blocks** — a chain whose blocks were built outside the round protocol (the single-node path) carries no certificates and cannot be synced — and **the certificate archive is in-memory**, so a restarted node cannot re-serve certificates for heights it committed before restarting, and the node layer (Task 6) must wire pulls, not assume a rejoining node can serve them the moment it is back.
+
+---
+
+## Task 9: Build for macOS, Linux and Windows — the Pi is not the only target
+
+**Why this exists.** Task 7 cross-compiles for the Pi, which is the *acceptance* target. But b10coin is not a Raspberry Pi application: the same binary is a full node, a validator, a faucet client and a relay on any laptop, and a contributor on macOS or Windows must be able to build and run it. A milestone whose build story is "Linux/ARM64 only" quietly tells most of the world they cannot participate.
+
+**What the controller measured before writing this task** (so the work is grounded, not speculative):
+
+| Target | `go build ./...` today |
+|---|---|
+| darwin/arm64, darwin/amd64 | OK |
+| linux/amd64, linux/arm64 | OK |
+| windows/amd64, windows/arm64 | OK |
+
+The **production** code is already portable — the store uses `filepath.Join`, permissions are advisory modes Windows ignores, and `syscall.SIGTERM` exists in Go's Windows syscall package. But:
+
+**`GOOS=windows go vet ./...` FAILS**:
+```
+internal/relay/relay_test.go:603:37: cannot use int(fd) (value of type int)
+    as syscall.Handle value in argument to syscall.GetsockoptInt
+```
+
+So the **test suite does not compile for Windows** — one Unix-only syscall in a test file. The package builds; its tests cannot. That is the concrete defect this task fixes, and it is the kind that hides indefinitely because CI only ever runs on Linux.
+
+**Files:**
+- Modify: `internal/relay/relay_test.go` (the Unix-only syscall), `Makefile`, `.github/workflows/ci.yml`, `README.md`
+- Create: `scripts/build-release.sh`, and split any OS-specific test helper behind build tags
+- Test: a CI matrix, plus a platform-matrix test assertion
+
+**Interfaces:**
+- Produces: `make release` writing per-platform artifacts to `dist/`; a CI matrix over the six targets; a `dist/` layout a person can hand to someone else
+
+- [ ] **Step 1: Reproduce the defect**
+
+Run: `GOOS=windows GOARCH=amd64 go vet ./...`
+Expected: FAIL at `internal/relay/relay_test.go` with the `syscall.GetsockoptInt` error above. **Confirm this before changing anything** — a cross-build failure that you have not reproduced is a guess.
+
+- [ ] **Step 2: Make the test suite compile everywhere**
+
+The relay's slow-reader test inspects a socket buffer via a Unix-only syscall. Fix it so **every** test file compiles for **every** target:
+- Prefer a portable assertion. The test's purpose is "a wedged peer does not stall the relay"; the kernel-buffer introspection is an implementation detail of how it provokes that. If it can be provoked portably, do that and delete the syscall.
+- If it genuinely cannot, put the Unix-only assertion behind a build constraint (`//go:build unix`) in a `_unix_test.go` file, with a **portable** fallback in the general file so the property is still tested on Windows.
+- Do not `t.Skip` the property on Windows — a skipped test is not evidence, and this project has an explicit rule about that.
+
+Then verify: `GOOS=windows GOARCH=amd64 go vet ./...` and `GOOS=darwin GOARCH=arm64 go vet ./...` must both pass, and `go vet ./...` on the host must still pass.
+
+- [ ] **Step 3: A release build a person can use**
+
+Add `make release` (backed by `scripts/build-release.sh`) that builds **both binaries** for **all six targets** and writes a predictable layout:
+
+```
+dist/b10coin-<version>-<os>-<arch>[.exe]
+dist/b10coin-relay-<version>-<os>-<arch>[.exe]
+dist/SHA256SUMS
+```
+
+Rules that make it usable rather than merely present:
+- Windows binaries get `.exe`.
+- The version comes from `internal/version` — do not invent a second source of truth.
+- `SHA256SUMS` covers every artifact, so a Pi operator can verify what they copied.
+- The script **fails loudly** if any target fails, rather than leaving a partial `dist/`.
+
+- [ ] **Step 4: Verify every artifact is really for its platform**
+
+Run `make release` and `file dist/*`. Expected: each artifact reports its own architecture — `Mach-O ... arm64`, `ELF 64-bit ... x86-64`, `PE32+ executable ... Aarch64` — and none is accidentally the host build.
+
+This is the step that catches a script that silently builds only for the host. Pin it: add a check that **the count of artifacts equals the number of targets**, so a missing target fails the build rather than shipping a hole.
+
+- [ ] **Step 5: Native smoke test**
+
+On the host (this repository is developed on macOS/arm64), run the **native** binary end to end:
+
+```bash
+./dist/b10coin-<version>-darwin-arm64 devnet --blocks 20
+```
+
+Expected: `OK`, exit 0. Compiling is not running — the one platform you can actually execute must be executed.
+
+- [ ] **Step 6: CI matrix**
+
+Replace the single-OS job with a matrix over the six targets, each running `go build ./...` **and** `go vet ./...`. `go vet` is what caught the Windows-only test defect, so building alone would not have found it.
+
+Keep the existing test job running on Linux (the suite is slow; running it six times buys little), and **add the ARM64 cross-compile Task 7 asked for** — the Pi artifact and the general matrix are the same mechanism.
+
+- [ ] **Step 7: Runtime portability, not just compilation**
+
+Compiling is necessary and not sufficient. Check and report on the three things that differ at runtime:
+- **Signal handling**: both commands use `syscall.SIGTERM`. On Windows that constant exists but is never delivered, so a Windows node shuts down on Ctrl-C (`os.Interrupt`) only. Confirm the code does not *depend* on `SIGTERM` for a clean shutdown — a graceful-stop path that only fires on a signal Windows cannot send is a data-loss path.
+- **File semantics**: the store appends with `os.O_APPEND` and uses `os.Rename`. Confirm nothing depends on POSIX rename atomicity or on advisory locking, and say what you concluded.
+- **Path handling**: confirm no code hand-builds a path with a literal `/`.
+
+State your conclusions in the report even where the answer is "already fine" — the point is that someone checked.
+
+- [ ] **Step 8: Document it**
+
+In `README.md`: the supported targets, the `make release` command, the `dist/` layout, and — plainly — that the Raspberry Pi is the *acceptance* target rather than the only one. Correct any statement that implies Linux-only.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add Makefile scripts/build-release.sh internal/relay .github/workflows/ci.yml README.md
+git commit -m "feat: build for macOS, Linux and Windows, not only the Pi
+
+The production code was already portable across all six targets, but the
+relay's test suite used a Unix-only syscall and so could not compile for
+Windows - invisible because CI only ever ran on Linux, and caught by go vet in
+the new matrix rather than by a build.
+
+Adds a release build producing per-platform artifacts with checksums, a CI
+matrix over every target, a native smoke test on the one platform that can
+actually be executed here, and a review of the runtime differences that
+compiling does not cover: signal delivery, file semantics and path handling."
+```
