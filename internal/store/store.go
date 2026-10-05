@@ -44,10 +44,17 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 )
 
 // BlocksPerSegment is how many blocks share one segment file.
 const BlocksPerSegment = 1000
+
+// maxOpenReaders bounds the per-segment read-handle cache. Reads walk arbitrary
+// non-head heights, so a long chain has far more segments than a process may
+// hold descriptors for; the cache keeps reads on the hot segments (replay
+// walks them in order) without an unbounded descriptor count.
+const maxOpenReaders = 8
 
 // lockLogName holds the lock log. The name deliberately does not end in
 // ".seg": scan would otherwise index lock records as block heights and
@@ -135,6 +142,16 @@ type Store struct {
 	// longer remembers. CertAt reads one record back through this handle.
 	certFile  *os.File
 	certIndex map[uint64]int64
+
+	// readMu guards the per-segment read-handle cache below (audit S-7).
+	// Store.Read is reached CONCURRENTLY by RPC readers under the chain's read
+	// lock, so the cache is shared mutable state and must be serialised. The
+	// handle is held for the whole Read, so a cache eviction can never close a
+	// handle another reader is mid-read on; the alternative - reading the whole
+	// segment into memory per call - is the allocation this cache removes.
+	readMu    sync.Mutex
+	readers   map[string]*os.File // segment name -> read handle
+	readerLRU []string            // most-recently-used last, bounded by maxOpenReaders
 }
 
 // segmentName maps a height to the segment file holding it. Names are
@@ -163,6 +180,7 @@ func Open(dir string) (*Store, error) {
 		index:     make(map[uint64]int64),
 		locks:     make(map[uint64]LockRecord),
 		certIndex: make(map[uint64]int64),
+		readers:   make(map[string]*os.File),
 		lock:      lock,
 	}
 	if err := s.scan(); err != nil {
@@ -254,7 +272,13 @@ func frame(raw []byte, off int64, exact int64) (int64, int64, error) {
 	if rem < int64(RecordHeaderLen) {
 		return 0, 0, errTornRecord
 	}
-	header := raw[off : off+RecordHeaderLen]
+	return frameHeader(raw[off:off+RecordHeaderLen], off, rem, exact)
+}
+
+// frameHeader is the whole framing policy, applied to a header that is already
+// in memory. frame and readRecordAt share it so an in-memory record and a
+// streamed one can never be framed by two slightly different rules.
+func frameHeader(header []byte, off, rem, exact int64) (int64, int64, error) {
 	if crc32.Checksum(header[:lengthFieldLen], crcTable) != binary.BigEndian.Uint32(header[lengthFieldLen:]) {
 		return 0, 0, errors.New("length-prefix checksum mismatch (the length is not trustworthy)")
 	}
@@ -269,10 +293,27 @@ func frame(raw []byte, off int64, exact int64) (int64, int64, error) {
 	}
 	payStart := off + RecordHeaderLen
 	recEnd := payStart + int64(n) + RecordTrailerLen
-	if recEnd > int64(len(raw)) {
+	if recEnd > off+rem {
 		return 0, 0, errTornRecord
 	}
 	return int64(n), recEnd, nil
+}
+
+// readRecordAt frames one record read straight from r at off, using size as the
+// file's end. It does not read the payload, only the fixed-width header, so
+// framing a record costs one 12-byte read instead of the whole segment (audit
+// S-7). A ReadAt failure is reported as itself, not as a torn record: a real
+// I/O error is not the crash shape truncation may repair.
+func readRecordAt(r io.ReaderAt, size, off, exact int64) (int64, int64, error) {
+	rem := size - off
+	if rem < int64(RecordHeaderLen) {
+		return 0, 0, errTornRecord
+	}
+	var header [RecordHeaderLen]byte
+	if _, err := r.ReadAt(header[:], off); err != nil {
+		return 0, 0, err
+	}
+	return frameHeader(header[:], off, rem, exact)
 }
 
 // scanSegment walks one segment record by record. Earlier segments are
@@ -283,28 +324,54 @@ func frame(raw []byte, off int64, exact int64) (int64, int64, error) {
 // cannot be trusted to find the next record's start, so indexing past it would
 // invent heights, and truncating there would delete the very bytes a repair
 // must preserve.
+//
+// The scan STREAMS the file (audit S-7): it reads a 12-byte header, then the
+// one record it frames, never the whole segment. Before this, Open read each
+// segment into memory once per record in it - a chain with N blocks paid
+// O(N x segment bytes) of allocation just to start.
 func (s *Store) scanSegment(name string, final bool) error {
 	path := filepath.Join(s.dir, name)
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := fi.Size()
 	off := int64(0)
-	for off < int64(len(raw)) {
-		n, recEnd, err := frame(raw, off, -1)
+	// buf is reused across records; it grows to the largest record and no more.
+	var buf []byte
+	for off < size {
+		n, recEnd, err := readRecordAt(f, size, off, -1)
 		if err != nil {
 			if final && errors.Is(err, errTornRecord) {
+				// Close before truncating: Windows refuses os.Truncate while a
+				// handle is open. The deferred Close then no-ops.
+				_ = f.Close()
 				return s.truncateTail(path, off)
 			}
 			return fmt.Errorf("%w: %s in %s at offset %d", ErrCorruptRecord, err, name, off)
 		}
-		payStart := off + RecordHeaderLen
+		need := RecordHeaderLen + int(n)
+		if cap(buf) < need {
+			buf = make([]byte, need)
+		} else {
+			buf = buf[:need]
+		}
+		if _, err := f.ReadAt(buf, off); err != nil {
+			return fmt.Errorf("%w: cannot read record at offset %d of %s: %v", ErrCorruptRecord, off, name, err)
+		}
+		var trailer [RecordTrailerLen]byte
+		if _, err := f.ReadAt(trailer[:], off+RecordHeaderLen+int64(n)); err != nil {
+			return fmt.Errorf("%w: cannot read trailer at offset %d of %s: %v", ErrCorruptRecord, off, name, err)
+		}
 		// The checksum covers the length prefix AND the payload: a length
 		// that disagrees with the bytes it frames cannot pass, whether or not
 		// the header's own checksum already caught it.
-		framed := raw[off : payStart+n : payStart+n]
-		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
-		if crc32.Checksum(framed, crcTable) != want {
+		if crc32.Checksum(buf, crcTable) != binary.BigEndian.Uint32(trailer[:]) {
 			return fmt.Errorf("%w: checksum mismatch in %s at offset %d", ErrCorruptRecord, name, off)
 		}
 		h := s.last + 1
@@ -399,37 +466,97 @@ func writeRecord(f *os.File, payload []byte) error {
 }
 
 // Read returns a copy of the payload stored at height.
+//
+// It reads ONLY the one record (audit S-7): a per-segment read handle plus
+// ReadAt, not os.ReadFile over the whole segment. A historical GET /block/{h}
+// used to allocate the entire segment (up to a gibibyte in the theoretical
+// worst case) to return one block; the cost is now the record's own size.
 func (s *Store) Read(height uint64) ([]byte, error) {
 	off, ok := s.index[height]
 	if !ok {
 		return nil, fmt.Errorf("%w: %d", ErrNotFound, height)
 	}
-	path := filepath.Join(s.dir, segmentName(height))
-	raw, err := os.ReadFile(path)
+	name := segmentName(height)
+	// Hold readMu for the whole read: it serialises the cache and keeps the
+	// handle open against a concurrent reader's eviction (the chain's read lock
+	// lets several RPC reads run at once).
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	f, err := s.readerLocked(name)
+	if err != nil {
+		return nil, err
+	}
+	size, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, err
 	}
 	// The index offsets come from the store's own scan, but the segment file
 	// can be rewritten underneath an open store: nothing here may panic on
-	// those bytes. frame re-validates the framing - the length prefix AND its
-	// checksum - before any offset arithmetic, exactly as scanSegment does
-	// before indexing; a torn or corrupt record is reported, never trusted.
-	if off < 0 || off >= int64(len(raw)) {
-		return nil, fmt.Errorf("%w: index offset %d is past the end of %s", ErrCorruptRecord, off, segmentName(height))
+	// those bytes. readRecordAt re-validates the framing - the length prefix
+	// AND its checksum - before any offset arithmetic, exactly as scanSegment
+	// does before indexing; a torn or corrupt record is reported, never
+	// trusted.
+	if off < 0 || off >= size {
+		return nil, fmt.Errorf("%w: index offset %d is past the end of %s", ErrCorruptRecord, off, name)
 	}
-	n, recEnd, err := frame(raw, off, -1)
+	n, _, err := readRecordAt(f, size, off, -1)
 	if err != nil {
 		return nil, fmt.Errorf("%w: at height %d: %v", ErrCorruptRecord, height, err)
 	}
-	payStart := off + RecordHeaderLen
-	payload := raw[payStart : payStart+n]
-	want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
-	if crc32.Checksum(raw[off:payStart+n], crcTable) != want {
+	// One buffer holds the header and the payload, so the checksum covers
+	// exactly the bytes the framing describes.
+	buf := make([]byte, RecordHeaderLen+int(n))
+	if _, err := f.ReadAt(buf, off); err != nil {
+		return nil, fmt.Errorf("%w: at height %d: cannot read record: %v", ErrCorruptRecord, height, err)
+	}
+	var trailer [RecordTrailerLen]byte
+	if _, err := f.ReadAt(trailer[:], off+RecordHeaderLen+int64(n)); err != nil {
+		return nil, fmt.Errorf("%w: at height %d: cannot read trailer: %v", ErrCorruptRecord, height, err)
+	}
+	if crc32.Checksum(buf, crcTable) != binary.BigEndian.Uint32(trailer[:]) {
 		return nil, fmt.Errorf("%w: at height %d", ErrCorruptRecord, height)
 	}
-	out := make([]byte, len(payload))
-	copy(out, payload)
+	out := make([]byte, n)
+	copy(out, buf[RecordHeaderLen:])
 	return out, nil
+}
+
+// readerLocked returns an open read handle on the named segment, opening and
+// caching it if needed, and refreshes its LRU position. The caller must hold
+// readMu for the whole lifetime of the returned handle: an eviction closes the
+// least-recently-used handle, and closing one a reader is mid-ReadAt on would
+// turn a concurrent read into a spurious error.
+func (s *Store) readerLocked(name string) (*os.File, error) {
+	if f, ok := s.readers[name]; ok {
+		s.touchReaderLocked(name)
+		return f, nil
+	}
+	f, err := os.Open(filepath.Join(s.dir, name))
+	if err != nil {
+		return nil, err
+	}
+	if len(s.readerLRU) >= maxOpenReaders {
+		oldest := s.readerLRU[0]
+		s.readerLRU = s.readerLRU[1:]
+		if of := s.readers[oldest]; of != nil {
+			_ = of.Close()
+		}
+		delete(s.readers, oldest)
+	}
+	s.readers[name] = f
+	s.readerLRU = append(s.readerLRU, name)
+	return f, nil
+}
+
+// touchReaderLocked moves name to the most-recently-used end of the LRU.
+func (s *Store) touchReaderLocked(name string) {
+	for i, n := range s.readerLRU {
+		if n == name {
+			s.readerLRU = append(s.readerLRU[:i], s.readerLRU[i+1:]...)
+			break
+		}
+	}
+	s.readerLRU = append(s.readerLRU, name)
 }
 
 // Height returns the highest stored height.
@@ -708,6 +835,15 @@ func (s *Store) Close() error {
 		certErr = s.certFile.Close()
 		s.certFile = nil
 	}
+	// Close the cached per-segment read handles (audit S-7) while still holding
+	// readMu, and clear the map so a repeated Close cannot close them twice.
+	s.readMu.Lock()
+	for name, f := range s.readers {
+		_ = f.Close()
+		delete(s.readers, name)
+	}
+	s.readerLRU = nil
+	s.readMu.Unlock()
 	if s.lock != nil {
 		s.lock.release()
 		s.lock = nil
