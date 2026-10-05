@@ -1726,3 +1726,176 @@ func TestHandshakeIDLargerThanTheBoundIsRefused(t *testing.T) {
 	}
 	waitPeersIs(t, tp, fmt.Sprintf("[%s]", string(id)))
 }
+
+// TestAnUnadmittedStrangerIsNotAPeerAndReceivesNoBroadcast is audit N-3's
+// admission rule, pinned from BOTH sides: a connection that completes the ID
+// handshake but never presents a frame Options.Admit accepts is a SOCKET, not
+// a peer - absent from Peers(), never enqueued for a Broadcast, and its
+// frames never reach OnMessage. A valid admitting frame turns it into a peer
+// and is dispatched. Every assertion is over CONSTRUCTED state (the registry,
+// the queue length, the gated counter), not over a timing race: the only
+// waits are for the server side to have installed the socket and then to have
+// processed a frame, both of which the test drives.
+func TestAnUnadmittedStrangerIsNotAPeerAndReceivesNoBroadcast(t *testing.T) {
+	const memberFrame = "member-hello"
+	delivered := make(chan transport.Message, 8)
+	a := listen(t, Options{
+		LocalID: "validator",
+		Admit:   func(frame []byte) bool { return string(frame) == memberFrame },
+	})
+	a.OnMessage(func(m transport.Message) { delivered <- m })
+
+	// The stranger dials the listener and completes the transport ID
+	// handshake - exactly the shape audit N-3 calls "a dialer with a
+	// distinct 1-byte ID".
+	nc := rawDial(t, a.Addr().String())
+	if err := wire.WriteFrame(nc, []byte("stranger")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.ReadFrame(nc, maxHandshakeIDBytes); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the pending connection to install", 5*time.Second, func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return len(a.conns) == 1
+	})
+	a.mu.Lock()
+	var pending *conn
+	for _, c := range a.conns {
+		pending = c
+	}
+	a.mu.Unlock()
+	if pending == nil {
+		t.Fatal("the connection did not install")
+	}
+
+	// NOT a peer, and a Broadcast reaches it not at all: the frame is not
+	// even enqueued (Broadcast filters on admission), which is deterministic
+	// to read off the bounded queue.
+	if got := a.Peers(); len(got) != 0 {
+		t.Fatalf("an unadmitted stranger is in Peers(): %v", got)
+	}
+	if err := a.Broadcast([]byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(pending.tq); n != 0 {
+		t.Fatalf("an unadmitted stranger received %d broadcast frames", n)
+	}
+
+	// A frame the gate refuses is dropped before OnMessage.
+	if err := wire.WriteFrame(nc, []byte("not-a-hello")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the stranger frame to be gated", 5*time.Second, func() bool { return a.GatedFrames() >= 1 })
+	if len(delivered) != 0 {
+		t.Fatal("a gated frame reached OnMessage")
+	}
+
+	// A frame the gate accepts admits it: it becomes a peer, the admitting
+	// frame dispatches, and broadcasts now reach it.
+	if err := wire.WriteFrame(nc, []byte(memberFrame)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the member to be admitted", 5*time.Second, func() bool { return len(a.Peers()) == 1 })
+	select {
+	case m := <-delivered:
+		if string(m.Data) != memberFrame {
+			t.Fatalf("the admitting frame was dispatched as %q", m.Data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the admitting frame was not dispatched")
+	}
+	if err := a.Broadcast([]byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	// The admitted peer's writer drains the queue onto the socket, so the
+	// observable is the frame arriving at the dialer, not the queue length.
+	_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	payload, err := wire.ReadFrame(nc, a.opts.MaxFrameBytes)
+	if err != nil {
+		t.Fatalf("an admitted peer did not receive the broadcast: %v", err)
+	}
+	if string(payload) != "after" {
+		t.Fatalf("an admitted peer received %q, want the broadcast", payload)
+	}
+}
+
+// TestTheAcceptCapRefusesDialsPastMaxConns is audit N-3's connection cap:
+// the listener holds at most MaxConns accepted connections, and a dial past
+// the cap is closed at accept and counted. The first two are real handshakes
+// and become peers; the third is refused BEFORE the handshake, which the
+// closed socket (not a timeout) proves.
+func TestTheAcceptCapRefusesDialsPastMaxConns(t *testing.T) {
+	a := listen(t, Options{LocalID: "validator", MaxConns: 2})
+
+	var live []net.Conn
+	for i := 0; i < 2; i++ {
+		nc := rawDial(t, a.Addr().String())
+		if err := wire.WriteFrame(nc, []byte(fmt.Sprintf("peer%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := wire.ReadFrame(nc, maxHandshakeIDBytes); err != nil {
+			t.Fatalf("handshake %d: %v", i, err)
+		}
+		live = append(live, nc)
+	}
+	waitPeersIs(t, a, "[peer0 peer1]")
+
+	third := rawDial(t, a.Addr().String())
+	waitClosedConn(t, third, "a dial past MaxConns")
+	waitFor(t, "the refusal counter", 5*time.Second, func() bool { return a.RefusedConns() >= 1 })
+	// The admitted two are untouched by the refusal.
+	waitPeersIs(t, a, "[peer0 peer1]")
+	_ = live
+}
+
+// TestAnIdleConnectionIsClosedByTheReadDeadline is audit N-3's idle deadline:
+// after the handshake the reader re-arms a read deadline before every frame,
+// so a connection that delivers nothing for the whole timeout is closed and
+// its slot released. The pre-fix code CLEARED the deadline after the
+// handshake, so this connection stayed open forever - the test fails by the
+// socket never closing, not by a slow runner.
+func TestAnIdleConnectionIsClosedByTheReadDeadline(t *testing.T) {
+	a := listen(t, Options{LocalID: "validator", IdleReadTimeout: 100 * time.Millisecond})
+	nc := rawDial(t, a.Addr().String())
+	if err := wire.WriteFrame(nc, []byte("peer")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.ReadFrame(nc, maxHandshakeIDBytes); err != nil {
+		t.Fatal(err)
+	}
+	waitPeersIs(t, a, "[peer]")
+	// Say nothing at all; the idle deadline ends the connection.
+	waitClosedConn(t, nc, "a connection idle past the read deadline")
+}
+
+// TestAPeerThatStopsReadingIsCutOffByTheWriteDeadline is audit N-3's per-frame
+// write deadline. It uses net.Pipe (a synchronous, socket-like net.Conn, no
+// kernel buffer) so the write blocks deterministically until the deadline:
+// a peer that never reads cannot park the writer, its frame and the queue
+// behind it forever.
+func TestAPeerThatStopsReadingIsCutOffByTheWriteDeadline(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	a, err := New(Options{LocalID: "validator", WriteTimeout: 150 * time.Millisecond, IdleReadTimeout: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	c, err := a.install(server, "pipe-peer", true, "pipe-peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.enqueue([]byte("frame")) {
+		t.Fatal("enqueue refused")
+	}
+	waitFor(t, "the per-frame write deadline to end the connection", 5*time.Second, func() bool {
+		select {
+		case <-c.dead:
+			return true
+		default:
+			return false
+		}
+	})
+}

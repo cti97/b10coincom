@@ -387,7 +387,32 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	if err != nil {
 		return nil, err
 	}
-	tp, err := tcp.New(tcp.Options{LocalID: transport.PeerID(fmt.Sprintf("v%d", cfg.Index))})
+	// admitHello is the transport's admission policy (audit N-3/N-7): an
+	// INBOUND socket becomes a peer only once it has delivered a HELLO signed
+	// by a member of THIS chain's committee. Before that it is absent from
+	// Peers(), receives no Broadcast, and its frames never reach the router -
+	// so a scanner, a misconfigured node or a stranger replaying a peer's
+	// transport name cannot make this validator copy every frame for it. The
+	// policy lives here, not in the transport, because it needs the committee
+	// and the chain id; the transport only calls it.
+	admitHello := func(frame []byte) bool {
+		h, err := wire.DecodeHello(frame)
+		if err != nil {
+			return false
+		}
+		if h.ChainID != g.ChainID {
+			return false
+		}
+		if genesis.SeatOfPubKey(g.Validators, h.Validator) < 0 {
+			return false
+		}
+		hh := helloHash(h)
+		return crypto.Verify(h.Validator, hh[:], h.Sig)
+	}
+	tp, err := tcp.New(tcp.Options{
+		LocalID:          transport.PeerID(fmt.Sprintf("v%d", cfg.Index)),
+		Admit:            admitHello,
+	})
 	if err != nil {
 		_ = ch.Close()
 		return nil, err

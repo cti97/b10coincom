@@ -138,6 +138,38 @@ const (
 	// name derived from a frame that happens to arrive first through the
 	// relay is stranger-controlled; a fixed name is not.
 	relayPeerIDPrefix = "relay:"
+
+	// DefaultMaxConns bounds the ACCEPTED (inbound) connections one listener
+	// may hold at once (audit N-3). Pre-fix there was no bound at all: every
+	// dialer with a distinct 1-byte ID held a socket, a reader, a writer, a
+	// 128-frame queue and a registry slot. A validator's honest inbound
+	// population is its direct peers plus reconnect blips - a handful - so a
+	// bound of 64 is far above honest use and far below a squatting flood. A
+	// dial arriving at the cap is closed immediately and counted
+	// (RefusedConns); the honest peer's maintainer redials through its own
+	// backoff. Outbound (dialled) connections are NOT capped: they are
+	// configured peers the operator chose, and refusing them would silently
+	// strip a node of a link it was told to keep.
+	DefaultMaxConns = 64
+	// DefaultIdleReadTimeout is the per-connection IDLE READ DEADLINE (audit
+	// N-3): the longest a live connection may deliver NO complete frame
+	// before it is closed and its slot released. Before it, the handshake
+	// read deadline was CLEARED after the handshake ("may block forever"),
+	// so a stranger that sent a valid 4-byte header and then stalled pinned a
+	// reader goroutine, a frame buffer up to DefaultMaxFrameBytes and a
+	// registry slot indefinitely. Armed before every frame read (not once per
+	// connection), so a peer actively sending is never cut off; 2 minutes is
+	// the relay's own per-frame bound and sits far above any honest
+	// validator's cadence (ticks every 50 ms, waves every 500 ms).
+	DefaultIdleReadTimeout = 2 * time.Minute
+	// DefaultWriteTimeout is the per-frame WRITE DEADLINE (audit N-3): the
+	// longest one WriteFrame may block on a peer that has stopped reading
+	// before the connection is ended. Pre-fix the writer had no deadline, so
+	// a sink that never read parked the writer forever, pinning the frame in
+	// its hand and the rest of the bounded queue behind it. A frame at the
+	// 1 MiB bound writes inside it at ~280 kbit/s; honest frames are
+	// hundreds of bytes.
+	DefaultWriteTimeout = 30 * time.Second
 )
 
 // RelayPeerName returns the registry name a relay-mode connection to addr
@@ -224,6 +256,27 @@ type Options struct {
 	// DefaultBackoffBase and DefaultBackoffMax.
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
+	// MaxConns bounds the accepted (inbound) connections this listener holds
+	// at once. Default DefaultMaxConns. Outbound connections are not capped.
+	MaxConns int
+	// IdleReadTimeout is the longest a live connection may deliver no
+	// complete frame before it is closed. Default DefaultIdleReadTimeout.
+	IdleReadTimeout time.Duration
+	// WriteTimeout is the longest one frame's write may block before the
+	// connection is ended. Default DefaultWriteTimeout.
+	WriteTimeout time.Duration
+	// Admit authenticates an INBOUND connection before it becomes a peer
+	// (audit N-3/N-7). When non-nil, an accepted connection is held PENDING:
+	// its frames are offered to Admit and, until one is accepted, they are
+	// dropped and never reach OnMessage; the connection is absent from
+	// Peers() and receives no Broadcast. The first frame Admit accepts
+	// admits the connection and is dispatched normally. Admit is supplied by
+	// the node layer (this package holds no keys and no chain identity) and
+	// is expected to require a signed HELLO from a committee member on the
+	// node's chain; a nil Admit means "no admission policy", the behaviour
+	// the socket-free tests and non-consensus users want. Dialled
+	// connections are never gated: they are addresses the operator chose.
+	Admit func(frame []byte) bool
 	// Rand is the source of the reconnection jitter. An explicitly seeded
 	// *rand.Rand makes the delay sequence a function of that seed, so a test
 	// asserts the delays rather than hoping they grew; if nil, one is seeded
@@ -255,16 +308,26 @@ func (o Options) withDefaults() Options {
 		// arbitrary point; raise the ceiling to the floor instead.
 		o.BackoffMax = o.BackoffBase
 	}
+	if o.MaxConns <= 0 {
+		o.MaxConns = DefaultMaxConns
+	}
+	if o.IdleReadTimeout <= 0 {
+		o.IdleReadTimeout = DefaultIdleReadTimeout
+	}
+	if o.WriteTimeout <= 0 {
+		o.WriteTimeout = DefaultWriteTimeout
+	}
 	if o.Rand == nil {
 		o.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 	return o
 }
 
+
 // conn is one live TCP connection. Its immutable fields (remote, nc, tq,
 // dead) are fixed before the reader and writer goroutines start; mutable
-// state is either atomic (dropped), protected by the transport's mutex
-// (registry membership), or owned by exactly one goroutine.
+// state is either atomic (dropped, admitted), protected by the transport's
+// mutex (registry membership), or owned by exactly one goroutine.
 type conn struct {
 	remote transport.PeerID
 	nc     net.Conn
@@ -305,6 +368,22 @@ type conn struct {
 	// winner while it stands rather than evicting it back (no ping-pong, no
 	// hot loop: at most one dial per backoff interval at the ceiling).
 	superseded bool
+	// admitted gates the two peer-facing surfaces (audit N-3): Peers() and
+	// Broadcast include a connection only once it is admitted. An INBOUND
+	// connection starts unadmitted and its reader offers frames to
+	// Options.Admit until one is accepted; a DIALED connection (or any
+	// connection when Admit is nil) is admitted at install. It is an atomic
+	// rather than a mutex field because the reader sets it once and Peers()/
+	// Broadcast read it on their own paths.
+	admitted atomic.Bool
+	// inbound records that this connection was ACCEPTED, so finish knows to
+	// release the accept-time slot it holds against MaxConns. Outbound
+	// connections are not capped and release nothing.
+	inbound bool
+	// gated counts frames dropped because the connection was not yet
+	// admitted. An observable for the tests, and the number an operator
+	// would want if a listener is being probed.
+	gated atomic.Uint64
 }
 
 // finish tears the connection down exactly once: unblock the maintainer, make
@@ -327,6 +406,9 @@ func (t *TcpTransport) finish(c *conn) {
 		_ = c.nc.Close()
 		if t.conns[c.remote] == c {
 			delete(t.conns, c.remote)
+		}
+		if c.inbound && t.inboundSlots > 0 {
+			t.inboundSlots-- // the accept-time cap sees the freed slot again
 		}
 		t.mu.Unlock()
 	})
@@ -397,6 +479,13 @@ type TcpTransport struct {
 
 	// droppedOversized counts frames refused by the size bound and skipped.
 	droppedOversized atomic.Uint64
+	// inboundSlots counts ACCEPTED connections currently holding a slot -
+	// including ones still mid-handshake, which is the point: the cap must
+	// bound sockets, not merely installed registrations. Guarded by mu.
+	inboundSlots int
+	// refusedConns counts inbound dials closed at accept because the cap was
+	// full. The observable an operator checks when honest peers cannot get in.
+	refusedConns atomic.Uint64
 	// lastRedialDelay records the delay the maintainer most recently backed
 	// off before redialling. Observability first - a peer flapping forever on
 	// a stuck 30s curve is diagnosable from this one number - and it is what
@@ -489,13 +578,33 @@ func (t *TcpTransport) acceptLoop(l net.Listener) {
 			nc.Close()
 			continue
 		}
+		// The accept-time connection cap (audit N-3). The slot is taken
+		// BEFORE the handshake goroutine starts, so a slow or silent dialer
+		// cannot hold an uncounted socket: inboundSlots bounds sockets, not
+		// merely installed registrations. A dial at the cap is refused here
+		// and counted; the honest peer's maintainer redials.
+		if t.inboundSlots >= t.opts.MaxConns {
+			t.mu.Unlock()
+			t.refusedConns.Add(1)
+			nc.Close()
+			continue
+		}
+		t.inboundSlots++
 		addr := nc.RemoteAddr().String()
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
 			// An inbound failure is the dialer's problem by definition:
-			// there is no registered maintainer to redial a stranger.
-			_, _ = t.adopt(nc, addr, false)
+			// there is no registered maintainer to redial a stranger. The
+			// slot is released here because no conn owns it; a successful
+			// adopt hands it to install, and finish releases it there.
+			if _, err := t.adopt(nc, addr, false); err != nil {
+				t.mu.Lock()
+				if t.inboundSlots > 0 {
+					t.inboundSlots--
+				}
+				t.mu.Unlock()
+			}
 		}()
 		t.mu.Unlock()
 	}
@@ -820,7 +929,15 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled bool, id transp
 		dead:    make(chan struct{}),
 		addr:    addr,
 		dialled: dialled,
+		inbound: !dialled,
 	}
+	// Admission (audit N-3): an INBOUND connection is a peer only after the
+	// node's Admit callback has accepted a frame from it. A dialled
+	// connection is one the operator chose, and a nil Admit means no policy
+	// was supplied (the socket-free tests and non-consensus users), so both
+	// are admitted at install. The reader promotes an inbound connection the
+	// moment Admit accepts a frame.
+	c.admitted.Store(dialled || t.opts.Admit == nil)
 
 	t.mu.Lock()
 	if t.closed.Load() {
@@ -910,11 +1027,27 @@ func newcomerWins(local transport.PeerID, existing, newcomer *conn) bool {
 	return false // same direction on both: the incumbent stays
 }
 
-// reader is the per-connection read goroutine: frame, dispatch, repeat, until
-// the framing fails. It owns the socket for reading for the connection's
-// lifetime.
+// reader is the per-connection read goroutine: frame, admit, rate-limit,
+// dispatch, repeat, until the framing fails. It owns the socket for reading
+// for the connection's lifetime.
+//
+// Three bounds run here, in the order the traffic meets them:
+//
+//   - the IDLE READ DEADLINE is re-armed before every frame (audit N-3), so a
+//     socket that delivers no complete frame for the whole timeout is ended
+//     and its slot released - the pre-fix code CLEARED the deadline after the
+//     handshake, letting a stranger pin a reader (and up to a 1 MiB buffer)
+//     forever with four bytes;
+//   - the RATE LIMIT (audit N-6) drops a frame over the per-connection token
+//     bucket, so no single connection can monopolise the one dispatch
+//     callback that serialises every reader;
+//   - the ADMISSION GATE (audit N-3/N-7) holds an inbound connection out of
+//     Peers() and Broadcast until Options.Admit accepts a frame.
 func (t *TcpTransport) reader(c *conn) {
 	for {
+		if err := c.nc.SetReadDeadline(time.Now().Add(t.opts.IdleReadTimeout)); err != nil {
+			break // the socket itself is gone; finish below cleans up
+		}
 		payload, err := wire.ReadFrame(c.nc, t.opts.MaxFrameBytes)
 		if err != nil {
 			var otl *wire.FrameTooLarge
@@ -925,11 +1058,21 @@ func (t *TcpTransport) reader(c *conn) {
 				break
 			}
 			// EOF, reset, truncation, a zero-length frame, a malformed
-			// header: framing is unsalvageable (there is no knowing where the
-			// next frame begins), so the connection ends. A reconnecting peer
-			// redials through its maintainer; the consensus layer tolerates
-			// the loss.
+			// header, or the idle deadline expiring: framing is
+			// unsalvageable (there is no knowing where the next frame
+			// begins), so the connection ends. A reconnecting peer redials
+			// through its maintainer; the consensus layer tolerates the loss.
 			break
+		}
+		if !c.admitted.Load() {
+			if t.opts.Admit == nil || !t.opts.Admit(payload) {
+				// Not yet a peer: the frame is dropped, never dispatched,
+				// and the connection stays out of Peers() and off every
+				// Broadcast. A stranger cannot reach OnMessage at all.
+				c.gated.Add(1)
+				continue
+			}
+			c.admitted.Store(true)
 		}
 		t.dispatch(transport.Message{From: c.remote, Data: payload})
 	}
@@ -977,16 +1120,26 @@ func (t *TcpTransport) dispatch(m transport.Message) {
 }
 
 // writer is the per-connection write goroutine: drain the queue onto the
-// socket, one framed payload at a time, and exit when the connection is over.
+// socket, one framed payload at a time under a per-frame WRITE DEADLINE
+// (audit N-3), and exit when the connection is over. A peer that stops
+// reading makes WriteFrame block; without the deadline the writer parked
+// forever and the frame in its hand plus the rest of the bounded queue stayed
+// pinned behind it. With it, the write ends in a timeout, finish releases the
+// connection, its queue and its slot, and the peer's maintainer redials.
 func (t *TcpTransport) writer(c *conn) {
 	for {
 		select {
 		case <-c.dead:
 			return
 		case b := <-c.tq:
+			if err := c.nc.SetWriteDeadline(time.Now().Add(t.opts.WriteTimeout)); err != nil {
+				t.finish(c)
+				return
+			}
 			if err := wire.WriteFrame(c.nc, b); err != nil {
-				// The socket failed; close it, which wakes the reader into
-				// finish (a no-op if we got here second).
+				// The socket failed or the per-frame write deadline expired;
+				// close it, which wakes the reader into finish (a no-op if we
+				// got here second).
 				t.finish(c)
 				return
 			}
@@ -994,12 +1147,17 @@ func (t *TcpTransport) writer(c *conn) {
 	}
 }
 
-// Broadcast enqueues data to every connected peer except the sender, copying
-// it first: the caller may reuse the buffer the moment this returns, and the
-// queue holds bytes long after. It returns in bounded time WHATEVER the
-// peers are doing - a queue-full peer is a dropped frame, not a blocked
+// Broadcast enqueues data to every ADMITTED connected peer except the sender,
+// copying it first: the caller may reuse the buffer the moment this returns,
+// and the queue holds bytes long after. It returns in bounded time WHATEVER
+// the peers are doing - a queue-full peer is a dropped frame, not a blocked
 // caller (Send's ErrQueueFull documents the policy for the caller who cares;
 // gossip does not).
+//
+// Admission (audit N-3) is filtered HERE as well as in Peers(): an inbound
+// connection that has not passed Options.Admit receives no broadcast, so a
+// stranger with a distinct handshake ID cannot make every honest node copy
+// every frame for it.
 //
 // "Except the sender" needs no check here, precisely because it is enforced
 // one layer down: a connection that announces itself with this node's own ID
@@ -1010,7 +1168,9 @@ func (t *TcpTransport) Broadcast(data []byte) error {
 	t.mu.Lock()
 	targets := make([]*conn, 0, len(t.conns))
 	for _, c := range t.conns {
-		targets = append(targets, c)
+		if c.admitted.Load() {
+			targets = append(targets, c)
+		}
 	}
 	t.mu.Unlock()
 	for _, c := range targets {
@@ -1066,20 +1226,47 @@ func (t *TcpTransport) OnMessage(fn func(transport.Message)) {
 	t.onMessage = fn
 }
 
-// Peers lists the connected peers sorted by ID. Deterministic order is not a
-// nicety: consensus iterates peers by position, and map-ordered output would
-// permute state transitions between runs - the sim's own Peers() doc says
-// exactly why that breaks replay.
+// Peers lists the ADMITTED connected peers sorted by ID. Deterministic order
+// is not a nicety: consensus iterates peers by position, and map-ordered
+// output would permute state transitions between runs - the sim's own Peers()
+// doc says exactly why that breaks replay.
+//
+// Admission (audit N-3) is the other property here: an inbound connection that
+// has not yet passed Options.Admit is a socket, not a peer, and must not
+// appear. A node that broadcasts its HELLOs to Peers() therefore never feeds
+// a stranger, and a stranger cannot claim a peer slot by dialing.
 func (t *TcpTransport) Peers() []transport.PeerID {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	ids := make([]transport.PeerID, 0, len(t.conns))
-	for id := range t.conns {
-		ids = append(ids, id)
+	for id, c := range t.conns {
+		if c.admitted.Load() {
+			ids = append(ids, id)
+		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
 }
+
+// RefusedConns reports how many inbound dials were closed at accept because
+// the listener already held MaxConns accepted connections (audit N-3). It is
+// the observable an operator checks when an honest peer cannot get in.
+func (t *TcpTransport) RefusedConns() uint64 { return t.refusedConns.Load() }
+
+// GatedFrames reports how many frames were dropped because their connection
+// had not passed Options.Admit (audit N-3/N-7). It is a diagnostic: a steady
+// nonzero value on a healthy committee means something is dialing the
+// listener without a committee HELLO.
+func (t *TcpTransport) GatedFrames() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var n uint64
+	for _, c := range t.conns {
+		n += c.gated.Load()
+	}
+	return n
+}
+
 
 // Close idempotently shuts the transport down. What it STOPS and WAITS for:
 // the listener, every live connection, and every goroutine that can be blocked
