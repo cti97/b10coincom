@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/types"
@@ -89,10 +90,23 @@ type Engine struct {
 	// the state root recomputed through the real transition (audit C-1).
 	// It runs in maybePrevote BEFORE the lock check, so an invalid proposal
 	// is prevoted NIL and can never gather the polka that would lock every
-	// honest validator onto block bytes the chain refuses. Nil (engines built
-	// without a driver) means no validation beyond the envelope's own:
-	// production engines always carry the seam, because they always carry a
-	// chain; a driver-less engine has no chain to disagree with.
+	// honest validator onto block bytes the chain refuses.
+	//
+	// It is never nil for an engine built the exported way: NewEngine
+	// installs refuseWithoutSeam, so a driver-less engine - one with no chain
+	// behind it - refuses every block and prevotes NIL, never FOR. Before
+	// round 3 a nil field meant "no validation beyond the envelope's own",
+	// which silently prevoted blocks whose header proposer and signature
+	// nobody ever checks (the envelope-proposer equality check was removed
+	// for C-2's re-proposals); the driver-less hole is closed by what the
+	// CONSTRUCTOR installs rather than by conventions about wiring: a
+	// prevotable engine arises only from a visible, deliberate replacement
+	// of the refusal through SetValidate (the driver's
+	// SetValidate(... chain.ValidateNext)), never from forgetting one.
+	// Production engines always carry a chain, so
+	// they always replace the refusal with the real seam; a driver-less
+	// engine has no chain to agree with, and its honest verdict on any block
+	// is refusal.
 	validate func(*types.Block) error
 
 	// lockedBlock retains the bytes of the proposal the lock names, and
@@ -126,20 +140,24 @@ type Engine struct {
 	// sets yet - C-3), but the DISCARDED vote still carries the one piece of information the
 	// round ladder needs: the committee has already moved past this round. On
 	// timeout the engine JUMPS its round - bounded, evidence-gated resync:
-	// strictly more than the Byzantine budget (f+1 members) must have
-	// attested a higher round, so at least one honest validator truly was
-	// there. A committee whose round counters drift apart (rebuilt engines
-	// re-arm their ladders mid-height) resynchronises through this; without
-	// it a follower can sit one round behind forever, dropping every proposal
-	// as wrong-round while every leader drops its vote back the same way - a
-	// fully live committee that never polkas again (observed with the capped
-	// round ladder the audit's C-2 asks for).
+	// strictly more than ONE THIRD OF TOTAL POWER (the same Byzantine budget
+	// every power fraction in this package is measured against, and the same
+	// TotalPower/quorum arithmetic the committee provides) must have attested
+	// a higher round, so the jump cannot be driven by any coalition that does
+	// not already exceed the committee's actual fault budget. A committee
+	// whose round counters drift apart (rebuilt engines re-arm their ladders
+	// mid-height) resynchronises through this; without it a follower can sit
+	// one round behind forever, dropping every proposal as wrong-round while
+	// every leader drops its vote back the same way - a fully live committee
+	// that never polkas again (observed with the capped round ladder the
+	// audit's C-2 asks for).
 	//
-	// One entry per member, replaced only forward: bounded memory, Byzantine
-	// claims contained (f members can attest at most f slots), and the f+1-th
-	// largest entry is then always the highest round AN honest member
-	// attested. Reset only by a new engine (per height); a round change
-	// deliberately keeps it.
+	// One entry per member, replaced only forward: bounded memory. The gate
+	// is POWER, not a seat count: committee seats and BFT fault budget are
+	// different quantities on a weighted committee, where floor(n/3)+1 seats
+	// can hold strictly less than a third of the power and, conversely, far
+	// fewer seats than that can hold more than a third. Reset only by a new
+	// engine (per height); a round change deliberately keeps it.
 	future map[int]*Vote
 
 	// persistLock, when non-nil, is called the instant the lock moves: the
@@ -156,14 +174,52 @@ type Engine struct {
 	out          []Outbound
 }
 
+// errNoValidationSeam is what NewEngine's default seam returns. It is the
+// failure mode of a driver-less engine, not a judgement about the block:
+// without a chain behind it, no engine can honestly judge a block's chain
+// validity, and refusing is the only safe verdict (audit round 3, F3).
+var errNoValidationSeam = errors.New("consensus: no validation seam wired: an engine without a chain cannot judge block validity and must not prevote it")
+
+// refuseWithoutSeam is the validate seam NewEngine installs by default: it
+// refuses every block, so a driver-less engine nil-prevotes instead of
+// prevoting for bytes whose header proposer and signature nobody verified.
+// The driver replaces it with the chain's ValidateNext in newEngine; tests
+// that model an acceptable block replace it with an explicitly accepting
+// validator. Both replacements are visible assignments - the refusal cannot
+// be bypassed by forgetting to wire something, only by writing code that
+// overwrites it.
+func refuseWithoutSeam(*types.Block) error { return errNoValidationSeam }
+
+// SetValidate replaces the engine's validation seam - the exported half of the
+// F3 enforcement. NewEngine's default refuses every block, so an engine built
+// through the exported constructor can never prevote FOR a block nobody judged;
+// only a visible call to THIS method, passing a real validator, can change that.
+// A nil function is refused with a panic at the assignment site: the one
+// assignment that would restore the old driver-less hole (prevote with no
+// chain judgement at all) cannot be made accidentally - it crashes the
+// constructor-shaped misuse immediately instead of quietly prevoting
+// unverified bytes.
+func (e *Engine) SetValidate(fn func(*types.Block) error) {
+	if fn == nil {
+		panic("consensus: a nil validation seam would prevote blocks nobody judged; replace the default refusal with a real validator or leave it in place")
+	}
+	e.validate = fn
+}
+
 // NewEngine creates an engine that will validate height, whose parent is parent,
 // signing with priv.
+//
+// The returned engine carries NO validation seam except the default refusal:
+// the caller - the driver, in production - must assign a real validator (the
+// chain's ValidateNext) through SetValidate before the engine can prevote FOR
+// any block. See the validate field.
 func NewEngine(cfg Config, height uint64, parent [32]byte, priv ed25519.PrivateKey, propose ProposeFn) *Engine {
 	pub := priv.Public().(ed25519.PublicKey)
 	e := &Engine{
 		cfg: cfg, priv: priv, pub: pub,
 		idx: cfg.IndexOf(pub), parent: parent, propose: propose,
-		height: height,
+		height:   height,
+		validate: refuseWithoutSeam,
 		// The lock's zero value is round 0, which is a REAL round, so "unlocked"
 		// must be set explicitly. Forgetting this makes a fresh validator believe
 		// it is locked on the zero block and prevote for nothing.
@@ -256,15 +312,17 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) {
 	// proposal whose justification failed stays silent by the gate's rule (no
 	// vote may rest on evidence that does not exist).
 	//
-	// Jump the ladder on evidence before entering the next round: if f+1
-	// committee members signed prevotes at rounds ahead of the one that just
-	// ended, the committee IS that far ahead, and stepping +1 would only keep
-	// this validator exactly one round behind a committee it can never catch -
+	// Jump the ladder on evidence before entering the next round: when
+	// committee members holding strictly more than one third of the total
+	// power signed prevotes at rounds ahead of the one that just ended, the
+	// committee IS that far ahead, and stepping +1 would only keep this
+	// validator exactly one round behind a committee it can never catch -
 	// its own votes and every peer's proposal for the rounds it keeps missing
 	// are dropped as wrong-round in BOTH directions, forever. The target is
-	// the highest round at least one honest member attested (the f+1-th
-	// largest observed member round; f Byzantine slots cannot reach that
-	// position). Without evidence the ladder escalates by one, as before.
+	// the highest round at which that much power sits, and it is additionally
+	// capped a bounded stride ahead of the current round (see jumpTarget):
+	// the evidence can never name a round the engine chases to its own
+	// ejection. Without evidence the ladder escalates by one, as before.
 	if target := e.jumpTarget(); target > e.round {
 		e.enterRound(target)
 		return
@@ -277,34 +335,101 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) {
 // and 0 when there is none (0 is never a valid target: the engine is at round
 // >= 0 and only jumps strictly forward).
 //
-// The criterion is f+1 distinct members' signed votes at rounds ahead of the
-// current one - strictly more than the Byzantine budget can supply. Each
-// member is counted once, at its highest attested round, and the target is
-// the f+1-th LARGEST of those: the highest round the evidence shows bulk at,
-// always SOME honest member's own attested round (f Byzantine claims cannot
-// reach the f+1-th slot). Jumping to the furthest claim would follow one
-// Byzantine member wherever it said; stepping by one would never close a
-// drifted round gap under a flat (capped) cadence. One jump moves to the
-// evidence's bulk; further evidence, on later timeouts, moves further.
+// The criterion is a POWER fraction, not a seat count: members carrying
+// strictly more than one third of the committee's TOTAL power - the same
+// Byzantine budget every other power comparison in this package is measured
+// against - must have attested a round ahead of the current one. It uses the
+// committee's own TotalPower arithmetic, so a weighted committee is measured
+// in its real currency. A seat count would be wrong twice: on a weighted
+// genesis a coalition holding strictly UNDER a third of the power can occupy
+// floor(n/3)+1 SEATS (demonstrated on n=7, powers {1,1,1,2,2,2,2}: three
+// power-1 seats hold 3/11 ≈ 0.27 of power yet fill the member gate exactly),
+// and a coalition holding MORE than a third can do it with fewer seats.
+//
+// The target is the highest round at which that bulk sits: entries are walked
+// from the furthest attested round down, accumulating each member's power
+// (one entry per member, highest round only - a member's repeat claims cannot
+// multiply its weight), and the target is the FIRST round at which the
+// accumulated power reaches the bar. Before that round the accumulated power
+// was under one third, so the target is bounded above by some honest member's
+// own attested round: a sub-third coalition cannot pull the target past the
+// furthest honest attestation, and a single Byzantine validator - whose power
+// the genesis power cap holds under one quarter of total - cannot reach the
+// bar at all. One jump moves to the evidence's bulk; further evidence, on
+// later timeouts, moves further.
+//
+// The target is additionally CAPPED at maxRoundEscalation rounds ahead of the
+// engine's own round. The gate is correct against the committee's fault
+// budget, but "correct" only bounds WHO can name the target, not the number
+// they name: a coalition that legitimately exceeds one third can still
+// attest an absurd round - and so can one buggy honest validator - and
+// jumping to math.MaxUint32 would park the engine in OnTimeout's wrap guard,
+// ejecting it from the height silently. The jump exists to resync a follower
+// onto a live committee; that never needs more than one bounded stride per
+// timeout (larger gaps close by repetition on later timeouts, at the capped
+// ladder's cadence), and the cap keeps round numbers reachable only by round
+// COUNTS of timeouts, never by one jump. With maxRoundEscalation the bound is
+// deliberately the same number the timeout ladder uses: past that many
+// rounds, escalation adds nothing, and a jump that far needs no extra reach.
 func (e *Engine) jumpTarget() uint32 {
-	fplus1 := len(e.cfg.Committee)/3 + 1
-	if e.future == nil || len(e.future) < fplus1 {
+	if len(e.future) == 0 {
 		return 0
 	}
-	rounds := make([]uint32, 0, len(e.future))
-	for _, v := range e.future {
-		rounds = append(rounds, v.Round)
+	// The bar: the smallest power that is strictly more than one third of the
+	// total. total/3+1 in integer arithmetic is exactly that smallest value,
+	// for every remainder of total mod 3, and total/3 cannot overflow uint64.
+	bar := e.cfg.TotalPower()/3 + 1
+
+	// Walk the attested members from the furthest round down, accumulating
+	// power; stop at the first round whose prefix reaches the bar. The walk
+	// is an insertion sort over at most one entry per member, so it costs
+	// O(k^2) in attested members on a single timeout decision - a committee
+	// member count, not a message count.
+	type attestation struct {
+		round uint32
+		power uint64
 	}
-	// Sort descending; index fplus1-1 is the f+1-th largest.
+	rounds := make([]attestation, 0, len(e.future))
+	for idx, v := range e.future {
+		rounds = append(rounds, attestation{round: v.Round, power: e.cfg.Committee[idx].Power})
+	}
 	for i := 1; i < len(rounds); i++ {
-		for j := i; j > 0 && rounds[j-1] < rounds[j]; j-- {
+		for j := i; j > 0 && rounds[j-1].round < rounds[j].round; j-- {
 			rounds[j-1], rounds[j] = rounds[j], rounds[j-1]
 		}
 	}
-	if int64(rounds[fplus1-1]) <= int64(e.round) {
-		return 0
+
+	var cum uint64
+	for _, a := range rounds {
+		var carry uint64
+		cum, carry = bits.Add64(cum, a.power, 0)
+		if carry != 0 {
+			// A wrapped accumulation means unvalidated committee powers; a
+			// wrapped comparison would invent or miss a crossing. Refuse to
+			// jump rather than act on wrapped arithmetic - the same posture
+			// the committee's own overflow guard takes.
+			return 0
+		}
+		if cum < bar {
+			continue
+		}
+		if a.round <= e.round {
+			return 0 // the bulk sits behind us: no evidence the committee is ahead
+		}
+		// The bounded stride: never leave the current round by more than
+		// maxRoundEscalation in one jump (see the function comment). The wrap
+		// guard below covers e.round close enough to MaxUint32 that the sum
+		// would wrap; at e.round == MaxUint32 OnTimeout has already returned.
+		limit := e.round + maxRoundEscalation
+		if limit < e.round { // wrapped
+			limit = math.MaxUint32
+		}
+		if a.round > limit {
+			return limit
+		}
+		return a.round
 	}
-	return rounds[fplus1-1]
+	return 0
 }
 
 // enterRound moves to a later round, resetting the per-round tally. The lock
@@ -409,12 +534,15 @@ func (e *Engine) onVote(v *Vote) error {
 	if v.Height != e.height || v.Round != e.round {
 		// Not this round. A vote from a round AHEAD of ours is still
 		// evidence for the ladder jump: record the member's highest attested
-		// round (signature and membership verified here, because this path
-		// makes a jump decision and must not trust unauthenticated input).
+		// round (membership checked FIRST - a free linear scan against a
+		// stranger's frame, the audit C-8 discipline; signature verification
+		// (Ed25519) runs only for a member's vote, so a non-member cannot
+		// force even one verification per frame - and this path makes a jump
+		// decision and must not trust unauthenticated input).
 		// Past-round votes need no record: the committee has left them behind
 		// and our own ladder never wants to enter one.
-		if v.Height == e.height && v.Round > e.round && v.Verify() == nil {
-			if idx := e.cfg.IndexOf(v.Validator); idx >= 0 {
+		if v.Height == e.height && v.Round > e.round {
+			if idx := e.cfg.IndexOf(v.Validator); idx >= 0 && v.Verify() == nil {
 				if cur, seen := e.future[idx]; !seen || v.Round > cur.Round {
 					if e.future == nil {
 						e.future = make(map[int]*Vote)

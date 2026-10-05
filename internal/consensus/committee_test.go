@@ -27,6 +27,24 @@ func evenCommittee(t *testing.T, n int, power uint64) Config {
 	return c
 }
 
+// weightedCommittee builds a committee with per-seat powers, the shape the
+// committee FILE always allowed (genesis.CommitteeEntry.Power) even though
+// every shipped genesis so far has been equal-power. Deterministic keys, one
+// per seat, so a failure is reproducible and the tests above can name seats
+// by power.
+func weightedCommittee(t *testing.T, powers ...uint64) Config {
+	t.Helper()
+	vals := make([]genesis.Validator, 0, len(powers))
+	for i, p := range powers {
+		vals = append(vals, testValidator(i, p))
+	}
+	c := Config{Committee: vals, TimeoutBase: 1, TimeoutStep: 1, PowerCapNum: 1, PowerCapDen: 4}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("weighted committee rejected: %v", err)
+	}
+	return c
+}
+
 // testValidator derives validator idx's key through the derivation every
 // test fixture in this package must use. testCommitteeKey (testkeys_test.go)
 // is the cross-task helper carrying that same derivation; the tripwire below

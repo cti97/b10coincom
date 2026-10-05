@@ -55,12 +55,23 @@ func conflictingBlock(t *testing.T, cfg Config, height uint64, round uint32, par
 
 // newTestEngine builds an engine for committee index idx, starting at height 1
 // with an all-zero parent and no lock.
+//
+// Since round 3 (F3), NewEngine installs a refusing default validation seam -
+// a driver-less engine never prevotes FOR an unjudged block. The consensus
+// tests here model the consensus logic on a block whose chain validity is
+// not under test (the chain's seam has its own tests, and the driver wiring
+// is exercised by the driver and committee tests), so the fixture DELIBERATELY
+// replaces the refusal with an accepting validator - a visible assignment,
+// the exact act the F3 design requires, never an absence of wiring. Tests of
+// the refusal itself build their engine directly with NewEngine and keep the
+// default.
 func newTestEngine(t *testing.T, cfg Config, idx int, height uint64, parent [32]byte) *Engine {
 	t.Helper()
 	priv := testCommitteeKey(idx)
 	e := NewEngine(cfg, height, parent, priv, func(h uint64, r uint32, p [32]byte) (types.Block, error) {
 		return testProposer(t, cfg, h, r, p), nil
 	})
+	e.SetValidate(func(*types.Block) error { return nil }) // accept: chain validity is not this file's subject
 	if e.Locked() {
 		t.Fatal("a fresh engine must not be locked: the lock's zero value is round 0, which is a real round")
 	}
@@ -799,6 +810,174 @@ func TestValidRoundAboveUint32IsRejected(t *testing.T) {
 	}
 }
 
+// The validation seam is ENFORCED, not conventional (round-3 F3). After the
+// C-2 fix removed the envelope-vs-header-proposer equality (necessarily: a
+// locked re-proposal offers another validator's block), a block's header
+// proposer key and signature are checked ONLY by the seam - so a driver-less
+// engine built through the EXPORTED NewEngine used to prevote bytes nobody
+// ever verified. The constructor now installs a default seam that refuses
+// every block, and only a visible replacement (SetValidate, or the driver's
+// direct wiring) can enable a FOR prevote - a prevotable engine cannot arise
+// from forgetting to wire something.
+func TestEngineWithoutAValidationSeamNeverPrevotesForABlockItDidNotJudge(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 0, true, parent)
+
+	// The mechanism, asserted where it lives: the exported constructor's
+	// default seam is installed (never nil) and refuses with its named error.
+	// Checked AFTER the behavioural verdicts below, so a mutant removing the
+	// installation fails on the behaviour the finding is about, not only on
+	// the fixture check.
+	p0 := NewEngine(cfg, h, parent, testCommitteeKey(0), func(hh uint64, rr uint32, pp [32]byte) (types.Block, error) {
+		return testProposer(t, cfg, hh, rr, pp), nil
+	})
+
+	// Proposer side: the seam-less engine IS this round's proposer. It still
+	// proposes (refusing to propose is not the fix - rounds must stay
+	// leavable) but must NIL-prevote its own emission: the block was never
+	// judged, and FOR would stake a vote on bytes nobody authenticated.
+	if err := p0.StartProposing(); err != nil {
+		t.Fatal(err)
+	}
+	sawProposal, sawFor, sawNil := false, false, false
+	for _, o := range p0.Drain() {
+		if p := tryProposal(o.Data); p != nil {
+			sawProposal = true
+		}
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote {
+			if v.IsNil() {
+				sawNil = true
+			} else {
+				sawFor = true
+			}
+		}
+	}
+	if !sawProposal {
+		t.Fatal("fixture: the proposer emitted no proposal; the fixture must exercise the prevote")
+	}
+	if sawFor {
+		t.Fatal("a driver-less engine PREVOTED FOR its own proposal: the header proposer's key and signature were never checked by anyone - the driver-less prevote hole F3 closes")
+	}
+	if !sawNil {
+		t.Fatal("the seam-less engine was silent instead of nil-prevoting: a validator that casts nothing leaves its weight out of the nil tally and stalls the round")
+	}
+
+	// Follower side: a perfectly signed, well-formed proposal from the real
+	// round proposer arrives at a seam-less engine. Same verdict: the refusal
+	// is about the missing judge, not the bytes, so the verdict is nil - once.
+	p1 := NewEngine(cfg, h, parent, testCommitteeKey(1), func(hh uint64, rr uint32, pp [32]byte) (types.Block, error) {
+		return testProposer(t, cfg, hh, rr, pp), nil
+	})
+	blk := testProposer(t, cfg, h, 0, parent)
+	p := &Proposal{Height: h, Round: 0, Block: blk, ValidRound: -1, Validator: cfg.Proposer(h, 0, parent)}
+	p.Sig = signProposal(t, cfg, p)
+	if err := p1.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatalf("the seam-less engine must still accept the signed proposal as round data, got %v", err)
+	}
+	outs := p1.Drain()
+	if len(outs) != 1 {
+		t.Fatalf("the seam-less follower emitted %d message(s) for one unusable proposal, want exactly the nil prevote", len(outs))
+	}
+	v, err := DecodeVote(outs[0].Data)
+	if err != nil || v.Type != MsgPrevote || !v.IsNil() {
+		t.Fatal("the seam-less follower's only emission was not a nil prevote: either it prevoted FOR unjudged bytes or it emitted nothing at all")
+	}
+	if p1.Locked() {
+		t.Fatal("the seam-less engine locked a block its refusal itself named unusable")
+	}
+
+	// The mechanism, now that the behaviour is pinned: the exported
+	// constructor's default seam is installed (never nil) and refuses with
+	// its named error - the detail that makes the refusal hold for every
+	// exported construction, not just this fixture's two engines.
+	if p0.validate == nil {
+		t.Fatal("NewEngine must install a default validation seam; a nil field is the bypass this fix closed")
+	}
+	if err := p0.validate(nil); !errors.Is(err, errNoValidationSeam) {
+		t.Fatalf("NewEngine's default seam returned %v, want the named refusal errNoValidationSeam", err)
+	}
+
+	// And the nil-proof wiring: SetValidate(nil) - the assignment that would
+	// restore the hole through the exported API - cannot be made at all.
+	defer func() {
+		if recover() == nil {
+			t.Fatal("SetValidate(nil) did not panic: the exported API can silently disable the validation seam again")
+		}
+	}()
+	p1.SetValidate(nil)
+}
+
+// A future-round vote is membership-checked BEFORE any signature verification
+// (round-3 F2, the audit's C-8 discipline): IndexOf is a linear scan the
+// engine pays anyway, an Ed25519 verification is not, and the old order let
+// any peer force one verification per frame with a self-signed future-round
+// vote. The instrument is crypto.VerifyHook - an observation point that
+// counts exactly the Ed25519 evaluations; production never sets it.
+func TestAFutureRoundVoteFromANonMemberCostsNoSignatureVerification(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	someID := crypto.HashParts([]byte("some-later-block"))
+	h := round0ProposerHeight(t, cfg, 0, false, parent)
+	e := newTestEngine(t, cfg, 0, h, parent)
+
+	strangerPub, strangerPriv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifications := 0
+	crypto.VerifyHook = func() { verifications++ }
+	defer func() { crypto.VerifyHook = nil }()
+
+	// Eight self-signed future-round votes from a key NOT in the committee:
+	// per frame, the old order paid one Ed25519 verification (each vote's
+	// signature is genuinely valid - the peer is just not a member), the new
+	// order pays none.
+	for r := uint32(1); r <= 8; r++ {
+		v := &Vote{Type: MsgPrevote, Height: h, Round: r, BlockID: someID, Validator: strangerPub}
+		hash := v.SigningHash()
+		v.Sig = crypto.Sign(strangerPriv, hash[:])
+		if err := e.OnMessage(EncodeVote(v)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if verifications != 0 {
+		t.Fatalf("%d non-member frame(s) each forced an Ed25519 verification before the membership check: the free check must run first (want 0 verifications)", verifications)
+	}
+	if len(e.future) != 0 {
+		t.Fatalf("non-member future-round votes left %d recorded entr(y/ies): a stranger's vote must also be refused for recording", len(e.future))
+	}
+
+	// Non-vacuity control 1: the branch DOES verify a member's vote - exactly
+	// one verification for the member's valid future vote, which is then
+	// recorded. A hook that never fires cannot pass this test, and the
+	// reorder cannot have silenced the evidence path.
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 1, MsgPrevote, h, 5, someID))); err != nil {
+		t.Fatal(err)
+	}
+	if verifications != 1 {
+		t.Fatalf("a member's valid future-round vote reached %d verification(s), want exactly 1: the reorder must keep authentication", verifications)
+	}
+	if p := e.future[1]; p == nil || p.Round != 5 {
+		t.Fatal("the member's valid future-round vote was not recorded: the branch under test never ran")
+	}
+
+	// Non-vacuity control 2: membership first does not mean trust members -
+	// a member's vote with a corrupted signature is verified (the free pass
+	// would be the next hole) and recorded nowhere.
+	bad := voteFrom(t, cfg, 2, MsgPrevote, h, 7, someID)
+	bad.Sig[0] ^= 0xff
+	if err := e.OnMessage(EncodeVote(bad)); err != nil {
+		t.Fatal(err)
+	}
+	if verifications != 2 {
+		t.Fatalf("a member's corrupted future-round vote reached %d verification(s), want 2: membership first must not skip the member's own verification", verifications)
+	}
+	if _, seen := e.future[2]; seen {
+		t.Fatal("a member's badly signed future-round vote was recorded: the reorder dropped the signature gate")
+	}
+}
+
 // sealedChainFixture opens a REAL chain under cfg's committee so an engine can
 // carry the driver's validation seam: the seam's judgement is the chain's own
 // ValidateNext - the same policy Append runs - against a chain whose head the
@@ -859,7 +1038,7 @@ func TestGarbageStateRootProposalIsNilPrevotedAndNeverLocked(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	ch, height, parent := sealedChainFixture(t, cfg)
 	e := newTestEngine(t, cfg, 1, height, parent)
-	e.validate = ch.ValidateNext
+	e.SetValidate(ch.ValidateNext)
 
 	attack, attackID := attackProposalForStateRoot(t, cfg, height, 0, parent)
 	if err := e.OnMessage(EncodeProposal(attack)); err != nil {
@@ -904,7 +1083,7 @@ func TestAValidBlockIsStillPrevotedThroughTheSeam(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	ch, height, parent := sealedChainFixture(t, cfg)
 	e := newTestEngine(t, cfg, 1, height, parent)
-	e.validate = ch.ValidateNext
+	e.SetValidate(ch.ValidateNext)
 
 	pPub := cfg.Proposer(height, 0, parent)
 	b, err := ch.Build(testCommitteeKey(cfg.IndexOf(pPub)), nil, ch.Head().Header.Timestamp+1)
@@ -997,6 +1176,10 @@ func roundProposerHeight(t *testing.T, cfg Config, wantIdx int, round uint32, pa
 func engineLockedAtRound0(t *testing.T, cfg Config, idx int, height uint64, parent [32]byte, blkA types.Block, propose ProposeFn) *Engine {
 	t.Helper()
 	e := NewEngine(cfg, height, parent, testCommitteeKey(idx), propose)
+	// The polka below is the fixture's premise, so chain validity is granted
+	// explicitly (round 3, F3): NewEngine's default seam refuses every block,
+	// and an engine leaving that refusal in place can never be locked by it.
+	e.SetValidate(func(*types.Block) error { return nil })
 	if e.Locked() {
 		t.Fatal("fixture: a fresh engine must not be locked")
 	}

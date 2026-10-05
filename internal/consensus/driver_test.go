@@ -3,6 +3,7 @@ package consensus
 import (
 	"crypto/ed25519"
 	"fmt"
+	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -2112,15 +2113,17 @@ func minInt64(a, b uint32) int64 {
 	return int64(a)
 }
 
-// A timeout must JUMP the ladder when f+1 committee members signed prevotes at
-// rounds ahead of the current one (the minimal round-resync the capped ladder
-// needs): the committee is that far ahead, and a +1 step would keep this
-// validator permanently one round behind, dropping every proposal as
-// wrong-round in both directions.
+// A timeout must JUMP the ladder when members holding more than one third of
+// the committee's total power signed prevotes at rounds ahead of the current
+// one (the minimal round-resync the capped ladder needs): the committee is
+// that far ahead, and a +1 step would keep this validator permanently one
+// round behind, dropping every proposal as wrong-round in both directions.
 //
-// The engine holds no future evidence for the first two firings (one attesting
-// member is below the bar of f+1 = 2 for four validators) and the ladder
-// escalates by one each time; the third firing has two members' future
+// On four equal-power validators the power bar is total/3+1 = 2 members - on
+// an EQUAL committee the same number the old seat gate gave, which is why
+// equal-power behaviour is unchanged. The engine holds no future evidence for
+// the first two firings (one attesting member is below the bar of 2) and the
+// ladder escalates by one each time; the third firing has two members' future
 // prevotes and jumps straight to the attested round.
 func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
@@ -2131,7 +2134,7 @@ func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
 		t.Fatal("fixture: the engine must start unproposing at round 0")
 	}
 
-	// One attesting member: below f+1 = 2. The ladder escalates by one.
+	// One attesting member: below the power bar of 2. The ladder escalates by one.
 	v0 := voteFrom(t, cfg, 0, MsgPrevote, h, 3, crypto.HashParts([]byte("some-later-block")))
 	if err := e.OnMessage(EncodeVote(v0)); err != nil {
 		t.Fatal(err)
@@ -2141,16 +2144,17 @@ func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
 		t.Fatalf("one future-round vote must not move the ladder bar: engine at round %d, want 1", e.Round())
 	}
 
-	// A second attesting member at a further round: f+1 = 2 evidence. The next
-	// timeout jumps to the f+1-th LARGEST attested round - the smallest round
-	// at which the evidence's bulk sits, here 3 of {5, 3} sorted [5, 3].
+	// A second attesting member at a further round: power 2 of 4, the bar. The
+	// next timeout jumps to the round where the evidence's bulk is first
+	// completed - the smallest round whose accumulated power reaches the bar,
+	// here 3, the 2nd largest of rounds {5, 3}.
 	v2 := voteFrom(t, cfg, 2, MsgPrevote, h, 5, crypto.HashParts([]byte("some-later-block")))
 	if err := e.OnMessage(EncodeVote(v2)); err != nil {
 		t.Fatal(err)
 	}
 	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
 	if e.Round() != 3 {
-		t.Fatalf("f+1 members' future rounds must jump the ladder: engine at round %d, want 3 (the f+1-th largest of rounds 5, 3)", e.Round())
+		t.Fatalf("the power bar's future rounds must jump the ladder: engine at round %d, want 3 (the bar-completing round of attestations 5, 3)", e.Round())
 	}
 	if p := e.future[2]; p == nil || p.Round != 5 {
 		t.Fatal("fixture: the recorded future evidence is wrong")
@@ -2163,28 +2167,28 @@ func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
 		t.Fatalf("after the jump the engine is at step %s, want propose", e.Step())
 	}
 	// The evidence survives the round change and a further member attests
-	// round 9: rounds {3, 5, 9}, f+1-th largest = 5, so the next timeout
-	// advances only to 5. The engine rides the evidence's bulk forward, not
-	// any single member's furthest claim.
+	// round 9: the bar-completing round is then 5 (power 2 attesting at 5 or
+	// above), so the next timeout advances only to 5. The engine rides the
+	// evidence's bulk forward, not any single member's furthest claim.
 	v1 := voteFrom(t, cfg, 1, MsgPrevote, h, 9, crypto.HashParts([]byte("some-later-block")))
 	if err := e.OnMessage(EncodeVote(v1)); err != nil {
 		t.Fatal(err)
 	}
 	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
 	if e.Round() != 5 {
-		t.Fatalf("the jump target is the f+1-th largest attested round, not the furthest: engine at round %d, want 5", e.Round())
+		t.Fatalf("the jump target is the bar-completing round, not the furthest attested: engine at round %d, want 5", e.Round())
 	}
 }
 
-// The jump's gate is f+1, not one: a single signed future-round vote (at most
-// one Byzantine member's claim) must never move the ladder. A committee that
+// The jump's gate is a third of the POWER, not one member's claim: a single
+// signed future-round vote must never move the ladder. A committee that
 // jumped on any single attestation would follow one Byzantine member into
 // rounds nobody else is in - and never come back, because the votes its
 // laggards see are all past-rounds relative to the jumped validator.
 //
-// For four validators f+1 = 2: two attestations from the SAME member (its
-// highest wins) still count as one. The jump fires only when a second,
-// distinct member attests.
+// For four equal validators the power bar is 2: attesting twice from the SAME
+// member (its highest wins) still counts as one member's power. The jump
+// fires only when a second, distinct member attests.
 func TestTimeoutJumpNeedsDistinctMembersNotOneByzantine(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	parent := crypto.HashParts([]byte("parent"))
@@ -2203,5 +2207,140 @@ func TestTimeoutJumpNeedsDistinctMembersNotOneByzantine(t *testing.T) {
 	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
 	if e.Round() != 1 {
 		t.Fatalf("a single member's future rounds must not jump the ladder (want +1 step, engine at round %d)", e.Round())
+	}
+}
+
+// The jump gate counts POWER, not SEATS (round-3 F1): the committee file
+// carries a per-entry power, so on a weighted genesis the Byzantine budget is
+// a fraction of total power, while the previous round's gate counted
+// floor(n/3)+1 COMMITTEE SEATS - and a coalition holding strictly UNDER one
+// third of the power can occupy exactly that many seats.
+//
+// The weighted committee is the reviewer's: n=7, powers {1,1,1,2,2,2,2},
+// total 11. The seat gate is 7/3+1 = 3 members; the power bar (the same
+// integers TotalPower feeds the quorum) is 11/3+1 = 4. Three power-1 seats
+// hold 3/11 = 0.273 of the power - strictly under a third - and exactly fill
+// the seat gate; the power gate must refuse them. Conversely a coalition that
+// genuinely exceeds one third of power in FEWER seats (two power-2 members:
+// 4/11 = 0.364 at two seats, below the seat gate of 3) must still be able to
+// move the round, so the gate is not simply dead: both directions below.
+func TestJumpGateCountsPowerNotSeats(t *testing.T) {
+	cfg := weightedCommittee(t, 1, 1, 1, 2, 2, 2, 2)
+	parent := crypto.HashParts([]byte("parent"))
+	someID := crypto.HashParts([]byte("some-later-block"))
+	// The engine's seat is the last one (power 2): it is not one of the
+	// attesting attackers below, and the fixture anchor asserts that.
+	idx := 6
+	h := round0ProposerHeight(t, cfg, idx, false, parent)
+
+	if total := cfg.TotalPower(); total != 11 {
+		t.Fatalf("fixture: total power %d, want 11 for powers {1,1,1,2,2,2,2}", total)
+	}
+	if bar := cfg.TotalPower()/3 + 1; bar != 4 {
+		t.Fatalf("fixture: the power bar is %d, want 4 (strictly more than a third of 11)", bar)
+	}
+
+	// Direction 1 (the attack): three seats holding 3/11 of the power attest
+	// round 9. They fill the SEAT gate (3 = floor(7/3)+1) exactly, so the
+	// member-count version of this gate jumped the engine to their claimed
+	// round; the power gate must not move it.
+	e := newTestEngine(t, cfg, idx, h, parent)
+	for _, seat := range []int{0, 1, 2} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, 9, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 1 {
+		t.Fatalf("a coalition with 3/11 = 0.273 of the power in 3 seats moved the round to %d: 3 of 11 is strictly under one third and must not reach the power gate (want round 1)", e.Round())
+	}
+
+	// A SINGLE Byzantine validator must never move the round either - the
+	// property round 2 established, kept on a weighted committee: the
+	// heaviest member holds 2/11, under the bar of 4.
+	e = newTestEngine(t, cfg, idx, h, parent)
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 0, MsgPrevote, h, 9, someID))); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 1 {
+		t.Fatalf("one member holding 2/11 of the power moved the round to %d: a single validator must not reach the gate at all", e.Round())
+	}
+
+	// Direction 2a (the gate is alive): two power-2 seats at round 9 hold
+	// 4/11 = 0.364 of the power, above the bar in TWO seats - fewer than the
+	// old seat gate of 3. The round must move, to the round the bulk attests.
+	e = newTestEngine(t, cfg, idx, h, parent)
+	for _, seat := range []int{3, 4} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, 9, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 9 {
+		t.Fatalf("a coalition holding 4/11 of the power in 2 seats did not move the round (at %d, want 9): the power gate must stay live", e.Round())
+	}
+
+	// Direction 2b (the target never follows a sub-third coalition's claim):
+	// the same three sub-third seats attest round 9 and ONE honest member -
+	// without whose power the gate would refuse - attests round 5. The
+	// crossing happens where the power reaches the bar, so the jump goes to
+	// the honest member's round 5, not the attackers' claimed 9.
+	e = newTestEngine(t, cfg, idx, h, parent)
+	for _, seat := range []int{0, 1, 2} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, 9, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 3, MsgPrevote, h, 5, someID))); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 5 {
+		t.Fatalf("the jump went to round %d, want 5: with power 3 at claimed round 9 and power 2 attested at round 5, the bar of 4 is first reached at the honest member's round 5 - the target must not follow the sub-third coalition's furthest claim", e.Round())
+	}
+}
+
+// The jump target is CAPPED (round-3 F1): a power-gated jump bounds WHO can
+// name the target, not the number they name - a coalition that legitimately
+// exceeds one third of power (and, equally, one buggy honest validator) can
+// attest math.MaxUint32, and a jump there parks OnTimeout's wrap guard, which
+// returns silently: the validator would be permanently ejected from the
+// height, its votes and every proposal wrong-round in both directions. So the
+// jump never leaves the current round by more than maxRoundEscalation - the
+// same stride the timeout ladder uses - and a genuinely further committee is
+// caught by repetition on later timeouts instead of one unbounded step.
+func TestJumpNeverTravelsFurtherThanABoundedStride(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1) // total 4: the bar is 4/3+1 = 2 power
+	parent := crypto.HashParts([]byte("parent"))
+	someID := crypto.HashParts([]byte("some-later-block"))
+	idx := 2
+	h := round0ProposerHeight(t, cfg, idx, false, parent)
+	e := newTestEngine(t, cfg, idx, h, parent)
+
+	// Two members attest math.MaxUint32: the power gate is genuinely
+	// satisfied (2 of 4), and the crossing - the round the old code would
+	// have jumped TO - is MaxUint32 itself, where OnTimeout silently returns
+	// forever after. The engine must jump to the BOUND instead.
+	for _, seat := range []int{0, 1} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, math.MaxUint32, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != maxRoundEscalation {
+		t.Fatalf("a MaxUint32-evidenced jump landed at round %d, want the bounded stride %d (an unbounded jump would strand the engine at OnTimeout's wrap guard and eject it from the height)", e.Round(), maxRoundEscalation)
+	}
+	if e.Step() != StepPropose {
+		t.Fatalf("after the bounded jump the engine is at step %s, want propose: it must stay live", e.Step())
+	}
+
+	// The bound is per jump, not per height: the same evidence, still ahead,
+	// moves the engine another bounded stride on the next timeout - a gap
+	// wider than the stride is closed by repetition, and no jump ever reaches
+	// the wrap guard's round.
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 2*maxRoundEscalation {
+		t.Fatalf("the second timeout did not carry another bounded stride (at round %d, want %d): the bound must not dead-end resync", e.Round(), 2*maxRoundEscalation)
 	}
 }

@@ -166,7 +166,15 @@ func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
 	// where they could disagree (a garbage state root carrying a polka to a
 	// commit and then refusing at Append, parking the whole committee) is
 	// closed before any vote is cast.
-	eng.validate = func(b *types.Block) error { return d.ch.ValidateNext(b) }
+	//
+	// The seam's COST is deliberate and bounded: it runs the full head+1
+	// state transition (including any Argon2id claim verification, the block's
+	// own bounds applying) under the chain's read lock on each judged proposal,
+	// at most once per round - a Byzantine proposer can therefore force that
+	// one transition per round for a block it knows fails the root compare.
+	// The cost statement lives with the seam itself: chain.ValidateNext's doc,
+	// "COST" paragraph (audit round 3, F4).
+	eng.SetValidate(func(b *types.Block) error { return d.ch.ValidateNext(b) })
 	if rec, ok := d.ch.LockAt(height); ok {
 		eng.restoreLock(rec.Round, rec.BlockID)
 	}

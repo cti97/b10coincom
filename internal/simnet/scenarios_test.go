@@ -616,6 +616,12 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 		}
 	}
 	eng := consensus.NewEngine(cfg, h, parent, n.keys[actor].priv, nil)
+	// Wire the honest validator's seam (audit round 3, F3): NewEngine's
+	// default REFUSES every block - a driver-less engine never prevotes FOR
+	// unjudged bytes - and this replica judges against n.ch[0], the chain the
+	// scenario's proposals were built over, exactly as the driver wires
+	// ValidateNext in production.
+	eng.SetValidate(n.ch[0].ValidateNext)
 
 	signedVote := func(signer int, round uint32, id [32]byte) *consensus.Vote {
 		v := &consensus.Vote{Type: consensus.MsgPrevote, Height: h, Round: round, BlockID: id, Validator: n.keys[signer].priv.Public().(ed25519.PublicKey)}
