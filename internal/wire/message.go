@@ -234,6 +234,18 @@ func EncodeBlockSyncResp(r *BlockSyncResp) []byte {
 	return e.Bytes()
 }
 
+// The minimum wire size of a BLOCK_SYNC response's unit count. It exists so
+// the decoder can cap its allocation HINT against the bytes actually
+// available (audit N-4): the count is attacker-supplied and bounded only by
+// the remaining frame bytes, while a BlockSyncUnit costs 56 bytes in memory
+// (two slice headers and a uint32), roughly 9x its 6-byte minimum wire form.
+// Capping at remaining/minBlockSyncUnitWireBytes turns "a hostile unit count"
+// from a 56x pre-allocation into at most the number of units the frame could
+// possibly carry. The bytes are still decoded exactly count times; only the
+// slice CAPACITY is capped, so a short or lying count still fails in the loop
+// below with no change in semantics.
+const minBlockSyncUnitWireBytes = 1 + 4 + 1 // len(block) varint + Round(4) + len(votes) varint
+
 func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 	d := types.NewDecoder(b)
 	raw, err := d.U8()
@@ -251,7 +263,17 @@ func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.Units = make([]BlockSyncUnit, 0, count)
+	// The capacity hint is capped to what the remaining bytes could hold
+	// (audit N-4): `count` is bounded only by `remaining` (Len refuses a
+	// count larger than the bytes left), and a BlockSyncUnit is 56 bytes in
+	// memory against 6 on the wire, so trusting it pre-allocates up to 56x
+	// the frame. The LOOP still runs `count` times, so the decode semantics -
+	// a lying count fails on the short buffer - are unchanged.
+	hint := count
+	if max := d.Remaining() / minBlockSyncUnitWireBytes; hint > max {
+		hint = max
+	}
+	r.Units = make([]BlockSyncUnit, 0, hint)
 	for i := 0; i < count; i++ {
 		u := BlockSyncUnit{}
 		if u.Block, err = d.VarBytes(); err != nil {
@@ -264,14 +286,22 @@ func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 		if err != nil {
 			return nil, err
 		}
-		u.Votes = make([][]byte, 0, vn)
+		// The vote count is capped by `remaining` too, but a vote is framed
+		// as an opaque length-prefixed blob whose minimum wire form is ONE
+		// byte, so no capacity hint derived from `remaining` can ever bind
+		// below `vn` - and `make([][]byte, 0, vn)` would pre-allocate 24
+		// bytes per claimed vote (audit N-4). A length-prefixed sequence
+		// needs no hint at all: append grows to the votes actually present,
+		// so a hostile `vn` with no bytes behind it costs nothing.
+		var votes [][]byte
 		for j := 0; j < vn; j++ {
 			v, err := d.VarBytes()
 			if err != nil {
 				return nil, err
 			}
-			u.Votes = append(u.Votes, v)
+			votes = append(votes, v)
 		}
+		u.Votes = votes
 		r.Units = append(r.Units, u)
 	}
 	if r.Responder, err = d.VarBytes(); err != nil {

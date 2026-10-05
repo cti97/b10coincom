@@ -85,7 +85,16 @@ type Decoder struct {
 
 func NewDecoder(b []byte) *Decoder { return &Decoder{buf: b} }
 
+// remaining reports the unread byte count.
 func (d *Decoder) remaining() int { return len(d.buf) - d.off }
+
+// Remaining exposes the unread byte count. A decoder that must pre-allocate
+// from an attacker-supplied element count uses it to cap the allocation hint:
+// a count is bounded only by the bytes that could follow it, and a struct is
+// often far larger in memory than its minimum wire form, so a hint trusted at
+// face value can allocate many times the frame size (audit N-4). The bytes
+// themselves are still decoded count-by-count - only the HINT is capped.
+func (d *Decoder) Remaining() int { return d.remaining() }
 
 // Done reports whether every byte was consumed. Callers MUST call it after
 // decoding: unconsumed bytes mean the input had a second interpretation.

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"runtime"
 	"testing"
+
+	"github.com/cti97/b10coincom/internal/types"
 )
 
 // TestFrameRoundTrips pins the frame layer's contract: it DELIMITS a payload
@@ -289,5 +291,73 @@ func TestMessagesRejectTrailingBytes(t *testing.T) {
 	padded = append(EncodeBlockSyncResp(&BlockSyncResp{}), 0xFF)
 	if _, err := DecodeBlockSyncResp(padded); err == nil {
 		t.Fatal("DecodeBlockSyncResp accepted bytes trailing its fields")
+	}
+}
+
+// TestDecodeBlockSyncRespCapsAHostileCount pins audit N-4 with a MemStats
+// assertion of the same shape as the oversized-frame test: the element COUNT
+// in a BLOCK_SYNC response is attacker bytes. Len refuses a count larger than
+// the bytes remaining, so the count can be as large as the frame - and a
+// BlockSyncUnit costs 56 bytes in memory against a 6-byte minimum on the
+// wire, while a vote's slice header costs 24 against a 1-byte minimum. A
+// decoder that pre-allocates `make([]BlockSyncUnit, 0, count)` (or
+// `make([][]byte, 0, vn)`) therefore multiplies a 1 MiB frame into tens of
+// MiB. runtime.MemStats.TotalAlloc is a monotonic heap-byte counter, so the
+// pre-allocation shows up here as a large jump even though the decode then
+// fails on the short buffer.
+//
+// The bound asserted is a small multiple of the FRAME size, not a fixed byte
+// count: the prescribed cap (audit N-4) is `remaining / minUnitBytes`, which
+// for units is a ~9x multiple, and for votes the fix is to append with no
+// hint at all because a 1-byte minimum cannot bind. 16x is comfortably above
+// the capped-unit case and far below the 56x/24x a trusted count reaches, so
+// the test fails on the pre-fix code and passes on the fix.
+func TestDecodeBlockSyncRespCapsAHostileCount(t *testing.T) {
+	const hostile = 1 << 20 // one MiB: also the payload, because Len refuses a count above the remaining bytes
+
+	// A response claiming `hostile` units, then `hostile` bytes whose leading
+	// length varint is far larger than what remains, so the first unit fails
+	// immediately after the capacity hint is made.
+	unitCount := types.NewEncoder()
+	unitCount.U8(uint8(MsgBlockSyncResp))
+	unitCount.U64(0) // Nonce
+	unitCount.Len(hostile)
+	unitCount.Raw([]byte{0xFE, 0xFF, 0xFF, 0xFF, 0x0F}) // a block length ~2^32: fails fast
+	unitCount.Raw(make([]byte, hostile-5))
+	unitFrame := unitCount.Bytes()
+
+	// A response claiming ONE unit whose vote count is `hostile`, again with
+	// `hostile` filler bytes behind it - the 24x vote-side shape of the same
+	// defect.
+	voteCount := types.NewEncoder()
+	voteCount.U8(uint8(MsgBlockSyncResp))
+	voteCount.U64(0) // Nonce
+	voteCount.Len(1)
+	voteCount.VarBytes(nil)                             // unit 0's block: empty
+	voteCount.U32(0)                                    // unit 0's Round
+	voteCount.Len(hostile)                              // unit 0's vote count
+	voteCount.Raw([]byte{0xFE, 0xFF, 0xFF, 0xFF, 0x0F}) // a vote length ~2^32: fails fast
+	voteCount.Raw(make([]byte, hostile-5))
+	voteFrame := voteCount.Bytes()
+
+	cases := []struct {
+		name  string
+		frame []byte
+	}{{"units", unitFrame}, {"votes", voteFrame}}
+	for _, tc := range cases {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := DecodeBlockSyncResp(tc.frame)
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			t.Errorf("%s: a truncated response must fail to decode", tc.name)
+			continue
+		}
+		grown := after.TotalAlloc - before.TotalAlloc
+		t.Logf("%s: hostile count %d over a %d-byte frame allocated %d B (%.1fx)", tc.name, hostile, len(tc.frame), grown, float64(grown)/float64(len(tc.frame)))
+		if grown > 16*uint64(len(tc.frame)) {
+			t.Errorf("%s: a %d-byte frame with a hostile count allocated %d B before failing - the allocation must be bounded by the frame, not by the claimed element count (audit N-4)",
+				tc.name, len(tc.frame), grown)
+		}
 	}
 }
