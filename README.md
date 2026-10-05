@@ -312,7 +312,7 @@ never a blocked forwarder) and cannot occupy more than its fair share of
 another connection's queue — a share of the **receiver's own queue capacity**
 divided among the sender accounts contending for it, so one uncontended sender
 may use the whole queue and loses nothing while the receiver has room, while
-the share still reserves room under contention. The share is keyed on the
+the share bounds any single sender to `limit/senders` of a receiver's queue, so one host is capped at half of it at the shipped defaults; note that the per-frame floor means the equal-division reservation only binds below three sender accounts, so three or more accounts can still fill a queue between them. The share is keyed on the
 **sender's source group**, not the connection, so two connections from one host
 cannot split a receiver's budget between them; and two socket-level timers
 bound how long a connection may *hold* what it has taken — nothing is parsed to
