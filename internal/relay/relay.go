@@ -35,7 +35,11 @@
 //     bound the queue's per-frame entry memory, so the count is an explicit
 //     ring, and one sender - one source group, not one connection - cannot
 //     occupy all of a receiver's budget and thereby censor another sender's
-//     frames;
+//     frames. The share is a fraction of the RECEIVER'S OWN queue capacity
+//     divided among the sender groups that can contend for it (shareFor),
+//     never a fixed cap on throughput: the sole sender of a queue faces a
+//     share of the whole capacity and, while the queue has room, loses
+//     nothing;
 //   - MaxConns and MaxConnsPerIP at accept, the latter grouped by source
 //     PREFIX (IPv6 /64, IPv4 /24): a stranger is bounded in how many slots it
 //     can hold, total and per group, so one routed prefix cannot bypass the
@@ -448,8 +452,12 @@ func shareAccountOf(c *conn) shareAccount {
 // sendQ is the bounded write queue: a FIFO of frames whose TOTAL queued
 // payload bytes never exceed limit AND whose entry count never exceeds
 // maxFrames, and in which no single SENDER (shareAccount - a source group,
-// not a connection) ever occupies more than share of the bytes (audit N-2:
-// byte-bounded queues, per-frame entry bound, per-sender fair share).
+// not a connection) ever occupies more than its share of the bytes (audit
+// N-2: byte-bounded queues, per-frame entry bound, per-sender fair share).
+// The share is capacity-relative, not an absolute in-flight budget: it is the
+// queue's OWN limit divided among the sender accounts contending for it
+// (shareFor), so a queue with one sender admits up to its whole budget, and
+// the cap bites only where the queue's room is actually shared.
 //
 // The queue is a fixed ring of maxFrames entries allocated once at accept, so
 // its entry memory is exactly maxFrames x queuedFrameEntryBytes - the term a
@@ -466,9 +474,9 @@ func shareAccountOf(c *conn) shareAccount {
 // a trickle of every frame - making each individual write "succeed" - is
 // still ended once its backlog has failed to clear (audit N-2's slow sink).
 type sendQ struct {
-	limit     int // total queued payload bytes admitted
-	share     int // per-sender (per-group) cap on queued payload bytes
-	maxFrames int // entry-ring length: the per-frame memory bound
+	limit         int // total queued payload bytes admitted
+	maxFrameBytes int // the frame bound the share floors itself at
+	maxFrames     int // entry-ring length: the per-frame memory bound
 
 	mu     sync.Mutex
 	ents   []sentFrame // ring buffer, fixed length maxFrames
@@ -482,14 +490,11 @@ type sendQ struct {
 
 // newSendQ derives the bounds from the options: limit is the byte budget as
 // given (already floored at MaxFrameBytes by withDefaults); maxFrames is the
-// frame-count bound (already defaulted); share is half the budget with a
-// floor of one maximum frame, so a legitimate largest frame always has room
-// to be admitted even when no other sender is queued.
+// frame-count bound (already defaulted). The per-sender share is NOT a fixed
+// constant here: it is computed per push by shareFor from the number of
+// sender accounts contending for THIS queue's capacity, so a single
+// uncontended sender may use the whole budget.
 func newSendQ(limit, maxFrameBytes, maxFrames int) *sendQ {
-	share := limit / 2
-	if share < maxFrameBytes {
-		share = maxFrameBytes
-	}
 	if maxFrames < 1 {
 		// A non-positive entry bound would make the ring empty and every
 		// push a modulo-by-zero; floor it at one entry, the smallest queue
@@ -497,28 +502,59 @@ func newSendQ(limit, maxFrameBytes, maxFrames int) *sendQ {
 		maxFrames = 1
 	}
 	return &sendQ{
-		limit:     limit,
-		share:     share,
-		maxFrames: maxFrames,
-		ents:      make([]sentFrame, maxFrames),
-		from:      make(map[shareAccount]int),
-		ready:     make(chan struct{}, 1),
+		limit:         limit,
+		maxFrameBytes: maxFrameBytes,
+		maxFrames:     maxFrames,
+		ents:          make([]sentFrame, maxFrames),
+		from:          make(map[shareAccount]int),
+		ready:         make(chan struct{}, 1),
 	}
 }
 
+// shareFor returns the most queued payload bytes one sender account may hold
+// in this queue when `senders` distinct accounts can contend for it: an equal
+// fraction (1/senders) of the queue's OWN byte capacity, floored at one
+// maximum frame so a legitimate largest frame always has room even when the
+// division would round it below a frame, and never above the queue's own
+// budget.
+//
+// Dividing the receiver's capacity - rather than capping a sender at a fixed
+// in-flight number - is what keeps the share from throttling a healthy flow:
+// with one sender the fraction is the whole budget, so a sender loses nothing
+// while the receiver has room; the fraction bites only where two or more
+// sender accounts actually share that room, which is the contention the share
+// exists to bound. It still parses nothing: the count is endpoint identities,
+// not payload.
+func (s *sendQ) shareFor(senders int) int {
+	if senders < 1 {
+		senders = 1
+	}
+	share := s.limit / senders
+	if share < s.maxFrameBytes {
+		share = s.maxFrameBytes
+	}
+	if share > s.limit {
+		share = s.limit
+	}
+	return share
+}
+
 // push admits one frame from sender if it fits in the byte budget, in the
-// frame-count bound, AND in the sender's share of the bytes, and returns
-// whether it was admitted. It never blocks: an admitted frame is placed in
-// the ring and (only on the empty-to-non-empty transition) signalled; a
-// refused frame costs a boolean, which is what keeps a wedged receiver from
-// stalling the sender's forwarding path.
-func (s *sendQ) push(sender *conn, b []byte) bool {
+// frame-count bound, AND in the sender's share of the bytes - where the share
+// is `senders`' equal fraction of the queue's own capacity (shareFor), passed
+// in by the fan-out that knows the receiver's contending sender accounts. It
+// never blocks: an admitted frame is placed in the ring and (only on the
+// empty-to-non-empty transition) signalled; a refused frame costs a boolean,
+// which is what keeps a wedged receiver from stalling the sender's forwarding
+// path.
+func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 	acct := shareAccountOf(sender)
+	share := s.shareFor(senders)
 	s.mu.Lock()
 	ok := len(b) <= s.limit &&
 		s.bytes+len(b) <= s.limit &&
 		s.n < s.maxFrames &&
-		s.from[acct]+len(b) <= s.share
+		s.from[acct]+len(b) <= share
 	if ok {
 		if s.n == 0 {
 			s.oldest = time.Now()
@@ -863,22 +899,51 @@ func (r *Relay) reader(c *conn) {
 // drains in queue order - per (sender, receiver) pair, frames arrive in the
 // order the sender wrote them. A frame refused by a queue's budget or by
 // its sender's share is a Dropped counter increment and nothing else.
+//
+// The share each target charges this sender is capacity-relative: the
+// receiver's own queue budget divided among the distinct sender ACCOUNTS
+// (source groups) that can contend for it, i.e. every registered connection
+// except the receiver's own account. The whole registry is read under one
+// lock alongside the target snapshot. A receiver that is the only member of
+// its own account is not one of its senders, so its account is not counted;
+// a receiver with a sibling in its account (another connection from the same
+// host) IS contended by that sibling and counts it. The count is connection
+// identities, never payload: the relay still parses nothing.
 func (r *Relay) forward(sender *conn, payload []byte) {
 	r.mu.Lock()
 	targets := make([]*conn, 0, len(r.conns))
+	accounts := make(map[shareAccount]int, len(r.conns))
 	for c := range r.conns {
+		accounts[shareAccountOf(c)]++
 		if c != sender {
 			targets = append(targets, c)
 		}
 	}
 	r.mu.Unlock()
 	for _, c := range targets {
-		if c.q.push(sender, payload) {
+		if c.q.push(sender, payload, sendersFor(c, accounts)) {
 			r.forwarded.Add(1)
 		} else {
 			r.dropped.Add(1)
 		}
 	}
+}
+
+// sendersFor reports how many distinct sender accounts can contend for the
+// queue of receiver c, given the registry's per-account connection counts
+// (accounts, built by forward under the registry lock and used by the
+// socket-free share tests identically). The receiver's own account is not one
+// of its senders when this connection is that account's only member; when a
+// sibling connection shares the account, the account IS a sender and is
+// counted. The sender of the frame under consideration is always still in the
+// registry, so the result is never below one - a queue with one contending
+// account charges that sender its whole capacity.
+func sendersFor(c *conn, accounts map[shareAccount]int) int {
+	senders := len(accounts)
+	if accounts[shareAccountOf(c)] == 1 {
+		senders--
+	}
+	return senders
 }
 
 // writer is the per-connection write goroutine: drain the queue onto the

@@ -76,6 +76,10 @@ THE TRUST TRADE — read before running one
   it), the per-connection write queue in PAYLOAD BYTES (--write-queue-bytes)
   and in FRAMES (--write-queue-frames, because a byte budget cannot bound the
   queue's per-frame entry memory when the smallest frame is a single byte),
+  with each sender source GROUP held to its capacity-relative fair share of a
+  receiver's queue (the budget divided among the sender groups contending for
+  it: one uncontended sender may use the whole queue, while two connections
+  from one host share one account and cannot split a receiver's budget),
   and two socket deadlines (--read-timeout, --write-timeout). A frame over
   the bound ends its connection; a dial past either connection bound is
   closed at accept. (Zero or negative for any knob selects its default.)

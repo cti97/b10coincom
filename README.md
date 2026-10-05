@@ -309,10 +309,13 @@ rotate addresses past the cap); every connection buffers at most a bounded
 per-frame entry memory when the smallest legal frame is one byte), so a peer
 that stops reading cannot stall the relay for the others (dropped frames,
 never a blocked forwarder) and cannot occupy more than its fair share of
-another connection's queue — the share is keyed on the **sender's source
-group**, not the connection, so two connections from one host cannot split a
-receiver's budget between them; and two socket-level timers bound how
-long a connection may *hold* what it has taken — nothing is parsed to
+another connection's queue — a share of the **receiver's own queue capacity**
+divided among the sender accounts contending for it, so one uncontended sender
+may use the whole queue and loses nothing while the receiver has room, while
+the share still reserves room under contention. The share is keyed on the
+**sender's source group**, not the connection, so two connections from one host
+cannot split a receiver's budget between them; and two socket-level timers
+bound how long a connection may *hold* what it has taken — nothing is parsed to
 enforce them. The per-frame read timeout (`--read-timeout`, default 120
 seconds) is armed before each frame's 4-byte header and refreshed at every
 completed frame, so an actively sending peer is never cut off. The write
@@ -358,7 +361,7 @@ relay with exponential backoff. Bandwidth is kilobytes per second.
 | `--max-frame-bytes N` | `1048576` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic) |
 | `--max-conns N` | `32` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
 | `--max-conns-per-ip N` | `8` | how many of those slots one source **prefix** may hold — the IPv6 `/64` or IPv4 `/24`, IPv4-mapped IPv6 unmapped, masked — so a routed prefix cannot bypass the cap by rotating addresses; a dial from a prefix at its cap is closed at accept |
-| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than half the budget (fair share; two connections from one host share one account) |
+| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than its capacity-relative fair share — the queue budget divided among the sender accounts contending for it, so one uncontended sender may use the whole budget and two connections from one host share one account |
 | `--write-queue-frames N` | `4096` | per-connection write-queue bound in **frames**: the entry ring, so the queue's per-frame memory is structural (a byte budget alone admits ~2 million one-byte entries). Counted into `relay.Options.MaxPinnedBytes` at 32 bytes each |
 | `--write-timeout SECONDS` | `30` | per-connection write deadline, anchored to when the queue became non-empty: the backlog must drain to empty within it, so a never-reading sink **and** a slow-reading one are ended and their queued bytes and entry ring released |
 | `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |
