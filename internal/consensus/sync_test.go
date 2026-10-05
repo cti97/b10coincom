@@ -557,12 +557,16 @@ func TestASyncerPullsAndAdoptsMissedBlocks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rec, ok := c.pull.commits[h]
+		rec, ok := c.pull.certificateAt(h)
 		if !ok {
 			t.Fatalf("adopted block %d left no certificate in the puller's archive: it could not serve onward at all", h)
 		}
 		seen := map[string]bool{}
-		for _, v := range rec.votes {
+		for _, raw := range rec.encoded {
+			v, err := DecodeVote(raw)
+			if err != nil {
+				t.Fatalf("archived certificate vote at height %d does not decode: %v", h, err)
+			}
 			if err := v.Verify(); err != nil {
 				t.Fatalf("archived certificate vote at height %d does not verify: %v", h, err)
 			}
@@ -835,7 +839,7 @@ func TestPullAndAdoptAdoptsAProperlyCertifiedBlock(t *testing.T) {
 		t.Fatalf("the certified block did not land: height %d", w.pullCh.Height())
 	}
 	// And it archived the certificate, so it can serve onward.
-	if _, ok := w.pull.commits[1]; !ok {
+	if _, ok := w.pull.certificateAt(1); !ok {
 		t.Fatal("the adopted block's certificate was not archived")
 	}
 }
@@ -1893,5 +1897,85 @@ func TestTheAnswererEchoesTheRequestNonce(t *testing.T) {
 	}
 	if resp.Nonce != req.Nonce {
 		t.Fatalf("the answer echoed nonce %d, want the request's %d", resp.Nonce, req.Nonce)
+	}
+}
+
+// TestCertificatesSurviveARestartAndAreServedAgain is the C-7 pin, end to end:
+// a committee member commits blocks with real quorum certificates, the node is
+// CLOSED, and a process that shares nothing with it - a reopened chain and a
+// fresh syncer - still serves the certificate for a block it adopted before it
+// restarted. Before the fix the archive was a map in that process's memory, so
+// a rolling restart of the committee left nobody able to serve the history
+// committed before the restarts, and a lagging or new validator could never
+// catch up on those heights.
+func TestCertificatesSurviveARestartAndAreServedAgain(t *testing.T) {
+	dir := t.TempDir()
+	g := fourValGenesis(t)
+
+	ch, err := chain.Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const certRound = 3
+	var committed []*types.Block
+	for h := uint64(1); h <= 2; h++ {
+		b, err := ch.Build(testCommitteeKey(1), nil, ch.Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ch.Append(b); err != nil {
+			t.Fatal(err)
+		}
+		// The certificate goes to the store's certificate log - the same
+		// crash-tolerant directory the block it certifies lives in - and the
+		// process's own archive is not consulted again afterwards.
+		NewSyncer(ch, nil, testCommitteeKey(1)).RecordCommit(h, certRound, quorumCertFor(t, b, h, certRound))
+		committed = append(committed, b)
+	}
+	if _, ok := ch.CertAt(1); !ok {
+		t.Fatal("the certificate for height 1 did not reach the store's log")
+	}
+	if err := ch.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := chain.Open(g, dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	if reopened.Height() != 2 {
+		t.Fatalf("replayed height = %d, want 2", reopened.Height())
+	}
+
+	// A syncer built AFTER the restart, sharing nothing with the one that
+	// recorded the certificate, answers for the earlier height.
+	srv := NewSyncer(reopened, nil, testCommitteeKey(1))
+	resp, err := srv.Answer(syncSignReq(t, testCommitteeKey(0), 1, 1))
+	if err != nil {
+		t.Fatalf("a restarted validator could not serve a certificate it holds: %v", err)
+	}
+	if len(resp.Units) != 1 {
+		t.Fatalf("the restarted answer carried %d units, want 1", len(resp.Units))
+	}
+	unit := resp.Units[0]
+	if unit.Round != certRound {
+		t.Fatalf("the served certificate names round %d, want %d", unit.Round, certRound)
+	}
+	if len(unit.Votes) == 0 {
+		t.Fatal("the served unit carries no precommit votes at all")
+	}
+	want := committed[0].ID()
+	for i, raw := range unit.Votes {
+		v, err := DecodeVote(raw)
+		if err != nil {
+			t.Fatalf("served certificate vote %d does not decode: %v", i+1, err)
+		}
+		if err := v.Verify(); err != nil {
+			t.Fatalf("served certificate vote %d does not verify: %v", i+1, err)
+		}
+		if v.BlockID != want {
+			t.Fatalf("the restarted node served a certificate for block %x, not the adopted block %x", v.BlockID[:8], want[:8])
+		}
 	}
 }

@@ -516,3 +516,102 @@ func TestReadRejectsOverflowingLengthPrefixInsteadOfPanicking(t *testing.T) {
 		t.Fatalf("Read(1) = %v, want an error wrapping ErrCorruptRecord (and no panic)", err)
 	}
 }
+
+// The certificate log (audit C-7) is keyed by height and survives a reopen:
+// the bytes a node served for a block it holds must outlive the process that
+// adopted it, which is what lets a restarted validator answer for history
+// committed before it restarted. First record for a height wins - a committed
+// height never changes its block - and an unknown height is an absence, not an
+// error or a panic.
+func TestCertLogSurvivesReopenAndKeepsTheFirstRecordPerHeight(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCert(1, []byte("certificate-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCert(2, []byte("certificate-two")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCert(1, []byte("a second claim for the same height")); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.CertAt(1); !ok || string(got) != "certificate-one" {
+		t.Fatalf("CertAt(1) = %q, %v; want the first record for that height", got, ok)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen with a certificate log: %v", err)
+	}
+	defer s2.Close()
+	for h, want := range map[uint64]string{1: "certificate-one", 2: "certificate-two"} {
+		got, ok := s2.CertAt(h)
+		if !ok || string(got) != want {
+			t.Fatalf("CertAt(%d) after reopen = %q, %v; want %q", h, got, ok, want)
+		}
+	}
+	if _, ok := s2.CertAt(3); ok {
+		t.Fatal("CertAt on a height with no certificate reported one")
+	}
+	// The returned slice is a copy: mutating it must not change what is served.
+	got, _ := s2.CertAt(1)
+	got[0] = 'Z'
+	if again, _ := s2.CertAt(1); string(again) != "certificate-one" {
+		t.Fatalf("mutating a returned certificate changed the log: %q", again)
+	}
+}
+
+// A crash mid-append leaves the certificate log with a torn tail. The tear is
+// the one shape only a crash can leave, so Open truncates it and every earlier
+// certificate survives: losing one height's evidence costs that height's
+// service, never the node's ability to start. Corruption in a COMPLETE record
+// is a different thing and still stops the scan.
+func TestTornCertificateTailIsTruncatedAndEarlierRecordsSurvive(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCert(1, []byte("certificate-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(dir, certLogName)
+	intact, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A complete, valid header for a record that never finished arriving.
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header [RecordHeaderLen]byte
+	binary.BigEndian.PutUint64(header[:8], 40)
+	binary.BigEndian.PutUint32(header[8:], crc32.Checksum(header[:8], crcTable))
+	if _, err := f.Write(append(header[:], 1, 2, 3)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("a torn certificate tail must be truncated, not fail Open: %v", err)
+	}
+	defer s2.Close()
+	if got, ok := s2.CertAt(1); !ok || string(got) != "certificate-one" {
+		t.Fatalf("the certificate before the tear was lost: %q, %v", got, ok)
+	}
+	if st, err := os.Stat(logPath); err != nil || st.Size() != intact.Size() {
+		t.Fatalf("the torn certificate tail was not cut: size = %d, want %d (%v)", st.Size(), intact.Size(), err)
+	}
+}

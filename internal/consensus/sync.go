@@ -277,23 +277,6 @@ type Syncer struct {
 	// pub is this node's validator key: the Requester field of every request
 	// the syncer signs, the same key the answerer checks membership against.
 	pub ed25519.PublicKey
-
-	// commits is this syncer's COMMIT CERTIFICATE ARCHIVE: per height, the
-	// round and the precommit votes that committed the block the chain holds
-	// there, plus their encoded wire form. The encoded form is built ONCE, at
-	// RecordCommit, because Answer would otherwise re-encode a quorum's votes
-	// for every served height (audit C-4's answer cost). It is written by
-	// RecordCommit - from the driver's commit witness (wired by whoever builds
-	// both) for commits this node judged live, and from PullAndAdopt for
-	// blocks this node itself adopted, so a caught-up node can serve onward
-	// what certified it in the first place. In-memory only: a restart forgets
-	// it (recorded limit; a restarted node cannot re-serve certificates for
-	// heights it committed before it crashed). Every entry was verified
-	// against the same quorum rule the puller applies, so Answer never serves
-	// a certificate it has not stood behind. Answers read it, so it is
-	// mutex-guarded.
-	commitMu sync.Mutex
-	commits  map[uint64]commitRecord
 }
 
 // pendingReply is the ONE request a pull has in flight. Receive files into ch
@@ -307,10 +290,57 @@ type pendingReply struct {
 	ch     chan *wire.BlockSyncResp
 }
 
+// commitRecord is one height's certificate as this node serves it: the round
+// its precommits committed in and the precommit frames exactly as they travel
+// on the wire. It is built fresh from the certificate LOG on every read (see
+// certificateAt); nothing about it is kept between calls, so serving a long
+// history costs no memory that grows with the chain (audit C-7).
 type commitRecord struct {
 	round   uint32
-	votes   []*Vote
-	encoded [][]byte // the wire form of votes, built once at RecordCommit
+	encoded [][]byte // the wire form of the votes, exactly as stored
+}
+
+// encodeCertRecord renders a certificate for the store's certificate log:
+// the round, then a varint count followed by that many varint-prefixed
+// precommit frames, canonically - fixed-width big-endian integers, counted
+// slices, no map and no JSON, exactly the discipline every hashed or stored
+// path here uses. The votes are the wire frames the response serves, so the
+// archived bytes are the evidence itself, not a re-encoding of it.
+func encodeCertRecord(round uint32, encoded [][]byte) []byte {
+	e := types.NewEncoder()
+	e.U32(round)
+	e.Len(len(encoded))
+	for _, raw := range encoded {
+		e.VarBytes(raw)
+	}
+	return e.Bytes()
+}
+
+// decodeCertRecord reads encodeCertRecord back. It is strict - trailing bytes
+// and a non-canonical count are refused - because a certificate decoded from
+// a misframed record must never become evidence this node serves.
+func decodeCertRecord(b []byte) (uint32, [][]byte, error) {
+	d := types.NewDecoder(b)
+	round, err := d.U32()
+	if err != nil {
+		return 0, nil, err
+	}
+	n, err := d.Len()
+	if err != nil {
+		return 0, nil, err
+	}
+	encoded := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		raw, err := d.VarBytes()
+		if err != nil {
+			return 0, nil, err
+		}
+		encoded = append(encoded, raw)
+	}
+	if err := d.Done(); err != nil {
+		return 0, nil, err
+	}
+	return round, encoded, nil
 }
 
 // rateBucket is one requester's fixed-window token bucket.
@@ -604,12 +634,29 @@ func valsQuorum(vals []genesis.Validator) uint64 { return Config{Committee: vals
 // it verified while adopting. A certificate is archived ONLY if it proves
 // quorum for the block the chain now holds at that height - an archive entry
 // is a claim this syncer will serve to a stranger, and an unverified claim
-// served is the same hole the puller refuses. The votes' wire encoding is
-// built HERE, once, so Answer serves cached bytes instead of re-encoding a
-// quorum's votes per height.
+// served is the same hole the puller refuses.
 //
-// The first certificate for a height wins; a committed height never changes
-// its block, and later calls are the same evidence arriving again.
+// It is PERSISTED (audit C-7), not merely remembered: the certificate goes to
+// the chain's certificate log, the same crash-tolerant directory the blocks and
+// the lock promise live in, framed and fsynced like them. A restarted validator
+// therefore serves a certificate for a block it adopted in a previous life,
+// which the in-memory archive could not do - after a rolling restart of the
+// committee no node could serve the history committed before the restarts, and
+// a lagging or new validator could never catch up on those heights. Log records
+// are keyed by height and never overwritten, so a committed height keeps the
+// one certificate that stands.
+//
+// Nothing is cached in memory: Answer reads the one height's record from the
+// log, so the archive's memory is bounded by the record being served instead of
+// growing one entry per committed height forever. The first certificate for a
+// height wins in the log; a committed height never changes its block, and later
+// calls are the same evidence arriving again.
+//
+// A persist failure is not reported to the caller (the commit-witness seam
+// returns nothing) and is not fatal to consensus: a certificate is archival
+// evidence, not a safety promise. What it means is stated rather than hidden -
+// this height is not served until it is recorded again, and certificateAt will
+// not find it.
 func (s *Syncer) RecordCommit(height uint64, round uint32, votes []*Vote) {
 	blk, err := s.chain.BlockAt(height)
 	if err != nil {
@@ -618,53 +665,45 @@ func (s *Syncer) RecordCommit(height uint64, round uint32, votes []*Vote) {
 	if err := s.verifyCertificate(blk, round, votes); err != nil {
 		return // never archive (and later serve) evidence that proves nothing
 	}
-	s.commitMu.Lock()
-	defer s.commitMu.Unlock()
-	if s.commits == nil {
-		// Lazy-built under the same lock the map is read under: a hand-built
-		// Syncer (or a rebuild) must not race the map's first allocation.
-		s.commits = make(map[uint64]commitRecord)
-	}
-	if _, have := s.commits[height]; have {
-		return
-	}
-	vs := make([]*Vote, len(votes))
-	copy(vs, votes)
-	encoded := make([][]byte, 0, len(vs))
-	for _, v := range vs {
+	encoded := make([][]byte, 0, len(votes))
+	for _, v := range votes {
 		encoded = append(encoded, EncodeVote(v))
 	}
-	s.commits[height] = commitRecord{round: round, votes: vs, encoded: encoded}
+	_ = s.chain.PutCert(height, encodeCertRecord(round, encoded))
 }
 
-// certificateAt returns the archived certificate for height, re-proven against
-// the block the chain holds at that height now. A certificate archived for one
+// certificateAt returns the recorded certificate for height, re-proven against
+// the block the chain holds at that height now. A certificate recorded for one
 // block must never attach to a served block it does not stand behind; a height
 // with no (or no longer valid) certificate yields false, which Answer refuses.
-// The returned record's encoded form is the wire form Answer serves.
+// The record is decoded from the certificate log on every call - that is what
+// keeps a long chain's certificates off the heap - and the encoded form
+// returned is exactly the stored wire form the response serves.
 func (s *Syncer) certificateAt(height uint64) (commitRecord, bool) {
-	s.commitMu.Lock()
-	rec, ok := s.commits[height]
-	s.commitMu.Unlock()
+	payload, ok := s.chain.CertAt(height)
 	if !ok {
 		return commitRecord{}, false
+	}
+	round, encoded, err := decodeCertRecord(payload)
+	if err != nil {
+		return commitRecord{}, false
+	}
+	votes := make([]*Vote, 0, len(encoded))
+	for _, raw := range encoded {
+		v, err := DecodeVote(raw)
+		if err != nil {
+			return commitRecord{}, false
+		}
+		votes = append(votes, v)
 	}
 	blk, err := s.chain.BlockAt(height)
 	if err != nil {
 		return commitRecord{}, false
 	}
-	if err := s.verifyCertificate(blk, rec.round, rec.votes); err != nil {
+	if err := s.verifyCertificate(blk, round, votes); err != nil {
 		return commitRecord{}, false
 	}
-	if len(rec.encoded) == 0 && len(rec.votes) > 0 {
-		// A record written before the encoding cache existed (or by a test
-		// that seeded one): fill it here rather than re-encoding per answer.
-		rec.encoded = make([][]byte, 0, len(rec.votes))
-		for _, v := range rec.votes {
-			rec.encoded = append(rec.encoded, EncodeVote(v))
-		}
-	}
-	return rec, true
+	return commitRecord{round: round, encoded: encoded}, true
 }
 
 // Answer serves encoded blocks from the local chain for the requested range,

@@ -516,6 +516,29 @@ func (c *Chain) LockAt(height uint64) (store.LockRecord, bool) {
 	return c.store.LockAt(height)
 }
 
+// PutCert durably records the opaque commit certificate for height (audit
+// C-7). The chain exposes the store's certificate log for the same reason it
+// exposes the lock log: the evidence a node serves for a block it holds must
+// outlive the process that adopted the block, and it belongs in the one
+// crash-tolerant directory the blocks replay from. The encoding is the
+// consensus package's; the chain only files the bytes against a height.
+// Write-locked: it appends, fsyncs and re-indexes the store.
+func (c *Chain) PutCert(height uint64, payload []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.PutCert(height, payload)
+}
+
+// CertAt returns a copy of the recorded commit certificate for height, and
+// whether this chain holds one. A restarted node reads its history's
+// certificates back through here, so it can serve a peer the proof for blocks
+// it adopted in a previous life.
+func (c *Chain) CertAt(height uint64) ([]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.store.CertAt(height)
+}
+
 func (c *Chain) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
