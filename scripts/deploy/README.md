@@ -274,8 +274,16 @@ default and what the rest of this recipe assumes). One line, then silence —
 that arrives is forwarded onward untouched and unlogged:
 
 ```
-b10coin-relay forwarding on :7001 (max frame 1048576, max conns 256, queue 64, read timeout 2m0s, keepalive 15s)
+b10coin-relay forwarding on :7001 (max frame 1048576, max conns 32 (8 per IP), queue 2097152 bytes, read timeout 2m0s, write timeout 30s, keepalive 15s)
 ```
+
+At the relay's defaults the memory a stranger can pin is
+`max-conns × (write-queue-bytes + 2 × max-frame-bytes)` = 32 × (2 MiB + 2 ×
+1 MiB) = **128 MiB** (one write-queue budget plus the one frame in the
+writer's hand plus the one frame in the reader's hand, per connection), held
+at most one read- or write-timeout — the unit's `MemoryMax=256M` sits above
+that plus the runtime. The per-IP cap (`8` slots from any one source) keeps a
+single host from holding the registry.
 
 The address the Pis dial is `<VPS public IP or DNS name>:7001`. The VPS must
 allow inbound TCP 7001 **from the validators only** — both the cloud security

@@ -17,6 +17,24 @@
 // second implementation of the wire semantics living outside the wire
 // package, wrong in a way no validator ever sees.
 //
+// Every bound below is therefore STRUCTURAL - byte budgets, socket
+// deadlines, endpoint counts - never payload-shaped: the relay parses the
+// frame length and nothing beyond it, and audit N-2's fixes stay inside
+// that discipline. The bounds, in the order the traffic meets them:
+//
+//   - the frame-length cap, checked before any allocation;
+//   - per-frame READ and WRITE deadlines, each measuring only socket-level
+//     silence or stall: a peer that keeps speaking and reading is never cut
+//     off, and a peer that does either halfway is ENDED with its slot and
+//     its queued bytes released - nothing is pinned forever by a peer that
+//     keeps one five-byte frame alive (audit N-2);
+//   - a byte-bounded per-connection write queue with a per-sender fair
+//     share (Options.WriteQueueBytes, newSendQ): no wedge can hold more
+//     than the budget's bytes, and one sender cannot occupy all of a
+//     receiver's budget and thereby censor another sender's frames;
+//   - MaxConns and MaxConnsPerIP at accept: a stranger is bounded in how
+//     many slots it can hold, total and per source IP.
+//
 // Shape, mirroring the transport's answer to the same problem (one goroutine
 // per direction, a bounded write queue, never block the forwarding path):
 //
@@ -53,6 +71,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,29 +95,60 @@ const (
 	// fits at the ends but not in the middle, and the reconnect churn that
 	// follows would look like flapping peers, not like a misconfigured knob.
 	DefaultMaxFrameBytes = 1 << 20
-	// DefaultMaxConns bounds the registry at 256 connections. The honest
-	// population is one small validator set; the bound exists for everyone
-	// else, because the relay authenticates nothing - it cannot tell a
-	// validator from a stranger, that is what "knows nothing" costs - and a
-	// stranger with a loop of dials must not own the goroutines and buffers
-	// of an unbounded accept loop. A dialed-when-full connection is closed
-	// immediately; the honest validator's outbound backoff redials it later.
-	// The operational defence for a real deployment sits IN FRONT of the
-	// relay, not in it: a VPS firewall allowlisting validator IPs, which is
-	// exactly the access policy the relay itself is too dumb to have.
-	DefaultMaxConns = 256
-	// DefaultWriteQueueSize is the per-connection writer queue bound, the
-	// whole point of the writer design: forwarding ENQUEUES, so a wedged
-	// reader cannot hold the relay hostage. 64 frames at the frame cap is
-	// 64 MiB per wedged connection in the absolute worst case (every queued
-	// frame at today's size limit); at real consensus traffic - hundreds of
-	// bytes per frame, BLOCK_SYNC responses in the kilobytes - the same
-	// bound caps a wedged peer at a few MiB. Halved from the transport's
-	// 128 on the same reasoning that gave the transport its frame cap: this
-	// is the most exposed process in the project and it runs on the cheapest
-	// machine. Honest validators drop nothing: relaying kilobytes per second
-	// never approaches 64 backlogged frames.
-	DefaultWriteQueueSize = 64
+	// DefaultMaxConns bounds the registry. Audit N-2 lowered this from 256:
+	// the honest population of one relay is its validator set - a handful of
+	// members plus their reconnect blips - so every slot beyond a few dozen
+	// is stranger-collateral the 1 GB-class VPS pays for. A dial arriving
+	// when full is closed immediately; the honest validator's outbound
+	// backoff redials it later. (The operational defence for a real
+	// deployment sits IN FRONT of the relay, not in it: the source-IP
+	// allowlist, which is exactly the access policy the relay itself is too
+	// dumb to have.)
+	DefaultMaxConns = 32
+	// DefaultMaxConnsPerIP caps how many registry slots ONE source IP may
+	// hold (audit N-2's third attack: with no per-IP cap, one host held all
+	// the slots and pushed honest validators into RefusedConns). 8 covers a
+	// validator's flapping reconnects and a restart storm behind one NAT
+	// address with room to spare; a loopback-heavy test sets it explicitly,
+	// because every dial it makes is from one IP. Grouped by canonical IP -
+	// connHost - which examines no frame bytes.
+	DefaultMaxConnsPerIP = 8
+	// DefaultWriteTimeout is the per-frame WRITE deadline: the socket-level
+	// bound on how long ONE frame may remain unwritten before the connection
+	// is ended and its registry slot, queued bytes and goroutines are
+	// released. This is the timer a peer that stops reading runs against -
+	// pre-fix (audit N-2) the writer had no deadline, so a sink that never
+	// read backpressured the writer into an indefinite block while its full
+	// queue pinned its bytes forever, kept alive indefinitely by a five-byte
+	// keepalive frame refreshing the READ deadline. Now the pin is bounded:
+	// a queue backed up behind a non-reading peer ends the connection on
+	// this timer, whatever its keepalives say.
+	//
+	// It parses nothing: the deadline is armed on the socket before the
+	// frame write and re-armed per frame, so the question it answers is only
+	// "has this connection stopped accepting ENTIRELY for this long?" - a
+	// peer keeping up is never cut off, and neither the payload nor the
+	// framing is inspected.
+	//
+	// 30 seconds sits well above any honest link: a full 1 MiB frame is
+	// written inside it at ~280 kbit/s, and every honest peer's write is a
+	// few kilobytes.
+	DefaultWriteTimeout = 30 * time.Second
+	// DefaultWriteQueueBytes is the per-connection write-queue bound in
+	// PAYLOAD BYTES - a byte budget, not a frame count. This is the bound the
+	// audit's N-2 rebuilt: the pre-fix bound was in FRAMES (64 of them), and
+	// the documented memory claim omitted that whole factor. The old bound's
+	// worst case: 64 frames x MaxFrameBytes 1 MiB = 64 MiB pinned PER wedged
+	// connection, and MaxConns of them - 256 x 64 MiB = 16 GiB - held
+	// indefinitely by a sink that never read, against a documented claim of
+	// 256 MiB. A byte budget makes the per-connection pin independent of how
+	// many frames the bytes arrive in, and the write deadline above reclaims
+	// it in bounded time.
+	//
+	// 2 MiB sits far above honest backlog: relaying kilobytes per second, a
+	// queue's steady state is hundreds of bytes; a FULL budget is a wedged
+	// reader, and every byte of it is reclaimed by the write deadline.
+	DefaultWriteQueueBytes = 2 << 20
 	// DefaultReadTimeout is the per-frame READ DEADLINE: the socket-level
 	// bound on how long ONE frame (its 4-byte header plus its full payload)
 	// may take to arrive before the connection is ended and its registry
@@ -151,9 +201,18 @@ type Options struct {
 	MaxFrameBytes int
 	// MaxConns is the registry bound. Default DefaultMaxConns.
 	MaxConns int
-	// WriteQueueSize is the per-connection writer queue bound. Default
-	// DefaultWriteQueueSize.
-	WriteQueueSize int
+	// MaxConnsPerIP is how many registry slots one source IP may hold,
+	// enforced at accept before registration. Default DefaultMaxConnsPerIP.
+	MaxConnsPerIP int
+	// WriteQueueBytes is the per-connection writer queue bound in payload
+	// bytes, which also floors itself at MaxFrameBytes (a queue smaller than
+	// one maximum frame could never forward a full frame at all). Default
+	// DefaultWriteQueueBytes; see Options.MaxPinnedBytes for the aggregate
+	// arithmetic this participates in.
+	WriteQueueBytes int
+	// WriteTimeout is the per-frame write deadline for the connection's
+	// writer. Default DefaultWriteTimeout.
+	WriteTimeout time.Duration
 	// ReadTimeout is the per-frame read deadline: the longest a single frame
 	// (header plus full payload) may take to arrive before the connection is
 	// ended and its slot released. Armed on the socket before each header
@@ -172,8 +231,21 @@ func (o Options) withDefaults() Options {
 	if o.MaxConns <= 0 {
 		o.MaxConns = DefaultMaxConns
 	}
-	if o.WriteQueueSize <= 0 {
-		o.WriteQueueSize = DefaultWriteQueueSize
+	if o.MaxConnsPerIP <= 0 {
+		o.MaxConnsPerIP = DefaultMaxConnsPerIP
+	}
+	if o.WriteQueueBytes <= 0 {
+		o.WriteQueueBytes = DefaultWriteQueueBytes
+	}
+	if o.WriteQueueBytes < o.MaxFrameBytes {
+		// A queue smaller than one maximum frame can never forward a full
+		// frame at all, which is a misconfiguration masquerading as a bound;
+		// floor it at the frame cap instead. (Ordered AFTER the zero-default
+		// above, so an unset budget still lands at the default, not here.)
+		o.WriteQueueBytes = o.MaxFrameBytes
+	}
+	if o.WriteTimeout <= 0 {
+		o.WriteTimeout = DefaultWriteTimeout
 	}
 	if o.ReadTimeout <= 0 {
 		o.ReadTimeout = DefaultReadTimeout
@@ -184,6 +256,67 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
+// MaxPinnedBytes derives the aggregate memory the relay can pin for
+// frames - the number the README, --help and the systemd unit's MemoryMax
+// all have to agree on, COMPUTED rather than asserted, because a documented
+// bound whose arithmetic a reader cannot re-run is not a documented bound.
+// (Audit N-2's origin: the old claim was max-conns x max-frame-bytes of
+// memory, which omitted the write-queue factor entirely - 256 MiB claimed
+// where 256 x 64 frames x 1 MiB = 16 GiB was reachable.)
+//
+// The bound on one connection is the sum of what ONE hand can hold at the
+// same instant:
+//
+//   - its write queue: at most WriteQueueBytes of queued payloads - the
+//     byte budget is the bound, whatever frame sizes the bytes ride in;
+//
+//   - the one frame in the writer's hand: at most MaxFrameBytes, possibly
+//     half-written into the kernel while a non-reading peer holds the rest
+//     back (reclaimed by the write deadline, but pinned until then);
+//
+//   - the one frame in the reader's hand: at most MaxFrameBytes, from the
+//     read that produced the most recent forward.
+//
+//     per conn <= WriteQueueBytes + 2 * MaxFrameBytes
+//     aggregate = MaxConns * (WriteQueueBytes + 2 * MaxFrameBytes)
+//
+// Payload slices are SHARED across a fan-out's targets (one allocation per
+// received frame, referenced by every target's queue), so this bound is an
+// upper bound, not an account of copies: the distinct bytes are never more
+// than one reader-plus-queue's worth per connection. At the DEFAULTS:
+//
+//	32 conns x (2 MiB queue + 2 x 1 MiB hands) = 32 x 4 MiB = 128 MiB.
+//
+// which is the figure the documents quote, derived from these very fields -
+// change a default and the documents' number moves with it.
+func (o Options) MaxPinnedBytes() int {
+	return o.MaxConns * (o.WriteQueueBytes + 2*o.MaxFrameBytes)
+}
+
+// connHost extracts the canonical source-IP grouping key from a remote
+// address: its host part with IPv4-mapped IPv6 unmapped to plain IPv4, so
+// one host dialing over both stacks is ONE group, always. It reads no frame
+// bytes - the per-IP cap counts ENDPOINTS - and an address that fails to
+// parse falls through as its own group, so an unknown form can never hide
+// inside a real IP's budget.
+func connHost(ra net.Addr) string {
+	if ra == nil {
+		return ""
+	}
+	remote := ra.String()
+	if ap, err := netip.ParseAddrPort(remote); err == nil {
+		return ap.Addr().Unmap().String()
+	}
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		host = remote
+	}
+	if ip, perr := netip.ParseAddr(host); perr == nil {
+		host = ip.Unmap().String()
+	}
+	return host
+}
+
 // Stats is a point-in-time reading of the relay's counters: the minimum an
 // unattended process on a €4 VPS needs to be diagnosable over its operator's
 // SSH session.
@@ -192,13 +325,104 @@ type Stats struct {
 	Conns int
 	// Forwarded counts frames enqueued for onward delivery.
 	Forwarded uint64
-	// Dropped counts frames lost to a full write queue. A steady nonzero
-	// value is the diagnosis for one thing: a peer that is not keeping up.
-	// The bound held (nobody else stalled) but the relay is now the one
-	// censoring, which is liveness pressure a validator set feels.
+	// Dropped counts frames lost to a full (or fair-share-exhausted) write
+	// queue. A steady nonzero value is the diagnosis for one thing: a peer
+	// that is not keeping up - or, with the per-sender share, one sender
+	// monopolising the queue it is being held to. The bound held (nobody
+	// else stalled) but the relay is now the one censoring, which is
+	// liveness pressure a validator set feels.
 	Dropped uint64
-	// RefusedConns counts dials closed for exceeding MaxConns.
+	// RefusedConns counts dials closed at accept, for either refusing rule:
+	// over MaxConns, or past MaxConnsPerIP from one source.
 	RefusedConns uint64
+}
+
+// sentFrame is one queued payload and the sender whose fair share it was
+// admitted against; the share is refunded when the writer takes the frame.
+type sentFrame struct {
+	sender *conn
+	b      []byte
+}
+
+// sendQ is the byte-bounded write queue: a FIFO of frames whose TOTAL queued
+// payload bytes never exceed limit, and in which no single sender ever
+// occupies more than share of those bytes (audit N-2: byte-bounded queues,
+// per-sender fair share). push never blocks and never allocates for the
+// drop decision - a frame that cannot fit is refused at the door - and pop
+// is non-blocking; the writer sleeps on ready, which fires exactly on an
+// empty-to-non-empty transition, so a push can never wake it to nothing nor
+// leave it asleep with frames waiting.
+type sendQ struct {
+	limit int // total queued payload bytes admitted
+	share int // per-sender cap on queued payload bytes
+
+	mu    sync.Mutex
+	ents  []sentFrame
+	bytes int
+	from  map[*conn]int // queued bytes per sender, refunded on pop
+	ready chan struct{} // cap 1: signalled on empty -> non-empty
+}
+
+// newSendQ derives the bounds from the options: limit is the byte budget as
+// given (already floored at MaxFrameBytes by withDefaults); share is half
+// the budget with a floor of one maximum frame, so a legitimate largest
+// frame always has room to be admitted even when no other sender is queued.
+func newSendQ(limit, maxFrameBytes int) *sendQ {
+	share := limit / 2
+	if share < maxFrameBytes {
+		share = maxFrameBytes
+	}
+	return &sendQ{
+		limit: limit,
+		share: share,
+		from:  make(map[*conn]int),
+		ready: make(chan struct{}, 1),
+	}
+}
+
+// push admits one frame from sender if it fits in the budget AND in the
+// sender's share of it, and returns whether it was admitted. It never
+// blocks: an admitted frame is appended and (only on the empty-to-non-empty
+// transition) signalled; a refused frame costs a boolean, which is what
+// keeps a wedged receiver from stalling the sender's forwarding path.
+func (s *sendQ) push(sender *conn, b []byte) bool {
+	s.mu.Lock()
+	ok := len(b) <= s.limit &&
+		s.bytes+len(b) <= s.limit &&
+		s.from[sender]+len(b) <= s.share
+	if ok {
+		s.ents = append(s.ents, sentFrame{sender: sender, b: b})
+		s.bytes += len(b)
+		s.from[sender] += len(b)
+		if len(s.ents) == 1 { // the transitions the writer can be asleep across
+			select {
+			case s.ready <- struct{}{}:
+			default: // a token is already pending: the wake is not lost
+			}
+		}
+	}
+	s.mu.Unlock()
+	return ok
+}
+
+// pop takes the oldest admitted frame, refunding its bytes to the budget and
+// to its sender's share. It is non-blocking: nothing to take returns false,
+// and the writer goes back to sleep on ready.
+func (s *sendQ) pop() (sentFrame, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.ents) == 0 {
+		return sentFrame{}, false
+	}
+	f := s.ents[0]
+	s.ents[0] = sentFrame{}
+	s.ents = s.ents[1:]
+	s.bytes -= len(f.b)
+	s.from[f.sender] -= len(f.b)
+	if s.from[f.sender] <= 0 {
+		delete(s.from, f.sender) // dead senders leave no map entries behind
+	}
+	return f, true
 }
 
 // conn is one accepted connection. The relay knows its peers by NOTHING but
@@ -208,10 +432,14 @@ type Stats struct {
 // refuses to cross.
 type conn struct {
 	nc net.Conn
-	// wq is the BOUNDED write queue. The writer is its only reader; enqueue
-	// never blocks (select/default), which is the property that keeps a slow
-	// peer from stalling the relay for everyone else.
-	wq chan []byte
+	// q is the BOUNDED byte-budgeted write queue (see sendQ). The writer is
+	// its only consumer; push never blocks, which is the property that keeps
+	// a slow peer from stalling the relay for everyone else.
+	q *sendQ
+	// ip is the canonical source IP this connection came from, grouped for
+	// the per-IP cap at accept (audit N-2). Empty for a connection that
+	// never went through accept - only the queue-level tests build those.
+	ip string
 	// dead is closed exactly once, by finish, when the connection is over.
 	dead chan struct{}
 	// once makes finish idempotent: reader, writer and Close can all
@@ -221,13 +449,19 @@ type conn struct {
 
 // finish tears one connection down exactly once: close the socket (unblocking
 // every goroutine parked on it), close dead (unblocking the writer), and drop
-// the connection from the registry.
+// the connection from the registry and from its IP's count.
 func (r *Relay) finish(c *conn) {
 	c.once.Do(func() {
 		close(c.dead)
 		_ = c.nc.Close()
 		r.mu.Lock()
 		delete(r.conns, c)
+		if r.perIP[c.ip] > 0 {
+			r.perIP[c.ip]-- // the accept-time cap sees the freed slot again
+			if r.perIP[c.ip] == 0 {
+				delete(r.perIP, c.ip)
+			}
+		}
 		r.mu.Unlock()
 	})
 }
@@ -241,6 +475,9 @@ type Relay struct {
 	mu    sync.Mutex
 	lsn   net.Listener
 	conns map[*conn]struct{}
+	// perIP counts live conns by canonical source IP - the accept-time cap's
+	// bookkeeping, decremented by finish.
+	perIP map[string]int
 
 	quit      chan struct{}
 	closed    atomic.Bool
@@ -262,6 +499,7 @@ func New(opts Options) *Relay {
 	return &Relay{
 		opts:  opts.withDefaults(),
 		conns: make(map[*conn]struct{}),
+		perIP: make(map[string]int),
 		quit:  make(chan struct{}),
 	}
 }
@@ -333,34 +571,50 @@ func (r *Relay) acceptLoop(l net.Listener) {
 				continue
 			}
 		}
-		r.mu.Lock()
-		if r.closed.Load() {
-			r.mu.Unlock()
+		if err := r.admit(nc); err != nil {
+			// A refusal by BOUND (registry full, or one source IP at its
+			// cap) is counted; a close because the relay is shutting down
+			// is not a refusal, only a shutdown.
+			if !errors.Is(err, ErrClosed) {
+				r.refused.Add(1)
+			}
 			nc.Close()
-			continue
 		}
-		if len(r.conns) >= r.opts.MaxConns {
-			r.mu.Unlock()
-			r.refused.Add(1)
-			nc.Close()
-			continue
-		}
-		c := &conn{
-			nc:   nc,
-			wq:   make(chan []byte, r.opts.WriteQueueSize),
-			dead: make(chan struct{}),
-		}
-		r.conns[c] = struct{}{}
-		// Registered under the same lock that Close's snapshot takes, before
-		// the goroutines start: a Close racing an accept either sees the
-		// connection in the registry (and finishes it) or finds the closed
-		// flag up and closes the raw socket itself. The wait below is
-		// therefore never outrun by a spawn.
-		r.wg.Add(2)
-		go r.reader(c)
-		go r.writer(c)
-		r.mu.Unlock()
 	}
+}
+
+// admit applies the accept-time refusal rules in order - relay closed, then
+// MaxConns, then MaxConnsPerIP (audit N-2: no single source may hold every
+// slot; the per-IP count is kept under the same mutex the registry is) -
+// and registers the accepted connection with its two goroutines. The
+// registration stays under the same lock Close's snapshot takes, so a Close
+// racing an accept either sees the connection (and finishes it) or finds
+// the closed flag up and closes the raw socket itself.
+func (r *Relay) admit(nc net.Conn) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed.Load() {
+		return ErrClosed
+	}
+	if len(r.conns) >= r.opts.MaxConns {
+		return fmt.Errorf("relay: registry full (%d)", r.opts.MaxConns)
+	}
+	host := connHost(nc.RemoteAddr())
+	if r.perIP[host] >= r.opts.MaxConnsPerIP {
+		return fmt.Errorf("relay: source %s holds %d slots already (cap %d)", host, r.perIP[host], r.opts.MaxConnsPerIP)
+	}
+	c := &conn{
+		nc:   nc,
+		q:    newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes),
+		dead: make(chan struct{}),
+		ip:   host,
+	}
+	r.conns[c] = struct{}{}
+	r.perIP[host]++
+	r.wg.Add(2)
+	go r.reader(c)
+	go r.writer(c)
+	return nil
 }
 
 // reader is the per-connection read goroutine: read one frame, hand it to
@@ -421,17 +675,20 @@ func (r *Relay) reader(c *conn) {
 }
 
 // forward delivers one payload to every OTHER registered connection by
-// enqueuing it on their writers - never waiting, never parsing.
+// enqueuing it on their byte-budgeted queues - never waiting, never parsing.
 //
 // The payload slice is shared, not copied, and that is deliberate:
 // wire.ReadFrame allocated it fresh for this frame, the writers only read,
 // and each writer serialises its own writes onto its own socket. One
-// allocation per frame serves the whole fan-out.
+// allocation per frame serves the whole fan-out. Every target's queue
+// refunds the frame's bytes to its sender's share when the writer takes the
+// frame out, so no sender's occupancy outlives its frames.
 //
 // Per-conn enqueues keep the sender's order everywhere: a single reader per
 // connection enqueues in arrival order, and a single writer per target
 // drains in queue order - per (sender, receiver) pair, frames arrive in the
-// order the sender wrote them.
+// order the sender wrote them. A frame refused by a queue's budget or by
+// its sender's share is a Dropped counter increment and nothing else.
 func (r *Relay) forward(sender *conn, payload []byte) {
 	r.mu.Lock()
 	targets := make([]*conn, 0, len(r.conns))
@@ -442,31 +699,45 @@ func (r *Relay) forward(sender *conn, payload []byte) {
 	}
 	r.mu.Unlock()
 	for _, c := range targets {
-		select {
-		case c.wq <- payload:
+		if c.q.push(sender, payload) {
 			r.forwarded.Add(1)
-		default:
+		} else {
 			r.dropped.Add(1)
 		}
 	}
 }
 
 // writer is the per-connection write goroutine: drain the queue onto the
-// socket until the connection is over. A blocked write means a peer that has
-// stopped reading; it harms exactly this goroutine and this socket, and
-// finish sweeps the rest away.
+// socket until the connection is over, every frame under its own write
+// deadline. A blocked write means a peer that has stopped reading; the
+// deadline is what turns that from "this goroutine is parked forever and
+// its queue's bytes are pinned forever" (the pre-fix state, audit N-2)
+// into a bounded stall: the frame that cannot be written within
+// WriteTimeout ends the connection, finish releases the slot, the queued
+// bytes and the IP's count, and the reader unblocks into the same teardown.
 func (r *Relay) writer(c *conn) {
 	defer r.wg.Done()
 	for {
 		select {
 		case <-c.dead:
 			return
-		case b := <-c.wq:
-			if err := wire.WriteFrame(c.nc, b); err != nil {
-				// The socket failed; close it, which wakes the reader into
-				// finish (a no-op if we got here second).
-				r.finish(c)
-				return
+		case <-c.q.ready:
+			for {
+				f, ok := c.q.pop()
+				if !ok {
+					break // drained; sleep until the next push signals
+				}
+				if err := c.nc.SetWriteDeadline(time.Now().Add(r.opts.WriteTimeout)); err != nil {
+					r.finish(c)
+					return
+				}
+				if err := wire.WriteFrame(c.nc, f.b); err != nil {
+					// Socket failure or deadline expiry on a peer that has
+					// stopped reading - the same ending either way: nothing
+					// is parsed, nothing is retried, the slot is released.
+					r.finish(c)
+					return
+				}
 			}
 		}
 	}

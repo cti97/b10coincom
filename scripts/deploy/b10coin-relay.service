@@ -11,6 +11,18 @@
 #
 # The relay persists nothing and reads no config; everything in /opt is read
 # as a static binary, so ProtectSystem=strict is exact, not aspirational.
+#
+# MemoryMax is the audit's N-2 ceiling for the one component a stranger can
+# reach, and its number is DERIVED from the relay's own defaults, not guessed:
+# one CONNECTION holds at most (write-queue-bytes + 2 x max-frame-bytes) = 2 MiB queued + the 1 MiB
+# frame in the writer's hand + the 1 MiB frame in the reader's hand = 4 MiB,
+# and there are MaxConns=32 of them, so the framed-byte pin is
+# 32 x 4 MiB = 128 MiB (relay.Options.MaxPinnedBytes computes exactly this;
+# any change to a relay default must move that number AND this unit).
+# 256M buys the 128 MiB worst case plus the Go runtime's own heap/goroutine
+# overhead with clear headroom; if the bound ever lies, systemd kills this
+# process instead of the host dying, and Restart=always brings the relay
+# back (validators redial through their own backoff).
 
 [Unit]
 Description=b10coin relay (dumb frame forwarder for the home validators)
@@ -41,6 +53,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# 32 conns x (2 MiB queue + 2 x 1 MiB in the writer's/reader's hands) = 128
+# MiB of framed-byte pin at the relay's defaults, derived above; 256M is that
+# plus the Go runtime with headroom.
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target

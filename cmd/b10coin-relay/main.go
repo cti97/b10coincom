@@ -34,8 +34,10 @@ import (
 const helpText = `b10coin-relay — the forwarder validators dial outbound to
 
 Usage:
-  b10coin-relay [--addr ADDR] [--max-frame-bytes N] [--max-conns N] [--write-queue N]
-                [--read-timeout SECONDS] [--keepalive SECONDS]
+  b10coin-relay [--addr ADDR] [--max-frame-bytes N] [--max-conns N]
+                [--max-conns-per-ip N] [--write-queue-bytes N]
+                [--write-timeout SECONDS] [--read-timeout SECONDS]
+                [--keepalive SECONDS]
   b10coin-relay --help
 
 Every validator connects OUTBOUND to this relay (inbound to a home machine
@@ -65,28 +67,54 @@ THE TRUST TRADE — read before running one
   machines.
 
   Because the relay authenticates nothing, it must bind everything a
-  stranger controls: frame size (--max-frame-bytes, refused before
-  allocation), connection count (--max-conns), per-connection buffering
-  (--write-queue), and how long a connection may hold its slot without
-  delivering a frame (--read-timeout). A frame over the bound ends its
-  connection; a dial past the connection bound is closed at accept.
+  stranger controls - with STRUCTURAL bounds only (byte budgets, socket
+  deadlines, endpoint counts; it parses the frame length and nothing beyond
+  it): frame size (--max-frame-bytes, refused before allocation), connection
+  count in total (--max-conns) and per source IP (--max-conns-per-ip), the
+  per-connection write queue in BYTES (--write-queue-bytes), and two
+  per-frame socket deadlines (--read-timeout, --write-timeout). A frame over
+  the bound ends its connection; a dial past either connection bound is
+  closed at accept. (Zero or negative for any knob selects its default.)
 
-HOW LONG A STRANGER MAY HOLD A CONNECTION (both socket-level: nothing is
-parsed to enforce them)
+HOW MUCH AND HOW LONG A STRANGER MAY PIN (derivable; nothing is parsed to
+enforce any of it)
 
   --read-timeout (default 120) is a per-frame read deadline: armed before
   each frame's 4-byte header and refreshed at every completed frame, so a
   peer that is actively sending is never cut off. When it expires - a
   connection that delivered no complete frame for the whole period - the
-  connection is closed and its registry slot released the same instant.
-  The peer's outbound backoff redials it. A stranger can therefore pin at
-  most max-conns x max-frame-bytes of memory and max-conns of slots, each
-  for at most --read-timeout, never forever.
+  connection is closed and its registry slot released the same instant. The
+  peer's outbound backoff redials it.
+
+  --write-timeout (default 30) is a per-frame write deadline: a frame that
+  cannot be written inside it - the connection's reader has stopped reading
+  and the kernel is backpressuring - closes the connection the same way and
+  releases the bytes queued behind the writer. This is the timer that keeps
+  a sink that never reads from pinning its queue forever, WHATEVER keepalive
+  frames it keeps sending: keepalives refresh only the READ deadline, so
+  without a write deadline a sink could hold a full queue indefinitely (the
+  N-2 attack); with it, the pin is bounded by the deadline whether or not
+  the sink keeps talking.
 
   --keepalive (default 15) is the TCP keepalive probe period: a HALF-OPEN
   connection (a peer that vanished without closing, e.g. a power cut) is
-  reaped by the kernel after unanswered probes - minutes, by the OS's
-  count - again without the relay looking at any byte.
+  reaped by the kernel after unanswered probes - minutes, by the OS's count.
+
+  THE MEMORY ARITHMETIC, derived rather than asserted. One connection can
+  hold, at one instant, at most: its full write-queue byte budget
+  (--write-queue-bytes), the one frame in its writer's hand (<=
+  --max-frame-bytes), and the one frame in its reader's hand (<=
+  --max-frame-bytes). The aggregate is therefore:
+
+      max-conns x (write-queue-bytes + 2 x max-frame-bytes)
+
+  At the defaults: 32 x (2 MiB + 2 x 1 MiB) = 32 x 4 MiB = 128 MiB. (The
+  pre-fix claim in this space was wrong by the write-queue factor: 256
+  conns could each queue 64 FRAMES x 1 MiB = 64 MiB - 16 GiB aggregate, not
+  the 256 MiB documented - and hold it indefinitely, a sink that never
+  reads having no write deadline to end it.) Slots are additionally bounded
+  per source IP by --max-conns-per-ip (default 8), so one host cannot hold
+  the registry.
 
 Operation: run one instance per validator star, behind the VPS firewall
 allowlisting the validator IPs - the relay itself is too dumb to have an
@@ -121,8 +149,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout,
-		"b10coin-relay forwarding on %s (max frame %d, max conns %d, queue %d, read timeout %s, keepalive %s)\n",
-		r.Addr(), opts.MaxFrameBytes, opts.MaxConns, opts.WriteQueueSize, opts.ReadTimeout, opts.KeepAlive)
+		"b10coin-relay forwarding on %s (max frame %d, max conns %d (%d per IP), queue %d bytes, read timeout %s, write timeout %s, keepalive %s)\n",
+		r.Addr(), opts.MaxFrameBytes, opts.MaxConns, opts.MaxConnsPerIP, opts.WriteQueueBytes, opts.ReadTimeout, opts.WriteTimeout, opts.KeepAlive)
 
 	<-ctx.Done()
 	// Stop serving before draining: no new frames are accepted while the
@@ -162,7 +190,9 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 	addr := fs.String("addr", ":7001", "listen address (all interfaces; validators reach this one)")
 	maxFrame := fs.Int("max-frame-bytes", relay.DefaultMaxFrameBytes, "largest frame any connection may send; a larger declared length ends that connection")
 	maxConns := fs.Int("max-conns", relay.DefaultMaxConns, "maximum simultaneous connections; excess dials are closed at accept")
-	queue := fs.Int("write-queue", relay.DefaultWriteQueueSize, "per-connection buffered frames before forwarding drops instead of blocking")
+	maxPerIP := fs.Int("max-conns-per-ip", relay.DefaultMaxConnsPerIP, "maximum simultaneous connections from one source IP; excess dials from that IP are closed at accept")
+	queueBytes := fs.Int("write-queue-bytes", relay.DefaultWriteQueueBytes, "per-connection write-queue budget in PAYLOAD BYTES before forwarding drops instead of blocking (floored at max-frame-bytes)")
+	writeTimeout := fs.Int("write-timeout", int(relay.DefaultWriteTimeout/time.Second), "seconds one frame may remain unwritten to a connection that has stopped reading; expiry closes that connection and releases its queued bytes and slot")
 	readTimeout := fs.Int("read-timeout", int(relay.DefaultReadTimeout/time.Second), "seconds one frame may take to arrive; expiry closes that connection and releases its slot")
 	keepAlive := fs.Int("keepalive", int(relay.DefaultKeepAlive/time.Second), "TCP keepalive probe period in seconds; half-open connections are reaped by the kernel after unanswered probes")
 
@@ -182,10 +212,12 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 		return "", relay.Options{}, fmt.Errorf("unknown argument %q", fs.Arg(0))
 	}
 	return *addr, relay.Options{
-		MaxFrameBytes:  *maxFrame,
-		MaxConns:       *maxConns,
-		WriteQueueSize: *queue,
-		ReadTimeout:    time.Duration(*readTimeout) * time.Second,
-		KeepAlive:      time.Duration(*keepAlive) * time.Second,
+		MaxFrameBytes:   *maxFrame,
+		MaxConns:        *maxConns,
+		MaxConnsPerIP:   *maxPerIP,
+		WriteQueueBytes: *queueBytes,
+		WriteTimeout:    time.Duration(*writeTimeout) * time.Second,
+		ReadTimeout:     time.Duration(*readTimeout) * time.Second,
+		KeepAlive:       time.Duration(*keepAlive) * time.Second,
 	}, nil
 }
