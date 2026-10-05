@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cti97/b10coincom/internal/relay"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/wire"
 )
@@ -91,6 +92,42 @@ func waitPeersIs(t *testing.T, tp *TcpTransport, want string) {
 	waitFor(t, fmt.Sprintf("%s's peers becoming %s", tp.opts.LocalID, want), 5*time.Second, func() bool {
 		return fmt.Sprint(tp.Peers()) == want
 	})
+}
+
+// rawDial opens one plain socket to addr (no transport behind it - the
+// stranger's shape), closed when the test ends.
+func rawDial(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("raw dial %s: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// waitClosedConn asserts the transport closed OUR end of the connection: the
+// next read fails (EOF or reset) inside the deadline, never delivering data
+// first. A read that merely runs out of its own deadline is NOT a close, and
+// fails here instead of passing by accident.
+func waitClosedConn(t *testing.T, c net.Conn, what string) {
+	t.Helper()
+	if err := c.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 1)
+	for {
+		n, err := c.Read(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				t.Fatalf("%s: the connection stayed open (read timed out instead of closing)", what)
+			}
+			return // EOF (clean close) or reset: the socket was shut
+		}
+		if n > 0 {
+			t.Fatalf("%s: data arrived instead of the connection closing", what)
+		}
+	}
 }
 
 // TestTwoTransportsExchangeAMessage is the brief's smoke test: listen, dial,
@@ -1283,4 +1320,333 @@ func TestBackoffClampsAtMax(t *testing.T) {
 			t.Fatalf("attempt %d delay %v with base 100ms > max 20ms: the clamp did not pull the curve down", attempt, d)
 		}
 	}
+}
+
+// TestAStrangerThroughTheRelayCannotSilenceAValidator is the audit's N-1
+// flagship, run as the attack describes it: a stranger connected to the
+// relay streams a validator's own name ("v0") forever, FROM BEFORE the
+// validator exists, so the attack is in place for every connect, reconnect
+// and relay restart the validator ever does. Pre-fix, the handshake read
+// "whatever frame arrives first" as the peer's identity: a stranger's frame
+// naming v0 was consumed as v0's identity, the adopt refused it as a
+// self-connection, and the maintainer RETURNED - that address was never
+// redialled again, so the validator sat off the network until someone
+// restarted the process. What MAKES it self-healing now is two independent
+// properties, each load-bearing:
+//
+//   - the relay-mode handshake READS NOTHING (adoptRelay): no frame is ever
+//     consumed as an identity, so no stranger's bytes can produce a
+//     self/duplicate refusal on this link at all; and
+//   - the outbound maintainer treats every refusal - self, duplicate, ID
+//     too large, timeout - as an ordinary failure and backs off and redials
+//     forever, so even a refusal that does fire (a squatter on a direct
+//     link) cannot outlive the process (pinned separately, in
+//     TestADuplicateRefusalHealsWhenTheSquatterLeaves).
+//
+// The assertions, in order: the connection installs under the FIXED name
+// relay:<addr> (never a name any frame could supply); the stranger's very
+// bytes - the attack payload "v0" - arrive as DELIVERED MESSAGES under that
+// name, intact for the node layer to decode and drop; the link carries
+// traffic the other way (the validator's broadcast reaches a reader behind
+// the relay); and after the relay is torn down and a NEW relay is listening
+// on the same port, the maintainer redials and the whole shape restores.
+// The mutant "relay connections still read the first frame as the identity"
+// fails at the first assertion, with the registry holding either nothing
+// (a self-connection refusal, the audit's dormancy) or a name the stranger
+// picked - never the fixed relay name this test demands.
+func TestAStrangerThroughTheRelayCannotSilenceAValidator(t *testing.T) {
+	rl := relay.New(relay.Options{})
+	if err := rl.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	raddr := rl.Addr().String()
+
+	// The stranger: a raw socket with no transport behind it, flooding the
+	// validator's predictable ID through the relay every 100ms, forever,
+	// redialling the relay across restarts so the attack never lapses.
+	floodStop := make(chan struct{})
+	defer close(floodStop)
+	go func() {
+		for {
+			select {
+			case <-floodStop:
+				return
+			default:
+			}
+			sc, err := net.DialTimeout("tcp", raddr, 5*time.Second)
+			if err != nil {
+				select {
+				case <-floodStop:
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue // the relay is down; keep the attack pending until it returns
+			}
+			for {
+				if err := sc.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					break
+				}
+				if err := wire.WriteFrame(sc, []byte("v0")); err != nil {
+					break // the relay closed us (restart, write deadline): re-dial
+				}
+				select {
+				case <-floodStop:
+					_ = sc.Close()
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			_ = sc.Close()
+		}
+	}()
+	// The attack is only in place once the stranger's connection is IN the
+	// registry (a frame sent before registration is never forwarded -
+	// message-bus semantics): wait for it.
+	waitFor(t, "the stranger's flood connection registering", 5*time.Second, func() bool {
+		return relayStubStats(rl) == 1
+	})
+
+	tp, err := New(Options{
+		LocalID:     "v0",
+		BackoffBase: 10 * time.Millisecond,
+		BackoffMax:  200 * time.Millisecond,
+		Rand:        rand.New(rand.NewSource(7)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tp.Close() })
+
+	// The validator's first delivered message is observed (not consumed as
+	// the peer's identity), so OnMessage is registered BEFORE the dial.
+	rec := new(recorder)
+	tp.OnMessage(rec.collect)
+	if err := tp.AddRelay(raddr); err != nil {
+		t.Fatalf("AddRelay: %v", err)
+	}
+
+	// 1. The registry name is the FIXED relay name - through every frame the
+	// stranger sends. (Pre-fix this is where the attack lands: the handshake
+	// consumes a stranger frame and the name is the stranger's pick, or the
+	// connection is refused outright as a self-connection and the maintainer
+	// goes dormant.)
+	relayName := RelayPeerName(raddr)
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", relayName))
+
+	// 2. The attack bytes arrive as messages - identity read never happened.
+	waitFor(t, "the stranger's v0 frame arriving as a delivered message", 5*time.Second, func() bool {
+		ms := rec.snapshot()
+		return len(ms) >= 1 && ms[0].From == relayName && string(ms[0].Data) == "v0"
+	})
+
+	// 3. The link carries the validator's traffic out too: a reader behind
+	// the relay receives the validator's broadcast (its own "v0" flood is
+	// interleaved, so read until the probe appears - sender order per pair
+	// is what the relay promises). TWO deterministic gates, because a one-
+	// shot broadcast races the relay's accept: the probe's connection must
+	// be REGISTERED before anything can be forwarded to it (message-bus
+	// semantics - a frame sent inside the dial-to-register window is not
+	// queued up for anyone), and each poll then BROADCASTS (validators
+	// broadcast on a cadence; one probe frame per poll is what a real
+	// committee produces) and DRAINS until it sees one.
+	rlProbe := rawDial(t, raddr)
+	probeBroadcastAndDrain := func() bool {
+		_ = tp.Broadcast([]byte("validator-alive"))
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			_ = rlProbe.SetReadDeadline(deadline)
+			frame, err := wire.ReadFrame(rlProbe, 4096)
+			if err != nil {
+				return false
+			}
+			if string(frame) == "validator-alive" {
+				return true
+			}
+		}
+	}
+	waitFor(t, "the probe's connection registering at the relay", 5*time.Second, func() bool {
+		return relayStubStats(rl) == 3 // stranger + validator + probe
+	})
+	waitFor(t, "the validator's broadcast reaching a reader behind the relay", 5*time.Second, probeBroadcastAndDrain)
+
+	// 4. While the stranger keeps flooding, the link does not flap away.
+	time.Sleep(500 * time.Millisecond)
+	if got := tp.Peers(); len(got) != 1 || got[0] != relayName {
+		t.Fatalf("under a continuing stranger flood the validator's peers are %v, want [%s]: the link did not hold its fixed name", got, relayName)
+	}
+
+	// 5. THE dormancy clause: the relay restarts on the same port (boot, any
+	// blip). The maintainer must redial and restore the link - and it must
+	// do so while the stranger's flood is already renewed against the new
+	// relay, exactly the window in which the audit's attack used to park the
+	// validator until process restart.
+	rl.Close()
+	rl2 := relay.New(relay.Options{})
+	defer rl2.Close()
+	if err := rl2.Listen(raddr); err != nil {
+		t.Fatalf("the restarted relay could not bind %s: %v", raddr, err)
+	}
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", RelayPeerName(raddr)))
+	waitFor(t, "a delivered message after the relay restart", 5*time.Second, func() bool {
+		ms := rec.snapshot()
+		return len(ms) >= 2 && ms[len(ms)-1].From == RelayPeerName(raddr)
+	})
+}
+
+// relayStubStats reads the relay registry size without importing relay's
+// test helpers: one number, the count of registered connections.
+func relayStubStats(r *relay.Relay) int { return r.Stats().Conns }
+
+// TestADuplicateRefusalHealsWhenTheSquatterLeaves pins the OTHER half of the
+// N-1 fix: an outbound maintainer that loses a duplicate race must not
+// retire - the pre-fix code returned from maintain on ErrDuplicatePeer,
+// which made the refusal PERMANENT whenever the incumbent was a squatter
+// that had claimed the peer's name first (the audit's `--listen` variant).
+// The state is CONSTRUCTED, not raced: a raw squatter announces "aaa" into
+// this transport's listener and is INSTALLED before the maintainer is given
+// the real peer's address; "zzz" > "aaa" ranks the real link's dial as the
+// loser, so the maintainer's adopt is refused as a duplicate while the
+// squatter is present - deterministically, on every host. The fix then
+// shows exactly where dormancy used to begin: with the squatter gone, the
+// registry drains and the NEXT backoff retry installs the real peer. Under
+// the mutant (maintain returns on ErrDuplicatePeer again), the registry
+// stays empty forever after the squatter leaves: the test's waitPeersIs is
+// precisely what fails, for the reason it names.
+func TestADuplicateRefusalHealsWhenTheSquatterLeaves(t *testing.T) {
+	tp := listen(t, Options{LocalID: "zzz", BackoffBase: 20 * time.Millisecond, BackoffMax: 200 * time.Millisecond})
+
+	// The squatter: announces the real peer's ID into OUR listener before
+	// the real link is ever dialled, so the incumbent is in place BEFORE the
+	// maintainer starts. It is closed deliberately mid-test.
+	hc, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hc.Close() })
+	if err := wire.WriteFrame(hc, []byte("aaa")); err != nil {
+		t.Fatal(err)
+	}
+	waitPeersIs(t, tp, "[aaa]") // the constructed incumbent: the squatter holds the peer's name
+
+	// The real peer: a raw server that answers every handshake as "aaa" (the
+	// transport dials with local ID "zzz", so rawHandshake's "t" does not
+	// fit) and then holds its sockets open, draining whatever arrives. A
+	// stand-in for anything the squatter's presence currently refuses.
+	rl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rl.Close() })
+	go func() {
+		for {
+			nc, aerr := rl.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(nc net.Conn) {
+				defer nc.Close()
+				br := bufio.NewReader(nc)
+				_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+				if _, rerr := wire.ReadFrame(br, maxHandshakeIDBytes); rerr != nil {
+					return // the dialer's greeting ("zzz")
+				}
+				_ = nc.SetReadDeadline(time.Time{})
+				if werr := wire.WriteFrame(nc, []byte("aaa")); werr != nil {
+					return
+				}
+				buf := make([]byte, 64)
+				for {
+					if _, err := nc.Read(buf); err != nil {
+						return
+					}
+				}
+			}(nc)
+		}
+	}()
+
+	if err := tp.AddPeer(rl.Addr().String()); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	// While the squatter is present, the retries are refused (the rank keeps
+	// the incumbent): the registry still names ONLY the squatter's conn -
+	// churn is the backoff curve's, not the registry's.
+	time.Sleep(300 * time.Millisecond)
+	if got := tp.Peers(); fmt.Sprint(got) != "[aaa]" {
+		t.Fatalf("peers while the squatter is present: %v, want [aaa] held by the constructed incumbent", got)
+	}
+
+	// THE clause: the squatter leaves. Nothing about the maintainer's
+	// refusal was ever allowed to become permanent - the next redial wins.
+	// The wait names the exact outcome (a conn to "aaa" whose REMOTE is the
+	// real peer's listener), not just the peer name: between the squatter's
+	// Close and its reader's EOF the OLD squatter conn is still the [aaa]
+	// entry, and a name-only wait would pass on it.
+	hc.Close()
+	waitFor(t, "the real peer's connection replacing the squatter's", 5*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		c := tp.conns["aaa"]
+		return c != nil && c.nc.RemoteAddr().String() == rl.Addr().String() && !c.superseded
+	})
+	if err := tp.Send("aaa", []byte("healed")); err != nil {
+		t.Fatalf("Send over the healed link: %v", err)
+	}
+}
+
+// TestHandshakeIDLargerThanTheBoundIsRefused pins the identity bound (audit
+// N-1's third prescription): a DIRECT handshake may announce a few hundred
+// bytes of name, never the 1 MiB frame bound. A first frame declaring more
+// than maxHandshakeIDBytes is refused and the connection ends - no skip,
+// because the reader would be left mid-frame with no identity - and the
+// exact bound stays legal, so the check is "over", not "at or over".
+func TestHandshakeIDLargerThanTheBoundIsRefused(t *testing.T) {
+	tp := listen(t, Options{LocalID: "t"})
+
+	// Over the bound: a header declaring 2000 bytes, WITH its full payload on
+	// the wire - under the fix the bound refuses at the header and closes;
+	// under a mutant that reads with the full 1 MiB frame bound instead, the
+	// 2000 bytes decode as a (legal-shaped) identity and INSTALL, which the
+	// empty-registry assertion below names: the mutant fails for reading it,
+	// not for being slow.
+	over, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = over.Close() })
+	if err := over.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := over.Write([]byte{0, 0, 0x07, 0xD0}); err != nil { // 2000 > 512
+		t.Fatal(err)
+	}
+	if _, err := over.Write(make([]byte, 2000)); err != nil {
+		t.Fatal(err)
+	}
+	// The transport DID answer its own greeting first (both sides write
+	// ID-first); a plain read of one frame discards it, then the refusal is
+	// what the NEXT observations see: nothing in the registry (named first -
+	// a mutant reading with the full frame bound installs the 2000 bytes as
+	// an identity and fails HERE, with the peer list it accepted), and the
+	// connection closing.
+	_ = over.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(over)
+	if _, err := wire.ReadFrame(br, maxHandshakeIDBytes); err != nil {
+		t.Fatalf("reading the transport's greeting before the refusal: %v", err)
+	}
+	waitPeersIs(t, tp, "[]")
+	waitClosedConn(t, over, "a handshake ID declaring more than the identity bound")
+
+	// EXACTLY at the bound is a legal name, oversized as it looks.
+	at, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = at.Close() })
+	id := make([]byte, maxHandshakeIDBytes)
+	id[0] = 'A'
+	id[maxHandshakeIDBytes-1] = 'Z'
+	if err := wire.WriteFrame(at, id); err != nil {
+		t.Fatal(err)
+	}
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", string(id)))
 }

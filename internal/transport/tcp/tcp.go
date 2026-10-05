@@ -16,19 +16,36 @@
 //     the jitter from one explicitly seeded *rand.Rand so tests can assert
 //     the delay sequence instead of hoping.
 //
-// Identification: the first frame on a connection is the sender's ID, sent
-// unconditionally by both sides, so neither waits for the other. This is a
-// transport-level name, NOT authentication - a hostile dialer can claim any
-// ID, and verifying whoever owns an ID is the wire layer's signed HELLO plus
-// the relay/peer policy of later tasks. The transport only refuses IDs that
-// are USELESS: the local node's own ID (a validator must never be fed its own
-// messages back - it already holds its own votes, and re-feeding them would
-// double-count the one vote per validator the tally relies on), and a second
-// connection to a peer already connected. Which of two connections to the same
-// peer survives is decided by a deterministic rank, stated at
+// Identification: on a DIRECT connection, the first frame on the wire is the
+// sender's ID, sent unconditionally by both sides, so neither waits for the
+// other. On a RELAY connection (DialRelay/AddRelay), there is no such read at
+// all: the far end of the socket is the relay, which has no ID, and the
+// frames that reach a validator through it come from every other connection
+// behind the relay. Reading any of them as "the peer's identity" let a
+// stranger streaming the bytes v0, v1, v2 into the relay decide what a
+// validator's handshake saw - including the validator's own name, whose
+// refusal (below) used to be permanent, because the maintainer did not
+// redial. A relay connection is therefore registered under the fixed name
+// "relay:<addr>" and its handshake WRITES the local ID and reads nothing.
+// This is a transport-level name, NOT authentication - through a relay,
+// every frame arrives under the one relay name, and verifying who is behind
+// it is the wire layer's signed HELLO plus the membership checks of the node
+// layer. The transport only refuses IDs that are USEFUL to refuse: the local
+// node's own ID (a validator must never be fed its own messages back - it
+// already holds its own votes, and re-feeding them would double-count the one
+// vote per validator the tally relies on - still enforced on relay names
+// too, in case an operator names a transport "relay:<addr>" by hand), and a
+// second connection to a peer already connected. Which of two connections to
+// the same peer survives is decided by a deterministic rank, stated at
 // newcomerWins/ErrDuplicatePeer and computed IDENTICALLY at both ends of the
 // pair - two nodes that list each other at boot otherwise race their cross
 // dials and can end, each side evicting the other's winner, with none.
+//
+// The handshake ID frame is bounded at maxHandshakeIDBytes - a few hundred
+// bytes, not the transport's 1 MiB frame bound. A first frame that large is
+// a refusal (audit N-1: the identity read is where a stranger first meets a
+// validator's listener; a 1 MiB "identity" is nothing a legitimate peer
+// ever opens with), and the connection ends instead of being read.
 package tcp
 
 import (
@@ -87,7 +104,29 @@ const (
 	// transport is still open (e.g. a transient fd exhaustion), instead of
 	// hot-looping on a persistent error.
 	acceptRetryDelay = 100 * time.Millisecond
+	// maxHandshakeIDBytes bounds the DIRECT handshake's ID frame to a few
+	// hundred bytes, well inside the 1 MiB frame bound (audit N-1). Peer
+	// names are short ("v0", "validator-7", a relay:<addr> name); a first
+	// frame near this bound is a stranger's bytes, and a bound a thousand
+	// times larger than any honest ID buys nothing but a bigger read under
+	// the handshake deadline. The bound is on the FRAME: no payload byte
+	// beyond the length is interpreted.
+	maxHandshakeIDBytes = 512
+	// relayPeerIDPrefix names a RELAY connection in the registry: the
+	// connection's far end is the relay (which has no identity and reads
+	// nothing of the payload), so the name is the fixed prefix plus the
+	// dialled address, stable across every blip and restart. Audit N-1: any
+	// name derived from a frame that happens to arrive first through the
+	// relay is stranger-controlled; a fixed name is not.
+	relayPeerIDPrefix = "relay:"
 )
+
+// RelayPeerName returns the registry name a relay-mode connection to addr
+// carries - the fixed relay:<addr> form, the same string Peers() reports and
+// Send addresses, so callers can key their own state on it.
+func RelayPeerName(addr string) transport.PeerID {
+	return transport.PeerID(relayPeerIDPrefix + addr)
+}
 
 // Errors returned by the transport's methods and adopt path.
 var (
@@ -121,6 +160,13 @@ var (
 	// registration transfers to the winner's side, whose maintainer is the
 	// one keeping the link alive.
 	ErrDuplicatePeer = errors.New("tcp: a live connection to this peer already exists")
+	// ErrHandshakeIDTooLarge is returned when the DIRECT handshake's ID
+	// frame declares more than maxHandshakeIDBytes. No legitimate peer opens
+	// with an identity frame anywhere near that; the oversized read is
+	// refused WITHOUT skipping ahead (skipping would leave the reader
+	// mid-stream with no identity), and the connection ends. The maintainer
+	// redials like any other failure.
+	ErrHandshakeIDTooLarge = errors.New("tcp: handshake identity frame exceeds the identity bound")
 )
 
 // Options configures a TCP transport. Every duration and bound has a default;
@@ -277,6 +323,13 @@ func (c *conn) enqueue(data []byte) bool {
 // reconnection requirement.
 type outbound struct {
 	addr string
+	// relay selects the handshake mode: false = the direct ID exchange
+	// (both sides write and read an ID frame); true = the relay-aware mode
+	// (write the local ID, read NOTHING, register under relay:<addr>). A
+	// relay address must be dialled in relay mode - DialRelay/AddRelay - or
+	// the direct handshake reads whatever frame the relay forwards first as
+	// the peer's identity, which is stranger-controlled (audit N-1).
+	relay bool
 }
 
 // TcpTransport moves opaque bytes over real TCP.
@@ -421,10 +474,13 @@ func (t *TcpTransport) acceptLoop(l net.Listener) {
 // if the connection dies, it is redialled with backoff until Close. The
 // returned error is the FIRST dial's outcome - a later failure surfaces only
 // as the peer dropping in and out of Peers(). Calling Dial twice for the same
-// address is idempotent (one maintainer per address).
+// address is idempotent (one maintainer per address). addr must name a REAL
+// peer endpoint that runs this transport's own ID handshake; a relay is
+// dialled with DialRelay instead (the two handshakes are not interchangeable,
+// see outbound.relay).
 func (t *TcpTransport) Dial(addr string) error {
 	res := make(chan error, 1) // buffered: the maintainer must never park on us
-	spawned, err := t.registerOutbound(addr, res)
+	spawned, err := t.registerOutbound(addr, false, res)
 	if err != nil {
 		return err
 	}
@@ -440,7 +496,35 @@ func (t *TcpTransport) Dial(addr string) error {
 // goroutine and retries with backoff, which is what a node wants from its
 // static peer list at boot, when a peer may be down for minutes.
 func (t *TcpTransport) AddPeer(addr string) error {
-	_, err := t.registerOutbound(addr, nil)
+	_, err := t.registerOutbound(addr, false, nil)
+	return err
+}
+
+// DialRelay is Dial for the relay's address: the connection is maintained in
+// the relay mode (outbound.relay) - the local ID is written, NOTHING is read
+// back as an identity, and the connection is registered under the fixed name
+// relay:<addr>. The direct handshake must not face a relay: the relay
+// forwards every other connection's frames, so "the first frame" a dialing
+// validator reads is whichever bytes the relay happened to deliver - a
+// stranger's, a peer's, or the validator's own name (audit N-1, the
+// self-connection refusal that used to be permanent).
+func (t *TcpTransport) DialRelay(addr string) error {
+	res := make(chan error, 1)
+	spawned, err := t.registerOutbound(addr, true, res)
+	if err != nil {
+		return err
+	}
+	if !spawned {
+		return nil
+	}
+	return <-res
+}
+
+// AddRelay is AddPeer for the relay's address: relay mode, no blocking on the
+// network, backoff redials - and, since the N-1 fix, redials that cannot be
+// permanently stopped by anything the relay or its strangers do.
+func (t *TcpTransport) AddRelay(addr string) error {
+	_, err := t.registerOutbound(addr, true, nil)
 	return err
 }
 
@@ -450,7 +534,7 @@ func (t *TcpTransport) AddPeer(addr string) error {
 // can never be spawned "after" Close finished waiting on zero goroutines -
 // the classic Add-after-Wait race, refused here by construction, not by
 // counting on -race to find it.
-func (t *TcpTransport) registerOutbound(addr string, first chan<- error) (bool, error) {
+func (t *TcpTransport) registerOutbound(addr string, relay bool, first chan<- error) (bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.closed.Load() {
@@ -459,7 +543,7 @@ func (t *TcpTransport) registerOutbound(addr string, first chan<- error) (bool, 
 	if _, ok := t.outbounds[addr]; ok {
 		return false, nil
 	}
-	ob := &outbound{addr: addr}
+	ob := &outbound{addr: addr, relay: relay}
 	t.outbounds[addr] = ob
 	t.wg.Add(1)
 	go t.maintain(ob, first)
@@ -468,17 +552,29 @@ func (t *TcpTransport) registerOutbound(addr string, first chan<- error) (bool, 
 
 // maintain is the reconnection loop for one address: dial, handshake, hold
 // until the connection dies, then redial after a growing, jittered delay.
-// Three findings end the loop: the transport closing (quit); the peer
-// proving already-connected - duplicate or self - where redialling would
-// only re-create a connection the registry just refused (that link belongs
-// to whichever side's rank won it, and its maintainer is the one feeding
-// it); or the connection being superseded, which is the same case seen from
-// the losing maintainer's side of the handshake.
+// TWO findings end the loop: the transport closing (quit), or the connection
+// being SUPERSEDED - replaced in the registry by a higher-ranked connection
+// to the same peer, whose keeper is the one feeding the link (see
+// conn.superseded; the loser's registration is released with the exit).
 //
-// EVERY one of those exits releases the address registration (the deferred
-// forgetOutbound): a maintainer that stops running while its registration
-// survives would leave Dial/AddPeer reporting a maintainer that does not
-// exist, and behind that lie, a peer set nothing ever refills.
+// A self- or duplicate-peer refusal is deliberately NOT an end of the loop
+// any more, which is the heart of the audit's N-1 fix. Before it, such a
+// refusal returned from maintain - the address was never redialled again -
+// and through a relay, what the handshake read as the peer's identity was
+// merely whichever frame arrived first: ANYONE could send a validator its
+// own name through the relay, have the refusal fire, and leave that
+// validator permanently off the network until a process restart. Now a
+// refusal is an ordinary failure: the loop backs off (capped at BackoffMax,
+// 30s at defaults) and retries, so the link self-heals the moment the thing
+// that made it refused is gone. When the incumbent is genuine, the registry
+// refuses every retry (no churn beyond the backoff curve's floor), and when
+// it was a squatter, a later attempt wins: either way the maintainer stays
+// alive to keep trying, which is the only property a maintainer can own.
+//
+// That exit releases the address registration (the deferred forgetOutbound):
+// a maintainer that stops running while its registration survives would
+// leave Dial/AddPeer reporting a maintainer that does not exist, and behind
+// that lie, a peer set nothing ever refills.
 func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 	defer t.wg.Done()
 	addr := ob.addr
@@ -495,11 +591,14 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 	}
 	for {
 		nc, err := net.DialTimeout("tcp", addr, t.opts.DialTimeout)
-		if err != nil {
-			report(err)
-		} else {
-			// adopt owns nc from here; on failure it closed it.
-			c, err := t.adopt(nc, addr, true)
+		if err == nil {
+			// The handshake owns nc from here; on failure it closed it.
+			var c *conn
+			if ob.relay {
+				c, err = t.adoptRelay(nc, addr)
+			} else {
+				c, err = t.adopt(nc, addr, true)
+			}
 			report(err)
 			if err == nil {
 				attempt = 0 // a live connection resets the curve: one success outranks every prior failure
@@ -525,14 +624,17 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 				case <-t.quit:
 					return
 				}
-			} else if errors.Is(err, ErrSelfConnection) || errors.Is(err, ErrDuplicatePeer) {
-				// Dormant, not failed: there is nothing to connect to that
-				// is not already connected by a higher-ranked connection,
-				// maintained on this side or the far one. Redialling here
-				// would churn - each attempt opens a socket the registry
-				// immediately refuses.
-				return
 			}
+			// Every handshake failure - self, duplicate, ID too large, read
+			// timeout, socket death - is an ORDINARY failure here: it falls
+			// through to the backoff and the loop retries. No refusal may
+			// double as a permanent shutdown (audit N-1): what refused the
+			// link - a squatter claiming an ID, a misconfiguration, a
+			// stranger's frame under the old handshake - must never be the
+			// thing that keeps the address redialless for the process's
+			// remaining life.
+		} else {
+			report(err)
 		}
 		attempt++
 		delay := t.backoff.Next(attempt)
@@ -546,9 +648,11 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 }
 
 // forgetOutbound releases ob's address registration when its maintainer exits
-// for good - dormant, superseded, or the transport closing - so a later
-// Dial/AddPeer of the same address is answered by a maintainer that exists
-// rather than waved off as idempotent by a stale entry.
+// for good - superseded by a higher-ranked connection to the same peer, or
+// the transport closing - so a later Dial/AddPeer of the same address is
+// answered by a maintainer that exists rather than waved off as idempotent
+// by a stale entry. (A self- or duplicate refusal is no longer an exit at
+// all: it backs off and retries - audit N-1.)
 func (t *TcpTransport) forgetOutbound(ob *outbound) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -557,7 +661,7 @@ func (t *TcpTransport) forgetOutbound(ob *outbound) {
 	}
 }
 
-// adopt performs the identity handshake and installs the connection.
+// adopt performs the DIRECT identity handshake and installs the connection.
 //
 // Both sides write their ID FIRST, unconditionally and before reading, so
 // neither can block the other: a cross-dial (A dials B while B dials A)
@@ -569,40 +673,91 @@ func (t *TcpTransport) forgetOutbound(ob *outbound) {
 // maintainer's dial) or the side that accepted it; it feeds the duplicate
 // rank, which needs the direction to stay decidable identically at both ends.
 func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled bool) (*conn, error) {
+	if err := t.writeHello(nc, addr); err != nil {
+		return nil, err
+	}
+	id, err := t.readHello(nc, addr)
+	if err != nil {
+		return nil, err
+	}
+	return t.install(nc, addr, dialled, id)
+}
+
+// writeHello sends the local ID under the handshake write deadline - the
+// half of the identity exchange every mode shares (a relay connection still
+// announces the local ID; it only never reads one back, see adoptRelay).
+func (t *TcpTransport) writeHello(nc net.Conn, addr string) error {
 	if err := nc.SetWriteDeadline(time.Now().Add(t.opts.HandshakeTimeout)); err != nil {
 		nc.Close()
-		return nil, err
+		return err
 	}
 	if err := wire.WriteFrame(nc, []byte(t.opts.LocalID)); err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("tcp: writing handshake to %s: %w", addr, err)
+		return fmt.Errorf("tcp: writing handshake to %s: %w", addr, err)
 	}
 	if err := nc.SetWriteDeadline(time.Time{}); err != nil {
 		nc.Close()
-		return nil, err
+		return err
 	}
+	return nil
+}
 
+// readHello reads the direct handshake's ID frame: deadline-bounded, and
+// bounded in SIZE to maxHandshakeIDBytes - many hundreds of bytes beyond any
+// honest name, so a stranger's byte flood cannot present its opening frame
+// for a full 1 MiB identity read, and an over-large declaration is a
+// protocol violation that ends the connection rather than bytes to skip
+// (skipping would leave the stream mid-frame with no identity to install,
+// which is strictly worse than refusing).
+func (t *TcpTransport) readHello(nc net.Conn, addr string) (transport.PeerID, error) {
 	if err := nc.SetReadDeadline(time.Now().Add(t.opts.HandshakeTimeout)); err != nil {
 		nc.Close()
-		return nil, err
+		return "", err
 	}
-	hello, err := wire.ReadFrame(nc, t.opts.MaxFrameBytes)
+	hello, err := wire.ReadFrame(nc, maxHandshakeIDBytes)
 	if err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("tcp: reading handshake from %s: %w", addr, err)
+		var otl *wire.FrameTooLarge
+		if errors.As(err, &otl) {
+			return "", fmt.Errorf("%w: a %d-byte ID from %s (bound %d)",
+				ErrHandshakeIDTooLarge, otl.Declared, addr, maxHandshakeIDBytes)
+		}
+		return "", fmt.Errorf("tcp: reading handshake from %s: %w", addr, err)
 	}
 	// A live connection may be silent for hours: the deadline exists for the
 	// handshake only.
 	if err := nc.SetReadDeadline(time.Time{}); err != nil {
 		nc.Close()
-		return nil, err
+		return "", err
 	}
 	// wire.ReadFrame refuses zero-length frames, so hello cannot be empty:
 	// the handshake cannot introduce an "" peer. It can introduce a LIE, but
 	// a transport-level name is only a routing key - authentication is the
 	// signed HELLO of later tasks.
-	id := transport.PeerID(hello)
+	return transport.PeerID(hello), nil
+}
 
+// adoptRelay installs a RELAY-mode connection: the local ID is written (an
+// announcement, read by nobody here), NOTHING is read back, and the
+// connection is registered under the fixed name relay:<addr>. The name is
+// not derived from any frame, so nothing a stranger writes through the relay
+// can put this connection into the self-connection or duplicate branches -
+// the exact defect that let a stranger park a validator's maintainer for
+// good (audit N-1). dialled is true: this end opened the socket, and the
+// duplicate rank needs the direction to stay decidable.
+func (t *TcpTransport) adoptRelay(nc net.Conn, addr string) (*conn, error) {
+	if err := t.writeHello(nc, addr); err != nil {
+		return nil, err
+	}
+	return t.install(nc, addr, true, RelayPeerName(addr))
+}
+
+// install runs the registry acceptance an adopt or adoptRelay has already
+// negotiated: refusal of the useless IDs (self; a duplicate that outranks
+// the newcomer), the identical-rank replacement otherwise, and the reader
+// and writer goroutines. On refusal the socket is closed and the error is
+// the sentinel the maintainer's backoff path treats as every other failure.
+func (t *TcpTransport) install(nc net.Conn, addr string, dialled bool, id transport.PeerID) (*conn, error) {
 	c := &conn{
 		remote:  id,
 		nc:      nc,

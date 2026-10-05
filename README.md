@@ -237,7 +237,7 @@ whose keys sign, and that is the security boundary:**
 | `--genesis PATH` | *unset* | shared committee file listing the validators' public keys; giving it runs the consensus committee that file names |
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
-| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode) |
+| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back, is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |

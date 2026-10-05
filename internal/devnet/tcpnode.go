@@ -11,8 +11,10 @@ package devnet
 //
 //   - a tcp.TcpTransport (the shipped socket transport), its listener optional
 //     and its dial list given by the caller (the CLI joins --peers and
-//     --relay; the relay address dials exactly like a peer address, because a
-//     dumb forwarder is one from a socket's point of view);
+//     --relay, dialling peers directly and the relay through ConnectRelay:
+//     a relay connection must NOT run the ID handshake - the relay forwards
+//     everyone's frames, so "the first frame" is stranger-selectable, which
+//     is exactly the N-1 defect);
 //   - a consensus.Syncer over that transport, doing both catch-up halves:
 //     ANSWERING (the router feeds it BLOCK_SYNC requests, it serves certified
 //     heights) and PULLING (the wave loop pulls from the tallest peer);
@@ -121,6 +123,14 @@ type ValidatorConfig struct {
 	// Listen is the P2P listen address; empty means "dial only". A node
 	// behind NAT with a relay has no listener by design.
 	Listen string
+	// Relay is the relay address (or addresses) to dial. Each is maintained
+	// through the transport's relay mode - no ID read, registered under
+	// tcp.RelayPeerName(addr) - so a stranger's frames through the relay can
+	// neither name the connection nor silence it (audit N-1). Kept separate
+	// from the direct peer list because the two dial modes differ by
+	// construction; an address given as both a peer and a relay keeps
+	// whichever registration it got first.
+	Relay []string
 	// TickEvery is the driver's tick cadence (zero: defaultTickEvery).
 	TickEvery time.Duration
 	// WaveEvery is the HELLO/catch-up cadence (zero: defaultWaveEvery).
@@ -146,9 +156,13 @@ type Validator struct {
 	mu sync.Mutex
 
 	// peerH is the height each peer attested to in its HELLO, keyed by the
-	// transport-level name (forgeable; through a relay, the name is whatever
-	// frame first arrived). A signed hint only: it decides whether to pull
-	// and from whom - nothing else.
+	// transport-level name. On a DIRECT link that name is the peer's own
+	// handshake ID (forgeable - it is a routing key, not a proof). Through a
+	// relay every frame arrives under the ONE fixed connection name
+	// tcp.RelayPeerName(addr), which announces nothing about who is behind
+	// it and is stable across reconnects (audit N-1: never derived from any
+	// frame's bytes). Either way it is a signed hint only: it decides
+	// whether to pull and from whom - nothing else.
 	peerHMu sync.Mutex
 	peerH   map[transport.PeerID]uint64
 
@@ -357,15 +371,32 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	return v, nil
 }
 
-// Connect adds addresses to this validator's permanent dial list. The maintainer
-// dials and redials with backoff, so a peer that is not up yet is waited for,
-// not failed.
+// Connect adds DIRECT peer addresses to this validator's permanent dial
+// list. The maintainer dials and redials with backoff, so a peer that is not
+// up yet is waited for, not failed.
 func (v *Validator) Connect(addrs ...string) error {
 	for _, a := range addrs {
 		if a == "" {
 			continue
 		}
 		if err := v.ttp.AddPeer(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ConnectRelay registers relay addresses: the same permanent maintainer and
+// backoff as Connect, but through the transport's RELAY dial mode - the
+// connection announces the local ID, never reads one back, and is named
+// relay:<addr>, so no frame the relay forwards can be mistaken for the
+// peer's identity (audit N-1). The CLI's --relay lands here.
+func (v *Validator) ConnectRelay(addrs ...string) error {
+	for _, a := range addrs {
+		if a == "" {
+			continue
+		}
+		if err := v.ttp.AddRelay(a); err != nil {
 			return err
 		}
 	}

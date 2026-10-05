@@ -599,8 +599,12 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 			}
 		}
 	}
+	// The relay is kept out of the direct dial list: its connection runs the
+	// transport's RELAY dial mode (no ID read, fixed relay:<addr> name -
+	// audit N-1), which a plain peer address must not hit.
+	relayDial := make([]string, 0, 1)
 	if r := strings.TrimSpace(relay); r != "" {
-		dial = append(dial, r)
+		relayDial = append(relayDial, r)
 	}
 	committeeSize := committee
 	seatName := fmt.Sprintf("seat %d", seat)
@@ -608,7 +612,7 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 		committeeSize = len(g.Validators)
 		seatName = fmt.Sprintf("seat %d, %s", seatFromKey(g, priv), keyDesc)
 	}
-	if len(dial) == 0 && listen == "" && committeeSize > 1 && g == nil {
+	if len(dial) == 0 && len(relayDial) == 0 && listen == "" && committeeSize > 1 && g == nil {
 		// Fixture mode can be refused before anything starts. Genesis-file
 		// mode's membership refusal must come FIRST — a non-member key hears
 		// the refusal, not the peers hint — so StartValidator runs first for
@@ -627,7 +631,7 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 		return err
 	}
 	defer func() { _ = v.Close() }()
-	if g != nil && len(dial) == 0 && listen == "" && committeeSize > 1 {
+	if g != nil && len(dial) == 0 && len(relayDial) == 0 && listen == "" && committeeSize > 1 {
 		// The genesis-file mode's re-run of the guard: StartValidator has now
 		// vetted the key against the committee (a non-member key was already
 		// refused above), so this failure is exactly the peers hint.
@@ -635,6 +639,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 		return fmt.Errorf("a committee of %d needs reachable peers: give --peers, --relay, or --listen for the others to dial", committeeSize)
 	}
 	if err := v.Connect(dial...); err != nil {
+		return err
+	}
+	if err := v.ConnectRelay(relayDial...); err != nil {
 		return err
 	}
 	if g == nil {
