@@ -201,10 +201,15 @@ func TestTheRouterDrivesEveryVerifiedConsensusMessage(t *testing.T) {
 
 	var nonNil [32]byte
 	nonNil[0] = 7
+	// head+1 is the live engine's height, so it is inside the router's height
+	// window (audit C-8) and reaches Verify; a vote far outside the window is
+	// refused before its signature, which the window test pins. Classification,
+	// not height relevance, is this test's subject.
+	inWindow := rig.ch.Height() + 1
 	cases := map[string][]byte{
-		"prevote":   EncodeVote(voteFrom(t, rig.cfg, 0, MsgPrevote, 9, 2, nonNil)),
-		"precommit": EncodeVote(voteFrom(t, rig.cfg, 0, MsgPrecommit, 9, 2, nonNil)),
-		"proposal":  EncodeProposal(rig.signedProposal(9, 0)),
+		"prevote":   EncodeVote(voteFrom(t, rig.cfg, 0, MsgPrevote, inWindow, 2, nonNil)),
+		"precommit": EncodeVote(voteFrom(t, rig.cfg, 0, MsgPrecommit, inWindow, 2, nonNil)),
+		"proposal":  EncodeProposal(rig.signedProposal(inWindow, 0)),
 	}
 	for name, frame := range cases {
 		if got := rig.rt.Route(transport.Message{From: "v0", Data: frame}); !got {
@@ -299,7 +304,9 @@ func TestTheRouterRefusesAndCountsGarbage(t *testing.T) {
 
 	// An unsigned vote fails the VERIFIED consensus branch - the engine never
 	// sees it - whatever its bytes then read as (a wire branch or the count).
-	sigless := voteFrom(t, rig.cfg, 0, MsgPrevote, 3, 0, [32]byte{})
+	// head+1 is the in-window height, so this pins the SIGNATURE gate itself
+	// rather than the height window (which has its own test below).
+	sigless := voteFrom(t, rig.cfg, 0, MsgPrevote, rig.ch.Height()+1, 0, [32]byte{})
 	sigless.Sig = nil
 	if got := rig.rt.Route(transport.Message{From: "v0", Data: EncodeVote(sigless)}); got {
 		t.Fatal("an unsigned vote was routed to the engine: the vote branch did not VERIFY")

@@ -49,22 +49,24 @@ func TestValidatorCloseOrderingBlocksInFlightDispatchAndRefusesLaterOnes(t *test
 
 	// A signed prevote by THIS validator's seat key: the frame the router must
 	// verify and classify as consensus (Route() true). Each dispatch below
-	// uses a DISTINCT height because the node now installs the dedup seen-set
+	// uses a DISTINCT round because the node now installs the dedup seen-set
 	// (audit N-7): re-routing one identical frame would be refused as a
 	// duplicate and never reach the callback this test exists to block, which
-	// would make the close-gate assertions vacuous.
-	probe := func(height uint64) transport.Message {
+	// would make the close-gate assertions vacuous. The height is the router's
+	// in-window head+1 (audit C-8): a frame at any other height is refused
+	// before verification and could never reach the callback either.
+	probe := func(round uint32) transport.Message {
 		vote := &consensus.Vote{
 			Type:      consensus.MsgPrevote,
-			Height:    height,
-			Round:     3,
+			Height:    v.ch.Height() + 1,
+			Round:     round,
 			Validator: v.pub,
 		}
 		sig := vote.SigningHash()
 		vote.Sig = crypto.Sign(v.priv, sig[:])
 		return transport.Message{From: transport.PeerID("close-ordering-probe"), Data: consensus.EncodeVote(vote)}
 	}
-	msg, msg2, msg3 := probe(7), probe(8), probe(9)
+	msg, msg2, msg3 := probe(3), probe(4), probe(5)
 
 	// setDispatch swaps the driver's registered callback for a test one. The
 	// seam is production state (the atomic slot rebuildDriver also swaps), so

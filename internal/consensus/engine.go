@@ -707,11 +707,18 @@ func (e *Engine) onProposal(p *Proposal) error {
 		return fmt.Errorf("%w: header claims height %d, envelope names height %d",
 			ErrBadProposalHeight, p.Block.Header.Height, p.Height)
 	}
+	// The proposer check runs BEFORE Verify (audit C-8's membership-first
+	// discipline, on the engine side): the round's proposer is drawn from the
+	// committee, so a key that is not it is not a member either, and an
+	// unauthenticated frame must not cost an Ed25519 evaluation just to be
+	// discarded for the wrong key. A proposal from the real proposer is still
+	// fully verified below - the reorder skips only the frames the very next
+	// check would drop anyway.
+	if string(p.Validator) != string(e.Proposer()) {
+		return nil // not the proposer for this round (and not a member); ignore it
+	}
 	if err := p.Verify(); err != nil {
 		return err
-	}
-	if string(p.Validator) != string(e.Proposer()) {
-		return nil // not the proposer for this round; ignore it
 	}
 	if e.proposal != nil {
 		return nil // first proposal wins, so the choice is deterministic

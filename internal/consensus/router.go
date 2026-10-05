@@ -31,11 +31,23 @@ package consensus
 //     FIRST branch, so it can never be re-parsed as a same-tagged wire frame;
 //   - a wire frame (HELLO etc.) fails the vote/proposal branches (its tag is
 //     disjoint from both), and reaches its own branch;
-//   - an ATTACKER frame can pass at most one branch: each branch's check is
-//     a signature over a domain-separated hash the attacker cannot forge, and
-//     the one branch without a signature (BLOCK_SYNC response) is safe to
-//     misroute INTO, because nothing there reaches the chain except through
-//     the pull's certificate gate.
+//   - a frame with a consensus tag that is NOT from the committee is refused
+//     by the membership check BEFORE any signature work, and a vote whose
+//     height is outside the window the live engine can judge is refused by
+//     the height check, also before verification. The one branch without a
+//     signature (BLOCK_SYNC response) is safe to misroute INTO, because
+//     nothing there reaches the chain except through the pull's certificate
+//     gate.
+//
+// An earlier version of this comment claimed an attacker frame "cannot pass"
+// the consensus branches because it cannot forge a signature. That was wrong,
+// and audit C-8 records why: a signature is not a secret, so a stranger can
+// self-sign a perfectly valid vote with its OWN key and pass Verify. The
+// signature check proves the frame is internally consistent, never that its
+// signer belongs to this chain. Membership is what the signature cannot
+// prove, so it is checked first - both here and, in the same order, in
+// VoteSet.Add and the engine's proposal path - and the engine remains the
+// final gate for anything the router lets through.
 //
 // The struct deliberately holds no engine and takes no locks on the consensus
 // branch: the CALLER serialises its driver (a socket transport's readers are
@@ -49,6 +61,7 @@ package consensus
 import (
 	"sync/atomic"
 
+	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/wire"
 )
@@ -76,6 +89,15 @@ type MessageRouter struct {
 	SendReply  func(peer transport.PeerID, frame []byte) error
 	OnHello    func(peer transport.PeerID, h *wire.Hello)
 	AsyncServe func(m transport.Message)
+	// Committee, when non-nil, is the validator set whose keys may carry a
+	// consensus frame. A vote or proposal whose key is absent from it is
+	// refused BEFORE any Ed25519 verification (audit C-8): the key set check
+	// is a free linear scan, the signature is not, and a self-signed frame
+	// from a stranger is valid cryptography from an invalid signer. Nil means
+	// "derive from Sync's chain"; a router with neither has no membership
+	// source, which is the unit-test-only shape - NewMessageRouter, the way
+	// every node builds a router, always has one.
+	Committee []genesis.Validator
 	// Dedup, when non-nil, is the seen-set for verified consensus messages
 	// (audit N-7). It is consulted STRICTLY AFTER Verify, inside the branch
 	// that already decoded and verified the frame: a key is recorded only for
@@ -91,12 +113,74 @@ type MessageRouter struct {
 	servedReq atomic.Uint64
 	filed     atomic.Uint64
 	dups      atomic.Uint64
+	// refused counts consensus-tagged frames this router refused before any
+	// signature verification: a non-member's key, or a vote whose height the
+	// live engine cannot judge. A steady nonzero count on a healthy committee
+	// means a peer is sending frames for a chain this node is not on (or a
+	// stranger reached the port); zero is the healthy value.
+	refused atomic.Uint64
 }
 
 // NewMessageRouter builds a router with the given server half. The optional
 // callbacks stay nil until the node layer fills them.
+//
+// The router derives its committee key set from the syncer's chain, so the
+// membership gate of audit C-8 is wired by construction: every node builds
+// its router through here with a live syncer, and there is no field a caller
+// must remember to fill before the gate exists. Deriving it per frame (rather
+// than caching a snapshot here) also keeps it correct across a simnet
+// reseat, which swaps Sync to a reopened chain.
 func NewMessageRouter(sync *Syncer) *MessageRouter {
 	return &MessageRouter{Sync: sync}
+}
+
+// committee returns the validator set membership is checked against.
+// Committee, when set explicitly, wins; otherwise it is the syncer's chain's
+// genesis committee. The returned slice is never mutated here.
+func (r *MessageRouter) committee() []genesis.Validator {
+	if r.Committee != nil {
+		return r.Committee
+	}
+	if r.Sync != nil && r.Sync.chain != nil {
+		return r.Sync.chain.Genesis().Validators
+	}
+	return nil
+}
+
+// isMember reports whether pub is a committee key, and whether a committee is
+// known at all. known=false (no syncer chain and no explicit Committee) means
+// the caller must fall back to the signature check alone: the unit-test shape,
+// never a node built through NewMessageRouter.
+func (r *MessageRouter) isMember(pub []byte) (member, known bool) {
+	vals := r.committee()
+	if len(vals) == 0 {
+		return false, false
+	}
+	for i := range vals {
+		if string(vals[i].PubKey) == string(pub) {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// voteHeightInWindow reports whether a vote at height could still be judged by
+// the live engine, and whether a local head height is known. The engine always
+// voteHeightInWindow reports whether a vote at height could still be acted on
+// locally, and whether a local head height is known. The live engine judges
+// exactly head+1, and head is the height it has just committed - a quorum vote
+// for head can be the very frame that completed that commit, and an
+// equivocator's conflicting twin arrives right behind it, so both heights are
+// frames of a round the node is still acting on. Anything older is history the
+// chain already holds; anything further ahead cannot be judged until this node
+// catches up (the engine would drop it anyway). The window is therefore two
+// heights wide, not unbounded. known=false (no syncer chain) disables it.
+func (r *MessageRouter) voteHeightInWindow(height uint64) (ok, known bool) {
+	if r.Sync == nil || r.Sync.chain == nil {
+		return true, false
+	}
+	head := r.Sync.chain.Height()
+	return height == head || height == head+1, true
 }
 
 // voteDedupKey is the dedup key a decoded vote records.
@@ -128,28 +212,52 @@ func proposalDedupKey(p *Proposal) transport.VoteKey {
 // false for HELLO and BLOCK_SYNC traffic consumed here and for frames that
 // decode as nothing (counted, dropped).
 func (r *MessageRouter) Route(m transport.Message) bool {
-	// Consensus first, verified: an honest committee-signed frame belongs to
-	// the engine. The two unions are tag-disjoint (audit N-5), so a wire frame
-	// fails this branch on its first byte; a forged frame with a consensus tag
-	// can only pass by carrying a signature over a domain-separated hash the
-	// attacker cannot forge.
+	// Consensus first. The two unions are tag-disjoint (audit N-5), so a wire
+	// frame fails these branches on its first byte. Within them the ORDER is
+	// the audit C-8 fix: the two free checks - is the carried key a committee
+	// member, and can the live engine still judge this height - run BEFORE the
+	// Ed25519 evaluation. A self-signed frame from a stranger passes Verify by
+	// construction (its own key signs it), so verification alone never gates
+	// membership; and a vote for a height the engine has already left or has
+	// not reached is dead weight whatever its signature says.
 	//
 	// Dedup is consulted AFTER Verify, never before (audit N-7): a frame that
 	// fails Verify must not record a key, or a stranger could poison the key
 	// of an honest vote it cannot sign and silence it.
-	if v, err := DecodeVote(m.Data); err == nil && v.Verify() == nil {
-		if r.Dedup != nil && r.Dedup.Seen(voteDedupKey(v)) {
-			r.dups.Add(1)
+	if v, err := DecodeVote(m.Data); err == nil {
+		if member, known := r.isMember(v.Validator); known && !member {
+			r.refused.Add(1)
 			return false
 		}
-		return true
+		if ok, known := r.voteHeightInWindow(v.Height); known && !ok {
+			r.refused.Add(1)
+			return false
+		}
+		if v.Verify() == nil {
+			if r.Dedup != nil && r.Dedup.Seen(voteDedupKey(v)) {
+				r.dups.Add(1)
+				return false
+			}
+			return true
+		}
 	}
-	if p, err := DecodeProposal(m.Data); err == nil && p.Verify() == nil {
-		if r.Dedup != nil && r.Dedup.Seen(proposalDedupKey(p)) {
-			r.dups.Add(1)
+	if p, err := DecodeProposal(m.Data); err == nil {
+		// The proposer key is inside the proposal, after the block, so the
+		// decode is unavoidable; the membership check still runs before the
+		// signature, which is the expensive part of judging the decoded frame
+		// (audit C-8). A non-member's proposal costs one decode, never a
+		// verification, and never reaches the engine.
+		if member, known := r.isMember(p.Validator); known && !member {
+			r.refused.Add(1)
 			return false
 		}
-		return true
+		if p.Verify() == nil {
+			if r.Dedup != nil && r.Dedup.Seen(proposalDedupKey(p)) {
+				r.dups.Add(1)
+				return false
+			}
+			return true
+		}
 	}
 	if r.Sync != nil {
 		// A BLOCK_SYNC request: served out of the local chain, the reply
@@ -225,3 +333,11 @@ func (r *MessageRouter) DuplicatesDropped() uint64 { return r.dups.Load() }
 // does not (an old tag scheme, or garbage) and is the number to check first
 // when nothing finalises.
 func (r *MessageRouter) UnknownDropped() uint64 { return r.unknown.Load() }
+
+// RefusedBeforeVerify reports how many consensus-tagged frames were refused
+// before any signature verification: a key outside the committee, or a vote
+// for a height the live engine cannot judge (audit C-8). It is the observable
+// that the reorder is actually running - a router with a committee and a
+// syncer must count a self-signed stranger's vote here, and the Ed25519
+// evaluation count must stay flat for it.
+func (r *MessageRouter) RefusedBeforeVerify() uint64 { return r.refused.Load() }
