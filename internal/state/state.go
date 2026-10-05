@@ -107,6 +107,12 @@ func NewWithParams(p Params) *State {
 // transactions apply, rather than deriving it from any prior transition.
 func (s *State) SetHeight(h uint64) { s.height = h }
 
+// Params returns the protocol parameters this state was built with. Params is a
+// value with no references, so the copy is safe to hand out. The mempool's
+// stateful admission reads EpochBlocks from here (audit R-1) to decide whether
+// a claim's epoch is the current or the next one before paying for anything.
+func (s *State) Params() Params { return s.params }
+
 // Get returns the account, or the zero Account if it does not exist.
 func (s *State) Get(a types.Address) Account { return s.accounts[a] }
 

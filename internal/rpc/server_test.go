@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -22,7 +23,7 @@ func testServer(t *testing.T) (*Server, *httptest.Server) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
-	s := NewServer(c, mempool.New(100, c.Genesis().Hash()))
+	s := NewServer(c, mempool.New(100, c.Genesis().Hash(), c.AdmissionHead))
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return s, ts
@@ -158,7 +159,7 @@ func TestRPCReadsAreSafeDuringAppends(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	ts := httptest.NewServer(NewServer(c, mempool.New(100, c.Genesis().Hash())).Handler())
+	ts := httptest.NewServer(NewServer(c, mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)).Handler())
 	defer ts.Close()
 	_, priv := genesis.DevValidatorKey()
 
@@ -182,4 +183,80 @@ func TestRPCReadsAreSafeDuringAppends(t *testing.T) {
 		}
 	}
 	<-done
+}
+
+// Per-source /tx limiting (audit R-1). The clock is injected, so the test is a
+// constructed state: no sleep, no kernel buffer, no timing race.
+func TestTxEndpointRateLimitsOneSource(t *testing.T) {
+	s, ts := testServer(t)
+	fixed := time.Unix(1_700_000_000, 0)
+	s.txLimiter.now = func() time.Time { return fixed }
+	s.txLimiter.burst = 1
+	s.txLimiter.rate = 0
+
+	post := func() int {
+		enc := hex.EncodeToString(buildSignedTx(t).Encode())
+		resp, err := http.Post(ts.URL+"/tx", "text/plain", strings.NewReader(enc))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := post(); code != http.StatusOK {
+		t.Fatalf("first POST /tx = %d, want 200", code)
+	}
+	if code := post(); code != http.StatusTooManyRequests {
+		t.Fatalf("second POST /tx from one source with its burst spent = %d, want 429", code)
+	}
+	// Other endpoints are not rate limited by the /tx bucket.
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /status after a rate-limited POST = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestSourceLimiterIsPerSource(t *testing.T) {
+	l := newSourceLimiter(1, 0, 8)
+	l.now = func() time.Time { return time.Unix(0, 0) }
+	if !l.allow("1.1.1.1") {
+		t.Fatal("the first request from a source must be allowed")
+	}
+	if l.allow("1.1.1.1") {
+		t.Fatal("a source with an empty bucket must be refused")
+	}
+	if !l.allow("2.2.2.2") {
+		t.Fatal("a different source must have its own bucket")
+	}
+}
+
+func TestSourceLimiterRefills(t *testing.T) {
+	l := newSourceLimiter(1, 1, 8) // one token, refilled at one per second
+	now := time.Unix(0, 0)
+	l.now = func() time.Time { return now }
+	if !l.allow("a") {
+		t.Fatal("the first request must be allowed")
+	}
+	if l.allow("a") {
+		t.Fatal("a source with an empty bucket must be refused")
+	}
+	now = now.Add(time.Second)
+	if !l.allow("a") {
+		t.Fatal("a token should have refilled after one second")
+	}
+}
+
+func TestSourceLimiterBoundsItsMap(t *testing.T) {
+	l := newSourceLimiter(10, 0, 3)
+	l.now = func() time.Time { return time.Unix(0, 0) }
+	for _, s := range []string{"a", "b", "c", "d", "e"} {
+		l.allow(s)
+	}
+	if len(l.buckets) != 3 {
+		t.Fatalf("limiter tracks %d sources, want the bound 3: an address-cycling attacker must not grow the map", len(l.buckets))
+	}
 }

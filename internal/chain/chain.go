@@ -201,6 +201,18 @@ func (c *Chain) State() *state.State {
 	return c.state
 }
 
+// AdmissionHead returns the head state together with the head height, under one
+// lock so the pair cannot disagree. The mempool uses it to admit a transaction
+// against the state a block would execute now, before paying for any expensive
+// verification (audit R-1). The returned *State is immutable once published -
+// every transition clones and replaces it - so a caller may read it without the
+// chain lock, exactly as Chain.State's contract already allows.
+func (c *Chain) AdmissionHead() (*state.State, uint64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.state, c.head.Header.Height
+}
+
 // isValidator reports whether pub is in the genesis validator set.
 func (c *Chain) isValidator(pub []byte) bool {
 	for _, v := range c.gen.Validators {

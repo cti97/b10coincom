@@ -154,7 +154,7 @@ func oneValidatorFixtureOnGenesis(t *testing.T, g *genesis.Genesis) (d *Driver, 
 	// The fixture's mempool is returned precisely so tests can fill it: an
 	// empty pool proposes empty blocks, the behaviour every pre-existing
 	// driver test ran under before transactions had a source.
-	mp = mempool.New(1000, g.Hash())
+	mp = mempool.New(1000, g.Hash(), ch.AdmissionHead)
 	d = NewDriver(cfg, ch, priv, rec, mp)
 	return d, ch, rec, net, pub, priv, g, dir, mp
 }
@@ -192,7 +192,7 @@ func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *record
 	net.AddPeer("v0")
 	net.AddPeer("ghost") // listens, never sends: the absent second validator
 	rec = &recordingTransport{Transport: net.TransportFor("v0")}
-	mp = mempool.New(1000, g.Hash())
+	mp = mempool.New(1000, g.Hash(), ch.AdmissionHead)
 	d = NewDriver(cfg, ch, priv, rec, mp)
 	return d, ch, rec, net, pub, mp
 }
@@ -603,7 +603,7 @@ func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Ch
 		// The pools are handed back so tests can fill them: filling a
 		// validator's pool is what M4's relay tasks will do, and a scenario
 		// that wants transactions on the wire puts them here.
-		pool := mempool.New(1000, g.Hash())
+		pool := mempool.New(1000, g.Hash(), ch.AdmissionHead)
 		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)), pool))
 		chs = append(chs, ch)
 		pools = append(pools, pool)
@@ -1025,9 +1025,9 @@ func claimTx(t *testing.T, g *genesis.Genesis, index int, epoch uint64) types.Tx
 	h := crypto.HashParts([]byte("b10coin-driver-test-claimant"), []byte(strconv.Itoa(index)))
 	priv := ed25519.NewKeyFromSeed(h[:])
 	pub := priv.Public().(ed25519.PublicKey)
-	pow, ok := faucet.Solve(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1_000_000)
+	pow, ok := faucet.SolveClaim(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1<<24)
 	if !ok {
-		t.Fatalf("test claimant %d did not solve the fixture puzzle in 1,000,000 attempts", index)
+		t.Fatalf("test claimant %d did not solve the fixture puzzle in 16,777,216 attempts", index)
 	}
 	tx := &types.Tx{
 		Type:     types.TxFaucetClaim,
@@ -1342,7 +1342,7 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &stalledTransport{}
-	mp := mempool.New(1000, g.Hash())
+	mp := mempool.New(1000, g.Hash(), ch.AdmissionHead)
 	d := NewDriver(cfg, ch, priv0, rec, mp)
 
 	parent := ch.Head().ID()
@@ -1705,7 +1705,7 @@ func fourValidatorFixture(t *testing.T) (ds []*Driver, chs []*chain.Chain, recs 
 		if err != nil {
 			t.Fatal(err)
 		}
-		mp := mempool.New(1000, g.Hash())
+		mp := mempool.New(1000, g.Hash(), ch.AdmissionHead)
 		rec := &recordingTransport{Transport: net.TransportFor(fmt.Sprintf("v%d", i))}
 		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), rec, mp))
 		chs = append(chs, ch)

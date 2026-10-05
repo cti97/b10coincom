@@ -398,7 +398,7 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		}
 	}
 
-	pool := mempool.New(networkedMempoolCapacity, g.Hash())
+	pool := mempool.New(networkedMempoolCapacity, g.Hash(), ch.AdmissionHead)
 	sy := consensus.NewSyncer(ch, tp, priv)
 	rt := consensus.NewMessageRouter(sy)
 	rt.SendReply = tp.Send

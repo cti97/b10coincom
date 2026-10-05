@@ -223,7 +223,7 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 	}
 	defer c.Close()
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(100, g.Hash())
+	mp := mempool.New(100, g.Hash(), c.AdmissionHead)
 	n := node.New(c, priv, mp)
 
 	pub, key, err := crypto.GenerateKey()
@@ -247,7 +247,7 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 	epoch := c.Height()/params.EpochBlocks + 1
 
 	claim := func(nonce uint64) *types.Tx {
-		pow, ok := faucet.Solve(pub, epoch, params.PowTarget, params.PowArgon2, 5_000_000)
+		pow, ok := faucet.SolveClaim(pub, epoch, params.PowTarget, params.PowArgon2, 5_000_000)
 		if !ok {
 			t.Fatal("could not solve the devnet puzzle")
 		}
@@ -272,11 +272,15 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 	}
 
 	second := claim(c.State().Get(types.AddressFromPub(pub)).Nonce)
-	if errs := mp.Add([]types.Tx{*second}); errs[0] != nil {
-		t.Fatalf("mempool.Add: %v", errs[0])
+	// Since audit R-1 the mempool enforces the one-claim-per-epoch rule at
+	// ADMISSION: the second claim is refused at the door, so the pool never
+	// holds it and never pays for its puzzle. The rule's own sentinel pins the
+	// reason, exactly as the direct-state check at the end of this test does.
+	if err := mp.Add([]types.Tx{*second})[0]; !errors.Is(err, state.ErrClaimTooSoon) {
+		t.Fatalf("second same-epoch claim at admission: err = %v, want state.ErrClaimTooSoon", err)
 	}
-	// RunOnce evicts a transaction that cannot apply rather than failing, so the
-	// block is produced but must not contain the claim.
+	// The block is still produced (Take returns nothing) and must not contain
+	// the claim.
 	b, err := n.RunOnce(g0Time + 3)
 	if err != nil {
 		t.Fatalf("second claim block: %v", err)

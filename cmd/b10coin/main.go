@@ -269,10 +269,11 @@ func cmdKeygen(args []string) error {
 // is solved locally before anything is sent.
 var claimHTTP = &http.Client{Timeout: 15 * time.Second}
 
-// claimPuzzleAttempts bounds the local solve. The devnet's easy target needs
-// about two attempts; a failure means the tuning changed, not that mining is
-// slow.
-const claimPuzzleAttempts = 1_000_000
+// claimPuzzleAttempts bounds the local solve. The reference claimant solves the
+// cheap outer puzzle (16 leading zero bits) as well as the devnet's easy
+// Argon2id target, so the expected scan is about 2^17 nonces; a failure means
+// the tuning changed, not that mining is slow.
+const claimPuzzleAttempts = 1 << 24
 
 // cmdClaim solves the faucet puzzle for a FRESH EPHEMERAL key and submits the
 // signed claim to a node's /tx endpoint. There is no key file and no
@@ -319,7 +320,10 @@ func cmdClaim(args []string) error {
 	if err != nil {
 		return err
 	}
-	pow, ok := faucet.Solve(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, claimPuzzleAttempts)
+	// SolveClaim also satisfies the cheap outer puzzle a node's mempool now
+	// requires at admission (audit R-1); Solve alone would be refused at the
+	// door even though the block's Argon2id rule would have accepted it.
+	pow, ok := faucet.SolveClaim(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, claimPuzzleAttempts)
 	if !ok {
 		return fmt.Errorf("no solution found within %d attempts", claimPuzzleAttempts)
 	}
@@ -450,7 +454,7 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	defer c.Close()
 
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(10_000, c.Genesis().Hash())
+	mp := mempool.New(10_000, c.Genesis().Hash(), c.AdmissionHead)
 	n := node.New(c, priv, mp)
 	srv := rpc.NewServer(c, mp)
 
