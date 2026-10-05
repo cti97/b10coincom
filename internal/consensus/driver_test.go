@@ -154,7 +154,7 @@ func oneValidatorFixtureOnGenesis(t *testing.T, g *genesis.Genesis) (d *Driver, 
 	// The fixture's mempool is returned precisely so tests can fill it: an
 	// empty pool proposes empty blocks, the behaviour every pre-existing
 	// driver test ran under before transactions had a source.
-	mp = mempool.New(1000)
+	mp = mempool.New(1000, g.Hash())
 	d = NewDriver(cfg, ch, priv, rec, mp)
 	return d, ch, rec, net, pub, priv, g, dir, mp
 }
@@ -192,7 +192,7 @@ func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *record
 	net.AddPeer("v0")
 	net.AddPeer("ghost") // listens, never sends: the absent second validator
 	rec = &recordingTransport{Transport: net.TransportFor("v0")}
-	mp = mempool.New(1000)
+	mp = mempool.New(1000, g.Hash())
 	d = NewDriver(cfg, ch, priv, rec, mp)
 	return d, ch, rec, net, pub, mp
 }
@@ -418,7 +418,7 @@ func TestDriverRejectedAppendStaysAtSameHeight(t *testing.T) {
 	// The chain moves under the engine, the way an adopted peer block does:
 	// a DIFFERENT valid block at the same height, carried by a genuine
 	// transfer transaction so it cannot byte-match P.
-	foreign, err := ch.Build(testCommitteeKey(0), []types.Tx{transferTx(0, 1, 0, 1)}, ch.Head().Header.Timestamp+1)
+	foreign, err := ch.Build(testCommitteeKey(0), []types.Tx{transferTx(ch.Genesis(), 0, 1, 0, 1)}, ch.Head().Header.Timestamp+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +603,7 @@ func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Ch
 		// The pools are handed back so tests can fill them: filling a
 		// validator's pool is what M4's relay tasks will do, and a scenario
 		// that wants transactions on the wire puts them here.
-		pool := mempool.New(1000)
+		pool := mempool.New(1000, g.Hash())
 		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)), pool))
 		chs = append(chs, ch)
 		pools = append(pools, pool)
@@ -882,7 +882,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	// own test): the lock must still refuse a VALID conflicting block that
 	// carries no evidence.
 	badRound0Proposer := cfg.Proposer(1, 0, parent)
-	badBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(badRound0Proposer)), []types.Tx{transferTx(0, 1, 0, 1)}, ch2.Head().Header.Timestamp+1)
+	badBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(badRound0Proposer)), []types.Tx{transferTx(ch2.Genesis(), 0, 1, 0, 1)}, ch2.Head().Header.Timestamp+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -947,7 +947,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	// the same nonce but a different amount - a different tx, hence a
 	// different block ID from the bad block's.
 	p1 := cfg.Proposer(1, 1, parent)
-	newBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(p1)), []types.Tx{transferTx(0, 1, 0, 5)}, ch2.Head().Header.Timestamp+1)
+	newBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(p1)), []types.Tx{transferTx(ch2.Genesis(), 0, 1, 0, 5)}, ch2.Head().Header.Timestamp+1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -999,7 +999,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 // transferTx builds a signed transfer from devnet dev account from to dev
 // account to at the given nonce and amount. Account 0 holds one million b10 on
 // a fresh chain, so transfers out of it apply.
-func transferTx(from, to int, nonce, amount uint64) types.Tx {
+func transferTx(g *genesis.Genesis, from, to int, nonce, amount uint64) types.Tx {
 	fromPub, fromPriv := genesis.DevAccountKey(from)
 	toPub, _ := genesis.DevAccountKey(to)
 	tx := &types.Tx{
@@ -1007,10 +1007,11 @@ func transferTx(from, to int, nonce, amount uint64) types.Tx {
 		From:   types.AddressFromPub(fromPub),
 		PubKey: fromPub,
 		Nonce:  nonce,
+		Fee:    g.Params.MinFeeSparks,
 		To:     types.AddressFromPub(toPub),
 		Amount: amount,
 	}
-	sig := tx.SigningHash()
+	sig := tx.SigningHash(g.Hash())
 	tx.Sig = crypto.Sign(fromPriv, sig[:])
 	return *tx
 }
@@ -1036,7 +1037,7 @@ func claimTx(t *testing.T, g *genesis.Genesis, index int, epoch uint64) types.Tx
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
-	sig := tx.SigningHash()
+	sig := tx.SigningHash(g.Hash())
 	tx.Sig = crypto.Sign(priv, sig[:])
 	return *tx
 }
@@ -1067,7 +1068,7 @@ func committedBlock(t *testing.T, ch *chain.Chain, height uint64) *types.Block {
 func TestAConsensusBlockCarriesMempoolTransactions(t *testing.T) {
 	d, ch, rec, net, _, _, _, _, mp := oneValidatorFixture(t)
 
-	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	tx := transferTx(ch.Genesis(), 0, 1, 0, 250*genesis.SparksPerB10)
 	txID := tx.ID()
 	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatal(err)
@@ -1091,15 +1092,17 @@ func TestAConsensusBlockCarriesMempoolTransactions(t *testing.T) {
 		t.Fatalf("the committed block carries %d transaction(s) but not the mempool's transfer %x: it proposed something else", len(blk.Txs), txID[:8])
 	}
 	// The transfer must have been APPLIED, not merely carried: account 0's
-	// balance dropped by the amount and its nonce advanced, account 1 was
-	// credited, and the state root Append verified is the one that says so.
+	// balance dropped by the amount AND the burned fee (audit S-3), its nonce
+	// advanced, account 1 was credited, and the state root Append verified is
+	// the one that says so.
 	fromPub, _ := genesis.DevAccountKey(0)
 	toPub, _ := genesis.DevAccountKey(1)
 	if got := ch.State().Get(types.AddressFromPub(toPub)).Balance; got != 250*genesis.SparksPerB10 {
 		t.Fatalf("the recipient holds %d, want the transferred %d: the block carried bytes, it did not pay", got, 250*genesis.SparksPerB10)
 	}
-	if got := ch.State().Get(types.AddressFromPub(fromPub)); got.Balance != 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10 || got.Nonce != 1 {
-		t.Fatalf("the sender holds (balance %d, nonce %d), want (balance %d, nonce 1): the debit side did not run", got.Balance, got.Nonce, 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10)
+	fee := ch.Genesis().Params.MinFeeSparks
+	if got := ch.State().Get(types.AddressFromPub(fromPub)); got.Balance != 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10-fee || got.Nonce != 1 {
+		t.Fatalf("the sender holds (balance %d, nonce %d), want (balance %d, nonce 1): the debit side did not run", got.Balance, got.Nonce, 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10-fee)
 	}
 }
 
@@ -1156,9 +1159,9 @@ func TestAConsensusBlockPaysAFaucetClaimThroughConsensus(t *testing.T) {
 func TestInapplicableTransactionsAreExcludedNotFatal(t *testing.T) {
 	d, ch, _, net, _, _, _, _, mp := oneValidatorFixture(t)
 
-	good := transferTx(0, 1, 0, 250*genesis.SparksPerB10)               // applies: dev 0's nonce is 0
-	badNonce := transferTx(0, 1, 7, 100*genesis.SparksPerB10)           // nonce 7, dev 0 is at 0
-	insufficient := transferTx(0, 1, 1, 2_000_000*genesis.SparksPerB10) // after `good`, dev 0 cannot cover two million b10
+	good := transferTx(ch.Genesis(), 0, 1, 0, 250*genesis.SparksPerB10)               // applies: dev 0's nonce is 0
+	badNonce := transferTx(ch.Genesis(), 0, 1, 7, 100*genesis.SparksPerB10)           // nonce 7, dev 0 is at 0
+	insufficient := transferTx(ch.Genesis(), 0, 1, 1, 2_000_000*genesis.SparksPerB10) // after `good`, dev 0 cannot cover two million b10
 	txs := []types.Tx{good, badNonce, insufficient}
 	if errs := mp.Add(txs); errs[0] != nil || errs[1] != nil || errs[2] != nil {
 		t.Fatalf("the fixture's transactions failed the pool's signature checks: %v", errs)
@@ -1251,7 +1254,7 @@ func countFaucetClaims(blk *types.Block) int {
 func TestAnAbandonedRoundDoesNotEvaporateItsTransactions(t *testing.T) {
 	d, ch, rec, net, _, mp := blockedQuorumFixture(t)
 
-	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	tx := transferTx(ch.Genesis(), 0, 1, 0, 250*genesis.SparksPerB10)
 	txID := tx.ID()
 	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatal(err)
@@ -1339,12 +1342,12 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &stalledTransport{}
-	mp := mempool.New(1000)
+	mp := mempool.New(1000, g.Hash())
 	d := NewDriver(cfg, ch, priv0, rec, mp)
 
 	parent := ch.Head().ID()
 
-	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	tx := transferTx(ch.Genesis(), 0, 1, 0, 250*genesis.SparksPerB10)
 	txID := tx.ID()
 	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatal(err)
@@ -1490,7 +1493,7 @@ func TestThreeValidatorsAgreeOnABlockThatCarriesATransferAndAClaim(t *testing.T)
 	g := chs[0].Genesis()
 
 	claim := claimTx(t, g, 900, 1) // epoch 1, applied at height 1; index 900 stays clear of the bound test's keys
-	transfer := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	transfer := transferTx(g, 0, 1, 0, 250*genesis.SparksPerB10)
 	claimID, transferID := claim.ID(), transfer.ID()
 	for _, mp := range pools {
 		if errs := mp.Add([]types.Tx{transfer, claim}); errs[0] != nil || errs[1] != nil {
@@ -1702,7 +1705,7 @@ func fourValidatorFixture(t *testing.T) (ds []*Driver, chs []*chain.Chain, recs 
 		if err != nil {
 			t.Fatal(err)
 		}
-		mp := mempool.New(1000)
+		mp := mempool.New(1000, g.Hash())
 		rec := &recordingTransport{Transport: net.TransportFor(fmt.Sprintf("v%d", i))}
 		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), rec, mp))
 		chs = append(chs, ch)

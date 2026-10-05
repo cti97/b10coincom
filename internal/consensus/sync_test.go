@@ -927,7 +927,7 @@ func TestACertifiedPoisonBlockStillFailsAppend(t *testing.T) {
 					},
 					Txs: []types.Tx{badTx},
 				}
-				if badTx.VerifySignature() == nil {
+				if badTx.VerifySignature(w.pullCh.Genesis().Hash()) == nil {
 					t.Fatal("fixture: the poisoned transaction unexpectedly verifies")
 				}
 				if _, err := w.pullCh.Probe(bad.Txs); err == nil {

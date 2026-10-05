@@ -59,12 +59,19 @@ type Params struct {
 	// courtesy is pinned equal to the shipped chains' value by a test in
 	// this package. Validate refuses a genesis that leaves it zero.
 	MaxClaimsPerBlock uint64
-	MinStakeSparks    uint64
-	EpochBlocks       uint64
-	UnbondingEpochs   uint64
-	CommitteeSize     int
-	FaucetPowArgon2   faucet.Argon2Params
-	FaucetPowTarget   [32]byte
+	// MinFeeSparks is the least a transaction may pay the protocol (audit
+	// S-3). It is a consensus parameter, committed in the genesis encoding:
+	// two nodes that agreed on everything else but held different minimums
+	// would accept and reject the same blocks. state.applyTransfer enforces
+	// it, and Validate refuses a genesis that leaves it zero - a zero minimum
+	// is the free-transaction regime the finding is about.
+	MinFeeSparks    uint64
+	MinStakeSparks  uint64
+	EpochBlocks     uint64
+	UnbondingEpochs uint64
+	CommitteeSize   int
+	FaucetPowArgon2 faucet.Argon2Params
+	FaucetPowTarget [32]byte
 }
 
 // Validator is a genesis validator with its initial voting power.
@@ -113,6 +120,7 @@ func (g *Genesis) Encode() []byte {
 	e.U64(g.Params.HalvingIntervalBlocks)
 	e.U64(g.Params.ClaimAmountSparks)
 	e.U64(g.Params.MaxClaimsPerBlock)
+	e.U64(g.Params.MinFeeSparks)
 	e.U64(g.Params.MinStakeSparks)
 	e.U64(g.Params.EpochBlocks)
 	e.U64(g.Params.UnbondingEpochs)
@@ -217,6 +225,14 @@ func (g *Genesis) Validate() error {
 	if p.MaxClaimsPerBlock == 0 {
 		return fmt.Errorf("%w: MaxClaimsPerBlock must be at least 1 (an unbounded claim count per block is the amplification the state machine rejects)", ErrBadGenesis)
 	}
+	// A zero minimum is a chain whose transactions are free, which is exactly
+	// the regime audit S-3 closes. state.Params treats zero as "not engaged"
+	// for legacy unparameterized states, so without this rule a zero-valued
+	// genesis could silently ship free transactions through the one encoding
+	// the finding says must not be re-opened.
+	if p.MinFeeSparks == 0 {
+		return fmt.Errorf("%w: MinFeeSparks must be at least 1 (a zero minimum is the free-transaction regime the fee exists to end)", ErrBadGenesis)
+	}
 	return nil
 }
 
@@ -279,6 +295,9 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 		return nil, err
 	}
 	if g.Params.MaxClaimsPerBlock, err = d.U64(); err != nil {
+		return nil, err
+	}
+	if g.Params.MinFeeSparks, err = d.U64(); err != nil {
 		return nil, err
 	}
 	if g.Params.MinStakeSparks, err = d.U64(); err != nil {
@@ -344,10 +363,17 @@ func sharedParams(chainID string, epochBlocks, claimAmountSparks uint64, committ
 		// pinned equal to this value by a test in this package, so the pool
 		// can never hand a block producer more claims than the chain accepts.
 		MaxClaimsPerBlock: 8,
-		MinStakeSparks:    1_000 * SparksPerB10,
-		EpochBlocks:       epochBlocks,
-		UnbondingEpochs:   2,
-		CommitteeSize:     committee,
+		// The least a transfer may pay, on BOTH shipped chains. One spark is
+		// deliberately small: this change exists to put a FEE IN THE SIGNED
+		// BODY while the encoding is still free to change (audit S-3), not to
+		// set monetary policy. The level is a genesis parameter precisely so
+		// the level can be re-derived later without another fork; what is
+		// already fixed is that a zero-cost transfer is invalid.
+		MinFeeSparks:    1,
+		MinStakeSparks:  1_000 * SparksPerB10,
+		EpochBlocks:     epochBlocks,
+		UnbondingEpochs: 2,
+		CommitteeSize:   committee,
 	}
 }
 

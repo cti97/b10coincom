@@ -237,6 +237,30 @@ func TestGenesisRoundTripThroughEncoding(t *testing.T) {
 		t.Fatalf("genesis round trip lost MaxClaimsPerBlock: got %d, want %d",
 			got.Params.MaxClaimsPerBlock, g.Params.MaxClaimsPerBlock)
 	}
+	// MinFeeSparks is consensus too - it decides which transactions are valid -
+	// so a decode that drops it must fail here rather than quietly restoring
+	// free transfers (audit S-3).
+	if got.Params.MinFeeSparks != g.Params.MinFeeSparks {
+		t.Fatalf("genesis round trip lost MinFeeSparks: got %d, want %d",
+			got.Params.MinFeeSparks, g.Params.MinFeeSparks)
+	}
+}
+
+// MinFeeSparks is the floor a transfer must clear (audit S-3). It is pinned on
+// BOTH shipped chains, and a genesis that would re-open free transactions is
+// refused outright.
+func TestMinFeeIsPinnedPerChainAndZeroIsRefused(t *testing.T) {
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		if g.Params.MinFeeSparks != 1 {
+			t.Fatalf("%s: MinFeeSparks = %d, want the pinned 1", g.ChainID, g.Params.MinFeeSparks)
+		}
+		zeroed := g
+		*zeroed = *g
+		zeroed.Params.MinFeeSparks = 0
+		if err := zeroed.Validate(); !errors.Is(err, ErrBadGenesis) {
+			t.Fatalf("%s with MinFeeSparks 0 validated (%v), want ErrBadGenesis: a zero minimum is the free-transaction regime", g.ChainID, err)
+		}
+	}
 }
 
 func TestGenesisUsesBlake3Domain(t *testing.T) {
@@ -276,6 +300,7 @@ type genesisRecord struct {
 		HalvingIntervalBlocks uint64 `json:"halving_interval_blocks"`
 		ClaimAmountSparks     uint64 `json:"claim_amount_sparks"`
 		MaxClaimsPerBlock     uint64 `json:"max_claims_per_block"`
+		MinFeeSparks          uint64 `json:"min_fee_sparks"`
 		MinStakeSparks        uint64 `json:"min_stake_sparks"`
 		EpochBlocks           uint64 `json:"epoch_blocks"`
 		UnbondingEpochs       uint64 `json:"unbonding_epochs"`
@@ -374,6 +399,7 @@ func TestGenesisJSONRecordsMatchTheGoConstructors(t *testing.T) {
 			{"halving_interval_blocks", q.HalvingIntervalBlocks, p.HalvingIntervalBlocks},
 			{"claim_amount_sparks", q.ClaimAmountSparks, p.ClaimAmountSparks},
 			{"max_claims_per_block", q.MaxClaimsPerBlock, p.MaxClaimsPerBlock},
+			{"min_fee_sparks", q.MinFeeSparks, p.MinFeeSparks},
 			{"min_stake_sparks", q.MinStakeSparks, p.MinStakeSparks},
 			{"epoch_blocks", q.EpochBlocks, p.EpochBlocks},
 			{"unbonding_epochs", q.UnbondingEpochs, p.UnbondingEpochs},
@@ -433,7 +459,7 @@ func requiredParamsMissing(params map[string]json.RawMessage) []string {
 	for _, key := range []string{
 		"block_time_ms", "total_supply_sparks", "initial_reward_sparks",
 		"halving_interval_blocks", "claim_amount_sparks", "max_claims_per_block",
-		"min_stake_sparks",
+		"min_fee_sparks", "min_stake_sparks",
 		"epoch_blocks", "unbonding_epochs", "committee_size",
 		"faucet_pow_argon2", "faucet_pow_target",
 	} {

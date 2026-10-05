@@ -169,7 +169,7 @@ func Run(o Options) (Summary, error) {
 	defer c.Close()
 
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(1000)
+	mp := mempool.New(1000, g.Hash())
 	n := node.New(c, priv, mp)
 
 	tx, err := devTransfer(c, 250*genesis.SparksPerB10)
@@ -216,7 +216,7 @@ func Run(o Options) (Summary, error) {
 		if !ok {
 			return Summary{}, fmt.Errorf("devnet: claim attempt %d of %d did not solve the fixture puzzle", attempt+1, o.Claims)
 		}
-		claim := devClaim(pub, priv, c.State().Get(claimant).Nonce, epoch, pow)
+		claim := devClaim(pub, priv, c.Genesis().Hash(), c.State().Get(claimant).Nonce, epoch, pow)
 		if err := mp.Add([]types.Tx{*claim})[0]; err != nil {
 			return Summary{}, err
 		}
@@ -249,7 +249,7 @@ func Run(o Options) (Summary, error) {
 		// The double claim reuses the first claim's solution (the puzzle binds
 		// pubkey, epoch and nonce, not the transaction) and spends the account
 		// nonce the paid claim just advanced.
-		double := devClaim(pub, priv, c.State().Get(claimant).Nonce, epoch, pow)
+		double := devClaim(pub, priv, c.Genesis().Hash(), c.State().Get(claimant).Nonce, epoch, pow)
 		if err := mp.Add([]types.Tx{*double})[0]; err != nil {
 			return Summary{}, err
 		}
@@ -525,8 +525,9 @@ func devTransfer(c *chain.Chain, amount uint64) (*types.Tx, error) {
 		Nonce:  c.State().Get(from).Nonce,
 		To:     types.AddressFromPub(toPub),
 		Amount: amount,
+		Fee:    c.Genesis().Params.MinFeeSparks,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 	return tx, nil
 }
@@ -536,7 +537,7 @@ func devTransfer(c *chain.Chain, amount uint64) (*types.Tx, error) {
 // counter at application time: zero for a claimant key that has never
 // transacted, and the value the paid claim advanced for the same key's
 // double claim.
-func devClaim(pub ed25519.PublicKey, priv ed25519.PrivateKey, nonce, epoch, pow uint64) *types.Tx {
+func devClaim(pub ed25519.PublicKey, priv ed25519.PrivateKey, chainHash [32]byte, nonce, epoch, pow uint64) *types.Tx {
 	tx := &types.Tx{
 		Type:     types.TxFaucetClaim,
 		From:     types.AddressFromPub(pub),
@@ -545,7 +546,7 @@ func devClaim(pub ed25519.PublicKey, priv ed25519.PrivateKey, nonce, epoch, pow 
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(chainHash)
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return tx
 }

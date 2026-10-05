@@ -48,7 +48,7 @@ func fuzzSignedTx(tb testing.TB, typ TxType, nonce, amount uint64) *Tx {
 		tx.Epoch, tx.PowNonce = 1, 42
 	}
 	// SigningHash returns an array, which must be bound before it can be sliced.
-	hash := tx.SigningHash()
+	hash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, hash[:])
 	return tx
 }
@@ -202,6 +202,6 @@ func FuzzDecodeTx(f *testing.F) {
 		}
 		// The verification that always follows a decode on the live path must
 		// refuse - or accept - without panicking, whatever the key material.
-		_ = tx.VerifySignature()
+		_ = tx.VerifySignature(testChain())
 	})
 }

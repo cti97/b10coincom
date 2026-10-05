@@ -22,7 +22,7 @@ func testServer(t *testing.T) (*Server, *httptest.Server) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { c.Close() })
-	s := NewServer(c, mempool.New(100))
+	s := NewServer(c, mempool.New(100, c.Genesis().Hash()))
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 	return s, ts
@@ -111,10 +111,11 @@ func buildSignedTx(t *testing.T) *types.Tx {
 		From:   types.AddressFromPub(pub),
 		PubKey: pub,
 		Nonce:  0,
+		Fee:    1,
 		To:     types.AddressFromPub(otherPub),
 		Amount: 1,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(genesis.Devnet().Hash())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return tx
 }
@@ -157,7 +158,7 @@ func TestRPCReadsAreSafeDuringAppends(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	ts := httptest.NewServer(NewServer(c, mempool.New(100)).Handler())
+	ts := httptest.NewServer(NewServer(c, mempool.New(100, c.Genesis().Hash())).Handler())
 	defer ts.Close()
 	_, priv := genesis.DevValidatorKey()
 

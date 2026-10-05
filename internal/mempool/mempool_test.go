@@ -7,6 +7,11 @@ import (
 	"github.com/cti97/b10coincom/internal/types"
 )
 
+// testChain is the identifier the pool fixtures are built for: the pool and
+// the transactions it admits must agree on it, and a fixed value keeps the
+// fixtures independent of any chain package (mempool imports neither).
+func testChain() [32]byte { return [32]byte{0x11, 0x22} }
+
 func mkTx(t *testing.T, nonce uint64) types.Tx {
 	t.Helper()
 	pub, priv, err := crypto.GenerateKey()
@@ -25,7 +30,7 @@ func mkTx(t *testing.T, nonce uint64) types.Tx {
 		To:     types.AddressFromPub(otherPub),
 		Amount: 1,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return *tx
 }
@@ -44,13 +49,13 @@ func mkClaim(t *testing.T, nonce uint64) types.Tx {
 		Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: nonce, Epoch: 1, PowNonce: 0,
 	}
-	h := tx.SigningHash()
+	h := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, h[:])
 	return *tx
 }
 
 func TestMempoolAddAndTake(t *testing.T) {
-	m := New(10)
+	m := New(10, testChain())
 	errs := m.Add([]types.Tx{mkTx(t, 0), mkTx(t, 1)})
 	for i, err := range errs {
 		if err != nil {
@@ -70,7 +75,7 @@ func TestMempoolAddAndTake(t *testing.T) {
 }
 
 func TestMempoolDeduplicates(t *testing.T) {
-	m := New(10)
+	m := New(10, testChain())
 	tx := mkTx(t, 0)
 	if err := m.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatal(err)
@@ -84,7 +89,7 @@ func TestMempoolDeduplicates(t *testing.T) {
 }
 
 func TestMempoolRejectsBadSignature(t *testing.T) {
-	m := New(10)
+	m := New(10, testChain())
 	tx := mkTx(t, 0)
 	tx.Sig[0] ^= 0xFF
 	if err := m.Add([]types.Tx{tx})[0]; err == nil {
@@ -93,7 +98,7 @@ func TestMempoolRejectsBadSignature(t *testing.T) {
 }
 
 func TestMempoolRespectsCapacity(t *testing.T) {
-	m := New(2)
+	m := New(2, testChain())
 	_ = m.Add([]types.Tx{mkTx(t, 0), mkTx(t, 1), mkTx(t, 2)})
 	if m.Len() > 2 {
 		t.Fatalf("Len = %d exceeds capacity 2", m.Len())
@@ -101,7 +106,7 @@ func TestMempoolRespectsCapacity(t *testing.T) {
 }
 
 func TestMempoolRemove(t *testing.T) {
-	m := New(10)
+	m := New(10, testChain())
 	tx := mkTx(t, 0)
 	_ = m.Add([]types.Tx{tx})
 	m.Remove(tx.ID())
@@ -134,7 +139,7 @@ func TestMaxFaucetClaimsPerBlockIsActuallyABound(t *testing.T) {
 // re-measurement), so the ten thousand a full node pool holds would cost ~21
 // min of work per block; the pool must bound how many claims it will hand over.
 func TestTakeBoundsFaucetClaimsPerBlock(t *testing.T) {
-	m := New(1000)
+	m := New(1000, testChain())
 
 	// Fill the pool with claims, which are validly signed but carry no evidence
 	// that their puzzle was actually solved.

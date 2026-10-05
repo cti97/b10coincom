@@ -41,6 +41,13 @@ type Tx struct {
 	From   Address
 	PubKey []byte
 	Nonce  uint64
+	// Fee is the cost the sender pays the protocol for including this
+	// transaction (audit S-3). It is signed for EVERY type, so it is never an
+	// unauthenticated field that could vary under one transaction ID; a
+	// transfer must pay the chain's minimum, and a faucet claim must pay
+	// nothing (the protocol pays the claimant; a claim can come from an
+	// account holding nothing at all, so charging one would close the faucet).
+	Fee uint64
 
 	// TxTransfer only.
 	To     Address
@@ -63,6 +70,7 @@ func (tx *Tx) encodeBody() []byte {
 	e.Raw(tx.From[:])
 	e.VarBytes(tx.PubKey)
 	e.U64(tx.Nonce)
+	e.U64(tx.Fee)
 	if tx.Type == TxTransfer {
 		e.Raw(tx.To[:])
 		e.U64(tx.Amount)
@@ -76,8 +84,17 @@ func (tx *Tx) encodeBody() []byte {
 
 // SigningHash is the digest that must be signed. It deliberately excludes
 // Sig, so signing is not recursive.
-func (tx *Tx) SigningHash() [32]byte {
-	return crypto.HashParts([]byte("b10coin-tx"), tx.encodeBody())
+//
+// genesisHash is the CHAIN IDENTIFIER the signature is bound to (audit S-1):
+// the hash of the chain's genesis, which commits to every genesis parameter.
+// Without it a transfer signed on one chain was valid on any other chain that
+// shared the same nonce and balance, so a transaction could be replayed across
+// a testnet and a community fork, or across a devnet and a testnet. It is a
+// domain-separated HashParts part - length-prefixed like every other part, 32
+// fixed-width bytes - so no two chains' signatures can be confused and the
+// encoding stays canonical.
+func (tx *Tx) SigningHash(genesisHash [32]byte) [32]byte {
+	return crypto.HashParts([]byte("b10coin-tx"), genesisHash[:], tx.encodeBody())
 }
 
 // ID is the transaction identifier used for deduplication and indexing.
@@ -98,8 +115,11 @@ func (tx *Tx) Encode() []byte {
 	return e.Bytes()
 }
 
-// VerifySignature checks that PubKey matches From and that Sig is valid.
-func (tx *Tx) VerifySignature() error {
+// VerifySignature checks that PubKey matches From and that Sig is valid over
+// the chain identifier and the body. genesisHash must be the genesis hash of
+// the chain this transaction is being judged for: a transaction signed for
+// another chain fails here, which is what makes it unreplayable there.
+func (tx *Tx) VerifySignature(genesisHash [32]byte) error {
 	if len(tx.PubKey) == 0 {
 		return fmt.Errorf("%w: missing public key", ErrBadSignature)
 	}
@@ -108,7 +128,7 @@ func (tx *Tx) VerifySignature() error {
 	}
 	// SigningHash returns an array, which must be bound to a variable
 	// before it can be sliced (a call result is not addressable).
-	hash := tx.SigningHash()
+	hash := tx.SigningHash(genesisHash)
 	if !crypto.Verify(tx.PubKey, hash[:], tx.Sig) {
 		return ErrBadSignature
 	}
@@ -134,6 +154,9 @@ func DecodeTx(b []byte) (*Tx, error) {
 		return nil, err
 	}
 	if tx.Nonce, err = d.U64(); err != nil {
+		return nil, err
+	}
+	if tx.Fee, err = d.U64(); err != nil {
 		return nil, err
 	}
 	switch tx.Type {

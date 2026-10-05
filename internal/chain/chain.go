@@ -69,6 +69,12 @@ func genesisState(g *genesis.Genesis) *state.State {
 		// wiring it here the bound would exist only in states that tests
 		// construct by hand, and no real chain would enforce it.
 		MaxClaimsPerBlock: g.Params.MaxClaimsPerBlock,
+		// The chain identifier every transaction signature is bound to (audit
+		// S-1) and the fee floor a transfer must clear (audit S-3). Both are
+		// genesis parameters, so two chains that differ on either judge the
+		// same bytes differently - which is the point.
+		GenesisHash: g.Hash(),
+		MinFee:      g.Params.MinFeeSparks,
 	})
 	for _, d := range g.DevAccounts {
 		addr := types.AddressFromPub(d.PubKey)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/faucet"
+	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -20,6 +21,13 @@ func keypair(t *testing.T) (types.Address, []byte, []byte) {
 	return types.AddressFromPub(pub), pub, priv
 }
 
+// testChain is the chain identifier the state fixtures sign for. The fixture
+// states are built with New(), whose Params are zero, so the tests that do not
+// care about chain binding sign for the zero identifier too; the chain-binding
+// test below builds states with real identifiers and is where a mismatch is
+// exercised.
+func testChain() [32]byte { return [32]byte{} }
+
 // transfer builds a signed transfer.
 func transfer(t *testing.T, fromPub, fromPriv []byte, from types.Address, nonce, amount uint64, to types.Address) *types.Tx {
 	t.Helper()
@@ -31,7 +39,7 @@ func transfer(t *testing.T, fromPub, fromPriv []byte, from types.Address, nonce,
 		To:     to,
 		Amount: amount,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 	return tx
 }
@@ -307,7 +315,7 @@ func TestApplyTxRejectsUnsupportedType(t *testing.T) {
 
 	tx := transfer(t, pub, priv, from, 0, 10, to)
 	tx.Type = types.TxType(99)
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 
 	if err := s.ApplyTx(tx); !errors.Is(err, ErrUnsupportedTxType) {
@@ -394,7 +402,7 @@ func solvedClaim(t *testing.T, p Params, epoch, nonce uint64) *types.Tx {
 		Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: nonce, Epoch: epoch, PowNonce: pow,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return tx
 }
@@ -443,7 +451,7 @@ func TestClaimRejectsSecondClaimInTheSameEpoch(t *testing.T) {
 	}
 	first := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: firstNonce}
-	firstHash := first.SigningHash()
+	firstHash := first.SigningHash(testChain())
 	first.Sig = crypto.Sign(priv, firstHash[:])
 	if err := s.ApplyTx(first); err != nil {
 		t.Fatalf("first claim: %v", err)
@@ -455,7 +463,7 @@ func TestClaimRejectsSecondClaimInTheSameEpoch(t *testing.T) {
 	}
 	second := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 1, Epoch: 1, PowNonce: secondNonce}
-	secondHash := second.SigningHash()
+	secondHash := second.SigningHash(testChain())
 	second.Sig = crypto.Sign(priv, secondHash[:])
 
 	before := s.Root()
@@ -492,7 +500,7 @@ func TestClaimRejectsBadProofOfWork(t *testing.T) {
 	}
 	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: badNonce}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 
 	before := s.Root()
@@ -539,7 +547,7 @@ func TestClaimDebitsTheFaucetWithoutItsSignature(t *testing.T) {
 	if tx.From == p.FaucetAddress {
 		t.Fatal("fixture error: the claimant is the faucet address")
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	if !crypto.Verify(tx.PubKey, sigHash[:], tx.Sig) {
 		t.Fatal("fixture error: the claim is not validly signed by its claimant")
 	}
@@ -562,7 +570,7 @@ func TestClaimRejectsZeroValuedPuzzleParameters(t *testing.T) {
 	}
 	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: 0}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 
 	defer func() {
@@ -590,7 +598,7 @@ func TestClaimRejectsAZeroEpochLength(t *testing.T) {
 	}
 	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: 0}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 
 	defer func() {
@@ -669,7 +677,7 @@ func TestClaimPaysAgainInALaterEpochAndAccumulates(t *testing.T) {
 		}
 		tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 			Nonce: nonce, Epoch: epoch, PowNonce: pow}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(testChain())
 		tx.Sig = crypto.Sign(priv, sigHash[:])
 		if err := s.ApplyTx(tx); err != nil {
 			t.Fatalf("claim(epoch=%d, nonce=%d): %v", epoch, nonce, err)
@@ -772,7 +780,7 @@ func signedClaim(t *testing.T, epoch, nonce uint64) *types.Tx {
 		Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: nonce, Epoch: epoch, PowNonce: 0,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return tx
 }
@@ -877,5 +885,170 @@ func TestApplyBlockAcceptsAClaimFreeBlockWithTheBoundUnset(t *testing.T) {
 	}
 	if next.Get(to).Balance != 40 {
 		t.Fatalf("recipient balance = %d, want 40", next.Get(to).Balance)
+	}
+}
+
+// ------------------------------------------------- S-1: cross-chain replay
+
+// TestTransferSignedForOneChainIsRejectedOnAnother is audit S-1's own test: a
+// transfer signed on one chain is valid there and REFUSED on another, even
+// though the bytes are identical and the sender's nonce and balance would
+// allow it. Before the fix the signed body carried no chain identifier, so Bob
+// could take the very bytes Alice signed on a fork and re-submit them to
+// testnet for a second payment.
+func TestTransferSignedForOneChainIsRejectedOnAnother(t *testing.T) {
+	devnet, testnet := genesis.Devnet().Hash(), genesis.Testnet().Hash()
+	if devnet == testnet {
+		t.Fatal("fixture: the two chains must have different genesis hashes")
+	}
+	from, pub, priv := keypair(t)
+	to, _, _ := keypair(t)
+
+	tx := &types.Tx{
+		Type:   types.TxTransfer,
+		From:   from,
+		PubKey: pub,
+		Nonce:  0,
+		Fee:    1,
+		To:     to,
+		Amount: 400,
+	}
+	h := tx.SigningHash(devnet)
+	tx.Sig = crypto.Sign(priv, h[:])
+	// The transaction ITSELF is chain-agnostic: the same bytes are what would
+	// travel to either node. Only the signed preimage names the chain.
+	wire := tx.Encode()
+
+	// Accepted on the chain it was signed for.
+	onA := NewWithParams(Params{GenesisHash: devnet, MinFee: 1})
+	onA.Set(from, Account{Balance: 1000})
+	if err := onA.ApplyTx(tx); err != nil {
+		t.Fatalf("the chain the transfer was signed for refused it: %v", err)
+	}
+	if got := onA.Get(from); got.Balance != 599 || got.Nonce != 1 {
+		t.Fatalf("sender on chain A = %+v, want balance 599 (400 sent + 1 fee burned) and nonce 1", got)
+	}
+	if got := onA.Get(to); got.Balance != 400 {
+		t.Fatalf("recipient on chain A = %+v, want balance 400", got)
+	}
+
+	// Refused on the other chain, despite the identical bytes and a state that
+	// would otherwise accept it.
+	replayed, err := types.DecodeTx(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	onB := NewWithParams(Params{GenesisHash: testnet, MinFee: 1})
+	onB.Set(from, Account{Balance: 1000})
+	if err := onB.ApplyTx(replayed); !errors.Is(err, types.ErrBadSignature) {
+		t.Fatalf("chain B accepted a transaction signed for chain A: %v", err)
+	}
+	if got := onB.Get(from); got.Balance != 1000 || got.Nonce != 0 {
+		t.Fatalf("the refused replay still moved state on chain B: %+v", got)
+	}
+}
+
+// TestVerifySignatureRejectsAReplayOnADifferentIdentifier is the same property
+// at the primitive: the identifier is inside the signed preimage, so changing
+// only it invalidates the signature.
+func TestVerifySignatureRejectsAReplayOnADifferentIdentifier(t *testing.T) {
+	from, pub, priv := keypair(t)
+	to, _, _ := keypair(t)
+	tx := &types.Tx{
+		Type: types.TxTransfer, From: from, PubKey: pub, Nonce: 0, Fee: 1,
+		To: to, Amount: 400,
+	}
+	var a, b [32]byte
+	a[0], b[0] = 1, 2
+	h := tx.SigningHash(a)
+	tx.Sig = crypto.Sign(priv, h[:])
+	if err := tx.VerifySignature(a); err != nil {
+		t.Fatalf("the identifier it was signed for was refused: %v", err)
+	}
+	if err := tx.VerifySignature(b); !errors.Is(err, types.ErrBadSignature) {
+		t.Fatalf("a different chain identifier verified: %v", err)
+	}
+}
+
+// ------------------------------------------------------------ S-3: the fee
+
+// TestTransferMustPayTheChainsMinimumFee pins the floor: a transaction under
+// it is invalid, not merely discouraged, and it is refused before the balance
+// is even read.
+func TestTransferMustPayTheChainsMinimumFee(t *testing.T) {
+	from, pub, priv := keypair(t)
+	to, _, _ := keypair(t)
+	s := NewWithParams(Params{MinFee: 5})
+	s.Set(from, Account{Balance: 1000})
+
+	build := func(fee uint64) *types.Tx {
+		tx := &types.Tx{
+			Type: types.TxTransfer, From: from, PubKey: pub, Nonce: 0,
+			Fee: fee, To: to, Amount: 10,
+		}
+		h := tx.SigningHash(testChain())
+		tx.Sig = crypto.Sign(priv, h[:])
+		return tx
+	}
+	if err := s.ApplyTx(build(4)); !errors.Is(err, ErrFeeTooLow) {
+		t.Fatalf("a transfer one spark under the minimum gave %v, want ErrFeeTooLow", err)
+	}
+	if got := s.Get(from); got.Balance != 1000 || got.Nonce != 0 {
+		t.Fatalf("the underpaying transfer moved state: %+v", got)
+	}
+	if err := s.ApplyTx(build(5)); err != nil {
+		t.Fatalf("a transfer at exactly the minimum was refused: %v", err)
+	}
+	if got := s.Get(from); got.Balance != 985 || got.Nonce != 1 {
+		t.Fatalf("sender = %+v, want 985 (10 sent + 5 burned) and nonce 1", got)
+	}
+	if got := s.Get(to); got.Balance != 10 {
+		t.Fatalf("recipient = %+v, want the full amount, not the amount minus the fee", got)
+	}
+}
+
+// TestTransferFeeOverflowIsRejected: the amount and the fee are summed with the
+// overflow check, so a crafted pair cannot wrap the total below the balance.
+func TestTransferFeeOverflowIsRejected(t *testing.T) {
+	from, pub, priv := keypair(t)
+	to, _, _ := keypair(t)
+	s := New()
+	s.Set(from, Account{Balance: math.MaxUint64})
+
+	tx := &types.Tx{
+		Type: types.TxTransfer, From: from, PubKey: pub, Nonce: 0,
+		Fee: 1, To: to, Amount: math.MaxUint64,
+	}
+	h := tx.SigningHash(testChain())
+	tx.Sig = crypto.Sign(priv, h[:])
+
+	if err := s.ApplyTx(tx); !errors.Is(err, ErrBalanceOverflow) {
+		t.Fatalf("amount+fee overflow gave %v, want ErrBalanceOverflow", err)
+	}
+	if got := s.Get(from); got.Balance != math.MaxUint64 {
+		t.Fatalf("the refused overflow changed the balance: %d", got.Balance)
+	}
+}
+
+// TestClaimCarryingAFeeIsRejected: the protocol pays the claimant, and a
+// claimant may hold nothing, so a fee on a claim can never be collected. It is
+// refused rather than ignored because the fee field is signed for every type
+// and must not be a number nothing checks.
+func TestClaimCarryingAFeeIsRejected(t *testing.T) {
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimant := types.AddressFromPub(pub)
+	tx := &types.Tx{
+		Type: types.TxFaucetClaim, From: claimant, PubKey: pub,
+		Nonce: 0, Fee: 1, Epoch: 1, PowNonce: 7,
+	}
+	h := tx.SigningHash(testChain())
+	tx.Sig = crypto.Sign(priv, h[:])
+
+	s := NewWithParams(Params{GenesisHash: testChain()})
+	if err := s.ApplyTx(tx); !errors.Is(err, ErrClaimCarriesFee) {
+		t.Fatalf("a claim carrying a fee gave %v, want ErrClaimCarriesFee", err)
 	}
 }

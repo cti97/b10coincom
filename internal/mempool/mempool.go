@@ -38,14 +38,22 @@ const MaxFaucetClaimsPerBlock = 8
 // serve the RPC server (Add via POST /tx, Len via GET /status) while the
 // node loop runs Take.
 type Mempool struct {
-	max  int
-	mu   sync.RWMutex
-	txs  []types.Tx
-	seen map[[32]byte]struct{}
+	max int
+	// genesisHash is the chain identifier every transaction's signature is
+	// bound to (audit S-1). Admission verifies against it, so a transaction
+	// signed for another chain never enters this pool - it is refused for what
+	// it is, at the door, rather than by the state machine later.
+	genesisHash [32]byte
+	mu          sync.RWMutex
+	txs         []types.Tx
+	seen        map[[32]byte]struct{}
 }
 
-func New(max int) *Mempool {
-	return &Mempool{max: max, seen: make(map[[32]byte]struct{})}
+// New builds a pool of max transactions for the chain identified by
+// genesisHash. The identifier is a constructor argument, not a setter, so a
+// pool can never be built and then wrongly wired: the compiler demands it.
+func New(max int, genesisHash [32]byte) *Mempool {
+	return &Mempool{max: max, genesisHash: genesisHash, seen: make(map[[32]byte]struct{})}
 }
 
 // Add validates signatures and inserts transactions, returning one error per
@@ -56,7 +64,7 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 	errs := make([]error, len(txs))
 	for i := range txs {
 		tx := txs[i]
-		if err := tx.VerifySignature(); err != nil {
+		if err := tx.VerifySignature(m.genesisHash); err != nil {
 			errs[i] = err
 			continue
 		}

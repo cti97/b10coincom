@@ -7,8 +7,19 @@ import (
 	"github.com/cti97/b10coincom/internal/crypto"
 )
 
+// testChain is the chain identifier the types tests sign for. types cannot
+// import genesis (genesis imports types), so the tests use their own stable
+// 32-byte identifier; nothing here depends on which chain it stands for, only
+// that signing and verifying agree on it.
+func testChain() [32]byte { return [32]byte{0xC7, 0x4A, 0x11} }
+
 // signedTransfer builds a valid transfer signed by a fresh key.
 func signedTransfer(t *testing.T, nonce, amount uint64) *Tx {
+	return signedTransferWithFee(t, nonce, amount, 0)
+}
+
+// signedTransferWithFee is signedTransfer with the fee under test.
+func signedTransferWithFee(t *testing.T, nonce, amount, fee uint64) *Tx {
 	t.Helper()
 	pub, priv, err := crypto.GenerateKey()
 	if err != nil {
@@ -23,24 +34,25 @@ func signedTransfer(t *testing.T, nonce, amount uint64) *Tx {
 		From:   AddressFromPub(pub),
 		PubKey: pub,
 		Nonce:  nonce,
+		Fee:    fee,
 		To:     AddressFromPub(otherPub),
 		Amount: amount,
 	}
 	// SigningHash returns an array, which must be bound to a variable
 	// before it can be sliced (a call result is not addressable).
-	hash := tx.SigningHash()
+	hash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, hash[:])
 	return tx
 }
 
 func TestTxEncodeDecodeRoundTrip(t *testing.T) {
-	tx := signedTransfer(t, 7, 1234)
+	tx := signedTransferWithFee(t, 7, 1234, 9)
 	got, err := DecodeTx(tx.Encode())
 	if err != nil {
 		t.Fatalf("DecodeTx: %v", err)
 	}
 	if got.Type != tx.Type || got.From != tx.From || got.Nonce != tx.Nonce ||
-		got.To != tx.To || got.Amount != tx.Amount {
+		got.To != tx.To || got.Amount != tx.Amount || got.Fee != tx.Fee {
 		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got, tx)
 	}
 	if string(got.PubKey) != string(tx.PubKey) || string(got.Sig) != string(tx.Sig) {
@@ -48,6 +60,37 @@ func TestTxEncodeDecodeRoundTrip(t *testing.T) {
 	}
 	if got.ID() != tx.ID() {
 		t.Fatal("round trip changed the tx ID")
+	}
+}
+
+// The fee is part of the signed body (audit S-3): changing it after signing
+// must invalidate the signature, or a relayer could raise or lower what the
+// sender pays.
+func TestSigningHashCoversFee(t *testing.T) {
+	tx := signedTransferWithFee(t, 1, 10, 3)
+	if err := tx.VerifySignature(testChain()); err != nil {
+		t.Fatalf("the signed fee was refused: %v", err)
+	}
+	base := tx.SigningHash(testChain())
+	raised := *tx
+	raised.Fee = 4
+	if raised.SigningHash(testChain()) == base {
+		t.Fatal("SigningHash ignored the fee: the signed body does not cover it")
+	}
+	raised.Sig = tx.Sig
+	if err := raised.VerifySignature(testChain()); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("a raised fee still verified against the original signature: %v", err)
+	}
+}
+
+// The chain identifier is inside the signed preimage (audit S-1), so one
+// transaction cannot be valid on two chains.
+func TestSigningHashCoversTheChainIdentifier(t *testing.T) {
+	tx := signedTransferWithFee(t, 1, 10, 1)
+	var other [32]byte
+	copy(other[:], "another chain\x00\x00\x00")
+	if tx.SigningHash(testChain()) == tx.SigningHash(other) {
+		t.Fatal("SigningHash ignored the chain identifier")
 	}
 }
 
@@ -64,7 +107,7 @@ func TestTxIDIsDeterministicAndSensitive(t *testing.T) {
 }
 
 func TestVerifySignatureAcceptsValid(t *testing.T) {
-	if err := signedTransfer(t, 1, 10).VerifySignature(); err != nil {
+	if err := signedTransfer(t, 1, 10).VerifySignature(testChain()); err != nil {
 		t.Fatalf("valid signature rejected: %v", err)
 	}
 }
@@ -72,7 +115,7 @@ func TestVerifySignatureAcceptsValid(t *testing.T) {
 func TestVerifySignatureRejectsTamperedAmount(t *testing.T) {
 	tx := signedTransfer(t, 1, 10)
 	tx.Amount = 999999
-	if err := tx.VerifySignature(); !errors.Is(err, ErrBadSignature) {
+	if err := tx.VerifySignature(testChain()); !errors.Is(err, ErrBadSignature) {
 		t.Fatalf("expected ErrBadSignature, got %v", err)
 	}
 }
@@ -84,7 +127,7 @@ func TestVerifySignatureRejectsMismatchedFrom(t *testing.T) {
 	// Point From at an address that does not match PubKey. The key/address
 	// binding check must reject this before the signature is examined.
 	tx.From = AddressFromPub([]byte("not-the-real-key"))
-	if err := tx.VerifySignature(); !errors.Is(err, ErrAddressMismatch) {
+	if err := tx.VerifySignature(testChain()); !errors.Is(err, ErrAddressMismatch) {
 		t.Fatalf("expected ErrAddressMismatch, got %v", err)
 	}
 }
@@ -116,9 +159,9 @@ func TestDecodeTxRejectsUnsupportedType(t *testing.T) {
 // that never contained From).
 func TestSigningHashCoversFrom(t *testing.T) {
 	tx := signedTransfer(t, 1, 10)
-	before := tx.SigningHash()
+	before := tx.SigningHash(testChain())
 	tx.From = AddressFromPub([]byte("a-different-sender"))
-	if tx.SigningHash() == before {
+	if tx.SigningHash(testChain()) == before {
 		t.Fatal("SigningHash ignored the sender address: From is not in the signed body")
 	}
 }
@@ -188,7 +231,7 @@ func signedClaim(t *testing.T, epoch, powNonce uint64) *Tx {
 		Epoch:    epoch,
 		PowNonce: powNonce,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(testChain())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return tx
 }
@@ -212,7 +255,7 @@ func TestFaucetClaimRoundTrips(t *testing.T) {
 // solution.
 func TestFaucetClaimSignatureCoversEpochAndNonce(t *testing.T) {
 	tx := signedClaim(t, 7, 12345)
-	base := tx.SigningHash()
+	base := tx.SigningHash(testChain())
 
 	// Each variant is a copy of the SAME signed transaction with one field
 	// changed, so every other byte of the signed body is held constant and the
@@ -222,12 +265,12 @@ func TestFaucetClaimSignatureCoversEpochAndNonce(t *testing.T) {
 	// field — the RED run demonstrated exactly that.)
 	other := *tx
 	other.Epoch = 8
-	if other.SigningHash() == base {
+	if other.SigningHash(testChain()) == base {
 		t.Fatal("SigningHash ignored the epoch")
 	}
 	third := *tx
 	third.PowNonce = 999
-	if third.SigningHash() == base {
+	if third.SigningHash(testChain()) == base {
 		t.Fatal("SigningHash ignored the proof-of-work nonce")
 	}
 }

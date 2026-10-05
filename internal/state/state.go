@@ -72,6 +72,22 @@ type Params struct {
 	// so a state parameterised by a chain that pays claims is always
 	// bounded.
 	MaxClaimsPerBlock uint64
+
+	// GenesisHash is the CHAIN IDENTIFIER every transaction signature is bound
+	// to (audit S-1): the hash of the chain's genesis, which commits to every
+	// parameter above. VerifySignature uses it, so a transaction signed for
+	// one chain can never apply to another. The zero value means "no chain
+	// bound" - legacy New() states and fixtures that never set it verify
+	// transactions signed the same way - and a chain always sets it from its
+	// genesis, so a chain's state can never verify a foreign transaction.
+	GenesisHash [32]byte
+
+	// MinFee is the least a transfer may pay (audit S-3), in sparks. It comes
+	// from genesis.Params.MinFeeSparks via the chain; the zero value means
+	// "no minimum engaged" for legacy New() states, and genesis.Validate
+	// refuses a genesis that leaves it zero, so a real chain never runs with
+	// free transfers.
+	MinFee uint64
 }
 
 // New returns a state with zero-valued params: the M0-M1 behaviour. Claims are

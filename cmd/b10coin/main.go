@@ -332,7 +332,7 @@ func cmdClaim(args []string) error {
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(g.Hash())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 
 	txid, err := postTxHex(base+"/tx", tx.Encode())
@@ -450,7 +450,7 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	defer c.Close()
 
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(10_000)
+	mp := mempool.New(10_000, c.Genesis().Hash())
 	n := node.New(c, priv, mp)
 	srv := rpc.NewServer(c, mp)
 

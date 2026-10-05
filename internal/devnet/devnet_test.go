@@ -223,7 +223,7 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 	}
 	defer c.Close()
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(100)
+	mp := mempool.New(100, g.Hash())
 	n := node.New(c, priv, mp)
 
 	pub, key, err := crypto.GenerateKey()
@@ -255,7 +255,7 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 			Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 			Nonce: nonce, Epoch: epoch, PowNonce: pow,
 		}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(g.Hash())
 		tx.Sig = crypto.Sign(key, sigHash[:])
 		return tx
 	}

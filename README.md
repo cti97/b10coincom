@@ -61,7 +61,7 @@ It prints:
 ```text
 chain        b10coin-devnet-1
 height       102
-state root   be1c9e90914d23292d47873727e512a6dd76f6ccb7117b03bae189e9e51837ea
+state root   12a643be48c13ffb35d1339e07f2e174346ec110c6c347e206d043a049b3cf54
 txs included 2
 claims paid  1 of 1 attempts, 100000000 sparks each
 double claims refused 1 (one claim per key per epoch)
@@ -441,8 +441,12 @@ re-measured together on real hardware before any public testnet opens.
 - The reward starts at **0.5 b10 per block** (50,000,000 sparks), paid into
   the faucet account — height 0's genesis mint comes from the same formula.
 - It **halves every 21,000,000 blocks** (≈1.33 years at 2 s blocks) and
-  reaches zero at halving 26 — emission ends after ≈34.6 years of 2 s blocks,
-  and the chain then runs on fees only.
+  reaches zero at halving 26 — emission ends after ≈34.6 years of 2 s blocks.
+  A transfer must then pay the chain's minimum **fee**, a signed field of the
+  transaction body (`params.min_fee_sparks`, 1 spark on both shipped chains);
+  the fee is **burned** today, because the protocol has no proposer-reward
+  rule yet, so "runs on fees only" describes the schedule, not a distribution
+  rule the code already implements.
 - The **supply cap is 21,000,000 b10** (2.1 × 10¹⁵ sparks).
 - The **realized series lands at 20,999,997.48 b10** (2,099,999,748,000,000
   sparks): each halving's shift truncates, losing 252,000,000 sparks (2.52 b10)
@@ -590,16 +594,16 @@ alone, not by `devnet` — and
 | Package | Responsibility |
 |---|---|
 | `internal/crypto` | BLAKE3 over length-prefixed, domain-separated parts (`HashParts`); order-sensitive binary Merkle root; Ed25519 key generation, signing, verification |
-| `internal/types` | Consensus structures (`Address`, `Tx`, `Header`, `Block`) and the canonical binary codec; the decoder rejects short buffers, trailing bytes, and non-minimal varints |
-| `internal/state` | Address → account state map; the transfer transition (signature, nonce, balance rules) applied atomically per block on a clone; sorted-leaf Merkle state root; zero-value accounts pruned |
+| `internal/types` | Consensus structures (`Address`, `Tx`, `Header`, `Block`) and the canonical binary codec; the decoder rejects short buffers, trailing bytes, and non-minimal varints. A transaction's signed body carries its **fee** and is bound to a **chain identifier** (the genesis hash), so one transaction is not valid on two chains |
+| `internal/state` | Address → account state map; the transfer transition (chain-binding signature, nonce, minimum fee, balance rules, amount+fee overflow) applied atomically per block on a clone; the fee is burned; sorted-leaf Merkle state root; zero-value accounts pruned |
 | `internal/genesis` | Protocol parameters, genesis hash and validation, the devnet and testnet configurations, deterministic public dev fixtures, and the keyless faucet address |
 | `internal/faucet` | The M2 faucet machinery: the Argon2id claim puzzle (`Solve`, digest construction, target comparison) and the emission schedule (`Reward`, `SeriesTotal`) |
-| `internal/store` | Append-only block segment files (1,000 blocks per segment), each record CRC32C-checksummed; a partial trailing record from a crash is truncated on open and a damaged record is reported, never silently dropped |
+| `internal/store` | Append-only block segment files (1,000 blocks per segment), each record framed by a **checksummed fixed-width header** (length plus its CRC32C) and a trailing CRC32C over the length and payload, with the lock log and the commit-certificate log framed the same way; a torn trailing record is truncated on open, and a complete record whose checksum fails stops the scan and fails open, never silently dropped |
 | `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency |
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
 | `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size), `GET /block/{height}`, and `POST /tx` (hex-encoded canonical transaction bytes) |
-| `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters |
+| `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters. M4 adds BLOCK_SYNC catch-up and a certificate log: a commit certificate is persisted to the data directory, so a restarted validator still serves the evidence for blocks it adopted before it restarted |
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
 | `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, and prefix-agreement assertions — the harness the six seeded scenarios drive, and the multi-validator devnet with it |
@@ -635,7 +639,9 @@ alone, not by `devnet` — and
 5. **Capped emission whose realized total can never exceed the cap.** The
    base unit is the spark; `1 b10 = 10^8 sparks`. Supply caps at
    21,000,000 b10; the block reward starts at 0.5 b10 and halves every
-   21,000,000 blocks, after which the chain runs on fees only.
+   21,000,000 blocks, after which the chain's income is transaction fees — a
+   signed field of the transaction body, floored by `params.min_fee_sparks`
+   and burned for now, because no proposer-reward rule exists yet.
    `Genesis.Validate` requires the idealized identity
    `InitialRewardSparks × HalvingIntervalBlocks × 2 == TotalSupplySparks`
    (2.1 × 10¹⁵ sparks, comfortably inside `uint64`); the realized series —
@@ -643,12 +649,19 @@ alone, not by `devnet` — and
    20,999,997.48 b10, 2.52 b10 below the cap, and
    `TestEmissionNeverExceedsTheCap` keeps the cap a maximum, never a target.
 6. **Crash-tolerant, append-only block storage.** Blocks are written to
-   segment files as length-prefixed, CRC32C-checksummed records. Opening the
-   store truncates a partial trailing record — the crash-mid-write case — and
-   flags a structurally complete record whose checksum fails as corrupt on
-   read rather than silently dropping it. On restart the chain replays all
-   blocks from genesis and fails loudly if the recomputed state root diverges
-   from a committed header; a replay test closes this loop.
+   segment files as records with a fixed-width, checksummed header — the
+   payload length and the CRC32C of that length — followed by the payload and
+   a CRC32C over both. The length's own checksum is what lets the scanner
+   trust a length *before* using it to find the record's end; without it a
+   single flipped bit in a length prefix was indistinguishable from a crash,
+   and "repairing" the file truncated committed blocks. Opening the store
+   truncates only what a crash can leave (the file ending inside a record) and
+   otherwise stops at the first damaged record and fails loudly, never
+   dropping it silently. On restart the chain replays all blocks from genesis
+   and fails loudly if the recomputed state root diverges from a committed
+   header; a replay test closes this loop. The lock log and the
+   commit-certificate log use the same framing, so a lock promise and a
+   certificate survive a restart the same way a block does.
 
 ## Genesis configurations
 
@@ -665,7 +678,9 @@ monetary protocol constants: 2,000 ms block time, 21,000,000 b10 supply cap,
 50,000,000 sparks (0.5 b10) initial reward, 21,000,000-block halving interval,
 1,000 b10 minimum stake, and 2 unbonding epochs. They also share the
 **per-block faucet-claim bound of 8 claims** (`max_claims_per_block`), the
-consensus rule from [the per-block claim bound](#the-per-block-claim-bound).
+consensus rule from [the per-block claim bound](#the-per-block-claim-bound),
+and the **minimum transfer fee of 1 spark** (`min_fee_sparks`), which makes a
+zero-fee transfer invalid on both chains.
 The chains differ in these
 parameters: epoch length is **1,000-block epochs on devnet, 10,000-block
 epochs on testnet**, per the design's §6.3; the faucet claim amount is
@@ -683,6 +698,7 @@ differences are in the table below.
 | Committee size | 1 | 21 |
 | Faucet claim amount | 1 b10 (100,000,000 sparks) | 100 b10 (10,000,000,000 sparks) |
 | Max claims per block | 8 | 8 |
+| Min fee per transfer | 1 spark | 1 spark |
 | Faucet puzzle | Argon2id 64 KiB × 1 iteration × 1 lane, target `0x7f` + 31 × `0xff` | Argon2id 8 MiB × 1 iteration × 1 lane, target `0x0f` + 31 × `0xff` (re-derived with the claim bound; arithmetic in `Testnet`) |
 
 The devnet fixture exists to exercise transfers and the CLI; the testnet

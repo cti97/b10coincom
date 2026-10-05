@@ -247,7 +247,7 @@ func (n *Net) newDriver(i int, tpOverride transport.Transport) *consensus.Driver
 	if tpOverride != nil {
 		tp = tpOverride
 	}
-	d := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity))
+	d := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity, n.g.Hash()))
 	d.CommitWitness = n.syncs[i].RecordCommit
 	return d
 }
@@ -941,7 +941,7 @@ func (n *Net) reseat(i int, c *chain.Chain) {
 // restart scenario has always taken. The commit witness is re-wired so the
 // rebuilt driver keeps archiving certificates for the heights it commits.
 func (n *Net) rebuildDriver(i int) {
-	n.drv[i] = consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity))
+	n.drv[i] = consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity, n.g.Hash()))
 	n.drv[i].CommitWitness = n.syncs[i].RecordCommit
 }
 

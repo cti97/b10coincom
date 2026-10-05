@@ -211,10 +211,11 @@ func TestReplayRebuildsIdenticalState(t *testing.T) {
 			From:   from,
 			PubKey: fromPub,
 			Nonce:  c.State().Get(from).Nonce,
+			Fee:    g.Params.MinFeeSparks,
 			To:     to,
 			Amount: uint64(h) * genesis.SparksPerB10,
 		}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(c.Genesis().Hash())
 		tx.Sig = crypto.Sign(devPriv, sigHash[:])
 
 		b, err := c.Build(priv, []types.Tx{*tx}, int64(1_700_000_000+h))
@@ -273,10 +274,11 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 		From:   from,
 		PubKey: fromPub,
 		Nonce:  0,
+		Fee:    c.Genesis().Params.MinFeeSparks,
 		To:     to,
 		Amount: 250 * genesis.SparksPerB10,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(devPriv, sigHash[:])
 
 	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
@@ -287,20 +289,22 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	if got := c.State().Get(from).Balance; got != startFrom-250*genesis.SparksPerB10 {
-		t.Fatalf("sender balance = %d, want %d", got, startFrom-250*genesis.SparksPerB10)
+	// The sender pays the amount AND the fee (audit S-3); the fee is burned, so
+	// it leaves the supply entirely and never reaches the recipient.
+	fee := c.Genesis().Params.MinFeeSparks
+	if got := c.State().Get(from).Balance; got != startFrom-250*genesis.SparksPerB10-fee {
+		t.Fatalf("sender balance = %d, want %d (amount plus the burned fee %d)", got, startFrom-250*genesis.SparksPerB10-fee, fee)
 	}
 	if got := c.State().Get(to).Balance; got != startTo+250*genesis.SparksPerB10 {
 		t.Fatalf("recipient balance = %d, want %d", got, startTo+250*genesis.SparksPerB10)
 	}
 }
 
-// Total supply must change across a block by EXACTLY the block's emission and
-// nothing else: the transfer in the block still creates nothing and destroys
-// nothing. (Supersedes the M0-M1 version, which asserted supply was IDENTICAL
-// across a transfer, legitimate now that each block also mints its Reward -
-// and stricter: the exact per-height reward must account for the whole
-// delta.)
+// Total supply must change across a block by EXACTLY the block's emission minus
+// the fees the block's transactions paid: a transfer still creates nothing, and
+// since audit S-3 it DESTROYS its fee (the fee is burned - the protocol has no
+// proposer-reward rule yet). The delta is still fully accounted for, which is
+// the point: nothing minted or destroyed can go unaccounted.)
 func TestTotalSupplyChangesOnlyByTheBlockEmission(t *testing.T) {
 	c, priv := devChain(t)
 	before := c.State().TotalBalance()
@@ -318,10 +322,11 @@ func TestTotalSupplyChangesOnlyByTheBlockEmission(t *testing.T) {
 		From:   from,
 		PubKey: fromPub,
 		Nonce:  c.State().Get(from).Nonce,
+		Fee:    c.Genesis().Params.MinFeeSparks,
 		To:     types.AddressFromPub(toPub),
 		Amount: 123 * genesis.SparksPerB10,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(devPrivateKey(t), sigHash[:])
 
 	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
@@ -331,9 +336,11 @@ func TestTotalSupplyChangesOnlyByTheBlockEmission(t *testing.T) {
 	if err := c.Append(b); err != nil {
 		t.Fatal(err)
 	}
-	want := before + faucet.Reward(b.Header.Height, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks)
+	want := before +
+		faucet.Reward(b.Header.Height, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks) -
+		c.Genesis().Params.MinFeeSparks
 	if got := c.State().TotalBalance(); got != want {
-		t.Fatalf("total supply = %d, want %d (before %d plus exactly one block's emission)",
+		t.Fatalf("total supply = %d, want %d (before %d plus one block's emission minus the burned fee)",
 			got, want, before)
 	}
 }
@@ -483,7 +490,7 @@ func TestClaimMaySpendTheBlocksOwnEmission(t *testing.T) {
 	}
 	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: pow}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(key, sigHash[:])
 
 	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
@@ -539,7 +546,7 @@ func TestClaimVerifiesTheCurrentEpochThroughTheTransition(t *testing.T) {
 	}
 	tx := &types.Tx{Type: types.TxFaucetClaim, From: claimant, PubKey: pub,
 		Nonce: 0, Epoch: 2, PowNonce: pow}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(key, sigHash[:])
 
 	b2, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_101)
@@ -578,7 +585,7 @@ func TestProbeMirrorsTheBlockTransition(t *testing.T) {
 	}
 	claim := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: pow}
-	sigHash := claim.SigningHash()
+	sigHash := claim.SigningHash(c.Genesis().Hash())
 	claim.Sig = crypto.Sign(key, sigHash[:])
 
 	// Fixture guard: the claim must NEED the block's own emission, or this
@@ -654,7 +661,7 @@ func TestProbeUsesTheNextBlocksEpoch(t *testing.T) {
 	}
 	claim := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 2, PowNonce: pow}
-	sigHash := claim.SigningHash()
+	sigHash := claim.SigningHash(c.Genesis().Hash())
 	claim.Sig = crypto.Sign(key, sigHash[:])
 
 	probed, err := c.Probe([]types.Tx{*claim})
@@ -771,7 +778,7 @@ func TestChainRejectsABlockOverTheGenesisClaimBound(t *testing.T) {
 		}
 		tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(claimantPub), PubKey: claimantPub,
 			Nonce: 0, Epoch: 1, PowNonce: pow}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(c.Genesis().Hash())
 		tx.Sig = crypto.Sign(key, sigHash[:])
 		txs = append(txs, *tx)
 	}
@@ -858,10 +865,11 @@ func TestTransfersDoNotCountAgainstTheClaimBound(t *testing.T) {
 			From:   from,
 			PubKey: fromPub,
 			Nonce:  uint64(i),
+			Fee:    g.Params.MinFeeSparks,
 			To:     to,
 			Amount: 1,
 		}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(c.Genesis().Hash())
 		tx.Sig = crypto.Sign(devPriv, sigHash[:])
 		txs = append(txs, *tx)
 	}
