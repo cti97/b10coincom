@@ -19,8 +19,10 @@ package devnet
 //     ANSWERING (the router feeds it BLOCK_SYNC requests, it serves certified
 //     heights) and PULLING (the wave loop pulls from the tallest peer);
 //   - a consensus.MessageRouter splitting consensus frames from wire frames.
-//     The two message unions share the numeric range 1-3, so routing is by
-//     VERIFIED decode, never by a bare tag comparison (see the router's doc);
+//     The two message unions once shared the numeric range 1-3; audit N-5
+//     renumbered the wire tags to a disjoint range (wire.WireTagFloor), and
+//     routing still goes by VERIFIED decode, never by a bare tag comparison
+//     (see the router's doc);
 //   - a consensus.Driver whose OnMessage the router hands consensus frames
 //     to, and whose commit witness archives every commit's certificate
 //     (Design Decision 8) so the chain this node holds is pullable by a peer;

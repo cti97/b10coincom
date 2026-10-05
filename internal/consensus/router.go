@@ -3,14 +3,25 @@ package consensus
 // The message router for a node whose transport carries BOTH message unions:
 // consensus votes and proposals, and the wire's HELLO / BLOCK_SYNC frames.
 //
-// THE HAZARD THIS EXISTS FOR (Task 4 fix round, progress.md): the consensus
-// vote tags and the wire tags share the numeric range 1-3 —
-// MsgProposal/MsgPrevote/MsgPrecommit are 1/2/3, and MsgHello/MsgBlockSyncReq/
-// MsgBlockSyncResp are ALSO 1/2/3. A router keyed on the first byte alone
-// would feed every prevote and precommit (tags 2 and 3) into the sync layer
-// and lose the whole consensus stream; the Task-4 rig stalled exactly this
-// way before it dispatched by what a frame VERIFIES as. The rule, written
-// down: route by verified decode, never by a bare tag comparison.
+// THE TAG HISTORY THIS EXISTS FOR (Task 4 fix round, progress.md): before
+// audit N-5, the consensus vote tags and the wire tags shared the numeric
+// range 1-3 — MsgProposal/MsgPrevote/MsgPrecommit were 1/2/3, and
+// MsgHello/MsgBlockSyncReq/MsgBlockSyncResp were ALSO 1/2/3. A router keyed
+// on the first byte alone would feed every prevote and precommit (tags 2 and
+// 3) into the sync layer and lose the whole consensus stream; the Task-4 rig
+// stalled exactly this way before it dispatched by what a frame VERIFIES as.
+// The rule, written down then and kept: route by verified decode, never by a
+// bare tag comparison.
+//
+// Audit N-5 then renumbered the wire tags into a disjoint range
+// (wire.WireTagFloor = 0x80 upward), so the two unions can no longer collide
+// by construction. The verified-decode discipline stays anyway: a tag is a
+// claim about bytes, and the only thing that decides what a frame IS remains
+// a full decode plus, for the consensus messages, a verifying signature. What
+// the renumbering bought is that a wire frame now fails the consensus
+// branches on its FIRST byte (0x80+ is not a vote or proposal tag), so a
+// HELLO or a 1 MiB BLOCK_SYNC frame no longer costs a wasted vote-and-
+// proposal decode on every reader.
 //
 // "Verified" means decode into the full type (every decoder asserts its own
 // tag, refuses trailing bytes) AND, for the consensus messages, a verifying
@@ -19,8 +30,7 @@ package consensus
 //   - an honest committee-signed vote or proposal decodes and verifies in the
 //     FIRST branch, so it can never be re-parsed as a same-tagged wire frame;
 //   - a wire frame (HELLO etc.) fails the vote/proposal branches (its tag is
-//     in range, but its body is not a vote or proposal, or the signature
-//     never verifies without a committee key), and reaches its own branch;
+//     disjoint from both), and reaches its own branch;
 //   - an ATTACKER frame can pass at most one branch: each branch's check is
 //     a signature over a domain-separated hash the attacker cannot forge, and
 //     the one branch without a signature (BLOCK_SYNC response) is safe to
@@ -87,9 +97,10 @@ func NewMessageRouter(sync *Syncer) *MessageRouter {
 // decode as nothing (counted, dropped).
 func (r *MessageRouter) Route(m transport.Message) bool {
 	// Consensus first, verified: an honest committee-signed frame belongs to
-	// the engine, and a verified vote/proposal can never ALSO be a valid
-	// same-tagged wire frame, because each namespace's signature covers a
-	// different domain-separated hash.
+	// the engine. The two unions are tag-disjoint (audit N-5), so a wire frame
+	// fails this branch on its first byte; a forged frame with a consensus tag
+	// can only pass by carrying a signature over a domain-separated hash the
+	// attacker cannot forge.
 	if v, err := DecodeVote(m.Data); err == nil && v.Verify() == nil {
 		return true
 	}
@@ -160,7 +171,7 @@ func (r *MessageRouter) NoteServed() { r.servedReq.Add(1) }
 func (r *MessageRouter) SyncRepliesFiled() uint64 { return r.filed.Load() }
 
 // UnknownDropped reports how many frames decoded as nothing. A steady nonzero
-// count on a healthy committee means misrouted traffic - the tag hazard
-// arriving once more - and is the number to check first when nothing
-// finalises.
+// count on a healthy committee means a peer is speaking a language this node
+// does not (an old tag scheme, or garbage) and is the number to check first
+// when nothing finalises.
 func (r *MessageRouter) UnknownDropped() uint64 { return r.unknown.Load() }

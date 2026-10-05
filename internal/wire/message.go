@@ -24,17 +24,36 @@ import (
 
 // MsgType discriminates the wire message union. It is a wire value: never
 // renumber these.
+//
+// The wire tags live in a DISJOINT range from the consensus union
+// (consensus.MsgProposal/MsgPrevote/MsgPrecommit = 1/2/3). Design Decision 2
+// requires it, and before this renumbering they collided exactly there
+// (audit N-5): a router keyed on the first byte alone would have fed votes
+// into the sync layer, and a HELLO or BLOCK_SYNC frame made every reader
+// decode it as a vote and a proposal before failing. Nothing was deployed, so
+// the tags were moved instead of adding a workaround. The range is a wire
+// value and is part of the protocol: a peer that does not know these bytes
+// cannot speak M4.
+//
+// The wire namespace starts at 0x80 so it can never grow into the consensus
+// tags below it - the reserved boundary is 128, stated once here.
 type MsgType uint8
 
 const (
 	// MsgHello opens a connection: chain identity, the sender's validator
 	// key, and the height it is at.
-	MsgHello MsgType = 1
+	MsgHello MsgType = 0x80
 	// MsgBlockSyncReq asks a peer for a range of blocks.
-	MsgBlockSyncReq MsgType = 2
+	MsgBlockSyncReq MsgType = 0x81
 	// MsgBlockSyncResp answers a request with the encoded blocks.
-	MsgBlockSyncResp MsgType = 3
+	MsgBlockSyncResp MsgType = 0x82
 )
+
+// WireTagFloor is the lowest value the wire message union may use: every
+// wire tag is at or above it, and the consensus union (1/2/3) is strictly
+// below it. It exists so the disjointness is a named, testable boundary
+// rather than a property of three literals (audit N-5).
+const WireTagFloor MsgType = 0x80
 
 // ErrUnknownMsgType reports a frame whose tag byte is not the message the
 // decoder was asked for. Callers dispatch on the tag first; a decoder is also

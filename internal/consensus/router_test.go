@@ -4,8 +4,7 @@ package consensus
 // INDIRECTLY (through running validators); these pin the classification
 // DIRECTLY, frame by frame, because the failure mode of a bad router is
 // silence: a frame consumed by the wrong stream never reappears as an error,
-// only as a committee that stopped committing, on top of the 1-3 tag
-// collision the two message unions share.
+// only as a committee that stopped committing.
 
 import (
 	"fmt"
@@ -19,6 +18,38 @@ import (
 	"github.com/cti97/b10coincom/internal/types"
 	"github.com/cti97/b10coincom/internal/wire"
 )
+
+// TestWireTagsAreDisjointFromConsensusTags pins audit N-5: no wire message
+// tag may equal a consensus message tag, and every wire tag must sit at or
+// above wire.WireTagFloor. The two unions travel the same connection and are
+// told apart by their first byte before any body is decoded, so a collision
+// is a routing hazard rather than a cosmetic one - the pre-fix 1/2/3 overlap
+// fed every prevote and precommit into the sync layer and cost every HELLO a
+// wasted vote-and-proposal decode. The test is a table of the ACTUAL wire
+// tags against the ACTUAL consensus tags, so adding either union without
+// moving the boundary fails here rather than on a live committee.
+func TestWireTagsAreDisjointFromConsensusTags(t *testing.T) {
+	wireTags := map[string]wire.MsgType{
+		"MsgHello":         wire.MsgHello,
+		"MsgBlockSyncReq":  wire.MsgBlockSyncReq,
+		"MsgBlockSyncResp": wire.MsgBlockSyncResp,
+	}
+	consensusTags := map[string]MsgType{
+		"MsgProposal":  MsgProposal,
+		"MsgPrevote":   MsgPrevote,
+		"MsgPrecommit": MsgPrecommit,
+	}
+	for wn, wt := range wireTags {
+		if uint8(wt) < uint8(wire.WireTagFloor) {
+			t.Errorf("%s = %#x is below wire.WireTagFloor %#x: the wire union has grown into the consensus range", wn, uint8(wt), uint8(wire.WireTagFloor))
+		}
+		for cn, ct := range consensusTags {
+			if wt == wire.MsgType(ct) {
+				t.Errorf("%s tag %#x collides with consensus %s tag %#x", wn, uint8(wt), cn, uint8(ct))
+			}
+		}
+	}
+}
 
 // silentInner is the no-op transport the fixture's recording wrapper passes
 // through: no delivery, no peers, nothing to wait on.
