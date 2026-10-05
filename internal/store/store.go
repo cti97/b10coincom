@@ -15,12 +15,12 @@
 // checksum and Open FAILS loudly without touching a byte.
 //
 // The scan STOPS at the first corruption, in the final segment too: a
-// complete record whose payload checksum fails is corruption, not a torn
+// complete record whose record checksum fails is corruption, not a torn
 // tail, and the bytes after it cannot be framed (the corrupt record's own
 // length is what would say where they start). Truncating there would delete
-// exactly what a repair must preserve, so both logs refuse instead. Truncation
-// is confined to what only a crash can produce: the file ends inside a
-// record - an incomplete header, or a complete, VALID header whose record
+// exactly what a repair must preserve, so every log here refuses instead.
+// Truncation is confined to what only a crash can produce: the file ends inside
+// a record - an incomplete header, or a complete, VALID header whose record
 // runs past EOF. A crash cannot invent a different length, because a written
 // record's header checksum travels with the length it describes.
 //
