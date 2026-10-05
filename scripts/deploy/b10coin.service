@@ -72,5 +72,45 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/b10coin
 
+# --- Cheap sandboxing (audit N-10) -----------------------------------------
+# The node unit already had the baseline; the audit's one named gap was
+# PrivateTmp, and the rest of the standard set is added here for the same
+# reason the relay has it. A validator is long-lived and holds a key, so the
+# blast radius of a compromise is the whole chain identity, not one process.
+PrivateTmp=true
+# The store holds one open segment file per shard, the lock file, the key,
+# the RPC listener and the outbound relay socket; 4096 is ample and still a
+# hard ceiling on an fd leak.
+LimitNOFILE=4096
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# Static Go binary (CGO_ENABLED=0): the pure-Go resolver and TCP only.
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+PrivateMounts=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# It listens on >1024 ports and signs with a file key: no capabilities.
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+# NOTE: no MemoryMax here. The relay's pin is DERIVED (Options.MaxPinnedBytes)
+# and the unit's ceiling matches it; the node's live set depends on the chain
+# length, the certificate archive and the mempool, and there is no derived
+# bound to sit above. A guessed ceiling would kill a validator mid-commit
+# rather than protect it. Also, MemoryDenyWriteExecute is deliberately NOT
+# set (see the relay unit's note: unverifiable on this machine, and its
+# failure mode is a binary that cannot start).
+
 [Install]
 WantedBy=multi-user.target

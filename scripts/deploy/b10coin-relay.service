@@ -70,5 +70,52 @@ PrivateTmp=true
 # above; 256M is that plus the Go runtime with headroom.
 MemoryMax=256M
 
+# --- Cheap sandboxing (audit N-10) -----------------------------------------
+# The relay is the one component a stranger can reach, so it gets the smallest
+# sandbox a static Go binary can run in. Every line below is a property this
+# program does not need; none changes its behaviour.
+#
+# LimitNOFILE: the registry cap is 32 connections, each with one accept fd and
+# one socket fd, plus the listener; 4096 is two orders of magnitude of
+# headroom and still far below the host default, so an fd leak cannot exhaust
+# the machine.
+LimitNOFILE=4096
+# No device nodes: it opens sockets, nothing in /dev.
+PrivateDevices=true
+# Nothing it does writes a kernel tunable, loads a module, logs to the kernel,
+# touches cgroups or the clock, or renames the host.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# A static Go binary (CGO_ENABLED=0, scripts/build-release.sh) resolves DNS
+# with the pure-Go resolver over AF_INET/AF_INET6 and speaks only TCP: Unix
+# sockets, netlink and packet sockets are not needed.
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+PrivateMounts=true
+SystemCallArchitectures=native
+# @system-service is the syscall set a normal service uses; anything outside
+# it is denied (EPERM), not fatal.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# It binds port 7001 (>1024) as an unprivileged user and needs no capability
+# at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# New files are owner-only even if a future edit makes it write one.
+UMask=0077
+# NOTE: MemoryDenyWriteExecute is deliberately NOT set. The Go runtime does
+# not need simultaneous W+X today, but it is the one directive here whose
+# failure mode would be a binary that cannot start, and it could not be
+# exercised on this machine (no Linux, no systemd). Add it only after a
+# `systemd-analyze security` + live start on the target.
+
 [Install]
 WantedBy=multi-user.target
