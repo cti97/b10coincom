@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -415,6 +416,7 @@ func cmdNode(args []string) error {
 	//     anyone with the repository can reproduce, for development only.
 	peers := fs.String("peers", "", "comma-separated peer addresses to dial")
 	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
+	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8); sent as the first frame of every --relay dial, because the relay compares bytes and decodes nothing")
 	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
 	validators := fs.Int("validators", 0, "FIXTURE committee size (development mode; committee from --genesis otherwise)")
 	index := fs.Int("index", 0, "FIXTURE committee seat (development mode; the seat of --key is derived from --genesis otherwise)")
@@ -434,9 +436,25 @@ func cmdNode(args []string) error {
 		if *keyPath != "" {
 			return fmt.Errorf("--key signs for a committee seat, but this node (no networking flags) is the single-node devnet producer and signs with its fixture key: give --genesis together with --key, or drop --key")
 		}
+		if *relayTokenPath != "" {
+			return fmt.Errorf("--relay-access-token-file credentials a --relay connection, but no networking flag is set: give --relay ADDR together with it, or drop it")
+		}
 		return runProducerNode(*dir, *addr, *blockTime)
 	}
-	return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *keyPath, *genesisPath, *validators, *index)
+	var relayToken []byte
+	if *relayTokenPath != "" {
+		data, err := os.ReadFile(*relayTokenPath)
+		if err != nil {
+			return fmt.Errorf("reading relay access-token file %q: %w", *relayTokenPath, err)
+		}
+		// A trailing newline is an editor artifact, not part of the token;
+		// the relay trims the same way, so both ends agree on the bytes.
+		relayToken = bytes.TrimRight(data, "\r\n")
+		if len(relayToken) == 0 {
+			return fmt.Errorf("relay access-token file %q is empty; remove the flag or give it at least one byte", *relayTokenPath)
+		}
+	}
+	return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken)
 }
 
 // runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
@@ -532,7 +550,7 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 //
 // --block-time is refused with networking: a committee's cadence is its
 // round-timeout ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, keyPath, genesisPath string, committee, seat int) error {
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte) error {
 	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -627,9 +645,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 	var v *devnet.Validator
 	var err error
 	if g != nil {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, RelayAccessToken: relayToken})
 	} else {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, RelayAccessToken: relayToken})
 	}
 	if err != nil {
 		return err

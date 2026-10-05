@@ -41,6 +41,12 @@ Environment=B10COIN_HTTP=127.0.0.1:8645
 Environment=B10COIN_RELAY=changeme.example.com:7001
 Environment=B10COIN_GENESIS=/var/lib/b10coin/committee.json
 Environment=B10COIN_KEY=/var/lib/b10coin/b10coin.key
+# B10COIN_RELAY_TOKEN is the relay's pre-shared access-token file (audit N-8).
+# Leave it EMPTY for an allowlist-only relay; set it to /var/lib/b10coin/relay.token
+# (the file copied from the VPS, mode 0600) when the relay runs with
+# --access-token-file. An empty value passes an empty flag, which the node
+# treats as "no token". Empty default keeps every existing deployment working.
+Environment=B10COIN_RELAY_TOKEN=
 
 # The node's seat is derived from where its key's public half sits in the
 # committee file; a key that is not listed there REFUSES to start rather
@@ -49,6 +55,7 @@ ExecStart=/opt/b10coin/b10coin node \
     --dir ${B10COIN_DATA} \
     --http ${B10COIN_HTTP} \
     --relay ${B10COIN_RELAY} \
+    --relay-access-token-file ${B10COIN_RELAY_TOKEN} \
     --genesis ${B10COIN_GENESIS} \
     --key ${B10COIN_KEY}
 

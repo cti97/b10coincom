@@ -157,6 +157,12 @@ type ValidatorConfig struct {
 	// construction; an address given as both a peer and a relay keeps
 	// whichever registration it got first.
 	Relay []string
+	// RelayAccessToken, when non-empty, is the pre-shared first frame sent on
+	// every relay dial (audit N-8): the credential a relay started with
+	// Options.AccessToken requires before it registers the link. It is NOT a
+	// consensus secret - the relay only compares bytes by length and equality
+	// - and an empty value keeps the previous behaviour.
+	RelayAccessToken []byte
 	// TickEvery is the driver's tick cadence (zero: defaultTickEvery).
 	TickEvery time.Duration
 	// WaveEvery is the HELLO/catch-up cadence (zero: defaultWaveEvery).
@@ -416,6 +422,7 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	tp, err := tcp.New(tcp.Options{
 		LocalID:          transport.PeerID(fmt.Sprintf("v%d", cfg.Index)),
 		Admit:            admitHello,
+		RelayAccessToken: cfg.RelayAccessToken,
 	})
 	if err != nil {
 		_ = ch.Close()

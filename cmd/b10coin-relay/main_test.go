@@ -9,6 +9,9 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +46,7 @@ func TestRunHelpPrintsTheTrustTrade(t *testing.T) {
 		"write-queue-frames x 32",
 		"32 x (2 MiB + 4096 x 32 B + 2 x 1 MiB) = 32 x 4.125 MiB",
 		"= 132 MiB",
+		"--access-token-file",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("--help is missing %q - an operator would not see it", want)
@@ -93,7 +97,7 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		ReadTimeout:      2 * time.Minute,
 		KeepAlive:        15 * time.Second,
 	}
-	if opts != want {
+	if !reflect.DeepEqual(opts, want) {
 		t.Fatalf("default Options drifted from the documented numbers: got %+v, want %+v", opts, want)
 	}
 
@@ -125,7 +129,7 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		ReadTimeout:      30 * time.Second,
 		KeepAlive:        10 * time.Second,
 	}
-	if opts != wantOverride {
+	if !reflect.DeepEqual(opts, wantOverride) {
 		t.Fatalf("overrides did not reach Options: got %+v, want %+v", opts, wantOverride)
 	}
 
@@ -150,5 +154,39 @@ func TestRunBadAddrExitsOne(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "error:") {
 		t.Fatalf("listen failure did not report the error on stderr: %q", stderr.String())
+	}
+}
+
+// TestParseArgsReadsTheAccessTokenFile pins audit N-8's CLI wiring: the token
+// is read from a FILE (not argv, where ps would show it), a trailing newline
+// from an editor is trimmed, and an empty or missing file is a bad invocation
+// rather than a silently disabled gate.
+func TestParseArgsReadsTheAccessTokenFile(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("shared-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	_, opts, err := parseArgs([]string{"--access-token-file", tokenPath}, &stderr)
+	if err != nil {
+		t.Fatalf("parseArgs with a token file: %v", err)
+	}
+	if string(opts.AccessToken) != "shared-secret" {
+		t.Fatalf("AccessToken = %q, want %q (with the trailing newline trimmed)", opts.AccessToken, "shared-secret")
+	}
+
+	// A missing file is an error, not an open relay.
+	if _, _, err := parseArgs([]string{"--access-token-file", filepath.Join(dir, "missing")}, &stderr); err == nil {
+		t.Fatal("a missing access-token file was accepted, leaving the relay open")
+	}
+	// An empty file too: an empty token would compare equal to nothing and
+	// disable the gate without saying so.
+	emptyPath := filepath.Join(dir, "empty")
+	if err := os.WriteFile(emptyPath, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := parseArgs([]string{"--access-token-file", emptyPath}, &stderr); err == nil {
+		t.Fatal("an empty access-token file was accepted")
 	}
 }

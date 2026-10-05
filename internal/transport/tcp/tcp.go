@@ -294,6 +294,13 @@ type Options struct {
 	// the socket-free tests and non-consensus users want. Dialled
 	// connections are never gated: they are addresses the operator chose.
 	Admit func(frame []byte) bool
+	// RelayAccessToken, when non-empty, is sent as the first frame of every
+	// RELAY-mode dial (audit N-8): the pre-shared credential a relay with
+	// Options.AccessToken requires before it registers the connection. It is
+	// sent INSTEAD of the (unused) ID announcement, so the relay consumes one
+	// frame and the node injects no junk into the forwarding path. Empty
+	// keeps the previous behaviour. It has no effect on direct connections.
+	RelayAccessToken []byte
 	// Rand is the source of the reconnection jitter. An explicitly seeded
 	// *rand.Rand makes the delay sequence a function of that seed, so a test
 	// asserts the delays rather than hoping they grew; if nil, one is seeded
@@ -929,11 +936,19 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled bool) (*conn, err
 // half of the identity exchange every mode shares (a relay connection still
 // announces the local ID; it only never reads one back, see adoptRelay).
 func (t *TcpTransport) writeHello(nc net.Conn, addr string) error {
+	return t.writeHandshakeFrame(nc, addr, []byte(t.opts.LocalID))
+}
+
+// writeHandshakeFrame writes one connection-opening frame under the handshake
+// write deadline and clears the deadline afterwards. It is shared by the ID
+// announcement and the relay access token (audit N-8), so the "a stalled
+// handshake write is bounded" property holds for both.
+func (t *TcpTransport) writeHandshakeFrame(nc net.Conn, addr string, frame []byte) error {
 	if err := nc.SetWriteDeadline(time.Now().Add(t.opts.HandshakeTimeout)); err != nil {
 		nc.Close()
 		return err
 	}
-	if err := wire.WriteFrame(nc, []byte(t.opts.LocalID)); err != nil {
+	if err := wire.WriteFrame(nc, frame); err != nil {
 		nc.Close()
 		return fmt.Errorf("tcp: writing handshake to %s: %w", addr, err)
 	}
@@ -987,8 +1002,19 @@ func (t *TcpTransport) readHello(nc net.Conn, addr string) (transport.PeerID, er
 // the exact defect that let a stranger park a validator's maintainer for
 // good (audit N-1). dialled is true: this end opened the socket, and the
 // duplicate rank needs the direction to stay decidable.
+//
+// When Options.RelayAccessToken is set, it is sent as the FIRST frame and the
+// ID announcement is omitted: the relay's access gate (audit N-8) consumes
+// exactly one frame and compares it by length and equality, so sending the
+// token in place of the junk ID frame is both the credential and one fewer
+// unknown frame forwarded to every peer. Without a token the ID announcement
+// is unchanged, so every existing relay deployment is untouched.
 func (t *TcpTransport) adoptRelay(nc net.Conn, addr string) (*conn, error) {
-	if err := t.writeHello(nc, addr); err != nil {
+	if len(t.opts.RelayAccessToken) > 0 {
+		if err := t.writeHandshakeFrame(nc, addr, t.opts.RelayAccessToken); err != nil {
+			return nil, err
+		}
+	} else if err := t.writeHello(nc, addr); err != nil {
 		return nil, err
 	}
 	return t.install(nc, addr, true, RelayPeerName(addr))

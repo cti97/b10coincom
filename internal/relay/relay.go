@@ -77,6 +77,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -93,6 +94,13 @@ import (
 // still open (transient fd exhaustion, say), instead of hot-looping on a
 // persistent error.
 const acceptRetryDelay = 100 * time.Millisecond
+
+// accessTokenTimeout bounds how long an accepted connection may take to
+// present the pre-shared access token (audit N-8) before it is closed. It is
+// short because the honest client sends the token immediately on connect; a
+// socket that is silent for this long is a scanner. The read is otherwise
+// bounded by Options.ReadTimeout, which is far too long to hold a handshake.
+const accessTokenTimeout = 5 * time.Second
 
 const (
 	// DefaultMaxFrameBytes bounds a frame at 1 MiB, the same bound the TCP
@@ -275,6 +283,26 @@ type Options struct {
 	// KeepAlive is the TCP keepalive probe period for accepted connections,
 	// how they shed half-open peers in minutes. Default DefaultKeepAlive.
 	KeepAlive time.Duration
+	// AccessToken, when non-empty, is a PRE-SHARED FIRST FRAME (audit N-8):
+	// a newly accepted connection must present exactly these bytes as its
+	// first frame or it is closed and counted as unauthorized. It is the
+	// in-process access control that works where an IP allowlist cannot -
+	// behind CGNAT, or when a home validator's outbound address rotates -
+	// and it keeps the relay's "parses nothing" posture by construction: the
+	// check is a length-and-equality comparison of raw frame bytes, never a
+	// decode, so the relay still understands nothing about consensus.
+	//
+	// The token frame is CONSUMED, not forwarded, and a connection that has
+	// not presented it is never registered: it cannot receive another peer's
+	// frames and cannot forward anything. Empty disables the check (the
+	// pre-existing behaviour), so an existing deployment that adds no token
+	// is unchanged.
+	AccessToken []byte
+	// AccessTimeout bounds how long an accepted connection may take to
+	// present AccessToken before it is closed. Default accessTokenTimeout.
+	// It is short because an honest client sends the token immediately; a
+	// socket silent for this long is a scanner.
+	AccessTimeout time.Duration
 }
 
 func (o Options) withDefaults() Options {
@@ -308,6 +336,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.KeepAlive <= 0 {
 		o.KeepAlive = DefaultKeepAlive
+	}
+	if o.AccessTimeout <= 0 {
+		o.AccessTimeout = accessTokenTimeout
 	}
 	return o
 }
@@ -420,6 +451,11 @@ type Stats struct {
 	// RefusedConns counts dials closed at accept, for either refusing rule:
 	// over MaxConns, or past MaxConnsPerIP from one source.
 	RefusedConns uint64
+	// Unauthorized counts dials closed because they did not present the
+	// configured AccessToken first (audit N-8). It is zero when no token is
+	// configured; a steady nonzero value is a stranger (or a validator with a
+	// stale token) probing the relay.
+	Unauthorized uint64
 }
 
 // sentFrame is one queued payload and the sender whose fair share it was
@@ -711,29 +747,37 @@ type Relay struct {
 	// perGroup counts live conns by canonical source PREFIX - the
 	// accept-time cap's bookkeeping, decremented by finish.
 	perGroup map[string]int
+	// handshaking holds accepted sockets that have not yet presented the
+	// access token (audit N-8), so Close can close them instead of waiting
+	// out accessTokenTimeout. A connection is in this set only between
+	// Accept and admit; it is never registered and never forwarded.
+	handshaking map[net.Conn]struct{}
 
 	quit      chan struct{}
 	closed    atomic.Bool
 	closeOnce sync.Once
-	// wg counts the accept loop and every per-connection reader and writer.
-	// Unlike the transport, the relay CAN wait for all of them at Close: its
-	// goroutines never run caller code (everything is a socket call), so
-	// closing the sockets unblocks each one deterministically.
+	// wg counts the accept loop, every token handshake, and every
+	// per-connection reader and writer. Unlike the transport, the relay CAN
+	// wait for all of them at Close: its goroutines never run caller code
+	// (everything is a socket call), so closing the sockets unblocks each one
+	// deterministically.
 	wg sync.WaitGroup
 
-	forwarded atomic.Uint64
-	dropped   atomic.Uint64
-	refused   atomic.Uint64
+	forwarded    atomic.Uint64
+	dropped      atomic.Uint64
+	refused      atomic.Uint64
+	unauthorized atomic.Uint64
 }
 
 // New returns a relay with all bounds defaulted. Nothing runs and nothing is
 // open until Listen.
 func New(opts Options) *Relay {
 	return &Relay{
-		opts:     opts.withDefaults(),
-		conns:    make(map[*conn]struct{}),
-		perGroup: make(map[string]int),
-		quit:     make(chan struct{}),
+		opts:        opts.withDefaults(),
+		conns:       make(map[*conn]struct{}),
+		perGroup:    make(map[string]int),
+		handshaking: make(map[net.Conn]struct{}),
+		quit:        make(chan struct{}),
 	}
 }
 
@@ -782,6 +826,7 @@ func (r *Relay) Stats() Stats {
 		Forwarded:    r.forwarded.Load(),
 		Dropped:      r.dropped.Load(),
 		RefusedConns: r.refused.Load(),
+		Unauthorized: r.unauthorized.Load(),
 	}
 }
 
@@ -804,15 +849,71 @@ func (r *Relay) acceptLoop(l net.Listener) {
 				continue
 			}
 		}
-		if err := r.admit(nc); err != nil {
-			// A refusal by BOUND (registry full, or one source IP at its
-			// cap) is counted; a close because the relay is shutting down
-			// is not a refusal, only a shutdown.
-			if !errors.Is(err, ErrClosed) {
-				r.refused.Add(1)
-			}
+		// handshake performs the access-token read when a token is
+		// configured, which BLOCKS on the remote speaking - it must never run
+		// on the accept loop, or one silent dialer would stall every other
+		// connection. The handshake goroutine is counted on the same
+		// WaitGroup Close waits on, and the socket is tracked in
+		// r.handshaking so Close can close it rather than wait out the token
+		// deadline.
+		r.wg.Add(1)
+		go r.handshake(nc)
+	}
+}
+
+// handshake presents the access-token gate (audit N-8) and then admits the
+// connection. With no token configured it is the admit call alone. With a
+// token, the FIRST frame must equal it EXACTLY - length and bytes - and is
+// then consumed, never forwarded. The check reads only the frame length
+// (wire.ReadFrame) and compares raw bytes: the relay decodes nothing, so its
+// "parses nothing" posture is intact. A connection that fails, or says
+// nothing within accessTokenTimeout, is closed and counted as unauthorized;
+// it is NEVER registered, so it can neither receive nor forward a frame.
+func (r *Relay) handshake(nc net.Conn) {
+	defer r.wg.Done()
+	if len(r.opts.AccessToken) > 0 {
+		r.mu.Lock()
+		if r.closed.Load() {
+			r.mu.Unlock()
 			nc.Close()
+			return
 		}
+		r.handshaking[nc] = struct{}{}
+		r.mu.Unlock()
+		defer func() {
+			r.mu.Lock()
+			delete(r.handshaking, nc)
+			r.mu.Unlock()
+		}()
+
+		if err := nc.SetReadDeadline(time.Now().Add(r.opts.AccessTimeout)); err != nil {
+			r.unauthorized.Add(1)
+			nc.Close()
+			return
+		}
+		frame, err := wire.ReadFrame(nc, r.opts.MaxFrameBytes)
+		// Length-and-equality only: no decode, no interpretation. A token of
+		// a different length is refused without a byte comparison.
+		if err != nil || len(frame) != len(r.opts.AccessToken) || !bytes.Equal(frame, r.opts.AccessToken) {
+			r.unauthorized.Add(1)
+			nc.Close()
+			return
+		}
+		// The token frame is consumed; clear the deadline so the reader arms
+		// its own per-frame one.
+		if err := nc.SetReadDeadline(time.Time{}); err != nil {
+			nc.Close()
+			return
+		}
+	}
+	if err := r.admit(nc); err != nil {
+		// A refusal by BOUND (registry full, or one source IP at its cap) is
+		// counted; a close because the relay is shutting down is not a
+		// refusal, only a shutdown.
+		if !errors.Is(err, ErrClosed) {
+			r.refused.Add(1)
+		}
+		nc.Close()
 	}
 }
 
@@ -1039,9 +1140,20 @@ func (r *Relay) Close() {
 		for c := range r.conns {
 			conns = append(conns, c)
 		}
+		// Sockets still presenting the access token are not registered, so
+		// the conns snapshot misses them: close them here too, or Close would
+		// wait out accessTokenTimeout for each. Their handshake goroutines
+		// then unblock into the ErrClosed path.
+		handshaking := make([]net.Conn, 0, len(r.handshaking))
+		for nc := range r.handshaking {
+			handshaking = append(handshaking, nc)
+		}
 		r.mu.Unlock()
 		if lsn != nil {
 			_ = lsn.Close()
+		}
+		for _, nc := range handshaking {
+			_ = nc.Close()
 		}
 		for _, c := range conns {
 			r.finish(c)

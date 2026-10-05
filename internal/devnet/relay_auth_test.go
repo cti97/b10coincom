@@ -113,3 +113,53 @@ func TestAStrangerOnTheRelayCannotStallTheLateJoiner(t *testing.T) {
 	assertIdenticalHistory(t, vs, h+6)
 	assertVotesAtOrAbove(t, late, uint64(h), 150*time.Second)
 }
+
+// TestValidatorsFinaliseThroughATokenProtectedRelay is audit N-8's
+// end-to-end proof: the relay runs with an AccessToken, every validator is
+// configured with the same token, and the committee finalises and a late
+// joiner catches up over the authenticated link. It is the interop the two
+// halves need - the relay side that compares the first frame by length and
+// equality, and the node side that sends the token in place of the (unused)
+// relay ID frame. A relay gate the node could not satisfy would be worse than
+// none, which is exactly why this test exists.
+func TestValidatorsFinaliseThroughATokenProtectedRelay(t *testing.T) {
+	token := []byte("integration-access-token")
+	rl := relay.New(relay.Options{AccessToken: token, MaxConnsPerIP: 16})
+	defer rl.Close()
+	if err := rl.Listen("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	raddr := rl.Addr().String()
+
+	vs := make([]*Validator, 4)
+	for i := 0; i < 3; i++ {
+		v, err := StartValidator(ValidatorConfig{Dir: t.TempDir(), Index: i, Validators: 4, RelayAccessToken: token})
+		if err != nil {
+			t.Fatal(err)
+		}
+		vs[i] = v
+		if err := v.ConnectRelay(raddr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer closeAll(vs)
+	waitAllReach(t, vs[:3], 4, 120*time.Second)
+
+	late, err := StartValidator(ValidatorConfig{Dir: t.TempDir(), Index: 3, Validators: 4, RelayAccessToken: token})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs[3] = late
+	if err := late.ConnectRelay(raddr); err != nil {
+		t.Fatal(err)
+	}
+	h := waitConvergedEqual(t, vs, 6, 150*time.Second)
+	waitAdopted(t, late, 1, 10*time.Second)
+	waitAllReach(t, vs, h+6, 150*time.Second)
+	assertIdenticalHistory(t, vs, h+6)
+	assertVotesAtOrAbove(t, late, uint64(h), 150*time.Second)
+	// The gate never refused an honest dial.
+	if got := rl.Stats().Unauthorized; got != 0 {
+		t.Fatalf("the token-protected relay counted %d unauthorized dials from the token holders", got)
+	}
+}

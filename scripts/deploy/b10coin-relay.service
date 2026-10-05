@@ -46,8 +46,15 @@ WorkingDirectory=/opt/b10coin
 # the same decision, in the same file. (NOTE: the relay's flag is --addr, not
 # --listen — --listen is the node command's optional direct-peer listener.)
 Environment=B10COIN_RELAY_ADDR=:7001
+# B10COIN_RELAY_TOKEN is the pre-shared access-token file (audit N-8). Leave it
+# EMPTY for the allowlist-only behaviour; set it (e.g. to
+# /var/lib/b10coin/relay.token, owned by b10coin, mode 0600) to require every
+# connection to present the token as its first frame. ProtectSystem=strict
+# leaves the file readable; the relay only compares its bytes.
+Environment=B10COIN_RELAY_TOKEN=
 
-ExecStart=/opt/b10coin/b10coin-relay --addr ${B10COIN_RELAY_ADDR}
+ExecStart=/opt/b10coin/b10coin-relay --addr ${B10COIN_RELAY_ADDR} \
+    --access-token-file ${B10COIN_RELAY_TOKEN}
 
 Restart=always
 RestartSec=5

@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -38,7 +39,7 @@ Usage:
                 [--max-conns-per-ip N] [--write-queue-bytes N]
                 [--write-queue-frames N]
                 [--write-timeout SECONDS] [--read-timeout SECONDS]
-                [--keepalive SECONDS]
+                [--keepalive SECONDS] [--access-token-file PATH]
   b10coin-relay --help
 
 Every validator connects OUTBOUND to this relay (inbound to a home machine
@@ -134,10 +135,24 @@ enforce any of it)
   source PREFIX by --max-conns-per-ip (default 8), so one host - or one
   routed prefix - cannot hold the registry.
 
+  --access-token-file (default unset) enables the relay's own access control
+  (audit N-8). When set, the file's bytes (a trailing newline is trimmed) are
+  the PRE-SHARED FIRST FRAME: every connection must send exactly those bytes
+  as its first frame or it is closed and counted unauthorized. The relay
+  compares length and bytes only - it still decodes nothing, so this is not a
+  second implementation of any wire semantics. This is the defence that works
+  where an IP allowlist cannot (home validators behind CGNAT, rotating
+  outbound addresses): the token is a secret both ends hold, not an address.
+  The token frame is consumed, never forwarded, and an unauthenticated
+  connection is never registered, so it receives nothing. With no token the
+  relay behaves exactly as before.
+
 Operation: run one instance per validator star, behind the VPS firewall
-allowlisting the validator IPs - the relay itself is too dumb to have an
-access policy, which is the point. Validators reconnect to it with
-exponential backoff if it restarts. Bandwidth is kilobytes per second.
+allowlisting the validator IPs where that is practical - and with
+--access-token-file as the in-process layer for the cases where it is not.
+The relay itself is too dumb to have an address policy, which is the point.
+Validators reconnect to it with exponential backoff if it restarts.
+Bandwidth is kilobytes per second.
 `
 
 func main() {
@@ -167,14 +182,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout,
-		"b10coin-relay forwarding on %s (max frame %d, max conns %d (%d per prefix), queue %d bytes / %d frames, read timeout %s, write timeout %s, keepalive %s)\n",
-		r.Addr(), opts.MaxFrameBytes, opts.MaxConns, opts.MaxConnsPerIP, opts.WriteQueueBytes, opts.WriteQueueFrames, opts.ReadTimeout, opts.WriteTimeout, opts.KeepAlive)
+		"b10coin-relay forwarding on %s (max frame %d, max conns %d (%d per prefix), queue %d bytes / %d frames, read timeout %s, write timeout %s, keepalive %s, access token %s)\n",
+		r.Addr(), opts.MaxFrameBytes, opts.MaxConns, opts.MaxConnsPerIP, opts.WriteQueueBytes, opts.WriteQueueFrames, opts.ReadTimeout, opts.WriteTimeout, opts.KeepAlive,
+		accessTokenMode(opts.AccessToken))
 
 	<-ctx.Done()
 	// Stop serving before draining: no new frames are accepted while the
 	// wait below joins every reader and writer.
 	r.Close()
 	return 0
+}
+
+// accessTokenMode describes the access-control state for the startup line
+// without ever printing the token itself.
+func accessTokenMode(token []byte) string {
+	if len(token) == 0 {
+		return "off"
+	}
+	return fmt.Sprintf("on (%d bytes, hidden)", len(token))
 }
 
 // errHelp is the sentinel parseArgs returns when the operator asked for
@@ -214,6 +239,7 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 	writeTimeout := fs.Int("write-timeout", int(relay.DefaultWriteTimeout/time.Second), "seconds a connection's write queue may stay backed up before it is closed and its queued bytes and slot released; the queue must drain to empty within it")
 	readTimeout := fs.Int("read-timeout", int(relay.DefaultReadTimeout/time.Second), "seconds one frame may take to arrive; expiry closes that connection and releases its slot")
 	keepAlive := fs.Int("keepalive", int(relay.DefaultKeepAlive/time.Second), "TCP keepalive probe period in seconds; half-open connections are reaped by the kernel after unanswered probes")
+	accessTokenFile := fs.String("access-token-file", "", "path to a file whose bytes are the pre-shared first-frame access token (audit N-8); each connection must send exactly those bytes first or be closed. Compared by length and equality; the relay decodes nothing")
 
 	err := fs.Parse(args)
 	switch {
@@ -230,6 +256,20 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 		fs.Usage()
 		return "", relay.Options{}, fmt.Errorf("unknown argument %q", fs.Arg(0))
 	}
+	var token []byte
+	if *accessTokenFile != "" {
+		data, err := os.ReadFile(*accessTokenFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "reading access-token file: %v\n", err)
+			return "", relay.Options{}, fmt.Errorf("reading access-token file %q: %w", *accessTokenFile, err)
+		}
+		// A newline at the end is an editor artifact, not part of a token.
+		token = bytes.TrimRight(data, "\r\n")
+		if len(token) == 0 {
+			fmt.Fprintln(stderr, "the access-token file is empty; remove the flag or give it at least one byte")
+			return "", relay.Options{}, fmt.Errorf("access-token file %q is empty", *accessTokenFile)
+		}
+	}
 	return *addr, relay.Options{
 		MaxFrameBytes:    *maxFrame,
 		MaxConns:         *maxConns,
@@ -239,5 +279,6 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 		WriteTimeout:     time.Duration(*writeTimeout) * time.Second,
 		ReadTimeout:      time.Duration(*readTimeout) * time.Second,
 		KeepAlive:        time.Duration(*keepAlive) * time.Second,
+		AccessToken:      token,
 	}, nil
 }

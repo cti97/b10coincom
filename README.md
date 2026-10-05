@@ -238,6 +238,7 @@ whose keys sign, and that is the security boundary:**
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
 | `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back, is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
+| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8): sent as the first frame of every `--relay` dial so a relay started with `--access-token-file` admits this node. The relay compares it by length and equality and decodes nothing |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |
@@ -290,8 +291,13 @@ committee (`--validators/--index`), whose keys are derived from public seeds
 anyone with this repository can reproduce: with a fixture committee, anyone
 can be every validator, and no property of the relay matters because forging
 needs no relay at all. That is why the deployment recipe's firewall step
-allowlists the validators' IPs and why the fixture committee must never reach
-a publicly reachable relay. If relay-only trust ever stops being acceptable
+allowlists the validators' IPs — and why the relay also supports a
+**pre-shared first-frame access token** (`--access-token-file` on the relay,
+`--relay-access-token-file` on each node), which is the layer that works
+behind CGNAT where a source-IP allowlist cannot, and why the fixture
+committee must never reach a publicly reachable relay. The token is compared
+by length and byte equality and is opaque to the relay: the relay still
+decodes nothing. If relay-only trust ever stops being acceptable
 the answer is multiple relays and direct connections — never a smarter relay,
 because a relay that understood consensus would be a relay that could be
 wrong about it.

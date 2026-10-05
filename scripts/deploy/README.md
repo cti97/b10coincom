@@ -314,6 +314,37 @@ authenticates nothing by design, so whatever can reach 7001 can flood, pin
 connection slots and censor honest votes (its `--help` records the bound it
 puts on that) — allowlisting the validators is what keeps strangers off.
 
+### 4.1 The in-process access token (audit N-8)
+
+An IP allowlist is not always usable: a home validator behind CGNAT shares a
+pool address that rotates, and the allowlist has to be edited every time it
+does. The relay therefore ALSO supports a **pre-shared first frame** — a
+token both ends hold, compared by length and equality, with no decoding:
+
+```sh
+# on the VPS, once; readable only by the service user
+printf '%s' "$(head -c 32 /dev/urandom | base64)" | sudo tee /var/lib/b10coin/relay.token >/dev/null
+sudo chown b10coin:b10coin /var/lib/b10coin/relay.token
+sudo chmod 600 /var/lib/b10coin/relay.token
+# then start the relay with the gate on:
+sudo -u b10coin /opt/b10coin/b10coin-relay --addr :7001 \
+    --access-token-file /var/lib/b10coin/relay.token
+```
+
+Every connection must send exactly those bytes (a trailing newline is
+trimmed) as its first frame or it is closed and counted `unauthorized`. The
+token frame is consumed, never forwarded, and an unauthenticated connection
+is never registered, so it receives nothing. Copy the SAME token file to
+every Pi (`scp`, mode 0600) and give each node `--relay-access-token-file`
+(§5, §6); each node sends it in place of the relay's unused ID frame.
+
+This keeps the relay's "parses nothing" property exactly: the check is a
+length comparison and a byte comparison of raw frame bytes. There is no
+decoder, no tag check and no consensus concept anywhere in the path — the
+token is opaque to the relay. Use BOTH layers where you can: the allowlist is
+the cheap outer filter, and the token is the one that survives a rotating
+CGNAT address. With no token the relay behaves exactly as before.
+
 The relay binds everything a stranger controls (frame size, connection
 count, per-connection buffers, stalled-read timeout) and authenticates
 nothing: anyone who finds the port may connect, so its abuse ceiling is

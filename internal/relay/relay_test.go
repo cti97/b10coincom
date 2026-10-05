@@ -70,6 +70,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -1180,8 +1181,9 @@ func TestRelayOptionDefaultsPinTheOperatorNumbers(t *testing.T) {
 		WriteTimeout:     30 * time.Second,
 		ReadTimeout:      2 * time.Minute,
 		KeepAlive:        15 * time.Second,
+		AccessTimeout:    5 * time.Second,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("relay defaults drifted from the documented operator numbers: got %+v, want %+v", got, want)
 	}
 	// The AGGREGATE memory bound the documents quote is DERIVED from these
@@ -1875,5 +1877,67 @@ func TestRelayFullRegistryStaysWithinTheDerivedBound(t *testing.T) {
 		r.opts.MaxConns, r.opts.WriteQueueFrames, measured, float64(measured)/(1<<20), bound, float64(bound)/(1<<20))
 	if measured > bound {
 		t.Fatalf("the full registry pinned %d bytes of heap, over the derived MaxPinnedBytes %d - the documented aggregate does not cover what the relay can hold", measured, bound)
+	}
+}
+
+// TestTheAccessTokenGateAdmitsOnlyTheTokenHolder pins audit N-8's in-process
+// access control. With a token configured, a connection that does not present
+// exactly those bytes first is closed and counted, and is NEVER registered -
+// so it can neither receive another peer's frames nor forward its own. A
+// holder is registered, and its token frame is CONSUMED, not forwarded: the
+// other peer's first frame is the real payload. Both the same-length (byte
+// comparison) and different-length (refused without comparing) refusals are
+// exercised, because a gate that only handled one would let the other shape
+// through.
+func TestTheAccessTokenGateAdmitsOnlyTheTokenHolder(t *testing.T) {
+	token := []byte("pre-shared-access-token")
+	r := startRelay(t, Options{
+		MaxFrameBytes: 4096, MaxConns: 8, MaxConnsPerIP: 8,
+		WriteQueueBytes: 1 << 16, AccessToken: token,
+	})
+
+	// A wrong token of the SAME length is refused by the byte comparison; a
+	// wrong token of a DIFFERENT length is refused on length alone.
+	sameLength := bytes.Repeat([]byte{'x'}, len(token))
+	differentLength := append([]byte("short"), token...)
+	for name, bad := range map[string][]byte{"same-length": sameLength, "different-length": differentLength} {
+		c := dial(t, r.Addr().String())
+		writeFrame(t, c, bad)
+		waitClosed(t, c, "a "+name+" wrong-token dial")
+	}
+	waitFor(t, func() bool { return r.Stats().Unauthorized == 2 }, "both wrong-token dials to be counted unauthorized")
+	if got := r.Stats().Conns; got != 0 {
+		t.Fatalf("%d wrong-token dials were registered", got)
+	}
+
+	// Two holders register, and the token frame never reaches the forwarding
+	// path.
+	a := dial(t, r.Addr().String())
+	writeFrame(t, a, token)
+	waitRegistered(t, r, 1, "the first token holder was not registered")
+	b := dial(t, r.Addr().String())
+	writeFrame(t, b, token)
+	waitRegistered(t, r, 2, "the second token holder was not registered")
+
+	writeFrame(t, a, []byte("payload"))
+	if got := readFrame(t, b, 4096); !bytes.Equal(got, []byte("payload")) {
+		t.Fatalf("the token frame leaked into the forwarding path: the peer read %q", got)
+	}
+}
+
+// TestTheRelayRefusesATokenDialThatSaysNothing is the other half of N-8's
+// gate: a socket that connects and never presents the token is ended by the
+// access deadline, counted, and never registered. The deadline is injected
+// here (150ms) so the test does not wait out the 5s production default.
+func TestTheRelayRefusesATokenDialThatSaysNothing(t *testing.T) {
+	r := startRelay(t, Options{
+		MaxFrameBytes: 4096, MaxConns: 8, MaxConnsPerIP: 8,
+		WriteQueueBytes: 1 << 16, AccessToken: []byte("token"), AccessTimeout: 150 * time.Millisecond,
+	})
+	c := dial(t, r.Addr().String())
+	waitClosed(t, c, "a dial that never presented the token")
+	waitFor(t, func() bool { return r.Stats().Unauthorized >= 1 }, "the silent dial to be counted unauthorized")
+	if got := r.Stats().Conns; got != 0 {
+		t.Fatalf("a silent dial was registered (Conns=%d)", got)
 	}
 }
