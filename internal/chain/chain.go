@@ -26,6 +26,13 @@ var (
 	ErrNotValidator    = errors.New("chain: proposer is not in the validator set")
 	ErrGenesisReplay   = errors.New("chain: replay diverged from stored state root")
 	ErrUnknownProposer = errors.New("chain: cannot determine proposer key")
+	// ErrBadTimestamp reports a block whose timestamp is not strictly greater
+	// than its parent's, or - on the consensus path - one that is not exactly
+	// the parent's plus one (audit S-8). Timestamps feed no economic rule
+	// today (epochs are height-based), but leaving them unvalidated let a
+	// proposer set any positive value, including one behind its parent, and
+	// made the timestamp a free grinding input for the next proposer draw.
+	ErrBadTimestamp = errors.New("chain: block timestamp is not valid for its parent")
 )
 
 // Chain is a validated, durably-stored block sequence. It is safe for
@@ -405,6 +412,15 @@ func (c *Chain) validateLocked(b *types.Block) (*state.State, error) {
 	if err := b.ValidateStructure(); err != nil {
 		return nil, err
 	}
+	// Strict monotonicity (audit S-8): a block's timestamp must be greater than
+	// its parent's. This is the deterministic half of the fix - it depends only
+	// on the two headers, never on a wall clock - so replay and consensus stay
+	// exact. It runs before the state transition so a bad timestamp costs no
+	// Argon2id work.
+	if b.Header.Timestamp <= c.head.Header.Timestamp {
+		return nil, fmt.Errorf("%w: block timestamp %d is not after parent timestamp %d",
+			ErrBadTimestamp, b.Header.Timestamp, c.head.Header.Timestamp)
+	}
 	if !c.isValidator(b.Header.Proposer) {
 		return nil, ErrNotValidator
 	}
@@ -464,6 +480,38 @@ func (c *Chain) ValidateNext(b *types.Block) error {
 	defer c.mu.RUnlock()
 	_, err := c.validateLocked(b)
 	return err
+}
+
+// ValidateConsensusNext is ValidateNext plus the consensus path's timestamp
+// pin (audit S-8): a block this node will prevote must carry EXACTLY the
+// parent's timestamp plus one.
+//
+// This is the second half of the S-8 fix and the stricter one. The audit
+// offered a wall-clock future bound (Timestamp <= now + drift) or pinning the
+// consensus path to parent+1. The pin was chosen because a wall-clock bound
+// would put each validator's local clock into a consensus rule: the same block
+// could be valid at one node and invalid at a clock-skewed neighbour, and a
+// replayed check could disagree with the live one. The chain's own driver
+// already builds every proposal at parent+1 (deterministic and replayable), so
+// pinning it as a rule costs honest peers nothing and removes the proposer's
+// timestamp-grinding lever (C-14) entirely: on the consensus path there is one
+// legal timestamp, not a range.
+//
+// Append deliberately keeps only the monotonic rule. The single-node/RPC path
+// (node.RunOnce) is not consensus - it stamps the block with the local clock -
+// and requiring parent+1 there would be a needless hard fork. The weaker rule
+// still refuses a timestamp behind the parent on every path.
+func (c *Chain) ValidateConsensusNext(b *types.Block) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if _, err := c.validateLocked(b); err != nil {
+		return err
+	}
+	if want := c.head.Header.Timestamp + 1; b.Header.Timestamp != want {
+		return fmt.Errorf("%w: the consensus path pins the timestamp to parent+1; got %d, want %d",
+			ErrBadTimestamp, b.Header.Timestamp, want)
+	}
+	return nil
 }
 
 // Append validates a block against the current head and state, then stores

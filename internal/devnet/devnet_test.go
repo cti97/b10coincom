@@ -529,18 +529,23 @@ func forkedCommittee(t *testing.T, fork bool) *forkNet {
 	}
 	t.Cleanup(func() { _ = b.Close() })
 
-	ts := int64(1000)
+	// Timestamps must be strictly greater than the genesis time (audit S-8:
+	// chain.Append enforces monotonicity now). The fork is still carried by a
+	// timestamp difference: fork gives the two chains different blocks at
+	// height 1, and the control keeps them byte-identical.
+	parent := a.Head().Header.Timestamp
+	tsB := parent + 1
 	if fork {
-		ts = 2000
+		tsB = parent + 2
 	}
-	bA, err := a.Build(priv, nil, 1000)
+	bA, err := a.Build(priv, nil, parent+1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Append(bA); err != nil {
 		t.Fatal(err)
 	}
-	bB, err := b.Build(priv, nil, ts)
+	bB, err := b.Build(priv, nil, tsB)
 	if err != nil {
 		t.Fatal(err)
 	}

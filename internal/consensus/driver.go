@@ -174,7 +174,13 @@ func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
 	// one transition per round for a block it knows fails the root compare.
 	// The cost statement lives with the seam itself: chain.ValidateNext's doc,
 	// "COST" paragraph (audit round 3, F4).
-	eng.SetValidate(func(b *types.Block) error { return d.ch.ValidateNext(b) })
+	//
+	// ValidateConsensusNext, not bare ValidateNext: the consensus path also
+	// pins the block timestamp to parent+1 (audit S-8), so a proposal carrying
+	// any other timestamp is nil-prevoted here rather than merely being
+	// monotonic. Every honest driver builds parent+1, so the pin never binds
+	// an honest proposer.
+	eng.SetValidate(func(b *types.Block) error { return d.ch.ValidateConsensusNext(b) })
 	if rec, ok := d.ch.LockAt(height); ok {
 		eng.restoreLock(rec.Round, rec.BlockID)
 	}

@@ -174,7 +174,9 @@ func TestRPCReadsAreSafeDuringAppends(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 80; i++ {
-		b, err := c.Build(priv, nil, int64(1_700_000_000+i))
+		// Strictly after the parent, as chain.Append now requires (audit S-8);
+		// the test is about concurrent reads during appends, not timestamps.
+		b, err := c.Build(priv, nil, c.Head().Header.Timestamp+1)
 		if err != nil {
 			t.Fatal(err)
 		}
