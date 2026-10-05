@@ -113,20 +113,26 @@ Two answers are likely:
 Copy the binaries to the machine that runs each, then install (the static
 binaries need no runtime packages; current 64-bit Raspberry Pi OS and any
 current Debian/Ubuntu VPS run them as-is — the relay "as-is" only once it is
-the architecture-matched file from the branch above):
+the architecture-matched file from the branch above). **Copy `bin/SHA256SUMS`
+too, and verify on the target before installing** — `scripts/deploy/build.sh`
+writes it over the stable names it produced, and the target check is what
+turns "I copied the right bytes" from a hope into a check (audit B-2;
+`--ignore-missing` lets the one checksum file serve a machine that received
+only some of the artifacts):
 
 ```sh
 # from the build machine — replace pi@ and vps@ with your real SSH targets
-scp bin/b10coin-relay-linux-amd64 vps@example.com:/tmp/    # x86_64 VPS (uname -m above)
-# scp bin/b10coin-relay-linux-arm64 vps@example.com:/tmp/  # aarch64 VPS: that line instead
+scp bin/SHA256SUMS bin/b10coin-relay-linux-amd64 vps@example.com:/tmp/    # x86_64 VPS (uname -m above)
+# scp bin/SHA256SUMS bin/b10coin-relay-linux-arm64 vps@example.com:/tmp/  # aarch64 VPS: that line instead
 for p in 192.0.2.11 192.0.2.12 192.0.2.13; do
-    scp bin/b10coin-linux-arm64 pi@$p:/tmp/
+    scp bin/SHA256SUMS bin/b10coin-linux-arm64 pi@$p:/tmp/
 done
 ```
 
-On the VPS:
+On the VPS (verify FIRST; a mismatch stops the install):
 
 ```sh
+cd /tmp && sha256sum -c --ignore-missing SHA256SUMS
 sudo useradd --system --home-dir /var/lib/b10coin --shell /usr/sbin/nologin b10coin || true
 sudo mkdir -p /opt/b10coin
 sudo install -m 0755 /tmp/b10coin-relay-linux-amd64 /opt/b10coin/b10coin-relay   # -arm64 on an aarch64 VPS
@@ -140,6 +146,7 @@ systemd's `StateDirectory` only guarantees the directory once the unit first
 starts:
 
 ```sh
+cd /tmp && sha256sum -c --ignore-missing SHA256SUMS
 sudo useradd --system --home-dir /var/lib/b10coin --shell /usr/sbin/nologin b10coin || true
 sudo mkdir -p /opt/b10coin
 sudo install -m 0755 /tmp/b10coin-linux-arm64 /opt/b10coin/b10coin
