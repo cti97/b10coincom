@@ -44,10 +44,18 @@ jobs:
           # drift apart (the audit's B-1: '1.23' was end-of-life).
           go-version-file: go.mod
       # -count=1 forces real test execution: without it cached results make a
-      # flaky test report green from a previous run.
+      # flaky test report green from a previous run. -timeout is the audit's
+      # T-3 ask: internal/devnet's poll loops carry wall-clock ceilings, so a
+      # slow-but-progressing run can outlive go test's default 10-minute
+      # package timeout and die with a goroutine dump — a failure that says
+      # nothing about the code. The audit's "roughly 940 s" is the tcp_test.go
+      # subset; re-measured, the package's poll ceilings now total ~1770 s
+      # (all second-literals, ~2340 s), so 20 m would still be short. 40 m
+      # clears the whole package's ceilings and is far above the measured
+      # healthy pass (~24 s), which is the only run that should ever finish.
       - run: go vet ./...
-      - run: go test -count=1 ./...
-      - run: go test -race -count=1 ./...
+      - run: go test -timeout 40m -count=1 ./...
+      - run: go test -race -timeout 40m -count=1 ./...
       - run: go build ./...
       # The milestone acceptance commands must keep printing OK with exit 0.
       # The first is the default run — its --claims default makes it pay one
