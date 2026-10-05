@@ -9,6 +9,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -188,5 +189,58 @@ func TestParseArgsReadsTheAccessTokenFile(t *testing.T) {
 	}
 	if _, _, err := parseArgs([]string{"--access-token-file", emptyPath}, &stderr); err == nil {
 		t.Fatal("an empty access-token file was accepted")
+	}
+}
+
+// writerFunc adapts a function to io.Writer for the stats test's channel.
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// TestLogStatsSurfacesTheCountersOnTheTimerAndTheSignal pins audit N-9: the
+// relay's Dropped and RefusedConns counters - the numbers that reveal the
+// relay censoring - are printed on a timer AND on demand. The line is read
+// off a channel, so the assertions are on produced output, not on a sleep.
+func TestLogStatsSurfacesTheCountersOnTheTimerAndTheSignal(t *testing.T) {
+	lines := make(chan string, 8)
+	w := writerFunc(func(p []byte) (int, error) { lines <- string(p); return len(p), nil })
+	r := relay.New(relay.Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sig := make(chan os.Signal, 1)
+	go logStats(ctx, sig, r, w, 20*time.Millisecond)
+
+	readLine := func(what string) string {
+		t.Helper()
+		select {
+		case line := <-lines:
+			return line
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: logStats wrote nothing", what)
+			return ""
+		}
+	}
+	timerLine := readLine("the timer path")
+	for _, want := range []string{"conns=", "forwarded=", "dropped=", "refused=", "unauthorized="} {
+		if !strings.Contains(timerLine, want) {
+			t.Fatalf("the stats line omits %q, so a relay silently dropping frames would still look healthy: %q", want, timerLine)
+		}
+	}
+	// The signal path writes one line per signal, immediately.
+	sig <- os.Interrupt
+	signalLine := readLine("the signal path")
+	if !strings.Contains(signalLine, "b10coin-relay stats:") {
+		t.Fatalf("the signal path wrote %q, not a stats line", signalLine)
+	}
+	cancel()
+}
+
+// TestRelayStatsLineReportsEveryCounter pins the exact fields of the line, so
+// a future edit cannot quietly drop the two counters N-9 exists for.
+func TestRelayStatsLineReportsEveryCounter(t *testing.T) {
+	got := relayStatsLine(relay.Stats{Conns: 3, Forwarded: 11, Dropped: 2, RefusedConns: 5, Unauthorized: 7})
+	want := "b10coin-relay stats: conns=3 forwarded=11 dropped=2 refused=5 unauthorized=7"
+	if got != want {
+		t.Fatalf("relayStatsLine = %q, want %q", got, want)
 	}
 }

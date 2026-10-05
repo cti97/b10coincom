@@ -153,7 +153,44 @@ allowlisting the validator IPs where that is practical - and with
 The relay itself is too dumb to have an address policy, which is the point.
 Validators reconnect to it with exponential backoff if it restarts.
 Bandwidth is kilobytes per second.
+
+Observability: the relay logs a stats line every 60 seconds and on SIGUSR1
+(Unix; on Windows the timer alone), because "no error and no output" is also
+what a relay silently dropping frames looks like (audit N-9). The line
+reports conns, forwarded, dropped, refused and unauthorized counts; a rising
+dropped or refused is the signal to read, not a healthy silence.
 `
+
+// defaultStatsInterval is how often the relay writes its counters line while
+// running (audit N-9). SIGUSR1 writes one on demand as well, which is the
+// operator's "what is it doing right now?" without waiting out the timer.
+const defaultStatsInterval = 60 * time.Second
+
+// relayStatsLine renders one Stats reading as the single line both the timer
+// and the signal path print. It is a function so the test pins the exact
+// fields - Dropped and RefusedConns are the counters that reveal the relay
+// censoring (N-2's history), and a line that omit them is worse than silence.
+func relayStatsLine(s relay.Stats) string {
+	return fmt.Sprintf("b10coin-relay stats: conns=%d forwarded=%d dropped=%d refused=%d unauthorized=%d",
+		s.Conns, s.Forwarded, s.Dropped, s.RefusedConns, s.Unauthorized)
+}
+
+// logStats writes one counters line every interval and one for every value on
+// sig, until ctx is cancelled. It never touches the relay's hot path.
+func logStats(ctx context.Context, sig <-chan os.Signal, r *relay.Relay, w io.Writer, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fmt.Fprintln(w, relayStatsLine(r.Stats()))
+		case <-sig:
+			fmt.Fprintln(w, relayStatsLine(r.Stats()))
+		}
+	}
+}
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -185,6 +222,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		"b10coin-relay forwarding on %s (max frame %d, max conns %d (%d per prefix), queue %d bytes / %d frames, read timeout %s, write timeout %s, keepalive %s, access token %s)\n",
 		r.Addr(), opts.MaxFrameBytes, opts.MaxConns, opts.MaxConnsPerIP, opts.WriteQueueBytes, opts.WriteQueueFrames, opts.ReadTimeout, opts.WriteTimeout, opts.KeepAlive,
 		accessTokenMode(opts.AccessToken))
+
+	// The stats line on a timer and on SIGUSR1 (audit N-9). "No error and no
+	// output" is also what a relay quietly dropping frames looks like, so
+	// silence is not the healthy signal the older README claimed it was.
+	statsSig := make(chan os.Signal, 1)
+	notifyStatsSignal(statsSig)
+	defer signal.Stop(statsSig)
+	go logStats(ctx, statsSig, r, stderr, defaultStatsInterval)
 
 	<-ctx.Done()
 	// Stop serving before draining: no new frames are accepted while the

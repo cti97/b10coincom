@@ -269,13 +269,22 @@ sudo -u b10coin /opt/b10coin/b10coin-relay --addr :7001
 ```
 
 `--addr` is the relay's listen address (`:7001`, all interfaces, is the
-default and what the rest of this recipe assumes). One line, then silence —
-**a relay with no error and no output is healthy**; every validator message
-that arrives is forwarded onward untouched and unlogged:
+default and what the rest of this recipe assumes). Every validator message
+that arrives is forwarded onward untouched and unlogged, so the startup line
+is **not** the health signal. The relay instead logs a counters line on a
+60-second timer and on `SIGUSR1` (audit N-9):
 
 ```
-b10coin-relay forwarding on :7001 (max frame 1048576, max conns 32 (8 per prefix), queue 2097152 bytes / 4096 frames, read timeout 2m0s, write timeout 30s, keepalive 15s)
+b10coin-relay forwarding on :7001 (max frame 1048576, max conns 32 (8 per prefix), queue 2097152 bytes / 4096 frames, read timeout 2m0s, write timeout 30s, keepalive 15s, access token off)
+b10coin-relay stats: conns=3 forwarded=18244 dropped=0 refused=0 unauthorized=0
 ```
+
+**A rising `dropped`, `refused` or `unauthorized` is the signal to read.**
+"no error and no output" is also exactly what a relay silently censoring
+honest votes looks like, and the counters are the only place the difference
+shows. `kill -USR1 $(pidof b10coin-relay)` prints a line on demand (Unix; on
+Windows the 60-second timer is all there is). §8's failure table reads these
+numbers.
 
 At the relay's defaults the memory a stranger can pin is
 `max-conns × (write-queue-bytes + write-queue-frames × 32 + 2 × max-frame-bytes)`
