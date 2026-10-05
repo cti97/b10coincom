@@ -281,11 +281,21 @@ func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
 // cumulative - each accepted transaction is inside the running state the next
 // probe starts from, so a candidate may chain onto its accepted siblings
 // (transfers with nonces 0 and 1 both survive; probing each against the bare
-// head state would evict the second). Equivalent-but-quadratic alternative:
-// probing every candidate through Probe(accepted... + candidate) re-derives and
-// re-verifies the accepted prefix's signatures per candidate, which on a
-// full MaxTxsPerBlock mempool is hours of ed25519 per block - a DoS the
-// one-base form avoids.
+// head state would evict the second).
+//
+// COST (audit S-6): the base is mutated IN PLACE by state.ApplyTx, so the
+// account map is cloned ONCE for the whole candidate list, not once per
+// candidate. ApplyTx's contract is that every validation runs before the first
+// write, so a rejected candidate leaves the running state untouched and the
+// next candidate still starts from valid state; that contract is load-bearing
+// here and is verified rather than trusted - see
+// state.TestApplyTxLeavesNoPartialWriteOnEveryFailurePath. Per candidate the
+// cost is one signature verification plus the transition's own writes, not a
+// full account-map copy (O(candidates × accounts) before this change, with up
+// to MaxTxsPerBlock = 10,000 candidates). A candidate that cannot apply is
+// dropped ALONE and leaves no trace on the running state; it does not discard
+// its valid siblings, and it is gone for good once the caller's Take does not
+// see it again - the caller owns what eviction means for its pool.
 //
 // The per-block claim bound is deliberately NOT applied here and its callers
 // must not duplicate it: state.ApplyBlock enforces it before any Argon2id
@@ -295,24 +305,21 @@ func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
 // a second claim rule that could drift from the state machine's; the two
 // layers this side of ApplyBlock stay exactly where they are.
 //
-// A candidate that cannot apply is dropped ALONE: it does not discard its
-// valid siblings, and it is gone for good once the caller's Take does not see
-// it again - the caller owns what eviction means for its pool. An error
-// return means the empty head+1 transition itself failed, so nothing applies
-// and every candidate was lost by the caller's bookkeeping; the caller is
-// expected to return its candidates to wherever they came from.
+// An error return means the empty head+1 transition itself failed, so nothing
+// applies and every candidate was lost by the caller's bookkeeping; the caller
+// is expected to return its candidates to wherever they came from.
 func (c *Chain) SelectApplicable(candidates []types.Tx) ([]types.Tx, error) {
+	// Probe returns a fresh state (advanceLocked clones before applying), so it
+	// is the caller's to mutate; no further clone is needed.
 	base, err := c.Probe(nil)
 	if err != nil {
 		return nil, err
 	}
 	valid := make([]types.Tx, 0, len(candidates))
 	for i := range candidates {
-		next, err := base.ApplyBlock([]types.Tx{candidates[i]})
-		if err != nil {
-			continue // evict: it cannot apply at this state
+		if err := base.ApplyTx(&candidates[i]); err != nil {
+			continue // evict: it cannot apply at this state, leaving base unchanged
 		}
-		base = next
 		valid = append(valid, candidates[i])
 	}
 	return valid, nil

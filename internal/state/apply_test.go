@@ -156,6 +156,185 @@ func TestFailedTxDoesNotMutateState(t *testing.T) {
 	}
 }
 
+// snapshotOf returns a full copy of a state's account set. It is the strongest
+// "unchanged" comparison available: the state root can in principle coincide
+// after a write-then-revert, while a per-address snapshot cannot.
+func snapshotOf(s *State) map[types.Address]Account {
+	out := make(map[types.Address]Account, s.Len())
+	for a, acc := range s.accounts {
+		out[a] = acc
+	}
+	return out
+}
+
+// TestApplyTxLeavesNoPartialWriteOnEveryFailurePath verifies the contract
+// SelectApplicable's clone-once fix rests on (audit S-6): ApplyTx runs every
+// validation before its first write, so a rejected transaction leaves the
+// receiver EXACTLY unchanged and the next candidate can apply on top of it.
+// The test does not trust the doc comment: it snapshots every account before
+// the call and compares afterwards, for every rejection path, including the
+// LAST check each transition performs before writing (the recipient-overflow
+// guard in applyTransfer and the faucet-empty and claimant-overflow guards in
+// applyFaucetClaim). A regression that wrote before one of those checks would
+// leave a partial debit and fail here.
+func TestApplyTxLeavesNoPartialWriteOnEveryFailurePath(t *testing.T) {
+	type c struct {
+		name  string
+		build func(t *testing.T) (*State, *types.Tx)
+		want  error
+	}
+
+	signClaim := func(pub, priv []byte, epoch, nonce, powNonce, fee uint64) *types.Tx {
+		tx := &types.Tx{
+			Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
+			Nonce: nonce, Fee: fee, Epoch: epoch, PowNonce: powNonce,
+		}
+		h := tx.SigningHash(testChain())
+		tx.Sig = crypto.Sign(priv, h[:])
+		return tx
+	}
+
+	cases := []c{
+		{"transfer: bad signature", func(t *testing.T) (*State, *types.Tx) {
+			from, pub, priv := keypair(t)
+			to, _, _ := keypair(t)
+			s := New()
+			s.Set(from, Account{Balance: 100})
+			tx := transfer(t, pub, priv, from, 0, 10, to)
+			tx.Sig[0] ^= 0xFF
+			return s, tx
+		}, types.ErrBadSignature},
+		{"transfer: zero amount", func(t *testing.T) (*State, *types.Tx) {
+			from, pub, priv := keypair(t)
+			to, _, _ := keypair(t)
+			s := New()
+			s.Set(from, Account{Balance: 100})
+			return s, transfer(t, pub, priv, from, 0, 0, to)
+		}, ErrZeroAmount},
+		{"transfer: self transfer", func(t *testing.T) (*State, *types.Tx) {
+			from, pub, priv := keypair(t)
+			s := New()
+			s.Set(from, Account{Balance: 100})
+			return s, transfer(t, pub, priv, from, 0, 10, from)
+		}, ErrSelfTransfer},
+		{"transfer: fee below the minimum", func(t *testing.T) (*State, *types.Tx) {
+			from, pub, priv := keypair(t)
+			to, _, _ := keypair(t)
+			s := NewWithParams(Params{MinFee: 10})
+			s.Set(from, Account{Balance: 100})
+			return s, transfer(t, pub, priv, from, 0, 10, to) // fee 0 < 10
+		}, ErrFeeTooLow},
+		{"transfer: nonce does not match", func(t *testing.T) (*State, *types.Tx) {
+			from, pub, priv := keypair(t)
+			to, _, _ := keypair(t)
+			s := New()
+			s.Set(from, Account{Balance: 100, Nonce: 5})
+			return s, transfer(t, pub, priv, from, 3, 10, to)
+		}, ErrBadNonce},
+		{"transfer: insufficient funds", func(t *testing.T) (*State, *types.Tx) {
+			from, pub, priv := keypair(t)
+			to, _, _ := keypair(t)
+			s := New()
+			s.Set(from, Account{Balance: 10})
+			return s, transfer(t, pub, priv, from, 0, 100, to)
+		}, ErrInsufficientFunds},
+		{"transfer: recipient overflow (last check before any write)", func(t *testing.T) (*State, *types.Tx) {
+			from, pub, priv := keypair(t)
+			to, _, _ := keypair(t)
+			s := New()
+			s.Set(from, Account{Balance: 100})
+			s.Set(to, Account{Balance: math.MaxUint64})
+			return s, transfer(t, pub, priv, from, 0, 1, to)
+		}, ErrBalanceOverflow},
+		{"claim: carries a fee", func(t *testing.T) (*State, *types.Tx) {
+			pub, priv, err := crypto.GenerateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := NewWithParams(testParams(t))
+			return s, signClaim(pub, priv, 1, 0, 0, 1)
+		}, ErrClaimCarriesFee},
+		{"claim: wrong epoch", func(t *testing.T) (*State, *types.Tx) {
+			p := testParams(t)
+			s := NewWithParams(p)
+			s.Set(p.FaucetAddress, Account{Balance: 1_000})
+			return s, solvedClaim(t, p, 2, 0) // state height 0 derives epoch 1
+		}, ErrWrongEpoch},
+		{"claim: already claimed this epoch", func(t *testing.T) (*State, *types.Tx) {
+			p := testParams(t)
+			s := NewWithParams(p)
+			s.Set(p.FaucetAddress, Account{Balance: 1_000})
+			tx := solvedClaim(t, p, 1, 0)
+			s.Set(tx.From, Account{ClaimedEpoch: 1})
+			return s, tx
+		}, ErrClaimTooSoon},
+		{"claim: nonce does not match", func(t *testing.T) (*State, *types.Tx) {
+			p := testParams(t)
+			s := NewWithParams(p)
+			s.Set(p.FaucetAddress, Account{Balance: 1_000})
+			tx := solvedClaim(t, p, 1, 0)
+			s.Set(tx.From, Account{Nonce: 5})
+			return s, tx
+		}, ErrBadNonce},
+		{"claim: bad proof of work", func(t *testing.T) (*State, *types.Tx) {
+			p := testParams(t)
+			s := NewWithParams(p)
+			s.Set(p.FaucetAddress, Account{Balance: 1_000})
+			pub, priv, err := crypto.GenerateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var bad uint64
+			for bad = 0; faucet.MeetsTarget(faucet.PowDigest(pub, 1, bad, p.PowArgon2), p.PowTarget); bad++ {
+			}
+			return s, signClaim(pub, priv, 1, 0, bad, 0)
+		}, ErrBadProofOfWork},
+		{"claim: faucet empty (last check before any write)", func(t *testing.T) (*State, *types.Tx) {
+			p := testParams(t)
+			s := NewWithParams(p)
+			s.Set(p.FaucetAddress, Account{Balance: p.ClaimAmount - 1})
+			return s, solvedClaim(t, p, 1, 0)
+		}, ErrFaucetEmpty},
+		{"claim: claimant overflow (the final check before any write)", func(t *testing.T) (*State, *types.Tx) {
+			p := testParams(t)
+			s := NewWithParams(p)
+			s.Set(p.FaucetAddress, Account{Balance: 1_000})
+			tx := solvedClaim(t, p, 1, 0)
+			s.Set(tx.From, Account{Balance: math.MaxUint64})
+			return s, tx
+		}, ErrBalanceOverflow},
+		{"unsupported type", func(t *testing.T) (*State, *types.Tx) {
+			from, pub, priv := keypair(t)
+			s := New()
+			s.Set(from, Account{Balance: 100})
+			tx := &types.Tx{Type: 99, From: from, PubKey: pub}
+			h := tx.SigningHash(testChain())
+			tx.Sig = crypto.Sign(priv, h[:])
+			return s, tx
+		}, ErrUnsupportedTxType},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, tx := tc.build(t)
+			before := snapshotOf(s)
+			err := s.ApplyTx(tx)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("ApplyTx returned %v, want %v", err, tc.want)
+			}
+			after := snapshotOf(s)
+			if len(after) != len(before) {
+				t.Fatalf("a rejected transaction changed the account count: %d -> %d", len(before), len(after))
+			}
+			for a, want := range before {
+				if got, ok := after[a]; !ok || got != want {
+					t.Fatalf("a rejected transaction changed account %x: %+v -> %+v (present %v)", a[:], want, got, ok)
+				}
+			}
+		})
+	}
+}
+
 // ApplyBlock is atomic: if any transaction fails, none are applied.
 func TestApplyBlockIsAtomic(t *testing.T) {
 	from, pub, priv := keypair(t)
