@@ -139,6 +139,16 @@ type Mempool struct {
 	claims        int
 	pending       map[types.Address]int
 	pendingClaims map[types.Address]int
+	// pendingNonces records the nonces of ordinary transfers already in the
+	// pool, per sender. A transfer is admitted against head state, and head
+	// state only advances when a block executes: two transactions from one
+	// sender carrying the SAME nonce both pass the "not below the head nonce"
+	// floor, so without this set both would sit in the pool, be handed to two
+	// different block builders, and one would fail at execution time - or, on
+	// one proposer, produce a block whose transactions cannot all apply. The
+	// per-sender cap already bounds how MANY transfers one sender holds; this
+	// set makes the nonces distinct. (audit S-9)
+	pendingNonces map[types.Address]map[uint64]struct{}
 }
 
 // New builds a pool of max transactions for the chain identified by
@@ -162,6 +172,7 @@ func New(max int, genesisHash [32]byte, head HeadView) *Mempool {
 		seen:          make(map[[32]byte]struct{}),
 		pending:       make(map[types.Address]int),
 		pendingClaims: make(map[types.Address]int),
+		pendingNonces: make(map[types.Address]map[uint64]struct{}),
 	}
 }
 
@@ -240,6 +251,15 @@ func (m *Mempool) admitTransfer(tx *types.Tx, st *state.State) error {
 	if acc := st.Get(tx.From); tx.Nonce < acc.Nonce {
 		return fmt.Errorf("%w: nonce %d, account nonce is %d", state.ErrBadNonce, tx.Nonce, acc.Nonce)
 	}
+	// The same nonce already pending from this sender: the two transactions
+	// are distinct (their IDs differ, so dedup does not catch them) but only
+	// one can ever execute at that nonce. Refuse the second here rather than
+	// let a block carry a transaction it cannot apply. (audit S-9)
+	if set := m.pendingNonces[tx.From]; set != nil {
+		if _, dup := set[tx.Nonce]; dup {
+			return fmt.Errorf("%w: nonce %d is already pending from %x", state.ErrBadNonce, tx.Nonce, tx.From[:])
+		}
+	}
 	return nil
 }
 
@@ -301,6 +321,14 @@ func (m *Mempool) insert(tx types.Tx, sender types.Address) {
 	m.txs = append(m.txs, entry{tx: tx, sender: sender})
 	m.seen[tx.ID()] = struct{}{}
 	m.pending[sender]++
+	if tx.Type == types.TxTransfer {
+		set := m.pendingNonces[sender]
+		if set == nil {
+			set = make(map[uint64]struct{})
+			m.pendingNonces[sender] = set
+		}
+		set[tx.Nonce] = struct{}{}
+	}
 	if tx.Type == types.TxFaucetClaim {
 		m.claims++
 		m.pendingClaims[sender]++
@@ -314,6 +342,14 @@ func (m *Mempool) forget(e entry) {
 		delete(m.pending, e.sender)
 	} else {
 		m.pending[e.sender] = n - 1
+	}
+	if e.tx.Type == types.TxTransfer {
+		if set := m.pendingNonces[e.sender]; set != nil {
+			delete(set, e.tx.Nonce)
+			if len(set) == 0 {
+				delete(m.pendingNonces, e.sender)
+			}
+		}
 	}
 	if e.tx.Type == types.TxFaucetClaim {
 		m.claims--
