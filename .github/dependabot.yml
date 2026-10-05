@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # The module graph is tiny (blake3, x/crypto and their indirects); a weekly
+  # cadence keeps security fixes arriving without the noise of daily PRs.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  # Actions are SHA-pinned in ci.yml; Dependabot tracks the tags and opens
+  # update PRs when a new release has been reviewed upstream — the pin stays
+  # between those PRs.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

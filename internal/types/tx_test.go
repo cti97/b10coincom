@@ -54,7 +54,8 @@ func TestTxEncodeDecodeRoundTrip(t *testing.T) {
 func TestTxIDIsDeterministicAndSensitive(t *testing.T) {
 	a := signedTransfer(t, 1, 100)
 	b := signedTransfer(t, 1, 100)
-	if a.ID() != a.ID() {
+	first, second := a.ID(), a.ID()
+	if first != second {
 		t.Fatal("ID is not deterministic")
 	}
 	if a.ID() == b.ID() {

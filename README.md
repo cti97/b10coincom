@@ -32,9 +32,12 @@ claim in seconds — never a consensus mechanism.
 
 ## Quick start
 
-Requires Go 1.23+. Two direct external dependencies:
-`lukechampine.com/blake3` (v1.4.1) and `golang.org/x/crypto` (v0.41.0, for
-Argon2id). From the repository root:
+Requires a supported Go — the `go` directive in `go.mod` is the floor
+(currently **1.26**) and the `toolchain` line names the exact toolchain the
+project builds with (currently **1.27.1**), so a plain `go` command uses
+exactly that toolchain, on every machine, automatically. Two direct external
+dependencies: `lukechampine.com/blake3` (v1.4.1) and `golang.org/x/crypto`
+(v0.41.0, for Argon2id). From the repository root:
 
 ```sh
 make build                                # go build -o bin/b10coin ./cmd/b10coin
@@ -679,16 +682,36 @@ The rule it enforces: agreeing-by-hash while stalled proves nothing, so a
 PASS requires every height to have *increased* **and** all validators to name
 the identical block at one height. See `scripts/deploy/README.md` §7.
 
+## License
+
+MIT — see [LICENSE](LICENSE). **This license is a decision still open for
+review**: it was chosen as the most permissive reasonable option among the
+audit's suggestions (MIT, Apache-2.0, BSD-3) so the multi-platform
+participation goal — anyone may legally run, copy and redistribute a node —
+holds by default, and because a from-scratch educational codebase gains
+little from Apache-2.0's patent-grant machinery at this stage. If the
+maintainers want the explicit patent grant for a public crypto codebase,
+switching to Apache-2.0 is a one-file change; the point is that it is a
+decision to make deliberately, not a default to be buried in a commit.
+
+## Reporting a vulnerability
+
+See [SECURITY.md](SECURITY.md): GitHub private security advisories, scope and
+non-goals. In particular: the fixture keys are public by design, and this is
+a valueless testnet.
+
 ## Checks
 
 `go test -count=1 ./...` and `go test -race ./...` are green across the test
-suite, and `go vet ./...` and `gofmt` are clean on this repository as
-committed. CI (`.github/workflows/ci.yml`) runs all three acceptance commands
-on every push and pull request as well, on Go 1.23:
+suite, and `go vet ./...`, `gofmt`, `staticcheck` and `govulncheck` are clean
+on this repository as committed. CI (`.github/workflows/ci.yml`) runs all
+three acceptance commands on every push and pull request as well, on the
+toolchain go.mod pins: currently Go 1.27.1 over language version 1.26.
 
 | Check | Command |
 |---|---|
 | Static analysis | `go vet ./...` |
+| Lint gate (the `lint` job) | `gofmt -l cmd internal` (must print nothing); `go mod tidy` (must leave no diff); `staticcheck` pinned to module version v0.8.1 (release 2026.2.1); `govulncheck` pinned to v1.8.0 — both run via `go run tool@version` so they never enter go.mod |
 | Test suite | `go test ./...` |
 | Build | `go build ./...` |
 | Cross-platform, per target | `GOOS=<os> GOARCH=<arch> go build ./...` and `go vet ./...` for each of the six targets (the matrix job) |
@@ -696,6 +719,11 @@ on every push and pull request as well, on Go 1.23:
 | Acceptance check, default run | `go run ./cmd/b10coin devnet --blocks 100` |
 | Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
+
+Actions in CI are pinned to commit SHAs, not mutable tags, and the whole
+workflow's token is scoped to `contents: read`
+(`.github/workflows/ci.yml`); Dependabot watches Go modules and GitHub
+Actions weekly (`.github/dependabot.yml`).
 
 Makefile targets: `make test`, `make race`, `make build` (produces
 `bin/b10coin`), `make release` (both binaries for all six targets into

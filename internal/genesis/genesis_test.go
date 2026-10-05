@@ -17,7 +17,11 @@ import (
 
 func TestGenesisHashIsDeterministic(t *testing.T) {
 	g := Devnet()
-	if g.Hash() != g.Hash() {
+	// Two separate calls, two variables: SA4000 flags `f(x) != f(x)` as an
+	// identical-expression comparison, and naming the two results also states
+	// the property under test (call-to-call determinism) more plainly.
+	first, second := g.Hash(), g.Hash()
+	if first != second {
 		t.Fatal("genesis hash is not deterministic")
 	}
 }

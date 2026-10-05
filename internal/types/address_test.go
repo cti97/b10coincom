@@ -40,13 +40,15 @@ func TestAddressHasPrefixAndIsLowercase(t *testing.T) {
 
 func TestAddressIsDeterministic(t *testing.T) {
 	pub := randomPub(t)
-	if AddressFromPub(pub) != AddressFromPub(pub) {
+	a, b := AddressFromPub(pub), AddressFromPub(pub)
+	if a != b {
 		t.Fatal("AddressFromPub is not deterministic")
 	}
 }
 
 func TestAddressDiffersForDifferentKeys(t *testing.T) {
-	if AddressFromPub(randomPub(t)) == AddressFromPub(randomPub(t)) {
+	a, b := AddressFromPub(randomPub(t)), AddressFromPub(randomPub(t))
+	if a == b {
 		t.Fatal("two distinct keys produced the same address")
 	}
 }
