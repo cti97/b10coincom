@@ -130,6 +130,12 @@ type Mempool struct {
 	// to isolate the stateful checks from the puzzle cost; the shipped value is
 	// pinned by TestDefaultPreTargetIsTheFaucetPolicy.
 	preTarget [32]byte
+	// verifyHook, when non-nil, replaces the real signature check in verify. It
+	// exists so a test can inject a blocking check and prove deterministically
+	// that verification happens OUTSIDE the pool lock (audit S-10). It is nil in
+	// production and unexported, so no caller outside this package can weaken
+	// admission.
+	verifyHook func(*types.Tx) error
 
 	mu   sync.RWMutex
 	txs  []entry
@@ -193,6 +199,17 @@ func claimCapacity(max int) int {
 	return c
 }
 
+// verify runs one transaction's signature check. It is the only place the
+// chain identifier meets the transaction, and it is a method so the test hook
+// above can substitute a deterministic check without a caller ever being able
+// to (audit S-10).
+func (m *Mempool) verify(tx *types.Tx) error {
+	if m.verifyHook != nil {
+		return m.verifyHook(tx)
+	}
+	return tx.VerifySignature(m.genesisHash)
+}
+
 // Add validates and inserts transactions, returning one error per input in the
 // same order. Insertion of one transaction never blocks another.
 //
@@ -201,16 +218,32 @@ func claimCapacity(max int) int {
 // the batch, because admission is a policy against the state the transactions
 // arrived into and one consistent snapshot is what a batch deserves.
 func (m *Mempool) Add(txs []types.Tx) []error {
+	// Phase 1, WITHOUT the pool lock: every signature check. Ed25519
+	// verification dominates the cost of admission, and a batch may carry
+	// MaxTxsPerBlock = 10,000 transactions (the consensus driver's re-add after
+	// a failed block). Holding the write lock across them - the pre-fix shape -
+	// blocked /status (Len's RLock) and Take for seconds (audit S-10). m.verify
+	// is immutable after New, so reading it here is safe.
+	sigErrs := make([]error, len(txs))
+	for i := range txs {
+		sigErrs[i] = m.verify(&txs[i])
+	}
+
+	// Phase 2, under the lock: the cheap stateful admission and the inserts.
+	// Everything that touches the pool's own maps - dedup, capacity, the
+	// per-sender counts, the pending-nonce set - is serialised here, and the
+	// head snapshot is taken here so a batch is judged against one consistent
+	// state, exactly as before.
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	errs := make([]error, len(txs))
 	st, headHeight := m.head()
 	for i := range txs {
-		tx := txs[i]
-		if err := tx.VerifySignature(m.genesisHash); err != nil {
+		if err := sigErrs[i]; err != nil {
 			errs[i] = err
 			continue
 		}
+		tx := txs[i]
 		id := tx.ID()
 		if _, dup := m.seen[id]; dup {
 			errs[i] = ErrDuplicate
