@@ -52,10 +52,20 @@ import (
 // frame — the pull reads silence either way. OnHello observes a peer's
 // height announcement; nil means hello frames are merely counted with the
 // unknown frames.
+//
+// AsyncServe, when non-nil, receives a decoded BLOCK_SYNC request INSTEAD of
+// the router serving it inline (audit C-4). Serving a request costs up to a
+// window of disk reads and quorum-many Ed25519 verifies per height; run on the
+// transport's dispatch goroutine it holds the dispatch lock and stalls every
+// consensus frame behind it — especially on a relay star, where one connection
+// carries the whole committee. The node layer installs a bounded worker pool
+// here. A nil AsyncServe keeps the inline path the deterministic in-process
+// simulator depends on.
 type MessageRouter struct {
-	Sync      *Syncer
-	SendReply func(peer transport.PeerID, frame []byte) error
-	OnHello   func(peer transport.PeerID, h *wire.Hello)
+	Sync       *Syncer
+	SendReply  func(peer transport.PeerID, frame []byte) error
+	OnHello    func(peer transport.PeerID, h *wire.Hello)
+	AsyncServe func(m transport.Message)
 
 	unknown   atomic.Uint64
 	hellos    atomic.Uint64
@@ -89,9 +99,17 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 	if r.Sync != nil {
 		// A BLOCK_SYNC request: served out of the local chain, the reply
 		// sent back to the one asker through SendReply. Refusal is silence
-		// (the wire has no negative response) - Handle's contract.
+		// (the wire has no negative response) - Handle's contract. With
+		// AsyncServe installed the serving happens on the node's worker, off
+		// this dispatch goroutine (audit C-4): the router hands the frame
+		// over and returns, so a slow Answer cannot hold the transport's
+		// dispatch lock.
 		if _, err := wire.DecodeBlockSyncReq(m.Data); err == nil {
 			r.servedReq.Add(1)
+			if r.AsyncServe != nil {
+				r.AsyncServe(m)
+				return false
+			}
 			if frame, ok := r.Sync.Handle(m.Data); ok {
 				if r.SendReply != nil {
 					_ = r.SendReply(m.From, frame) // a lost reply is the pull's retry, not an error here

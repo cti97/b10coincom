@@ -245,8 +245,14 @@ func encodedVotes(votes []*Vote) [][]byte {
 	return raw
 }
 
-func unitResp(units ...wire.BlockSyncUnit) []byte {
-	return wire.EncodeBlockSyncResp(&wire.BlockSyncResp{Units: units})
+// testNonce is a per-test-process unique nonce source: the syncer remembers
+// served (requester, nonce) pairs, so every helper-built request must carry a
+// distinct one or the second Answer of the same shape would be refused as a
+// replay.
+var testNonce atomic.Uint64
+
+func unitResp(nonce uint64, units ...wire.BlockSyncUnit) []byte {
+	return wire.EncodeBlockSyncResp(&wire.BlockSyncResp{Nonce: nonce, Units: units})
 }
 
 // ---------------------------------------------------------------- committee
@@ -458,10 +464,11 @@ func (w *certWorld) assertUnchanged(where string, height uint64, headID [32]byte
 // ------------------------------------------------------------ small pins
 
 // syncSignReq signs a request the way PullAndAdopt does, for tests that talk
-// to Answer directly.
+// to Answer directly. The nonce is unique per call: the syncer's replay set
+// keys on (requester, nonce), so a repeated fixture request must not reuse one.
 func syncSignReq(t *testing.T, priv ed25519PrivateKey, from, to uint64) *wire.BlockSyncReq {
 	t.Helper()
-	req := &wire.BlockSyncReq{From: from, To: to, Requester: priv.Public().(ed25519PublicKey)}
+	req := &wire.BlockSyncReq{From: from, To: to, Nonce: testNonce.Add(1), Requester: priv.Public().(ed25519PublicKey)}
 	h := syncReqHash(req)
 	req.Sig = crypto.Sign(priv, h[:])
 	return req
@@ -578,8 +585,8 @@ func TestPullAndAdoptRefusesAZeroVoteBlock(t *testing.T) {
 	}
 	height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
 
-	w.answer = func(*wire.BlockSyncReq) []byte {
-		return unitResp(wire.BlockSyncUnit{Block: atk.Encode(), Round: 7}) // one block, zero votes
+	w.answer = func(req *wire.BlockSyncReq) []byte {
+		return unitResp(req.Nonce, wire.BlockSyncUnit{Block: atk.Encode(), Round: 7}) // one block, zero votes
 	}
 	w.rig.start()
 	err = w.pull.PullAndAdopt(1)
@@ -609,8 +616,8 @@ func TestPullAndAdoptRefusesACertificateShortOfQuorum(t *testing.T) {
 		// Two VALID, correctly signed, correctly placed precommits: still
 		// below the quorum of three the live commit rule needs.
 		cert := []*Vote{craftPrecommit(t, 0, atk, 1, 7), craftPrecommit(t, 1, atk, 1, 7)}
-		w.answer = func(*wire.BlockSyncReq) []byte {
-			return unitResp(wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes(cert)})
+		w.answer = func(req *wire.BlockSyncReq) []byte {
+			return unitResp(req.Nonce, wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes(cert)})
 		}
 		w.rig.start()
 		height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -633,8 +640,8 @@ func TestPullAndAdoptRefusesACertificateShortOfQuorum(t *testing.T) {
 		// what stops two colluders manufacturing a quorum the committee
 		// never gave.
 		v := craftPrecommit(t, 0, atk, 1, 7)
-		w.answer = func(*wire.BlockSyncReq) []byte {
-			return unitResp(wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes([]*Vote{v, v, v})})
+		w.answer = func(req *wire.BlockSyncReq) []byte {
+			return unitResp(req.Nonce, wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes([]*Vote{v, v, v})})
 		}
 		w.rig.start()
 		height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -663,8 +670,8 @@ func TestPullAndAdoptRefusesACertificateShortOfQuorum(t *testing.T) {
 			t.Fatalf("fixture: the stranger's vote was not refused as non-member (%v)", err)
 		}
 		cert := []*Vote{craftPrecommit(t, 0, atk, 1, 7), craftPrecommit(t, 1, atk, 1, 7), sv}
-		w.answer = func(*wire.BlockSyncReq) []byte {
-			return unitResp(wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes(cert)})
+		w.answer = func(req *wire.BlockSyncReq) []byte {
+			return unitResp(req.Nonce, wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes(cert)})
 		}
 		w.rig.start()
 		height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -686,8 +693,8 @@ func TestPullAndAdoptRefusesACertificateShortOfQuorum(t *testing.T) {
 		// 7: re-tallying at the named round refuses the mismatch, so a
 		// certificate cannot relocate its own votes.
 		cert := []*Vote{craftPrecommit(t, 0, atk, 1, 9), craftPrecommit(t, 1, atk, 1, 9), craftPrecommit(t, 2, atk, 1, 9)}
-		w.answer = func(*wire.BlockSyncReq) []byte {
-			return unitResp(wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes(cert)})
+		w.answer = func(req *wire.BlockSyncReq) []byte {
+			return unitResp(req.Nonce, wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes(cert)})
 		}
 		w.rig.start()
 		height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -715,8 +722,8 @@ func TestPullAndAdoptRefusesACertificateShortOfQuorum(t *testing.T) {
 		// A full quorum precommitted a DIFFERENT block: none of it is
 		// evidence for the bytes that were served.
 		cert := quorumCertFor(t, other, 1, 7)
-		w.answer = func(*wire.BlockSyncReq) []byte {
-			return unitResp(wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes(cert)})
+		w.answer = func(req *wire.BlockSyncReq) []byte {
+			return unitResp(req.Nonce, wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: encodedVotes(cert)})
 		}
 		w.rig.start()
 		height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -734,8 +741,8 @@ func TestPullAndAdoptRefusesACertificateShortOfQuorum(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		w.answer = func(*wire.BlockSyncReq) []byte {
-			return unitResp(wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: [][]byte{{0x01}, {0x02}, {0x03}}})
+		w.answer = func(req *wire.BlockSyncReq) []byte {
+			return unitResp(req.Nonce, wire.BlockSyncUnit{Block: atk.Encode(), Round: 7, Votes: [][]byte{{0x01}, {0x02}, {0x03}}})
 		}
 		w.rig.start()
 		height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -762,8 +769,8 @@ func TestPullAndAdoptAdoptsAProperlyCertifiedBlock(t *testing.T) {
 	// correct placement. It is exactly the evidence a live commit would have
 	// produced.
 	cert := quorumCertFor(t, blk, 1, 7)
-	w.answer = func(*wire.BlockSyncReq) []byte {
-		return unitResp(wire.BlockSyncUnit{Block: blk.Encode(), Round: 7, Votes: encodedVotes(cert)})
+	w.answer = func(req *wire.BlockSyncReq) []byte {
+		return unitResp(req.Nonce, wire.BlockSyncUnit{Block: blk.Encode(), Round: 7, Votes: encodedVotes(cert)})
 	}
 	w.rig.start()
 
@@ -793,8 +800,8 @@ func TestThePullStopsAtTheFirstUncertifiedUnit(t *testing.T) {
 		t.Fatal(err)
 	}
 	cert := quorumCertFor(t, b1, 1, 5)
-	w.answer = func(*wire.BlockSyncReq) []byte {
-		return unitResp(
+	w.answer = func(req *wire.BlockSyncReq) []byte {
+		return unitResp(req.Nonce,
 			wire.BlockSyncUnit{Block: b1.Encode(), Round: 5, Votes: encodedVotes(cert)}, // certified
 			wire.BlockSyncUnit{Block: b1.Encode(), Round: 5},                            // zero votes
 			wire.BlockSyncUnit{Block: b1.Encode(), Round: 5, Votes: encodedVotes(cert)},
@@ -908,8 +915,8 @@ func TestACertifiedPoisonBlockStillFailsAppend(t *testing.T) {
 			// The certificate is REAL - a quorum of the committee signed
 			// precommits for exactly these bytes - and the pull still must
 			// not adopt: the certificate gate passes, Append's does not.
-			w.answer = func(*wire.BlockSyncReq) []byte {
-				return unitResp(wire.BlockSyncUnit{Block: bad.Encode(), Round: 2, Votes: encodedVotes(quorumCertFor(t, bad, bad.Header.Height, 2))})
+			w.answer = func(req *wire.BlockSyncReq) []byte {
+				return unitResp(req.Nonce, wire.BlockSyncUnit{Block: bad.Encode(), Round: 2, Votes: encodedVotes(quorumCertFor(t, bad, bad.Header.Height, 2))})
 			}
 			w.rig.start()
 			height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -930,8 +937,8 @@ func TestACertifiedPoisonBlockStillFailsAppend(t *testing.T) {
 func TestSyncerRefusesBytesThatAreNotABlock(t *testing.T) {
 	w := newCertWorld(t)
 	defer w.rig.halt()
-	w.answer = func(*wire.BlockSyncReq) []byte {
-		return unitResp(wire.BlockSyncUnit{Block: []byte{0xde, 0xad}, Round: 1})
+	w.answer = func(req *wire.BlockSyncReq) []byte {
+		return unitResp(req.Nonce, wire.BlockSyncUnit{Block: []byte{0xde, 0xad}, Round: 1})
 	}
 	w.rig.start()
 	height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -945,9 +952,10 @@ func TestSyncerRefusesBytesThatAreNotABlock(t *testing.T) {
 // ------------------------------------------------------- F2-adjacent pins
 
 // TestAStaleResponseDoesNotAnswerANewPull is the regression pin for the
-// synchronous-read defect: a response filed while NO pull waited must sit in
-// the slot until the next pull DRAINS it, never answer a request it was not
-// the answer to.
+// uncorrelated-response defect: a response delivered while NO pull waited is
+// dropped by Receive (there is no request for it to answer and no slot for it
+// to sit in), so the next pull - which carries a nonce this frame was never
+// the answer to - reads silence rather than the stale frame.
 func TestAStaleResponseDoesNotAnswerANewPull(t *testing.T) {
 	w := newCertWorld(t)
 	defer w.rig.halt()
@@ -958,7 +966,7 @@ func TestAStaleResponseDoesNotAnswerANewPull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stale := unitResp(wire.BlockSyncUnit{Block: blk.Encode(), Round: 3, Votes: encodedVotes(quorumCertFor(t, blk, 1, 3))})
+	stale := unitResp(1, wire.BlockSyncUnit{Block: blk.Encode(), Round: 3, Votes: encodedVotes(quorumCertFor(t, blk, 1, 3))})
 
 	delivered := make(chan struct{})
 	route := routeResp(w.pull, delivered)
@@ -991,7 +999,7 @@ func TestAStaleResponseDoesNotAnswerANewPull(t *testing.T) {
 func TestAnUndecodableResponseFrameIsSilence(t *testing.T) {
 	w := newCertWorld(t)
 	defer w.rig.halt()
-	w.answer = func(*wire.BlockSyncReq) []byte { return []byte{0x01} } // not a BLOCK_SYNC response
+	w.answer = func(req *wire.BlockSyncReq) []byte { return []byte{0x01} } // not a BLOCK_SYNC response
 	w.pull.ReplyWait = 20 * time.Millisecond
 	w.rig.start()
 	height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
@@ -1469,5 +1477,189 @@ func TestACaughtUpNodeServesItsCertificatesOnward(t *testing.T) {
 	}
 	if farCh.Head().ID() != c.pullCh.Head().ID() {
 		t.Fatal("the far node's head does not match the caught-up member's head")
+	}
+}
+
+// ------------------------------------------------- C-4/C-5 correlation pins
+
+// TestReceiveCorrelatesNonceAndSender is the C-5 proof at the boundary where a
+// response enters the syncer: only the asked peer's answer to the request
+// actually in flight is filed. Three wrong frames are built from the same
+// certified bytes and each is dropped for its own reason:
+//
+//   - the asked peer with the WRONG nonce (a late reply to another request);
+//   - a peer that was NOT asked with the RIGHT nonce;
+//   - any frame at all while no request is in flight.
+func TestReceiveCorrelatesNonceAndSender(t *testing.T) {
+	f := newCertServeFixture(t, 2)
+	s := f.server
+
+	// Construct the in-flight state: request nonce 7 was sent to peer v0.
+	// (The pull registers exactly this state before Send.)
+	ch := make(chan *wire.BlockSyncResp, 1)
+	s.reqMu.Lock()
+	s.waiting = &pendingReply{nonce: 7, peer: "v0", ch: ch}
+	s.reqMu.Unlock()
+
+	frame := func(nonce uint64) []byte {
+		return wire.EncodeBlockSyncResp(&wire.BlockSyncResp{Nonce: nonce, Units: []wire.BlockSyncUnit{{Block: []byte{0x01}}}})
+	}
+
+	// (a) The asked peer, the wrong nonce: a reply to a request that is not
+	// the one in flight. Consuming it would be the C-5 defect - a retry
+	// answered by the previous attempt's frame.
+	s.Receive("v0", frame(6))
+	if got := len(ch); got != 0 {
+		t.Fatalf("the asked peer's nonce-6 reply was consumed as the answer to the nonce-7 request: a reply answered a request it was not for")
+	}
+
+	// (b) A peer that was never asked, with the matching nonce: it knows the
+	// nonce (the request travels the wire), but it is not the peer the pull
+	// chose, so it cannot answer.
+	s.Receive("v9", frame(7))
+	if got := len(ch); got != 0 {
+		t.Fatalf("a reply from peer v9 was consumed while the pull was waiting on v0: a peer that was not asked answered")
+	}
+
+	// (c) The asked peer with the matching nonce: filed.
+	s.Receive("v0", frame(7))
+	if got := len(ch); got != 1 {
+		t.Fatalf("the asked peer's matching reply was not filed (%d filed)", got)
+	}
+
+	// (d) No request in flight: an otherwise perfect reply answers nothing.
+	<-ch
+	s.reqMu.Lock()
+	s.waiting = nil
+	s.reqMu.Unlock()
+	s.Receive("v0", frame(7))
+	if got := len(ch); got != 0 {
+		t.Fatalf("a reply was filed while no request was in flight")
+	}
+}
+
+// TestALateReplyAfterARetryAnswersNothing is the timing half of the C-5 proof,
+// over the real (asynchronous) sim transport: the first window's request is
+// withheld past ReplyWait, the retry goes out with a FRESH nonce, and only
+// then does the first request's answer arrive. It must not be consumed as the
+// retry's answer, and the certified block it carries must not be adopted.
+func TestALateReplyAfterARetryAnswersNothing(t *testing.T) {
+	w := newCertWorld(t)
+	defer w.rig.halt()
+
+	blk, err := w.pullCh.Build(testCommitteeKey(0), nil, w.pullCh.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit := wire.BlockSyncUnit{Block: blk.Encode(), Round: 3, Votes: encodedVotes(quorumCertFor(t, blk, 1, 3))}
+
+	var firstNonce uint64
+	calls := 0
+	w.answer = func(req *wire.BlockSyncReq) []byte {
+		calls++
+		if calls == 1 {
+			firstNonce = req.Nonce
+			return nil // withhold the first answer, forcing the pull's timeout
+		}
+		// The retry is answered by the FIRST request's frame, arriving late.
+		return unitResp(firstNonce, unit)
+	}
+	w.pull.ReplyWait = 20 * time.Millisecond
+	w.rig.start()
+	height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
+
+	if err := w.pull.PullAndAdopt(1); err != nil {
+		t.Fatalf("the withheld first pull errored instead of reading silence: %v", err)
+	}
+	if err := w.pull.PullAndAdopt(1); err != nil {
+		t.Fatalf("the retry errored: %v", err)
+	}
+	w.halt()
+	w.assertUnchanged("after a late reply to an earlier request was refused", height, headID)
+	if calls != 2 {
+		t.Fatalf("%d requests reached the peer, want 2 (the withheld original and the retry)", calls)
+	}
+}
+
+// TestPullRefusesAUnitOutsideTheRequestedWindow pins the range half of C-5: a
+// response may carry only blocks the request named. The served block here is
+// well-formed and one height past the window; a pull that ignored the range
+// would refuse it later for its missing votes, so the RANGE must be the reason
+// it dies - the distinction the mutant moves.
+func TestPullRefusesAUnitOutsideTheRequestedWindow(t *testing.T) {
+	w := newCertWorld(t)
+	defer w.rig.halt()
+
+	far, err := w.pullCh.Build(testCommitteeKey(0), nil, w.pullCh.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	far.Header.Height = w.pull.MaxBlocksPerResponse + 1 // one past the window [1, MaxBlocksPerResponse]
+	w.answer = func(req *wire.BlockSyncReq) []byte {
+		return unitResp(req.Nonce, wire.BlockSyncUnit{Block: far.Encode(), Round: 1})
+	}
+	w.pull.ReplyWait = 100 * time.Millisecond
+	w.rig.start()
+	height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
+
+	err = w.pull.PullAndAdopt(1)
+	if !errors.Is(err, ErrSyncUnitOutOfRange) {
+		t.Fatalf("an out-of-window unit gave (%v), want ErrSyncUnitOutOfRange", err)
+	}
+	w.halt()
+	w.assertUnchanged("after the out-of-window unit was refused", height, headID)
+}
+
+// TestSyncerRateLimitsARequester is the C-4 rate-limit pin: a requester gets a
+// bounded number of answers per window, and the bucket is per requester KEY -
+// one flooder cannot spend an honest peer's budget.
+func TestSyncerRateLimitsARequester(t *testing.T) {
+	f := newCertServeFixture(t, 2)
+	f.server.RateLimit = 3
+	f.server.RateWindow = time.Minute // never resets mid-test
+
+	ask := func(priv ed25519PrivateKey) error {
+		_, err := f.server.Answer(syncSignReq(t, priv, 1, 1))
+		return err
+	}
+	for i := 0; i < 3; i++ {
+		if err := ask(f.pullerKey); err != nil {
+			t.Fatalf("request %d inside the per-requester budget was refused: %v", i+1, err)
+		}
+	}
+	if err := ask(f.pullerKey); !errors.Is(err, ErrSyncRateLimited) {
+		t.Fatalf("a request over the per-requester budget gave (%v), want ErrSyncRateLimited", err)
+	}
+	if err := ask(testCommitteeKey(1)); err != nil {
+		t.Fatalf("a DIFFERENT requester was refused because another had spent its budget: %v", err)
+	}
+}
+
+// TestSyncerRefusesAReplayedRequest is the C-4 replay pin: the same signed
+// request served once cannot be served again while it is fresh, so one captured
+// frame cannot make the node repeat the full answer work.
+func TestSyncerRefusesAReplayedRequest(t *testing.T) {
+	f := newCertServeFixture(t, 2)
+	req := syncSignReq(t, f.pullerKey, 1, 1)
+	if _, err := f.server.Answer(req); err != nil {
+		t.Fatalf("the first request was refused: %v", err)
+	}
+	if _, err := f.server.Answer(req); !errors.Is(err, ErrSyncReplayed) {
+		t.Fatalf("the same signed request served a second time gave (%v), want ErrSyncReplayed", err)
+	}
+}
+
+// TestTheAnswererEchoesTheRequestNonce pins the wire half of the correlation:
+// Answer's response carries the request's nonce, so the puller's Receive has
+// something to match. A response with no echoed nonce correlates with nothing.
+func TestTheAnswererEchoesTheRequestNonce(t *testing.T) {
+	f := newCertServeFixture(t, 2)
+	req := syncSignReq(t, f.pullerKey, 1, 1)
+	resp, err := f.server.Answer(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Nonce != req.Nonce {
+		t.Fatalf("the answer echoed nonce %d, want the request's %d", resp.Nonce, req.Nonce)
 	}
 }

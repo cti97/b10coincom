@@ -99,20 +99,26 @@ func DecodeHello(b []byte) (*Hello, error) {
 type BlockSyncReq struct {
 	From uint64
 	To   uint64
-	// Requester identifies who asked, so a peer can rate-limit by asker
-	// rather than by connection.
+	// Nonce makes each request unique, so a response can be correlated with
+	// the one request it answers and a replayed request can be recognised.
+	// It is covered by Sig (the consensus layer's syncReqHash): a peer cannot
+	// move it to re-label an old frame. The wire layer only frames it.
+	Nonce uint64
+	// Requester identifies who asked, so a peer can authenticate the request
+	// and rate-limit by asker rather than by connection.
 	Requester []byte
 	Sig       []byte
 }
 
 // EncodeBlockSyncReq renders r canonically, in struct order:
 //
-//	tag(1) | From(8) | To(8) | len Requester | len Sig
+//	tag(1) | From(8) | To(8) | Nonce(8) | len Requester | len Sig
 func EncodeBlockSyncReq(r *BlockSyncReq) []byte {
 	e := types.NewEncoder()
 	e.U8(uint8(MsgBlockSyncReq))
 	e.U64(r.From)
 	e.U64(r.To)
+	e.U64(r.Nonce)
 	e.VarBytes(r.Requester)
 	e.VarBytes(r.Sig)
 	return e.Bytes()
@@ -132,6 +138,9 @@ func DecodeBlockSyncReq(b []byte) (*BlockSyncReq, error) {
 		return nil, err
 	}
 	if r.To, err = d.U64(); err != nil {
+		return nil, err
+	}
+	if r.Nonce, err = d.U64(); err != nil {
 		return nil, err
 	}
 	if r.Requester, err = d.VarBytes(); err != nil {
@@ -166,15 +175,21 @@ type BlockSyncUnit struct {
 // messages frame a justification: the decoder cannot ask a byte slice where it
 // ends, so the count must.
 type BlockSyncResp struct {
+	// Nonce echoes the request's Nonce. Without it a response carries no
+	// reference to the request it answers, so any peer could file one against
+	// whatever pull happened to be in flight. The wire layer only frames it;
+	// the syncer's Receive is what insists it matches the in-flight request.
+	Nonce uint64
 	Units []BlockSyncUnit
 }
 
 // EncodeBlockSyncResp renders r canonically:
 //
-//	tag(1) | count | count x (len block | round(4) | count votes | count x (len vote))
+//	tag(1) | Nonce(8) | count | count x (len block | round(4) | count votes | count x (len vote))
 func EncodeBlockSyncResp(r *BlockSyncResp) []byte {
 	e := types.NewEncoder()
 	e.U8(uint8(MsgBlockSyncResp))
+	e.U64(r.Nonce)
 	e.Len(len(r.Units))
 	for _, u := range r.Units {
 		e.VarBytes(u.Block)
@@ -197,6 +212,9 @@ func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 		return nil, fmt.Errorf("%w: %d is not a BLOCK_SYNC response", ErrUnknownMsgType, raw)
 	}
 	r := &BlockSyncResp{}
+	if r.Nonce, err = d.U64(); err != nil {
+		return nil, err
+	}
 	count, err := d.Len()
 	if err != nil {
 		return nil, err

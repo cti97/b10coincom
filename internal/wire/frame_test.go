@@ -174,7 +174,7 @@ func TestHelloRoundTrips(t *testing.T) {
 // range carried fixed-width so a peer cannot misread an off-by-one block
 // boundary.
 func TestBlockSyncReqRoundTrips(t *testing.T) {
-	req := &BlockSyncReq{From: 1, To: 100, Requester: []byte("requester-key"), Sig: []byte("signature")}
+	req := &BlockSyncReq{From: 1, To: 100, Nonce: 42, Requester: []byte("requester-key"), Sig: []byte("signature")}
 	enc := EncodeBlockSyncReq(req)
 	if len(enc) == 0 || MsgType(enc[0]) != MsgBlockSyncReq {
 		t.Fatalf("the encoded BLOCK_SYNC request must open with its tag byte, got %v", enc)
@@ -183,7 +183,7 @@ func TestBlockSyncReqRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dec.From != req.From || dec.To != req.To ||
+	if dec.From != req.From || dec.To != req.To || dec.Nonce != req.Nonce ||
 		string(dec.Requester) != string(req.Requester) || string(dec.Sig) != string(req.Sig) {
 		t.Fatalf("round trip lost fields: want %+v, got %+v", req, dec)
 	}
@@ -199,7 +199,7 @@ func TestBlockSyncReqRoundTrips(t *testing.T) {
 // empty list round-trips too: it is an honest "I have nothing for you", and a
 // unit with no votes decodes (the puller, not the decoder, refuses it).
 func TestBlockSyncRespRoundTrips(t *testing.T) {
-	resp := &BlockSyncResp{Units: []BlockSyncUnit{
+	resp := &BlockSyncResp{Nonce: 9, Units: []BlockSyncUnit{
 		{Block: []byte{0xAA, 0xBB}, Round: 4, Votes: [][]byte{{0x01, 0x02}, {0x03}}},
 		{}, // a fully empty unit still round-trips: the wire frames bytes, it refuses nothing
 		{Block: []byte{0xCC}, Round: 0},
@@ -211,6 +211,9 @@ func TestBlockSyncRespRoundTrips(t *testing.T) {
 	dec, err := DecodeBlockSyncResp(enc)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if dec.Nonce != resp.Nonce {
+		t.Fatalf("the response's echoed nonce was lost: want %d, got %d", resp.Nonce, dec.Nonce)
 	}
 	if len(dec.Units) != len(resp.Units) {
 		t.Fatalf("want %d units, got %d", len(resp.Units), len(dec.Units))

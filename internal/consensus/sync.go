@@ -38,22 +38,40 @@ package consensus
 // pull stops rather than skipping ahead, because a skipped block leaves a hole
 // no later block can link across.
 //
+// A RESPONSE BELONGS TO ONE REQUEST. A request carries a nonce, the signed
+// challenge covers it, and the answer echoes it. A pull registers the ONE
+// request it has in flight (peer, nonce, and a private reply channel) and files
+// a response only when the sender is that peer AND the nonce is that request's:
+// a response for an earlier request - a late answer arriving after a retry - is
+// dropped, never consumed as the current request's answer. Every served unit
+// must also fall inside the requested window [start, end], so a peer cannot
+// answer a one-window request with a block from somewhere else. Requesting is
+// itself bounded three ways: a served (requester, nonce) is remembered for a
+// short window so the SAME signed request cannot be replayed for another
+// answer; a per-requester token bucket caps how many requests one asker can
+// make the node serve; and each request authenticates as a signed committee
+// member.
+//
 // DELIVERY IS ASYNCHRONOUS. Neither shipped transport delivers inside Send -
 // sim and tcp enqueue (a transport that re-entered its caller mid-send would
 // break the engine's step ordering), so the requester cannot read the answer
-// where it sent the question. The pull registers nothing itself; the
-// transport-facing layer routes arriving BLOCK_SYNC_RESP frames into Receive,
-// and the pull waits on that filed frame with a deadline (ReplyWait). Silence
-// at the deadline - and a frame filed while no pull waited - is treated as
-// "nothing to adopt", never as an error a caller would retry blindly.
+// where it sent the question. The pull registers its request before sending;
+// the transport-facing layer routes arriving BLOCK_SYNC_RESP frames into
+// Receive, and the pull waits on that request's channel with a deadline
+// (ReplyWait). Silence at the deadline - and a frame filed while no pull
+// waited - is treated as "nothing to adopt", never as an error a caller would
+// retry blindly.
 
 import (
 	"bytes"
 	"crypto/ed25519"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
@@ -81,6 +99,28 @@ const DefaultMaxBlocksPerResponse = 64
 // "nothing came back" - the caught-up-or-lost branch of the pull's stop rules
 // - so it must not be so short that honest latency reads as caught-up.
 const DefaultReplyWait = 2 * time.Second
+
+// Defaults for the answer side's resource bounds (audit C-4). A request costs
+// the responder up to a window of disk reads plus quorum-many Ed25519 verifies
+// per height, so an unbounded asker is an amplifier. The bucket is per
+// requester key, sized for a legitimate windowed catch-up (a full 64-block
+// window per request means 128 requests/second is over 8000 blocks/second,
+// far past any honest pull) while still bounding a flood.
+const (
+	// DefaultSyncRateLimit is how many authenticated requests one requester
+	// may be served per DefaultSyncRateWindow when RateLimit is zero.
+	DefaultSyncRateLimit = 128
+	// DefaultSyncRateWindow is the length of the rate-limit window.
+	DefaultSyncRateWindow = time.Second
+	// DefaultSyncSeenTTL is how long a served (requester, nonce) is
+	// remembered, so a replayed request is refused while it is fresh. It is
+	// SHORT-LIVED by design: the set is in memory and bounded, not durable.
+	DefaultSyncSeenTTL = 30 * time.Second
+	// syncSeenMax caps the replay set's size. Reaching it evicts expired
+	// entries first and then an arbitrary one: the set is a short-lived
+	// replay cache, not a commitment.
+	syncSeenMax = 4096
+)
 
 var (
 	// ErrBadSyncRange reports a request whose range selects nothing: under
@@ -110,12 +150,25 @@ var (
 	// ErrBadSyncResp reports a response frame that decodes but carries bytes
 	// no block can be read out of.
 	ErrBadSyncResp = errors.New("consensus: peer served a block that does not decode")
+	// ErrSyncUnitOutOfRange reports a response unit whose block stands outside
+	// the window the request asked for. A peer that answers a range it was not
+	// asked about is refused before its certificate is even considered: the
+	// range, not the certificate, is the first thing the response must honour.
+	ErrSyncUnitOutOfRange = errors.New("consensus: peer served a block outside the requested range")
 	// ErrBadSyncCommit reports an adoptable-in-form block whose commit
 	// CERTIFICATE is missing, malformed, wrong-placed, non-member-signed, or
 	// short of the quorum the live commit rule requires. It is the puller's
 	// refusal sentinel and the answerer's own: a peer that cannot PROVE a
 	// quorum committed a block does not get to serve it either.
 	ErrBadSyncCommit = errors.New("consensus: peer served a block whose commit certificate does not prove a quorum commitment")
+	// ErrSyncRateLimited reports an authenticated requester that has spent its
+	// per-window budget. It is an answer-side refusal: Handle turns it into
+	// silence, and the asker's pull reads that as "nothing came back".
+	ErrSyncRateLimited = errors.New("consensus: BLOCK_SYNC request exceeds the requester's rate limit")
+	// ErrSyncReplayed reports the same signed request arriving twice within
+	// the seen-set window. Serving it again would let one signed request make
+	// the node do its full answer work repeatedly (audit C-4).
+	ErrSyncReplayed = errors.New("consensus: BLOCK_SYNC request was already served (replay)")
 )
 
 // Syncer answers BLOCK_SYNC requests from a local chain and pulls missed blocks
@@ -153,14 +206,43 @@ type Syncer struct {
 	// this deadline is the pull's, not consensus protocol time.
 	ReplyWait time.Duration
 
-	// reply files the one response a pull in flight is waiting for. It is
-	// written by Receive, which the transport-facing layer calls for every
-	// BLOCK_SYNC_RESP frame the connection hands it. A BLOCK_SYNC_RESP
-	// carries no reference to the request it answers, so responses cannot be
-	// correlated - the syncer therefore does one pull at a time and files at
-	// most one frame; a second arriving while the slot is full is dropped,
-	// and the pull in flight keeps the frame it was offered first.
-	reply chan *wire.BlockSyncResp
+	// RateLimit is how many authenticated requests one requester may be
+	// served per RateWindow; zero takes DefaultSyncRateLimit. A request costs
+	// a window of disk reads and quorum-many verifies per height, so an
+	// unbounded asker is an amplifier. The bucket is per requester KEY, not
+	// per connection: one flooder cannot spend an honest peer's budget.
+	RateLimit uint64
+	// RateWindow is the rate-limit window; zero takes DefaultSyncRateWindow.
+	RateWindow time.Duration
+	// SeenTTL is how long a served (requester, nonce) is remembered, so the
+	// same signed request cannot be replayed for a second answer; zero takes
+	// DefaultSyncSeenTTL. A restarted node seeds a fresh nonce sequence (see
+	// nonceSeed), so its first post-restart request is never mistaken for a
+	// replay of its pre-restart one.
+	SeenTTL time.Duration
+
+	// reqMu guards waiting: the ONE request a pull has in flight, and the
+	// channel its answer will be filed on. A response is filed only when the
+	// sender and nonce match this request (see Receive).
+	reqMu   sync.Mutex
+	waiting *pendingReply
+
+	// nonce is this syncer's request counter, seeded randomly at NewSyncer so
+	// a restart does not repeat a sequence a peer's seen-set may still hold.
+	nonce atomic.Uint64
+
+	// rateMu guards rate, the per-requester token buckets.
+	rateMu sync.Mutex
+	rate   map[string]*rateBucket
+
+	// seenMu guards seen, the short-lived replay set keyed by (requester,
+	// nonce).
+	seenMu sync.Mutex
+	seen   map[seenKey]time.Time
+
+	// clock is a test seam for the rate-limit and seen-set windows; nil means
+	// time.Now, the wire-facing layer owning every clock in this file.
+	clock func() time.Time
 
 	// pub is this node's validator key: the Requester field of every request
 	// the syncer signs, the same key the answerer checks membership against.
@@ -168,46 +250,100 @@ type Syncer struct {
 
 	// commits is this syncer's COMMIT CERTIFICATE ARCHIVE: per height, the
 	// round and the precommit votes that committed the block the chain holds
-	// there. It is written by RecordCommit - from the driver's commit
-	// witness (wired by whoever builds both) for commits this node judged
-	// live, and from PullAndAdopt for blocks this node itself adopted, so a
-	// caught-up node can serve onward what certified it in the first place.
-	// In-memory only: a restart forgets it (recorded limit; a restarted node
-	// cannot re-serve certificates for heights it committed before it
-	// crashed). Every entry was verified against the same quorum rule the
-	// puller applies, so Answer never serves a certificate it has not stood
-	// behind. Answers read it, so it is mutex-guarded.
+	// there, plus their encoded wire form. The encoded form is built ONCE, at
+	// RecordCommit, because Answer would otherwise re-encode a quorum's votes
+	// for every served height (audit C-4's answer cost). It is written by
+	// RecordCommit - from the driver's commit witness (wired by whoever builds
+	// both) for commits this node judged live, and from PullAndAdopt for
+	// blocks this node itself adopted, so a caught-up node can serve onward
+	// what certified it in the first place. In-memory only: a restart forgets
+	// it (recorded limit; a restarted node cannot re-serve certificates for
+	// heights it committed before it crashed). Every entry was verified
+	// against the same quorum rule the puller applies, so Answer never serves
+	// a certificate it has not stood behind. Answers read it, so it is
+	// mutex-guarded.
 	commitMu sync.Mutex
 	commits  map[uint64]commitRecord
 }
 
+// pendingReply is the ONE request a pull has in flight. Receive files into ch
+// only a response whose nonce equals nonce and whose sender equals peer.
+type pendingReply struct {
+	nonce uint64
+	peer  transport.PeerID
+	ch    chan *wire.BlockSyncResp
+}
+
 type commitRecord struct {
-	round uint32
-	votes []*Vote
+	round   uint32
+	votes   []*Vote
+	encoded [][]byte // the wire form of votes, built once at RecordCommit
+}
+
+// rateBucket is one requester's fixed-window token bucket.
+type rateBucket struct {
+	tokens uint64
+	reset  time.Time
+}
+
+// seenKey identifies one served request for the replay set.
+type seenKey struct {
+	who   string
+	nonce uint64
 }
 
 // NewSyncer builds a syncer over ch, signing its requests with priv and
 // carrying DefaultMaxBlocksPerResponse.
 func NewSyncer(ch *chain.Chain, tp transport.Transport, priv ed25519.PrivateKey) *Syncer {
 	pub, _ := priv.Public().(ed25519.PublicKey)
-	return &Syncer{
+	s := &Syncer{
 		chain:                ch,
 		tp:                   tp,
 		priv:                 priv,
 		MaxBlocksPerResponse: DefaultMaxBlocksPerResponse,
-		reply:                make(chan *wire.BlockSyncResp, 1),
 		pub:                  pub,
 	}
+	s.nonce.Store(nonceSeed())
+	return s
+}
+
+// nonceSeed is the random start of one syncer's request-nonce sequence. It is
+// random, not zero, for one specific reason: a restarted node builds a FRESH
+// syncer, and a counter starting at 1 would repeat the pre-restart sequence -
+// a peer still holding the old (requester, nonce) in its short-lived seen-set
+// would refuse the rejoin as a replay. Randomness makes the rejoin's first
+// request a request the peer has never seen.
+func nonceSeed() uint64 {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return uint64(time.Now().UnixNano())
+	}
+	return binary.BigEndian.Uint64(b[:])
+}
+
+// nextNonce returns the next request nonce. Nonces are unique within one
+// syncer's lifetime (a 64-bit counter), which is all the correlation needs.
+func (s *Syncer) nextNonce() uint64 { return s.nonce.Add(1) }
+
+// now reads the syncer's clock (nil: the wall clock). Tests inject a clock so
+// the rate-limit and seen-set windows are exercised without sleeping.
+func (s *Syncer) now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
 }
 
 // syncReqHash is the canonical challenge a BLOCK_SYNC request signature covers:
-// the range asked for and the key that asks. Domain separation keeps a sync
-// signature from ever being replayed as a vote or a proposal, the way every
-// signing hash in this codebase is kept apart.
+// the range asked for, the request's nonce, and the key that asks. Domain
+// separation keeps a sync signature from ever being replayed as a vote or a
+// proposal, the way every signing hash in this codebase is kept apart, and the
+// nonce is bound here so a peer cannot move it to re-label an old request.
 func syncReqHash(req *wire.BlockSyncReq) [32]byte {
 	e := types.NewEncoder()
 	e.U64(req.From)
 	e.U64(req.To)
+	e.U64(req.Nonce)
 	e.VarBytes(req.Requester)
 	return crypto.HashParts([]byte("b10coin-sync-req"), e.Bytes())
 }
@@ -235,6 +371,76 @@ func verifySyncReq(req *wire.BlockSyncReq, vals []genesis.Validator) error {
 		return fmt.Errorf("%w: signature does not verify", ErrBadSyncAuth)
 	}
 	return nil
+}
+
+// allowRequest charges one token to the requester's bucket. A requester over
+// its budget is refused (ErrSyncRateLimited) rather than served: the answer
+// side's work is bounded by the bucket, per requester key.
+func (s *Syncer) allowRequest(req *wire.BlockSyncReq) bool {
+	limit := s.RateLimit
+	if limit == 0 {
+		limit = DefaultSyncRateLimit
+	}
+	window := s.RateWindow
+	if window <= 0 {
+		window = DefaultSyncRateWindow
+	}
+	now := s.now()
+	key := string(req.Requester)
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	if s.rate == nil {
+		s.rate = make(map[string]*rateBucket)
+	}
+	b := s.rate[key]
+	if b == nil || now.Sub(b.reset) >= window {
+		b = &rateBucket{tokens: limit, reset: now}
+		s.rate[key] = b
+	}
+	if b.tokens == 0 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// noteRequest records a served (requester, nonce) and reports false when the
+// same signed request has already been served within SeenTTL. This is the
+// replay gate: the nonce makes each request's frame unique, and this set makes
+// a duplicate inert instead of a second full answer's work.
+func (s *Syncer) noteRequest(req *wire.BlockSyncReq) bool {
+	ttl := s.SeenTTL
+	if ttl <= 0 {
+		ttl = DefaultSyncSeenTTL
+	}
+	now := s.now()
+	k := seenKey{who: string(req.Requester), nonce: req.Nonce}
+	s.seenMu.Lock()
+	defer s.seenMu.Unlock()
+	if s.seen == nil {
+		s.seen = make(map[seenKey]time.Time)
+	}
+	if t, ok := s.seen[k]; ok && now.Sub(t) < ttl {
+		return false
+	}
+	if len(s.seen) >= syncSeenMax {
+		// Reclaim expired entries; if the set is still full, drop an
+		// arbitrary one. A short-lived replay cache needs bounded memory, not
+		// a perfect eviction order.
+		for key, t := range s.seen {
+			if now.Sub(t) >= ttl {
+				delete(s.seen, key)
+			}
+		}
+		if len(s.seen) >= syncSeenMax {
+			for key := range s.seen {
+				delete(s.seen, key)
+				break
+			}
+		}
+	}
+	s.seen[k] = now
+	return true
 }
 
 // certVoteSet builds the VoteSet a commit certificate is re-tallied through:
@@ -287,7 +493,9 @@ func valsQuorum(vals []genesis.Validator) uint64 { return Config{Committee: vals
 // it verified while adopting. A certificate is archived ONLY if it proves
 // quorum for the block the chain now holds at that height - an archive entry
 // is a claim this syncer will serve to a stranger, and an unverified claim
-// served is the same hole the puller refuses.
+// served is the same hole the puller refuses. The votes' wire encoding is
+// built HERE, once, so Answer serves cached bytes instead of re-encoding a
+// quorum's votes per height.
 //
 // The first certificate for a height wins; a committed height never changes
 // its block, and later calls are the same evidence arriving again.
@@ -311,37 +519,52 @@ func (s *Syncer) RecordCommit(height uint64, round uint32, votes []*Vote) {
 	}
 	vs := make([]*Vote, len(votes))
 	copy(vs, votes)
-	s.commits[height] = commitRecord{round: round, votes: vs}
+	encoded := make([][]byte, 0, len(vs))
+	for _, v := range vs {
+		encoded = append(encoded, EncodeVote(v))
+	}
+	s.commits[height] = commitRecord{round: round, votes: vs, encoded: encoded}
 }
 
 // certificateAt returns the archived certificate for height, re-proven against
 // the block the chain holds at that height now. A certificate archived for one
 // block must never attach to a served block it does not stand behind; a height
 // with no (or no longer valid) certificate yields false, which Answer refuses.
-func (s *Syncer) certificateAt(height uint64) (uint32, []*Vote, bool) {
+// The returned record's encoded form is the wire form Answer serves.
+func (s *Syncer) certificateAt(height uint64) (commitRecord, bool) {
 	s.commitMu.Lock()
 	rec, ok := s.commits[height]
 	s.commitMu.Unlock()
 	if !ok {
-		return 0, nil, false
+		return commitRecord{}, false
 	}
 	blk, err := s.chain.BlockAt(height)
 	if err != nil {
-		return 0, nil, false
+		return commitRecord{}, false
 	}
 	if err := s.verifyCertificate(blk, rec.round, rec.votes); err != nil {
-		return 0, nil, false
+		return commitRecord{}, false
 	}
-	return rec.round, rec.votes, true
+	if len(rec.encoded) == 0 && len(rec.votes) > 0 {
+		// A record written before the encoding cache existed (or by a test
+		// that seeded one): fill it here rather than re-encoding per answer.
+		rec.encoded = make([][]byte, 0, len(rec.votes))
+		for _, v := range rec.votes {
+			rec.encoded = append(rec.encoded, EncodeVote(v))
+		}
+	}
+	return rec, true
 }
 
 // Answer serves encoded blocks from the local chain for the requested range,
 // WITH their commit certificates: each unit carries the block and the archived
 // precommit votes that committed it.
 //
-// Five refusal rules, each an ERROR and never a short answer:
+// Refusal rules, each an ERROR and never a short answer:
 //
 //   - the request is not from a signed committee member (ErrBadSyncAuth);
+//   - the requester is over its per-window budget (ErrSyncRateLimited);
+//   - the same signed (requester, nonce) was already served (ErrSyncReplayed);
 //   - the range selects nothing (To < From under the wire's inclusive
 //     semantics) - malformed (ErrBadSyncRange);
 //   - the range is wider than MaxBlocksPerResponse - the count is bounded
@@ -362,6 +585,14 @@ func (s *Syncer) certificateAt(height uint64) (uint32, []*Vote, bool) {
 func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 	if err := verifySyncReq(req, s.chain.Genesis().Validators); err != nil {
 		return nil, err
+	}
+	// The resource gates come before any allocation or disk read. The rate
+	// bucket is charged first so even a replay flood is bounded by it.
+	if !s.allowRequest(req) {
+		return nil, fmt.Errorf("%w: %s", ErrSyncRateLimited, requesterLabel(req.Requester))
+	}
+	if !s.noteRequest(req) {
+		return nil, fmt.Errorf("%w: nonce %d was already served", ErrSyncReplayed, req.Nonce)
 	}
 	// Refusals come before the first make(): nothing is allocated for a
 	// request this syncer has already decided not to answer. The comparison
@@ -390,17 +621,22 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 			// must decode byte by byte: refuse the whole answer.
 			return nil, fmt.Errorf("consensus: block %d is unreadable: %w", h, err)
 		}
-		round, votes, ok := s.certificateAt(h)
+		rec, ok := s.certificateAt(h)
 		if !ok {
 			return nil, fmt.Errorf("%w: this node holds no commit certificate for height %d", ErrBadSyncCommit, h)
 		}
-		encoded := make([][]byte, 0, len(votes))
-		for _, v := range votes {
-			encoded = append(encoded, EncodeVote(v))
-		}
-		units = append(units, wire.BlockSyncUnit{Block: blk.Encode(), Round: round, Votes: encoded})
+		units = append(units, wire.BlockSyncUnit{Block: blk.Encode(), Round: rec.round, Votes: rec.encoded})
 	}
-	return &wire.BlockSyncResp{Units: units}, nil
+	return &wire.BlockSyncResp{Nonce: req.Nonce, Units: units}, nil
+}
+
+// requesterLabel renders a requester key for an error message without pulling
+// in a hex import: the first four bytes are enough to tell two askers apart.
+func requesterLabel(key []byte) string {
+	if len(key) > 4 {
+		key = key[:4]
+	}
+	return fmt.Sprintf("%x", key)
 }
 
 // Handle is the server-side frame entry point. The transport-facing layer
@@ -411,6 +647,11 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 // frame goes back: the wire has no negative response, so refusal is silence.
 // The consequences of silence are the requester's to interpret, and they are
 // written out at PullAndAdopt, which is the reference requester.
+//
+// Handle does the full answer on ITS caller's goroutine. The transport-facing
+// layer must therefore not call it on a goroutine whose stall would block
+// consensus dispatch (audit C-4): MessageRouter.AsyncServe exists to hand the
+// frame to a bounded worker instead, and the node layer installs one.
 func (s *Syncer) Handle(reqFrame []byte) (respFrame []byte, ok bool) {
 	req, err := wire.DecodeBlockSyncReq(reqFrame)
 	if err != nil {
@@ -423,50 +664,54 @@ func (s *Syncer) Handle(reqFrame []byte) (respFrame []byte, ok bool) {
 	return wire.EncodeBlockSyncResp(resp), true
 }
 
-// Receive files a BLOCK_SYNC_RESP frame for the pull in flight. The
-// transport-facing layer calls it for every such frame (its message router
-// decides what a frame is); the syncer keeps at most one at a time (see the
-// reply field). A frame that does not decode is dropped: a pull that gets
-// nothing for it reads the same silence a refused request produces, and stops.
+// Receive files a BLOCK_SYNC_RESP frame for the pull in flight, and ONLY that
+// pull's frame. A response is accepted when a request is in flight, when it
+// arrived from the peer that request was sent to, and when its nonce equals
+// that request's. Anything else is dropped: a response for a different request
+// (including a late answer to an earlier retry), a response from a peer that
+// was never asked, and a frame arriving while no pull waits all read the same
+// silence. A frame that does not decode is dropped for the same reason.
 func (s *Syncer) Receive(from transport.PeerID, data []byte) {
-	_ = from // BLOCK_SYNC_RESP carries no sender field to check it against
 	resp, err := wire.DecodeBlockSyncResp(data)
 	if err != nil {
 		return
 	}
+	s.reqMu.Lock()
+	w := s.waiting
+	s.reqMu.Unlock()
+	if w == nil {
+		return // no request in flight: nothing this frame could answer
+	}
+	if w.peer != from {
+		// The sender check: a peer that was not asked cannot answer.
+		return
+	}
+	if resp.Nonce != w.nonce {
+		// The correlation check: a reply to another request - an earlier one
+		// that timed out, or one never sent by us - is not this request's
+		// answer.
+		return
+	}
 	select {
-	case s.reply <- resp:
-	default: // one pull in flight; a second response would answer nothing
+	case w.ch <- resp:
+	default: // the request's channel is full: the first matching frame wins
 	}
 }
 
-// drainReply discards whatever frame sits in the reply slot. A pull runs one
-// window at a time, but frames do not stop arriving between pulls: an answer
-// filed before the pull started, or left behind by an earlier pull that
-// stopped on an error mid-window, is a reply to a request that is no longer in
-// flight. Consuming it as the fresh answer would adopt exactly what the
-// transport delivered on the LAST pull's timing - the stale-slot reading the
-// synchronous version of this code could not see.
-func (s *Syncer) drainReply() {
-	select {
-	case <-s.reply:
-	default:
-	}
-}
-
-// awaitReply blocks until a response is filed or the deadline finds nothing:
-// it is the requester's half of asynchronous delivery, because neither shipped
-// transport delivers inside Send. nil means "nothing came back", which is the
-// caught-up-or-lost branch of the stop rules, never a retry here. Zero or
-// negative ReplyWait means the default - a knob that silently waited zero
-// would reinstall the synchronous read this deadline exists to replace.
-func (s *Syncer) awaitReply() *wire.BlockSyncResp {
+// awaitReply waits on one request's private channel until an accepted response
+// is filed or the deadline finds nothing: it is the requester's half of
+// asynchronous delivery, because neither shipped transport delivers inside
+// Send. nil means "nothing came back", which is the caught-up-or-lost branch
+// of the stop rules, never a retry here. Zero or negative ReplyWait means the
+// default - a knob that silently waited zero would reinstall the synchronous
+// read this deadline exists to replace.
+func (s *Syncer) awaitReply(ch <-chan *wire.BlockSyncResp) *wire.BlockSyncResp {
 	wait := s.ReplyWait
 	if wait <= 0 {
 		wait = DefaultReplyWait
 	}
 	select {
-	case got := <-s.reply:
+	case got := <-ch:
 		return got
 	case <-time.After(wait):
 		return nil
@@ -503,19 +748,25 @@ func (s *Syncer) pullPeer() (transport.PeerID, error) {
 // as caught-up while the caller had named an impossible target. The refusal
 // names the confusion instead of hiding it.
 //
+// Each window's request carries a fresh nonce, is registered as the ONE
+// request in flight before it is sent, and is answered only by a response from
+// the peer it went to whose nonce echoes it. A stale answer for an earlier
+// window (a retry after a timeout) is therefore dropped, not consumed.
+//
 // Four stop rules:
 //
 //   - a request the transport refuses (peer down, partitioned, unknown)
 //     returns the error: the caller owns retry policy;
-//   - a unit that fails to decode, carries no usable COMMIT CERTIFICATE
-//     (missing, malformed, wrong-placed, non-member, or sub-quorum), or a
-//     block that fails Append STOPS the pull and is returned as the error -
-//     never skipped ahead. Without the certificate the block is a single
-//     validator's fork in the making no matter how valid its state is; with a
-//     hole, the blocks after it cannot link either; adopting past either
-//     would mean trusting the responder's bytes on the responder's say-so;
-//   - a file left in the reply slot between pulls is drained, not consumed:
-//     it answers no request in flight;
+//   - a unit outside the requested window, one that fails to decode, carries
+//     no usable COMMIT CERTIFICATE (missing, malformed, wrong-placed,
+//     non-member, or sub-quorum), or a block that fails Append STOPS the pull
+//     and is returned as the error - never skipped ahead. Without the
+//     certificate the block is a single validator's fork in the making no
+//     matter how valid its state is; with a hole, the blocks after it cannot
+//     link either; adopting past either would mean trusting the responder's
+//     bytes on the responder's say-so;
+//   - a response filed while no pull waits is dropped by Receive: it answers
+//     no request in flight;
 //   - silence - no response for the window within ReplyWait - ends the pull
 //     with nil. Refusal has no negative wire shape, so silence covers both
 //     "the peer has nothing at/after start" (the caught-up case) and a peer
@@ -557,18 +808,35 @@ func (s *Syncer) PullAndAdopt(from uint64) error {
 		if err != nil {
 			return err
 		}
-		req := &wire.BlockSyncReq{From: start, To: end, Requester: s.pub}
+		nonce := s.nextNonce()
+		req := &wire.BlockSyncReq{From: start, To: end, Nonce: nonce, Requester: s.pub}
 		h := syncReqHash(req)
 		req.Sig = crypto.Sign(s.priv, h[:])
-		s.drainReply() // a frame filed between pulls answers nothing now in flight
+		// Register the one request in flight BEFORE Send: a transport that
+		// delivers on its own goroutine must find the slot already armed, or
+		// its answer would be filed as a frame for no request and dropped.
+		pending := &pendingReply{nonce: nonce, peer: peer, ch: make(chan *wire.BlockSyncResp, 1)}
+		s.reqMu.Lock()
+		s.waiting = pending
+		s.reqMu.Unlock()
+		clear := func() {
+			s.reqMu.Lock()
+			if s.waiting == pending {
+				s.waiting = nil
+			}
+			s.reqMu.Unlock()
+		}
 		if err := s.tp.Send(peer, wire.EncodeBlockSyncReq(req)); err != nil {
+			clear()
 			return err
 		}
-		// The answer is whatever Receive files while the request is on the
-		// wire; awaitReply waits for it up to ReplyWait, because neither
-		// shipped transport delivers inside Send. Over sim the node's own
-		// Advance delivers; over tcp the connection's reader does.
-		got := s.awaitReply()
+		// The answer is whatever Receive files on this request's channel
+		// while the request is on the wire; awaitReply waits for it up to
+		// ReplyWait, because neither shipped transport delivers inside Send.
+		// Over sim the node's own Advance delivers; over tcp the
+		// connection's reader does.
+		got := s.awaitReply(pending.ch)
+		clear()
 		if got == nil || len(got.Units) == 0 {
 			return nil // silence: nothing to adopt, nothing to retry here
 		}
@@ -577,6 +845,13 @@ func (s *Syncer) PullAndAdopt(from uint64) error {
 			if err != nil {
 				return fmt.Errorf("%w: served block %d of %d does not decode: %v",
 					ErrBadSyncResp, i+1, len(got.Units), err)
+			}
+			// The window gate: a response may only carry blocks the request
+			// named. Checked before the certificate, because a block outside
+			// the range is refused whatever evidence is attached to it.
+			if h := blk.Header.Height; h < start || h > end {
+				return fmt.Errorf("%w: served block %d of %d is at height %d, outside the requested window [%d, %d]",
+					ErrSyncUnitOutOfRange, i+1, len(got.Units), h, start, end)
 			}
 			if len(unit.Votes) == 0 {
 				// Named for what it is: zero votes is the one-validator fork

@@ -24,8 +24,10 @@ package devnet
 //   - a consensus.Driver whose OnMessage the router hands consensus frames
 //     to, and whose commit witness archives every commit's certificate
 //     (Design Decision 8) so the chain this node holds is pullable by a peer;
-//   - two goroutines: the tick loop (the driver's clock at TickEvery) and the
-//     wave loop (HELLO heights out, catch-up pull in).
+//   - the loops: the tick loop (the driver's clock at TickEvery), the wave
+//     loop (HELLO heights out, catch-up pull in), and the bounded pool of
+//     BLOCK_SYNC workers the router hands requests to (audit C-4), so serving
+//     a request never runs on the transport's dispatch goroutine.
 //
 // Two concurrency rules keep the engine's single-threaded model intact over
 // sockets, which the in-process simulator never had to care about:
@@ -34,16 +36,18 @@ package devnet
 //     Tick and the reader goroutines' message dispatch through route. The
 //     socket transport may deliver from many readers; the engine must never
 //     be re-entered mid-step, or state transitions depend on goroutine
-//     scheduling rather than message order.
+//     scheduling rather than message order. The sync workers are outside
+//     this rule by construction: they read the chain and the syncer archive
+//     and never touch the engine.
 //   - The pull NEVER holds mu. It touches only the chain (whose own lock
-//     serialises Append against the driver's) and the syncer (whose reply
-//     slot is the one pull's). The interleavings a commit and an adoption can
-//     form are all safe - a collision at one height fails the loser's Append
-//     against the chain, which is the gate, not a bug - with ONE consequence
-//     handled explicitly: after a pull adopts anything, the driver is
-//     REBUILT (rebuildDriver), because its engine still judges a height the
-//     chain has already decided. A stale engine keeps round-looping forever
-//     at a height nobody is at; the rebuild is the rejoin.
+//     serialises Append against the driver's) and the syncer (whose one
+//     in-flight request is the pull's). The interleavings a commit and an
+//     adoption can form are all safe - a collision at one height fails the
+//     loser's Append against the chain, which is the gate, not a bug - with
+//     ONE consequence handled explicitly: after a pull adopts anything, the
+//     driver is REBUILT (rebuildDriver), because its engine still judges a
+//     height the chain has already decided. A stale engine keeps round-looping
+//     forever at a height nobody is at; the rebuild is the rejoin.
 
 import (
 	"bytes"
@@ -84,6 +88,25 @@ const (
 	// networkedMempoolCapacity is each networked validator's pool. The driver
 	// takes from it for proposals; the node's RPC fills it.
 	networkedMempoolCapacity = 1000
+
+	// syncWorkers and syncQueueDepth bound the async BLOCK_SYNC server (audit
+	// C-4): requests are served on their own goroutines so a slow answer
+	// cannot hold the transport's dispatch lock, the pool is small so a flood
+	// cannot spend the node's CPU on serving, and the queue is bounded so the
+	// work waiting to be served has a ceiling. A full queue is a dropped
+	// request - the asker reads silence and retries on a later wave.
+	syncWorkers    = 2
+	syncQueueDepth = 16
+
+	// peerHeightTTL is how many waves a HELLO's height stays usable without
+	// being refreshed. A peer that vanished stops being selected within this
+	// many waves rather than holding its old entry forever (audit C-6).
+	peerHeightTTL = 4
+	// peerDemoteWaves is how many waves a peer is skipped after a pull from
+	// it failed to substantiate the height it announced. This is the rotation
+	// that stops one lying member from monopolising every catch-up wave
+	// (audit C-6).
+	peerDemoteWaves = 4
 )
 
 // ValidatorConfig configures one networked validator. It has two modes:
@@ -137,6 +160,18 @@ type ValidatorConfig struct {
 	WaveEvery time.Duration
 }
 
+// peerAttestation is what one peer's HELLO leaves behind (audit C-6): the
+// height it last announced, the highest height a pull from it actually
+// reached, whether any pull has proven it at all, the wave it was last
+// refreshed in, and the wave until which selection skips it.
+type peerAttestation struct {
+	height        uint64 // latest announced height
+	substantiated uint64 // highest height a pull from this peer reached
+	proven        bool   // a pull from this peer has completed (successfully or not)
+	seen          uint64 // wave of the latest HELLO
+	demoted       uint64 // skip selection while demoted > the current wave
+}
+
 // Validator is one running networked validator.
 type Validator struct {
 	cfg   ValidatorConfig
@@ -155,7 +190,7 @@ type Validator struct {
 	// mu serialises every driver operation (see the package-level rules above).
 	mu sync.Mutex
 
-	// peerH is the height each peer attested to in its HELLO, keyed by the
+	// peerH is the state each peer's HELLO leaves behind, keyed by the
 	// transport-level name. On a DIRECT link that name is the peer's own
 	// handshake ID (forgeable - it is a routing key, not a proof). Through a
 	// relay every frame arrives under the ONE fixed connection name
@@ -163,8 +198,29 @@ type Validator struct {
 	// it and is stable across reconnects (audit N-1: never derived from any
 	// frame's bytes). Either way it is a signed hint only: it decides
 	// whether to pull and from whom - nothing else.
+	//
+	// The state remembers more than the latest height (audit C-6): when the
+	// announcement was last refreshed (so a vanished peer expires), how far a
+	// pull from that peer ever substantiated (so an announcement above what
+	// the peer can serve is capped for selection), and until when the peer is
+	// demoted (so a peer whose pull proved nothing is rotated away from).
 	peerHMu sync.Mutex
-	peerH   map[transport.PeerID]uint64
+	peerH   map[transport.PeerID]*peerAttestation
+	// wave counts catch-up waves. It advances once per maybeCatchUp, and is
+	// the clock peerHeightTTL and peerDemoteWaves are measured in.
+	wave uint64
+
+	// pull is the catch-up pull (from a height, to the adopted head): the
+	// syncer's PullAndAdopt unless a test installs a seam. Nil means
+	// v.sy.PullAndAdopt.
+	pull func(from uint64) error
+
+	// syncQ and syncWG are the bounded async BLOCK_SYNC server (audit C-4):
+	// the router hands requests here instead of serving them on the
+	// transport's dispatch goroutine.
+	syncQ       chan transport.Message
+	syncWG      sync.WaitGroup
+	syncDropped atomic.Uint64
 
 	// adopted counts blocks brought in by catch-up pulls: the observable a
 	// convergence test reads to prove the joiner ADOPTED rather than voted.
@@ -359,12 +415,22 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		drvTP: dtp,
 		cfgC:  ccfg,
 		drv:   drv,
-		peerH: make(map[transport.PeerID]uint64),
+		peerH: make(map[transport.PeerID]*peerAttestation),
+		syncQ: make(chan transport.Message, syncQueueDepth),
 		stop:  make(chan struct{}),
 	}
+	// A BLOCK_SYNC request is answered by the bounded worker pool, never on
+	// the transport's dispatch goroutine (audit C-4): serving one costs disk
+	// reads and quorum-many verifies per height, and that work on the
+	// dispatch goroutine would hold every consensus frame behind it.
+	rt.AsyncServe = v.enqueueSync
 	tp.OnMessage(v.route)
 	// The router's height observer: the wave loop pulls from what this sees.
 	rt.OnHello = v.observeHello
+	for i := 0; i < syncWorkers; i++ {
+		v.syncWG.Add(1)
+		go v.syncWorker()
+	}
 	v.wg.Add(2)
 	go v.tickLoop()
 	go v.waveLoop()
@@ -525,9 +591,10 @@ func helloHash(h *wire.Hello) [32]byte {
 // observeHello records a peer's attested height, refusing announcements from
 // another committee, non-member signatures, and unvouched heights. The only
 // decision a hello may influence is WHICH peer to pull from, and adoption
-// still runs the certificate gate - but a stranger inflating heights would
-// otherwise turn every wave into a ReplyWait of silence against a peer that
-// answers nothing.
+// still runs the certificate gate. The earlier reading - "a stranger inflating
+// heights" - was wrong on the code: a non-member is refused HERE, before
+// recordHeight, so the only actor who can inflate an entry is a signed
+// committee member. The rotation below (C-6) is what handles that member.
 func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	if h.ChainID != v.g.ChainID {
 		return
@@ -549,22 +616,63 @@ func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	v.recordHeight(from, h.Height)
 }
 
-// recordHeight keeps the tallest attestation per transport-level name.
+// beginWave advances the catch-up wave counter. Every wave boundary moves the
+// window in which a peer's announcement expires and a demotion lapses.
+func (v *Validator) beginWave() {
+	v.peerHMu.Lock()
+	v.wave++
+	v.peerHMu.Unlock()
+}
+
+// recordHeight keeps a peer's LATEST attestation - not its maximum ever (audit
+// C-6): a peer that re-announces a smaller, honest height can drop, and a
+// vanished peer's entry expires on the wave clock rather than standing forever.
 func (v *Validator) recordHeight(from transport.PeerID, height uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
-	if height > v.peerH[from] {
-		v.peerH[from] = height
+	st := v.peerH[from]
+	if st == nil {
+		st = &peerAttestation{}
+		v.peerH[from] = st
 	}
+	st.height = height
+	st.seen = v.wave
 }
 
-// tallestPeer returns the named peer and its attested height.
+// peerWindow is the selection cap's unit: one response window, read off the
+// syncer so the cap tracks the bound the pull actually uses.
+func (v *Validator) peerWindow() uint64 {
+	if v.sy != nil && v.sy.MaxBlocksPerResponse > 0 {
+		return v.sy.MaxBlocksPerResponse
+	}
+	return consensus.DefaultMaxBlocksPerResponse
+}
+
+// tallestPeer returns the tallest peer whose attestation is still usable: not
+// expired, not demoted, and capped by what that peer has ever substantiated
+// (audit C-6). An unproven peer is worth exactly one window - enough to try,
+// never enough to dwarf a peer that has served real blocks.
 func (v *Validator) tallestPeer() (transport.PeerID, uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
+	win := v.peerWindow()
 	var best transport.PeerID
 	var bestH uint64
-	for id, h := range v.peerH {
+	for id, st := range v.peerH {
+		if st.seen+peerHeightTTL < v.wave {
+			continue // not refreshed within a few waves: expired
+		}
+		if st.demoted > v.wave {
+			continue // a pull from this peer proved nothing: rotate away
+		}
+		h := st.height
+		if !st.proven {
+			if h > win {
+				h = win
+			}
+		} else if h > st.substantiated+win {
+			h = st.substantiated + win
+		}
 		if h > bestH {
 			best, bestH = id, h
 		}
@@ -572,29 +680,110 @@ func (v *Validator) tallestPeer() (transport.PeerID, uint64) {
 	return best, bestH
 }
 
+// demotePeer skips a peer for a few waves after a pull from it failed to
+// substantiate its announcement, and records how far that pull actually
+// reached so the cap lowers with it.
+func (v *Validator) demotePeer(peer transport.PeerID, reached uint64) {
+	v.peerHMu.Lock()
+	defer v.peerHMu.Unlock()
+	st := v.peerH[peer]
+	if st == nil {
+		return
+	}
+	st.demoted = v.wave + peerDemoteWaves
+	st.proven = true
+	st.substantiated = reached
+}
+
+// substantiatePeer records a pull that reached the peer's attested height and
+// clears any demotion: a peer that served what it claimed is trusted again.
+func (v *Validator) substantiatePeer(peer transport.PeerID, reached uint64) {
+	v.peerHMu.Lock()
+	defer v.peerHMu.Unlock()
+	st := v.peerH[peer]
+	if st == nil {
+		return
+	}
+	st.proven = true
+	if reached > st.substantiated {
+		st.substantiated = reached
+	}
+	st.demoted = 0
+}
+
 // maybeCatchUp pulls from the tallest attested peer when it stands above our
 // head, and - the load-bearing half - rebuilds the driver over the adopted
 // head, because the engine still judges the pre-pull height and would park
 // there forever once the committee moved on (see this file's rules).
+//
+// A pull that substantiates nothing while the peer stands above us - silence,
+// a refused window, a transport error, or no block adopted at all - DEMOTES
+// that peer for a few waves (audit C-6), so a member announcing an
+// unserveable height cannot make every wave wait on it while truthful peers
+// are passed over. A pull that reaches the attested height substantiates and
+// clears the demotion, so a merely slow peer is not distrusted forever.
 func (v *Validator) maybeCatchUp() {
+	v.beginWave()
 	peer, peerH := v.tallestPeer()
 	mine := v.ch.Height()
-	if peer == "" || uint64(peerH) <= mine {
+	if peer == "" || peerH <= mine {
 		return
 	}
 	before := mine
 	v.sy.Peer = peer
-	if err := v.sy.PullAndAdopt(before + 1); err != nil {
-		// The pull stopped on a refused or unadoptable window. The chain
-		// took nothing this wave; waves are bounded, and the next one
-		// re-reads the head and re-pulls. Never adopt past a failure.
-		return
+	pull := v.pull
+	if pull == nil {
+		pull = v.sy.PullAndAdopt
 	}
-	if after := v.ch.Height(); after > before {
+	err := pull(before + 1)
+	after := v.ch.Height()
+	if after > before {
 		v.rebuildDriver()
 		v.adopted.Add(after - before)
 	}
+	if err != nil || (after < peerH && after == before) {
+		v.demotePeer(peer, after)
+		return
+	}
+	v.substantiatePeer(peer, after)
 }
+
+// enqueueSync hands a BLOCK_SYNC request to the async server (installed as
+// MessageRouter.AsyncServe). It NEVER blocks: the queue is bounded, and a full
+// queue drops the request (the asker reads silence and retries on a later
+// wave) rather than stalling the transport's dispatch goroutine.
+func (v *Validator) enqueueSync(m transport.Message) {
+	if v.closing.Load() {
+		return
+	}
+	select {
+	case v.syncQ <- m:
+	default:
+		v.syncDropped.Add(1)
+	}
+}
+
+// syncWorker serves BLOCK_SYNC requests off the transport's dispatch
+// goroutine. It touches only the syncer and the chain, both of which are
+// guarded independently of the driver mutex, so serving cannot re-enter the
+// engine.
+func (v *Validator) syncWorker() {
+	defer v.syncWG.Done()
+	for {
+		select {
+		case <-v.stop:
+			return
+		case m := <-v.syncQ:
+			if frame, ok := v.sy.Handle(m.Data); ok && v.rt.SendReply != nil {
+				_ = v.rt.SendReply(m.From, frame)
+			}
+		}
+	}
+}
+
+// SyncRequestsDropped counts BLOCK_SYNC requests shed by the bounded async
+// queue. A nonzero count is the observable that the serving bound bit.
+func (v *Validator) SyncRequestsDropped() uint64 { return v.syncDropped.Load() }
 
 // rebuildDriver replaces the driver with one judging the chain's CURRENT head.
 // The old engine's volatile round state is discarded the way a restart's is;
@@ -614,14 +803,16 @@ func (v *Validator) Close() error {
 	// mu, so the one dispatch already in flight finishes before the flag is
 	// set); the wave loop is waited out - a catch-up pull in flight runs to
 	// its own deadline and its appends land BEFORE the chain closes - then
-	// the transport's sockets die (and the reader goroutines with them), and
-	// only then does the chain close, with no dispatch left that could
-	// still write.
+	// the async sync workers (a request being served finishes its own chain
+	// reads), the transport's sockets die (and the reader goroutines with
+	// them), and only then does the chain close, with no dispatch left that
+	// could still write.
 	v.mu.Lock()
 	v.closing.Store(true)
 	v.mu.Unlock()
 	v.stopOnce.Do(func() { close(v.stop) })
 	v.wg.Wait()
+	v.syncWG.Wait()
 	_ = v.ttp.Close()
 	if v.closed.Swap(true) {
 		return nil

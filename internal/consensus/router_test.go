@@ -9,6 +9,7 @@ package consensus
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/chain"
@@ -230,4 +231,35 @@ func routerTestHelloHash(h *wire.Hello) [32]byte {
 	e.VarBytes(h.Validator)
 	e.U64(h.Height)
 	return crypto.HashParts([]byte("b10coin-hello"), e.Bytes())
+}
+
+// TestTheRouterDefersSyncServingToItsAsyncServer is the C-4 async pin: when a
+// node installs AsyncServe, the router hands the request over and returns
+// WITHOUT running Answer on the dispatch goroutine. The rig's syncer CAN answer
+// this request inline (its chain holds a certified height 1), so if the async
+// branch were removed the router would send a reply frame - holding the
+// transport's dispatch lock across a window of disk reads and quorum-many
+// verifies, and stalling every consensus frame behind it.
+func TestTheRouterDefersSyncServingToItsAsyncServer(t *testing.T) {
+	rig := newRouterRig(t)
+
+	var handed atomic.Int64
+	rig.rt.AsyncServe = func(transport.Message) { handed.Add(1) }
+
+	req := &wire.BlockSyncReq{From: 1, To: 1, Nonce: 1, Requester: testCommitteeKey(0).Public().(ed25519PublicKey)}
+	q := syncReqHash(req)
+	req.Sig = crypto.Sign(rig.priv, q[:])
+
+	if got := rig.rt.Route(transport.Message{From: "v0", Data: wire.EncodeBlockSyncReq(req)}); got {
+		t.Fatal("a BLOCK_SYNC request was routed to the engine")
+	}
+	if got := handed.Load(); got != 1 {
+		t.Fatalf("the async server received %d requests, want 1", got)
+	}
+	if got := rig.rt.SyncRequestsServed(); got != 1 {
+		t.Fatalf("the served-request counter reads %d, want 1", got)
+	}
+	if got := len(rig.replies[transport.PeerID("v0")]); got != 0 {
+		t.Fatalf("the router served the request INLINE (%d reply frame(s) sent): a slow answer on the dispatch goroutine would stall every consensus frame behind it", got)
+	}
 }
