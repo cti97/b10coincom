@@ -38,8 +38,11 @@ func TestRunHelpPrintsTheTrustTrade(t *testing.T) {
 		"--keepalive (default 15)",
 		"--max-conns-per-ip (default 8)",
 		"connection is closed and its registry slot released",
-		"max-conns x (write-queue-bytes + 2 x max-frame-bytes)",
-		"32 x (2 MiB + 2 x 1 MiB) = 32 x 4 MiB = 128 MiB",
+		"--write-queue-frames",
+		"max-conns x (write-queue-bytes",
+		"write-queue-frames x 32",
+		"32 x (2 MiB + 4096 x 32 B + 2 x 1 MiB) = 32 x 4.125 MiB",
+		"= 132 MiB",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("--help is missing %q - an operator would not see it", want)
@@ -81,13 +84,14 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		t.Fatalf("default --addr = %q, want \":7001\"", addr)
 	}
 	want := relay.Options{
-		MaxFrameBytes:   1 << 20,
-		MaxConns:        32,
-		MaxConnsPerIP:   8,
-		WriteQueueBytes: 2 << 20,
-		WriteTimeout:    30 * time.Second,
-		ReadTimeout:     2 * time.Minute,
-		KeepAlive:       15 * time.Second,
+		MaxFrameBytes:    1 << 20,
+		MaxConns:         32,
+		MaxConnsPerIP:    8,
+		WriteQueueBytes:  2 << 20,
+		WriteQueueFrames: 4096,
+		WriteTimeout:     30 * time.Second,
+		ReadTimeout:      2 * time.Minute,
+		KeepAlive:        15 * time.Second,
 	}
 	if opts != want {
 		t.Fatalf("default Options drifted from the documented numbers: got %+v, want %+v", opts, want)
@@ -100,6 +104,7 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		"--max-conns", "7",
 		"--max-conns-per-ip", "5",
 		"--write-queue-bytes", "4096",
+		"--write-queue-frames", "17",
 		"--write-timeout", "6",
 		"--read-timeout", "30",
 		"--keepalive", "10",
@@ -111,13 +116,14 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		t.Fatalf("--addr = %q, want \"127.0.0.1:7005\"", addr)
 	}
 	wantOverride := relay.Options{
-		MaxFrameBytes:   8192,
-		MaxConns:        7,
-		MaxConnsPerIP:   5,
-		WriteQueueBytes: 4096,
-		WriteTimeout:    6 * time.Second,
-		ReadTimeout:     30 * time.Second,
-		KeepAlive:       10 * time.Second,
+		MaxFrameBytes:    8192,
+		MaxConns:         7,
+		MaxConnsPerIP:    5,
+		WriteQueueBytes:  4096,
+		WriteQueueFrames: 17,
+		WriteTimeout:     6 * time.Second,
+		ReadTimeout:      30 * time.Second,
+		KeepAlive:        10 * time.Second,
 	}
 	if opts != wantOverride {
 		t.Fatalf("overrides did not reach Options: got %+v, want %+v", opts, wantOverride)
@@ -125,11 +131,11 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 
 	// A zero is a deliberate convention ("use the default", relay.Options'
 	// contract) and must pass through untouched, not become some other value.
-	_, opts, err = parseArgs([]string{"--read-timeout", "0", "--keepalive", "0", "--write-timeout", "0", "--max-conns-per-ip", "0", "--write-queue-bytes", "0"}, &stderr2)
+	_, opts, err = parseArgs([]string{"--read-timeout", "0", "--keepalive", "0", "--write-timeout", "0", "--max-conns-per-ip", "0", "--write-queue-bytes", "0", "--write-queue-frames", "0"}, &stderr2)
 	if err != nil {
 		t.Fatalf("parseArgs(zeros): %v", err)
 	}
-	if opts.ReadTimeout != 0 || opts.KeepAlive != 0 || opts.WriteTimeout != 0 || opts.MaxConnsPerIP != 0 || opts.WriteQueueBytes != 0 {
+	if opts.ReadTimeout != 0 || opts.KeepAlive != 0 || opts.WriteTimeout != 0 || opts.MaxConnsPerIP != 0 || opts.WriteQueueBytes != 0 || opts.WriteQueueFrames != 0 {
 		t.Fatalf("zero flags must pass through for the relay's default convention: got %+v", opts)
 	}
 }

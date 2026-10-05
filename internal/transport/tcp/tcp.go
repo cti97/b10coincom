@@ -46,6 +46,24 @@
 // a refusal (audit N-1: the identity read is where a stranger first meets a
 // validator's listener; a 1 MiB "identity" is nothing a legitimate peer
 // ever opens with), and the connection ends instead of being read.
+//
+// Two further rules exist because a deterministic name is otherwise a free
+// handle (audit N-1, whose first fix introduced exactly that):
+//
+//   - the relay:<addr> name is RESERVED for this transport's own outbound
+//     relay registration. No ACCEPTED connection may claim it
+//     (ErrReservedPeerName): the name is produced only by RelayPeerName on
+//     the dialling side, an inbound peer never legitimately presents it, and
+//     the deterministic form would otherwise let any stranger who can reach
+//     the listener claim the relay link's identity for free.
+//
+//   - an outbound maintainer NEVER retires because its connection was
+//     superseded. It backs off and redials (see maintain): the rank's winner
+//     at the other end of a genuine cross-dial may be an accepted connection
+//     with no maintainer here, so a permanent exit is a link that a stranger
+//     can end by claiming a lower-sorting name on the listener. The retry
+//     deterministically loses to a genuine winner (bounded churn at the
+//     backoff ceiling) and wins the moment a squatter leaves.
 package tcp
 
 import (
@@ -55,6 +73,7 @@ import (
 	"math/rand"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -167,6 +186,15 @@ var (
 	// mid-stream with no identity), and the connection ends. The maintainer
 	// redials like any other failure.
 	ErrHandshakeIDTooLarge = errors.New("tcp: handshake identity frame exceeds the identity bound")
+	// ErrReservedPeerName is returned when an ACCEPTED (inbound) connection
+	// announces a name this transport reserves for its own outbound
+	// registrations - the relay:<addr> form. The name is deterministic and
+	// public (RelayPeerName), so allowing an inbound claim would hand any
+	// stranger who can reach the listener the relay link's identity for
+	// free; a legitimate relay connection is dialled out in relay mode and
+	// is never the accepted side (audit N-1). The connection is closed and
+	// the real relay maintainer is untouched.
+	ErrReservedPeerName = errors.New("tcp: accepted connection announced a reserved outbound name")
 )
 
 // Options configures a TCP transport. Every duration and bound has a default;
@@ -269,10 +297,13 @@ type conn struct {
 	// fire that close (its socket died of the same eviction) BEFORE the
 	// winner's adopt has written the flag - the race detector caught exactly
 	// that read racing the write - so the channel close is only the wake-up
-	// and every access to the flag is mutex-guarded. The maintainer checks
-	// it after <-dead: a superseded conn must not be redialled, or the old
-	// and new connections would keep evicting each other forever (four
-	// goroutines, one socket, all churning).
+	// and every access to the flag is mutex-guarded. The maintainer checks it
+	// after <-dead for ONE decision only: a superseded death does not reset
+	// the backoff curve. It does NOT retire the maintainer - that was the
+	// second N-1 hole; the maintainer backs off and redials, and because the
+	// rank is a fixed function of the pair, each retry loses to the same
+	// winner while it stands rather than evicting it back (no ping-pong, no
+	// hot loop: at most one dial per backoff interval at the ceiling).
 	superseded bool
 }
 
@@ -552,29 +583,44 @@ func (t *TcpTransport) registerOutbound(addr string, relay bool, first chan<- er
 
 // maintain is the reconnection loop for one address: dial, handshake, hold
 // until the connection dies, then redial after a growing, jittered delay.
-// TWO findings end the loop: the transport closing (quit), or the connection
-// being SUPERSEDED - replaced in the registry by a higher-ranked connection
-// to the same peer, whose keeper is the one feeding the link (see
-// conn.superseded; the loser's registration is released with the exit).
+// EXACTLY ONE finding ends the loop: the transport closing (quit). Every other
+// outcome - a dial error, a self or duplicate refusal, an oversized identity,
+// a read timeout, or the connection being SUPERSEDED by a higher-ranked
+// connection to the same peer - is an ordinary failure that backs off and
+// retries. Nothing a stranger can do to the registry may end a maintainer.
 //
-// A self- or duplicate-peer refusal is deliberately NOT an end of the loop
-// any more, which is the heart of the audit's N-1 fix. Before it, such a
-// refusal returned from maintain - the address was never redialled again -
-// and through a relay, what the handshake read as the peer's identity was
-// merely whichever frame arrived first: ANYONE could send a validator its
-// own name through the relay, have the refusal fire, and leave that
-// validator permanently off the network until a process restart. Now a
-// refusal is an ordinary failure: the loop backs off (capped at BackoffMax,
-// 30s at defaults) and retries, so the link self-heals the moment the thing
-// that made it refused is gone. When the incumbent is genuine, the registry
-// refuses every retry (no churn beyond the backoff curve's floor), and when
-// it was a squatter, a later attempt wins: either way the maintainer stays
-// alive to keep trying, which is the only property a maintainer can own.
+// A self- or duplicate-peer refusal is not an end of the loop, which is the
+// heart of the audit's N-1 fix. Before it, such a refusal returned from
+// maintain - the address was never redialled again - and through a relay,
+// what the handshake read as the peer's identity was merely whichever frame
+// arrived first: ANYONE could send a validator its own name through the
+// relay, have the refusal fire, and leave that validator permanently off the
+// network until a process restart. Now such a refusal is an ordinary failure:
+// the loop backs off (capped at BackoffMax, 30s at defaults) and retries, so
+// the link self-heals the moment the thing that made it refused is gone. When
+// the incumbent is genuine, the registry refuses every retry (no churn beyond
+// the backoff curve's ceiling), and when it was a squatter, a later attempt
+// wins: either way the maintainer stays alive to keep trying, which is the
+// only property a maintainer can own.
 //
-// That exit releases the address registration (the deferred forgetOutbound):
-// a maintainer that stops running while its registration survives would
-// leave Dial/AddPeer reporting a maintainer that does not exist, and behind
-// that lie, a peer set nothing ever refills.
+// A SUPERSEDE is the same shape, and it is the one the first N-1 fix missed
+// (audit N-1, second pass). The winner of a duplicate is not always a link
+// some local maintainer feeds: at the larger end of a genuine cross-dial the
+// winner is the smaller peer's ACCEPTED connection, kept alive from ITS side,
+// and the rank must give both ends that same socket or the pair strands with
+// zero links. So "an accepted connection may never evict an outbound link" is
+// not available as a rule. What IS available is that the loser's maintainer
+// keeps retrying: the deterministic rank makes each retry lose to the same
+// winner while it stands (bounded churn at the curve's ceiling) and win as
+// soon as it is gone. Before this second fix, a stranger claiming a
+// lower-sorting peer ID - or the deterministic relay:<addr> name - on a
+// validator's own listener evicted the incumbent and the maintainer returned
+// here, so the link was gone until process restart. It is not any more.
+//
+// The deferred forgetOutbound still releases the address registration, but now
+// only when the transport itself is closing (the sole exit), where no
+// Dial/AddPeer can be misled by a stale entry: the maintainer that still owns
+// the address is still running.
 func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 	defer t.wg.Done()
 	addr := ob.addr
@@ -601,7 +647,6 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 			}
 			report(err)
 			if err == nil {
-				attempt = 0 // a live connection resets the curve: one success outranks every prior failure
 				select {
 				case <-c.dead:
 					// The flag is mutex-guarded on BOTH sides (see
@@ -612,15 +657,25 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 					t.mu.Lock()
 					wasSuperseded := c.superseded
 					t.mu.Unlock()
-					if wasSuperseded {
-						// Replaced by a higher-ranked connection to this
-						// peer. The winner keeps the link, so this side
-						// stops maintaining it - and the deferred release
-						// above makes the stop honest: the registration
-						// goes with the maintainer instead of masking the
-						// absence of any redial behind a claimed one.
-						return
+					// A connection that died on its own resets the curve:
+					// one success outranks every prior failure. A SUPERSEDED
+					// death must NOT reset it - the retries below have to
+					// grow toward the backoff ceiling while the winner
+					// stands, or a settled cross-dial would be challenged at
+					// the curve's floor forever.
+					if !wasSuperseded {
+						attempt = 0
 					}
+					// And then the loop falls through: a supersede is an
+					// ORDINARY failure, not an exit. The winner here may be
+					// an ACCEPTED connection (the other end's genuine dial,
+					// which the rank gives the same physical socket at both
+					// ends) with no maintainer on this side; if this side
+					// retired, a stranger could end the link permanently by
+					// claiming a lower-sorting name on the listener (audit
+					// N-1). The deterministic rank makes the retry lose to a
+					// genuine winner and win the moment a squatter leaves,
+					// so the state is self-healing either way.
 				case <-t.quit:
 					return
 				}
@@ -648,11 +703,11 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 }
 
 // forgetOutbound releases ob's address registration when its maintainer exits
-// for good - superseded by a higher-ranked connection to the same peer, or
-// the transport closing - so a later Dial/AddPeer of the same address is
-// answered by a maintainer that exists rather than waved off as idempotent
-// by a stale entry. (A self- or duplicate refusal is no longer an exit at
-// all: it backs off and retries - audit N-1.)
+// for good. The only exit is the transport closing, so the release is
+// bookkeeping for shutdown rather than a live state change: while the
+// transport runs, every address a Dial/AddPeer registered still has the
+// maintainer it claims. (A self or duplicate refusal, and a supersede, are
+// not exits at all: they back off and retry - audit N-1, both passes.)
 func (t *TcpTransport) forgetOutbound(ob *outbound) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -777,6 +832,18 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled bool, id transp
 		t.mu.Unlock()
 		nc.Close()
 		return nil, fmt.Errorf("%w (%q on %s)", ErrSelfConnection, id, addr)
+	}
+	if !dialled && strings.HasPrefix(string(id), relayPeerIDPrefix) {
+		// A name this transport reserves for its OWN outbound relay
+		// registration, claimed by an ACCEPTED connection. relay:<addr> is
+		// deterministic and public, so an inbound claim is always a stranger
+		// reaching the listener: refuse it before it can enter the registry
+		// and evict the real relay link (audit N-1's free handle). A genuine
+		// relay connection is dialled in relay mode (adoptRelay, dialled
+		// true), so this branch never touches it.
+		t.mu.Unlock()
+		nc.Close()
+		return nil, fmt.Errorf("%w (%q on %s)", ErrReservedPeerName, id, addr)
 	}
 	existing := t.conns[id]
 	if existing != nil && !newcomerWins(t.opts.LocalID, existing, c) {

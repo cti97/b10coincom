@@ -1190,15 +1190,28 @@ func TestConcurrentSameIDHandshakesLeaveOneConnection(t *testing.T) {
 	}
 }
 
-// TestSupersededMaintainerReleasesItsRegistration pins F2: when a maintainer's
-// connection is superseded (here: the transport's own dial loses a duplicate
-// race to the peer's incoming dial, which the rank gives to the remote because
-// the remote's id is smaller), the maintainer must go dormant AND release its
-// address registration. The pre-fix code kept the stale entry, so Dial was
-// waved off as idempotent "nil" while nothing redialled - a peer set that
-// stayed empty forever. After the release, a fresh Dial must spawn a real
-// maintainer and reconnect.
-func TestSupersededMaintainerReleasesItsRegistration(t *testing.T) {
+// TestSupersededMaintainerRedialsAndHeals is the REAL shape of audit N-1's
+// second pass, and the one the first attempt's test dodged: the incumbent is
+// this transport's own OUTBOUND, EVICTED by a squatter's ACCEPTED connection.
+// The order is load-bearing. The transport dials a genuine peer and the link
+// installs; only then does a stranger dial the transport's OWN listener and
+// claim the same, lower-sorting peer ID. Because the local ID sorts above the
+// claimed one, the rank gives the squatter's accepted connection the registry
+// and SUPERSEDES the established outbound - exactly what any stranger who can
+// open a TCP connection to a validator's --listen port can do.
+//
+// Pre-fix, the superseded maintainer RETURNED at the supersede branch:
+// permanent dormancy, the link never restored until process restart, the peer
+// set empty indefinitely with the listener still accepting (the audit
+// reproduced it twice). The fix makes a supersede an ordinary failure - back
+// off, redial - so when the squatter leaves the next retry installs the real
+// peer, with NO new Dial and no restart.
+//
+// The reverting mutant (maintain returns on a superseded conn) fails the
+// healing wait below: the registry stays empty forever. That is the exact
+// permanent state, and it is why this test cannot be passed by the
+// losing-newcomer branch alone - the eviction must be observed first.
+func TestSupersededMaintainerRedialsAndHeals(t *testing.T) {
 	// A raw remote end, fully controlled: answers every handshake as "aaa"
 	// and holds its sockets open until closed or abandoned.
 	rl, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1215,9 +1228,9 @@ func TestSupersededMaintainerReleasesItsRegistration(t *testing.T) {
 			go func(nc net.Conn) {
 				defer nc.Close()
 				br := bufio.NewReader(nc)
-				nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+				_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
 				id, rerr := wire.ReadFrame(br, 4096)
-				nc.SetReadDeadline(time.Time{})
+				_ = nc.SetReadDeadline(time.Time{})
 				if rerr != nil || string(id) != "zzz" {
 					return
 				}
@@ -1235,60 +1248,123 @@ func TestSupersededMaintainerReleasesItsRegistration(t *testing.T) {
 	}()
 	addr := rl.Addr().String()
 
-	// zzz > aaa, so per newcomerWins the peer's dial (the smaller id's dial
-	// wins the rank) supersedes this transport's own outbound - the
-	// maintainer's connection is the one replaced.
-	tp, err := New(Options{LocalID: "zzz"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = tp.Close() })
-	// It must also listen: the superseding duplicate arrives as an INBOUND
-	// connection on this transport's own listener.
-	if err := tp.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
+	// zzz > aaa, so an ACCEPTED "aaa" outranks this transport's own outbound
+	// under the rank - the eviction direction the attack needs.
+	tp := listen(t, Options{
+		LocalID:     "zzz",
+		BackoffBase: 10 * time.Millisecond,
+		BackoffMax:  100 * time.Millisecond,
+		Rand:        rand.New(rand.NewSource(7)),
+	})
 	if err := tp.Dial(addr); err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	waitPeersIs(t, tp, "[aaa]")
-
-	// The duplicate: an inbound connection announcing the same peer id. It
-	// outranks our outbound, so our maintainer's connection is superseded.
-	hc, err := net.Dial("tcp", tp.Addr().String())
-	if err != nil {
-		t.Fatal(err)
+	// Pin the incumbent's direction before the eviction, so the test cannot
+	// pass on the wrong socket: it must be THIS transport's own dial.
+	tp.mu.Lock()
+	inc := tp.conns["aaa"]
+	incDialled, incRemote := inc != nil && inc.dialled, ""
+	if inc != nil {
+		incRemote = inc.nc.RemoteAddr().String()
 	}
-	t.Cleanup(func() { _ = hc.Close() })
+	tp.mu.Unlock()
+	if !incDialled || incRemote != addr {
+		t.Fatalf("the established link is not this transport's own dial to the peer (dialled=%v remote=%s): the constructed attack needs that incumbent", incDialled, incRemote)
+	}
+
+	// THE attack: the stranger claims the peer's lower-sorting ID on the
+	// transport's OWN listener. Accepted (dialled=false) outranks the
+	// maintainer's dial, so it evicts the established link.
+	hc := rawDial(t, tp.Addr().String())
 	if err := wire.WriteFrame(hc, []byte("aaa")); err != nil {
 		t.Fatal(err)
 	}
-	waitPeersIs(t, tp, "[aaa]") // still exactly one connection - the winner's
-
-	// The registration must be RELEASED (the winner here has no local
-	// maintainer - the peer's own dial holds the link from ITS side - so
-	// release, not transfer, is what honest bookkeeping looks like). A stale
-	// entry here is precisely the lie that made Dial return nil forever.
-	waitFor(t, "the superseded maintainer's registration being released", 2*time.Second, func() bool {
+	// Exactly one connection throughout; after the eviction it is the
+	// squatter's accepted socket, not the real peer's.
+	waitFor(t, "the squatter's accepted connection evicting the outbound link", 5*time.Second, func() bool {
 		tp.mu.Lock()
 		defer tp.mu.Unlock()
-		return len(tp.outbounds) == 0
+		if len(tp.conns) != 1 {
+			return false
+		}
+		c := tp.conns["aaa"]
+		return c != nil && !c.dialled && c.nc.RemoteAddr().String() != addr
 	})
 
-	// Kill the winner from the raw side. Nothing redials - the registration
-	// is gone, and pretending otherwise would be the lie above. The peer set
-	// drains to empty and STAYS empty until someone dials again.
-	hc.Close()
-	waitPeersIs(t, tp, "[]")
-
-	// Now Dial must spawn a FRESH maintainer: a maintainer exists again, and
-	// the reconnection the transport promises actually happens.
-	if err := tp.Dial(addr); err != nil {
-		t.Fatalf("Dial after the supersede released the registration: %v", err)
+	// The squatter leaves. The maintainer must heal the link with NO further
+	// Dial: the supersede was an ordinary failure, and the registry must name
+	// the real peer's listener again, dialled by this side.
+	_ = hc.Close()
+	waitFor(t, "the superseded maintainer redialling and restoring the real peer", 5*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		c := tp.conns["aaa"]
+		return len(tp.conns) == 1 && c != nil && c.dialled && !c.superseded && c.nc.RemoteAddr().String() == addr
+	})
+	if err := tp.Send("aaa", []byte("healed")); err != nil {
+		t.Fatalf("Send over the self-healed link: %v", err)
 	}
-	waitPeersIs(t, tp, "[aaa]")
-	if err := tp.Send("aaa", []byte("sync")); err != nil {
-		t.Fatalf("Send over the re-established link: %v", err)
+}
+
+// TestAnAcceptedConnectionCannotClaimTheRelayName pins the other half of the
+// N-1 second-pass fix: the deterministic relay:<addr> name is RESERVED for
+// this transport's own outbound relay registration, and an ACCEPTED
+// connection may not claim it. The name is produced only by RelayPeerName on
+// the dialling side, so an inbound peer presenting it is a stranger; without
+// the reservation it enters install's duplicate path with a deterministic,
+// public name and - because "v0" sorts above "relay:..." - evicts the real
+// relay link for free.
+//
+// The assertion is the registry's REMOTE address, not its name: the name is
+// identical either way, so only the socket distinguishes the real relay link
+// from the squatter's. Under the mutant that drops the reservation the
+// registry names the squatter's ephemeral socket and this fails.
+func TestAnAcceptedConnectionCannotClaimTheRelayName(t *testing.T) {
+	rl := relay.New(relay.Options{})
+	if err := rl.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	t.Cleanup(rl.Close)
+	raddr := rl.Addr().String()
+
+	tp := listen(t, Options{
+		LocalID:     "v0",
+		BackoffBase: 10 * time.Millisecond,
+		BackoffMax:  100 * time.Millisecond,
+		Rand:        rand.New(rand.NewSource(11)),
+	})
+	if err := tp.AddRelay(raddr); err != nil {
+		t.Fatalf("AddRelay: %v", err)
+	}
+	relayName := RelayPeerName(raddr)
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", relayName))
+
+	// The squatter on the transport's OWN listener, claiming the public,
+	// deterministic relay name.
+	sq := rawDial(t, tp.Addr().String())
+	if err := wire.WriteFrame(sq, []byte(relayName)); err != nil {
+		t.Fatal(err)
+	}
+	// The claim is refused: the registry still holds the REAL relay link
+	// (remote == the relay's listener), never the squatter's socket.
+	waitFor(t, "the accepted relay-name claim being refused", 5*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		c := tp.conns[relayName]
+		return len(tp.conns) == 1 && c != nil && c.nc.RemoteAddr().String() == raddr
+	})
+	// The transport greeted the squatter first (both sides write before
+	// reading), so consume that greeting, then the refusal closes the socket.
+	_ = sq.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := wire.ReadFrame(bufio.NewReader(sq), maxHandshakeIDBytes); err != nil {
+		t.Fatalf("reading the transport's greeting before the relay-name refusal: %v", err)
+	}
+	waitClosedConn(t, sq, "an accepted connection claiming the reserved relay name")
+
+	// The relay link is still a working link.
+	if err := tp.Send(relayName, []byte("still-alive")); err != nil {
+		t.Fatalf("Send over the untouched relay link: %v", err)
 	}
 }
 

@@ -67,12 +67,15 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"math/rand"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/cti97/b10coincom/internal/wire"
 )
@@ -526,7 +529,7 @@ func TestRelayStalledHeadersDoNotPinMemoryOrSlots(t *testing.T) {
 	r := startRelay(t, Options{
 		MaxFrameBytes:   1 << 20, // the reviewer's scenario: frames declared at exactly the default bound
 		MaxConns:        256,
-		MaxConnsPerIP:   256, // the attack is 100 dials from ONE host: the per-IP cap must not pre-empt the read-deadline scenario being tested
+		MaxConnsPerIP:   256, // the attack is 100 dials from ONE host: the per-source cap must not pre-empt the read-deadline scenario being tested
 		WriteQueueBytes: 4 << 20,
 		ReadTimeout:     3 * time.Second, // the knob under test, shrunk from the 2-minute default for a fast expiry
 	})
@@ -697,8 +700,8 @@ func TestRelayAByteBudgetDropsInsteadOfBlocking(t *testing.T) {
 	// loop and no goroutines; and these connections own no socket, so there
 	// is nothing for Close to finish either. The registry below is the only
 	// state forward reads.
-	sender := &conn{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})}
-	wedged := &conn{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})}
+	sender := &conn{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})}
+	wedged := &conn{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})}
 	r.mu.Lock()
 	r.conns[sender] = struct{}{}
 	r.conns[wedged] = struct{}{}
@@ -711,9 +714,9 @@ func TestRelayAByteBudgetDropsInsteadOfBlocking(t *testing.T) {
 	for i := 0; i < queueBytes/frameBytes; i++ {
 		r.forward(sender, fill)
 	}
-	if wedged.q.bytes != queueBytes || len(wedged.q.ents) != 3 {
+	if wedged.q.bytes != queueBytes || wedged.q.queued() != 3 {
 		t.Fatalf("the byte budget reads %d bytes / %d frames after %d x %d-byte enqueues (want exactly %d bytes / 3 frames) - the queue did not reach its budget, so the test's premise (an exactly-full byte budget) never formed",
-			wedged.q.bytes, len(wedged.q.ents), queueBytes/frameBytes, frameBytes, queueBytes)
+			wedged.q.bytes, wedged.q.queued(), queueBytes/frameBytes, frameBytes, queueBytes)
 	}
 	if st := r.Stats(); st.Forwarded != 3 || st.Dropped != 0 {
 		t.Fatalf("at budget the counters read Forwarded=%d/Dropped=%d, want 3/0 - the accounting drifted before a drop was even possible", st.Forwarded, st.Dropped)
@@ -746,8 +749,8 @@ func TestRelayAByteBudgetDropsInsteadOfBlocking(t *testing.T) {
 	if st := r.Stats(); st.Forwarded != 3 {
 		t.Fatalf("Stats().Forwarded == %d after the drop, want 3 - the dropped frame was counted as delivered", st.Forwarded)
 	}
-	if wedged.q.bytes != queueBytes || len(wedged.q.ents) != 3 {
-		t.Fatalf("the queue holds %d bytes / %d frames after the drop, want %d/3 - the dropped enqueue disturbed the queue", wedged.q.bytes, len(wedged.q.ents), queueBytes)
+	if wedged.q.bytes != queueBytes || wedged.q.queued() != 3 {
+		t.Fatalf("the queue holds %d bytes / %d frames after the drop, want %d/3 - the dropped enqueue disturbed the queue", wedged.q.bytes, wedged.q.queued(), queueBytes)
 	}
 	// And the budget's contents are uncorrupted: three fills, in order.
 	for i := 0; i < 3; i++ {
@@ -807,11 +810,11 @@ func TestRelayAWedgedPeerDoesNotDelayTheSenders(t *testing.T) {
 	// The registry below is the only state forward reads, and no writer
 	// goroutine exists to drain any queue - the wedged peer's queue, once at
 	// its budget, cannot move, on any host.
-	sender := &conn{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})}
-	wedged := &conn{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})}
+	sender := &conn{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})}
+	wedged := &conn{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})}
 	healthy := []*conn{
-		{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})},
-		{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})},
+		{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})},
+		{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})},
 	}
 	r.mu.Lock()
 	r.conns[sender] = struct{}{}
@@ -837,8 +840,8 @@ func TestRelayAWedgedPeerDoesNotDelayTheSenders(t *testing.T) {
 
 	// The wedge, verified, not assumed - and it could not be otherwise:
 	// nothing exists here to drain wedged.q.
-	if wedged.q.bytes != queueBytes || len(wedged.q.ents) != 4 {
-		t.Fatalf("the wedged peer's queue holds %d bytes / %d frames before the probe (want 400/4) - the test's premise (an exactly-full byte budget built by hand) never formed", wedged.q.bytes, len(wedged.q.ents))
+	if wedged.q.bytes != queueBytes || wedged.q.queued() != 4 {
+		t.Fatalf("the wedged peer's queue holds %d bytes / %d frames before the probe (want 400/4) - the test's premise (an exactly-full byte budget built by hand) never formed", wedged.q.bytes, wedged.q.queued())
 	}
 	// Unlike the wedged peer, the healthy peers' writers KEPT UP (nothing
 	// parked them, because nothing is parked at all): the fills are still
@@ -849,14 +852,14 @@ func TestRelayAWedgedPeerDoesNotDelayTheSenders(t *testing.T) {
 	// different about it - the distinction the assertions below rest on.
 	wantBytesAfterDrain := queueBytes - fillBytes
 	for i, h := range healthy {
-		if h.q.bytes != queueBytes || len(h.q.ents) != 4 {
-			t.Fatalf("healthy peer %d's queue holds %d bytes / %d fills after the fill fan-out (want %d/4) - the premise (every fill reached every non-wedged peer) never formed", i, h.q.bytes, len(h.q.ents), queueBytes)
+		if h.q.bytes != queueBytes || h.q.queued() != 4 {
+			t.Fatalf("healthy peer %d's queue holds %d bytes / %d fills after the fill fan-out (want %d/4) - the premise (every fill reached every non-wedged peer) never formed", i, h.q.bytes, h.q.queued(), queueBytes)
 		}
 		if got, ok := h.q.pop(); !ok || string(got.b[:len(fillBody)]) != fillBody {
 			t.Fatalf("healthy peer %d: the drained head of its queue is %q (present %v), want the oldest fill - the fan-out never came to rest in sender order", i, got.b, ok)
 		}
-		if h.q.bytes != wantBytesAfterDrain || len(h.q.ents) != 3 {
-			t.Fatalf("healthy peer %d's queue holds %d bytes / %d frames after one drain, want %d/3 - the drain did not leave the probe's room", i, h.q.bytes, len(h.q.ents), wantBytesAfterDrain)
+		if h.q.bytes != wantBytesAfterDrain || h.q.queued() != 3 {
+			t.Fatalf("healthy peer %d's queue holds %d bytes / %d frames after one drain, want %d/3 - the drain did not leave the probe's room", i, h.q.bytes, h.q.queued(), wantBytesAfterDrain)
 		}
 	}
 
@@ -886,8 +889,8 @@ func TestRelayAWedgedPeerDoesNotDelayTheSenders(t *testing.T) {
 	// healthy queue's LAST frame (its bytes ride on top of the three fills
 	// still queued: wantBytesAfterDrain + len(probeBody)).
 	for i, h := range healthy {
-		if want := wantBytesAfterDrain + len(probeBody); h.q.bytes != want || len(h.q.ents) != 4 {
-			t.Fatalf("healthy peer %d's queue holds %d bytes / %d frames after a forward with one peer full, want %d/4 - the stalled peer cost it the payload", i, h.q.bytes, len(h.q.ents), want)
+		if want := wantBytesAfterDrain + len(probeBody); h.q.bytes != want || h.q.queued() != 4 {
+			t.Fatalf("healthy peer %d's queue holds %d bytes / %d frames after a forward with one peer full, want %d/4 - the stalled peer cost it the payload", i, h.q.bytes, h.q.queued(), want)
 		}
 		for j := 0; j < 3; j++ {
 			if got, ok := h.q.pop(); !ok || string(got.b[:len(fillBody)]) != fillBody {
@@ -902,8 +905,8 @@ func TestRelayAWedgedPeerDoesNotDelayTheSenders(t *testing.T) {
 	// The probe went nowhere but the healthy peers: the wedged queue took
 	// the drop and kept its contents - the budget held for everyone else
 	// while holding the wedge in place.
-	if wedged.q.bytes != queueBytes || len(wedged.q.ents) != 4 {
-		t.Fatalf("the wedged peer's queue reads %d bytes / %d frames after the probe forward (want 400/4) - a frame entered a queue that was at its budget", wedged.q.bytes, len(wedged.q.ents))
+	if wedged.q.bytes != queueBytes || wedged.q.queued() != 4 {
+		t.Fatalf("the wedged peer's queue reads %d bytes / %d frames after the probe forward (want 400/4) - a frame entered a queue that was at its budget", wedged.q.bytes, wedged.q.queued())
 	}
 	for i := 0; i < 4; i++ {
 		if got, ok := wedged.q.pop(); !ok || string(got.b[:len(fillBody)]) != fillBody {
@@ -938,9 +941,9 @@ func TestRelayPerSenderShareStopsAFloodFromCensoring(t *testing.T) {
 		maxFrameBound = 32
 	)
 	r := New(Options{MaxFrameBytes: maxFrameBound, MaxConns: 8, MaxConnsPerIP: 8, WriteQueueBytes: queueBytes})
-	flooder := &conn{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})}
-	wedged := &conn{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})}
-	voter := &conn{q: newSendQ(queueBytes, maxFrameBound), dead: make(chan struct{})}
+	flooder := &conn{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})}
+	wedged := &conn{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})}
+	voter := &conn{q: newSendQ(queueBytes, maxFrameBound, queueBytes), dead: make(chan struct{})}
 	r.mu.Lock()
 	r.conns[flooder] = struct{}{}
 	r.conns[wedged] = struct{}{}
@@ -957,13 +960,13 @@ func TestRelayPerSenderShareStopsAFloodFromCensoring(t *testing.T) {
 	if st := r.Stats(); st.Forwarded != 2 || st.Dropped != 0 {
 		t.Fatalf("after the flooder's first frame the counters read Forwarded=%d/Dropped=%d, want 2/0 - the fan-out path lost an admission", st.Forwarded, st.Dropped)
 	}
-	if wedged.q.bytes != frameBytes || wedged.q.from[flooder] != frameBytes {
-		t.Fatalf("the flooder's occupancy of the wedged queue reads %d/%d - the first admission never landed", wedged.q.bytes, wedged.q.from[flooder])
+	if wedged.q.bytes != frameBytes || wedged.q.occupancy(flooder) != frameBytes {
+		t.Fatalf("the flooder's occupancy of the wedged queue reads %d/%d - the first admission never landed", wedged.q.bytes, wedged.q.occupancy(flooder))
 	}
 	// Its second: refused at the SHARE (100+100 > 150) - a flooder alone can
 	// never fill the budget, which is the property this test exists for.
 	if wedged.q.push(flooder, frame) {
-		t.Fatalf("the flooder's second frame was admitted (queue %d bytes, flooder share %d): the share holds nothing, so the flood's own frames would fill the queue and the honest frame below would drop with them", wedged.q.bytes, wedged.q.from[flooder])
+		t.Fatalf("the flooder's second frame was admitted (queue %d bytes, flooder share %d): the share holds nothing, so the flood's own frames would fill the queue and the honest frame below would drop with them", wedged.q.bytes, wedged.q.occupancy(flooder))
 	}
 	// THE property: the honest sender's frame is ADMITTED into the space the
 	// share guarantees - under a mutant that drops the share check, the
@@ -971,7 +974,7 @@ func TestRelayPerSenderShareStopsAFloodFromCensoring(t *testing.T) {
 	// is the one that drops, named by the message.
 	if !wedged.q.push(voter, vote) {
 		t.Fatalf("the honest sender's frame was refused with the flooder holding only %d of its %d-byte share (queue %d/%d bytes) - one sender's flood censored another sender's frame",
-			wedged.q.from[flooder], shareBytes, wedged.q.bytes, queueBytes)
+			wedged.q.occupancy(flooder), shareBytes, wedged.q.bytes, queueBytes)
 	}
 	// Order: flooder's frame first, honest second - FIFO per (sender,
 	// receiver); the share is keyed by sender conn, so the pops name them.
@@ -986,8 +989,8 @@ func TestRelayPerSenderShareStopsAFloodFromCensoring(t *testing.T) {
 	// The refunds: after both pops the budget and the flooder's share are
 	// fully free, so the flooder can enqueue again - the share caps what a
 	// sender HOLDS, never what it has sent in its life.
-	if wedged.q.bytes != 0 || wedged.q.from[flooder] != 0 {
-		t.Fatalf("after draining, the queue holds %d bytes and the flooder's occupancy is %d - the pop refund leaked", wedged.q.bytes, wedged.q.from[flooder])
+	if wedged.q.bytes != 0 || wedged.q.occupancy(flooder) != 0 {
+		t.Fatalf("after draining, the queue holds %d bytes and the flooder's occupancy is %d - the pop refund leaked", wedged.q.bytes, wedged.q.occupancy(flooder))
 	}
 	if !wedged.q.push(flooder, frame) {
 		t.Fatalf("the flooder's frame after a full drain was refused - the share did not refund its popped occupancy")
@@ -1027,13 +1030,14 @@ func TestRelayDoesNotDeduplicateARepeatedFrame(t *testing.T) {
 func TestRelayOptionDefaultsPinTheOperatorNumbers(t *testing.T) {
 	got := New(Options{}).opts
 	want := Options{
-		MaxFrameBytes:   1 << 20,
-		MaxConns:        32,
-		MaxConnsPerIP:   8,
-		WriteQueueBytes: 2 << 20,
-		WriteTimeout:    30 * time.Second,
-		ReadTimeout:     2 * time.Minute,
-		KeepAlive:       15 * time.Second,
+		MaxFrameBytes:    1 << 20,
+		MaxConns:         32,
+		MaxConnsPerIP:    8,
+		WriteQueueBytes:  2 << 20,
+		WriteQueueFrames: 4096,
+		WriteTimeout:     30 * time.Second,
+		ReadTimeout:      2 * time.Minute,
+		KeepAlive:        15 * time.Second,
 	}
 	if got != want {
 		t.Fatalf("relay defaults drifted from the documented operator numbers: got %+v, want %+v", got, want)
@@ -1041,17 +1045,31 @@ func TestRelayOptionDefaultsPinTheOperatorNumbers(t *testing.T) {
 	// The AGGREGATE memory bound the documents quote is DERIVED from these
 	// fields (Options.MaxPinnedBytes), not asserted beside them: pin the
 	// derivation's output at the defaults, so a changed default either moves
-	// the documents' number with it or fails here.
-	if bound := got.MaxPinnedBytes(); bound != 128<<20 {
-		t.Fatalf("MaxPinnedBytes() = %d bytes at the defaults, want %d (32 conns x (2 MiB queue + 2 x 1 MiB hands)) - the derived pin the README, --help and the unit's MemoryMax quote has drifted",
-			bound, 128<<20)
+	// the documents' number with it or fails here. The derivation includes
+	// the per-frame ENTRY ring (audit N-2's re-opened term): 32 x (2 MiB
+	// payload + 4096 x 32 B entries + 2 x 1 MiB hands) = 132 MiB.
+	wantBound := 32 * (2<<20 + 4096*queuedFrameEntryBytes + 2*(1<<20))
+	if bound := got.MaxPinnedBytes(); bound != wantBound {
+		t.Fatalf("MaxPinnedBytes() = %d bytes at the defaults, want %d (32 conns x (2 MiB payload + 4096 x 32 B entries + 2 x 1 MiB hands)) - the derived pin the README, --help and the unit's MemoryMax quote has drifted",
+			bound, wantBound)
+	}
+	if wantBound != 132<<20 {
+		t.Fatalf("the derived default bound is %d bytes, expected the documented 132 MiB (%d) - the constants and the documents have diverged", wantBound, 132<<20)
 	}
 	// And the bound is really a derivation: changing one input moves it (a
 	// hardcoded constant would silently break the arithmetic).
 	custom := got
 	custom.MaxConns = 8
-	if bound := custom.MaxPinnedBytes(); bound != 8*(2<<20+2*(1<<20)) {
-		t.Fatalf("MaxPinnedBytes() = %d with MaxConns 8, want %d - the bound is not derived from the options", bound, 8*(2<<20+2*(1<<20)))
+	if bound := custom.MaxPinnedBytes(); bound != 8*(2<<20+4096*queuedFrameEntryBytes+2*(1<<20)) {
+		t.Fatalf("MaxPinnedBytes() = %d with MaxConns 8, want %d - the bound is not derived from the options", bound, 8*(2<<20+4096*queuedFrameEntryBytes+2*(1<<20)))
+	}
+	// The entry term is not decorative: dropping the frame cap from the
+	// formula moves the number, which is what a byte-budget-only claim did
+	// (audit N-2: the same 2 MiB admits ~2M one-byte entries).
+	custom = got
+	custom.WriteQueueFrames = 1
+	if bound := custom.MaxPinnedBytes(); bound >= got.MaxPinnedBytes() {
+		t.Fatalf("MaxPinnedBytes() = %d with the frame cap at 1, not below the default %d - the per-frame entry term is not in the derivation", bound, got.MaxPinnedBytes())
 	}
 }
 
@@ -1260,13 +1278,13 @@ func TestRelayAKeepaliveSinkCannotPinASlotOrMemory(t *testing.T) {
 	waitGoroutines(t, baseline+5, "goroutines leaked behind the reaped sink (want accept loop + flooder pair + fresh pair)")
 }
 
-// One source IP cannot hold the registry (audit N-2's third attack): the
-// per-IP cap is enforced at accept, counts against the canonical source IP,
-// and frees a slot only when a connection ends. The relay listens dual-stack
-// so the test can prove the cap is PER-IP and not a second global bound: a
-// dial from a DIFFERENT IP (::1) is admitted while the 127.0.0.1 group is at
-// its cap.
-func TestRelayPerSourceIPCapBitesAtAccept(t *testing.T) {
+// One source PREFIX cannot hold the registry (audit N-2's third attack): the
+// cap is enforced at accept, counts against the canonical source prefix
+// (connGroup), and frees a slot only when a connection ends. The relay listens
+// dual-stack so the test can prove the cap is PER-GROUP and not a second
+// global bound: a dial whose prefix differs (::1, i.e. ::/64) is admitted
+// while the 127.0.0.0/24 group is at its cap.
+func TestRelayPerSourcePrefixCapBitesAtAccept(t *testing.T) {
 	r := New(Options{MaxFrameBytes: 4096, MaxConns: 64, MaxConnsPerIP: 2, WriteQueueBytes: 1 << 16})
 	if err := r.Listen("[::]:0"); err != nil { // dual-stack: v4 and v6 sources are separate groups
 		t.Fatalf("dual-stack listen: %v", err)
@@ -1277,18 +1295,18 @@ func TestRelayPerSourceIPCapBitesAtAccept(t *testing.T) {
 	b := dialFrom(t, addr, "127.0.0.1")
 	waitRegistered(t, r, 2, "the first two loopback dials completed while their connections sat unregistered")
 
-	// The third dial from the SAME IP: refused at accept.
+	// The third dial from the SAME prefix: refused at accept.
 	third := dialFrom(t, addr, "127.0.0.1")
-	waitClosed(t, third, "a third dial from one source IP past the per-IP cap")
-	waitFor(t, func() bool { return r.Stats().RefusedConns == 1 }, "the per-IP refusal being counted")
+	waitClosed(t, third, "a third dial from one source prefix past the per-prefix cap")
+	waitFor(t, func() bool { return r.Stats().RefusedConns == 1 }, "the per-prefix refusal being counted")
 
-	// A dial from a DIFFERENT IP: admitted - the cap is per source, and the
-	// established peers are untouched.
+	// A dial from a DIFFERENT prefix: admitted - the cap is per group, and
+	// the established peers are untouched.
 	v6 := dialFrom(t, addr, "::1")
-	waitRegistered(t, r, 3, "the different-IP dial being admitted")
+	waitRegistered(t, r, 3, "the different-prefix dial being admitted")
 	writeFrame(t, a, []byte("still here"))
 	if got := readFrame(t, b, 4096); string(got) != "still here" {
-		t.Fatalf("b read %q, want %q - the per-IP refusal disturbed the established peers", got, "still here")
+		t.Fatalf("b read %q, want %q - the per-prefix refusal disturbed the established peers", got, "still here")
 	}
 	writeFrame(t, v6, []byte("six"))
 	if got := readFrame(t, a, 4096); string(got) != "six" {
@@ -1309,23 +1327,367 @@ func dialFrom(t *testing.T, addr, sourceIP string) net.Conn {
 	return c
 }
 
-// The per-IP cap's grouping key is a pure function of the ADDRESS - pinned
+// The accept cap's grouping key is a pure function of the ADDRESS - pinned
 // on its own so the accept-time rule's input is specified, not incidental:
-// v4 stays v4, IPv4-mapped IPv6 unmaps to the same group as its v4 self,
+// IPv4 masks to its /24, IPv6 to its /64 (the audit's bypass was a routed /64
+// rotating addresses past a full-address cap), IPv4-mapped IPv6 unmaps to the
+// same v4 group as its v4 self, two addresses inside one prefix share a group,
 // and a nil address degenerates to a single group.
-func TestConnHostCanonicalisesTheSourceGroup(t *testing.T) {
+func TestConnGroupPrefixesTheSource(t *testing.T) {
 	cases := []struct {
 		ra   net.Addr
 		want string
 	}{
-		{&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5}, "127.0.0.1"},
-		{&net.TCPAddr{IP: net.ParseIP("::ffff:127.0.0.1"), Port: 5}, "127.0.0.1"},
-		{&net.TCPAddr{IP: net.ParseIP("::1"), Port: 5}, "::1"},
+		{&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5}, "127.0.0.0/24"},
+		{&net.TCPAddr{IP: net.IPv4(127, 0, 0, 77), Port: 5}, "127.0.0.0/24"},
+		{&net.TCPAddr{IP: net.IPv4(192, 168, 4, 9), Port: 5}, "192.168.4.0/24"},
+		{&net.TCPAddr{IP: net.ParseIP("::ffff:127.0.0.1"), Port: 5}, "127.0.0.0/24"},
+		{&net.TCPAddr{IP: net.ParseIP("::1"), Port: 5}, "::/64"},
+		{&net.TCPAddr{IP: net.ParseIP("2001:db8:1:2:3:4:5:6"), Port: 5}, "2001:db8:1:2::/64"},
+		{&net.TCPAddr{IP: net.ParseIP("2001:db8:1:2:ffff::1"), Port: 5}, "2001:db8:1:2::/64"},
 		{nil, ""},
 	}
 	for _, tc := range cases {
-		if got := connHost(tc.ra); got != tc.want {
-			t.Fatalf("connHost(%v) = %q, want %q - the per-IP cap's grouping is not address-canonical", tc.ra, got, tc.want)
+		if got := connGroup(tc.ra); got != tc.want {
+			t.Fatalf("connGroup(%v) = %q, want %q - the accept cap's grouping is not address-prefix-canonical", tc.ra, got, tc.want)
 		}
+	}
+}
+
+// The per-frame entry cost the derivation includes must be the REAL cost of
+// the queue's entry type: if sentFrame grows, MaxPinnedBytes silently
+// under-counts and the documents' number becomes a lie again (audit N-2's
+// re-opened term was exactly a per-frame cost left out). unsafe.Sizeof is the
+// only way to pin a constant against a type, and it inspects no data - the
+// relay still parses nothing.
+func TestRelayQueuedFrameEntryCostMatchesTheType(t *testing.T) {
+	if got := int(unsafe.Sizeof(sentFrame{})); got != queuedFrameEntryBytes {
+		t.Fatalf("queuedFrameEntryBytes = %d but unsafe.Sizeof(sentFrame{}) = %d - the memory derivation no longer matches the queue's entry type", queuedFrameEntryBytes, got)
+	}
+}
+
+// The byte budget alone cannot bound the queue's entry memory, because the
+// minimum legal frame is one byte (wire.ReadFrame refuses only zero): a 1 MiB
+// budget would admit a million one-byte entries. The FRAME cap is the
+// structural bound, and this constructs the exact case - a byte budget far
+// larger than the frame cap, filled with the smallest frames - so the fifth
+// one-byte frame is refused by the COUNT, not the bytes. Fully socket-free
+// and deterministic: no flood, no buffer, no schedule. Under the mutant that
+// drops the count comparison from push, the fifth entry is admitted and the
+// assertions below name the cap that failed to hold.
+func TestRelayAFrameCapBoundsTheQueueEntries(t *testing.T) {
+	const capFrames = 4
+	r := New(Options{MaxFrameBytes: 32, MaxConns: 8, MaxConnsPerIP: 8, WriteQueueBytes: 1 << 20})
+	sender := &conn{q: newSendQ(1<<20, 32, capFrames), dead: make(chan struct{})}
+	wedged := &conn{q: newSendQ(1<<20, 32, capFrames), dead: make(chan struct{})}
+	r.mu.Lock()
+	r.conns[sender] = struct{}{}
+	r.conns[wedged] = struct{}{}
+	r.mu.Unlock()
+
+	for i := 0; i < capFrames; i++ {
+		r.forward(sender, []byte{byte(i)})
+	}
+	if got := wedged.q.queued(); got != capFrames {
+		t.Fatalf("the queue holds %d frames after %d one-byte pushes at a %d-frame cap - the entry bound never filled", got, capFrames, capFrames)
+	}
+	if st := r.Stats(); st.Forwarded != capFrames || st.Dropped != 0 {
+		t.Fatalf("at the frame cap the counters read Forwarded=%d/Dropped=%d, want %d/0 - the accounting drifted before the cap could bite", st.Forwarded, st.Dropped, capFrames)
+	}
+	r.forward(sender, []byte{0xff})
+	if got := wedged.q.queued(); got != capFrames {
+		t.Fatalf("a frame entered a queue already at its %d-frame cap (%d entries) - only the byte budget bounds the queue, and one-byte frames make that unbounded entry memory", capFrames, got)
+	}
+	if st := r.Stats(); st.Dropped != 1 {
+		t.Fatalf("Stats().Dropped = %d after one push past the frame cap, want exactly 1 - the entry bound did not refuse", st.Dropped)
+	}
+}
+
+// Two attacker CONNECTIONS from one host must not split a receiver's budget
+// between them (audit N-2): the fair share is keyed on the SENDER's source
+// group, so the second connection of one host lands in the same account as
+// the first and cannot open a fresh share. The construction is fully
+// deterministic and socket-free - the sender groups are set on hand-built
+// connections - so no host's notion of "same IP" gets a vote. Under the
+// mutant that keys the share on the connection, the second attacker frame is
+// admitted, the queue reaches the byte budget, and the honest sender's frame
+// is refused: the exact censorship the share exists to prevent.
+func TestRelayTwoConnectionsFromOneHostCannotSplitTheShare(t *testing.T) {
+	const (
+		frameBytes    = 100
+		queueBytes    = 250 // share = max(250/2, 32) = 125
+		maxFrameBound = 32
+	)
+	newConn := func(group string) *conn {
+		return &conn{q: newSendQ(queueBytes, maxFrameBound, 64), dead: make(chan struct{}), srcGroup: group}
+	}
+	r := New(Options{MaxFrameBytes: maxFrameBound, MaxConns: 8, MaxConnsPerIP: 8, WriteQueueBytes: queueBytes})
+	attacker1 := newConn("198.51.100.0/24")
+	attacker2 := newConn("198.51.100.0/24") // same host/prefix, different connection
+	honest := newConn("203.0.113.0/24")
+	wedged := newConn("192.0.2.0/24") // the receiver whose queue they contend for
+	r.mu.Lock()
+	for _, c := range []*conn{attacker1, attacker2, honest, wedged} {
+		r.conns[c] = struct{}{}
+	}
+	r.mu.Unlock()
+
+	frame := make([]byte, frameBytes)
+	if !wedged.q.push(attacker1, frame) {
+		t.Fatalf("the first attacker frame was refused with the queue empty (budget %d, share %d) - the test's premise never formed", queueBytes, wedged.q.share)
+	}
+	if wedged.q.push(attacker2, frame) {
+		t.Fatalf("a second connection from the SAME host was admitted on its own share (queue %d bytes, attacker1 %d): two attacker connections split a receiver's budget between them", wedged.q.bytes, wedged.q.occupancy(attacker1))
+	}
+	if !wedged.q.push(honest, frame) {
+		t.Fatalf("the honest sender's frame was refused with the attackers holding only %d of %d bytes - two connections from one host censored another sender", wedged.q.bytes, queueBytes)
+	}
+	// The refused connection's account is the SAME account as the first
+	// attacker's (one host, one share), and it holds only the first frame:
+	// the second was refused cleanly, charged nothing and enqueued nothing.
+	if got := wedged.q.occupancy(attacker2); got != frameBytes {
+		t.Fatalf("after the refusal the shared sender account holds %d bytes, want only the first attacker's %d - the refused frame was charged anyway", got, frameBytes)
+	}
+}
+
+// progressConn is a net.Conn for the slow-reading-sink test: every Write
+// SUCCEEDS (after writeDelay), so a deadline re-armed per frame at
+// now+timeout would never fire - it is a sink that makes progress on every
+// frame while never letting the backlog drain. It honours the write deadline
+// it is given, and it owns no kernel buffer and no scheduling dependence: the
+// delay and the deadline are the test's own values.
+type progressConn struct {
+	writeDelay time.Duration
+
+	mu       sync.Mutex
+	deadline time.Time
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func (p *progressConn) Read([]byte) (int, error) {
+	<-p.closed
+	return 0, io.EOF
+}
+
+func (p *progressConn) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	deadline := p.deadline
+	p.mu.Unlock()
+	time.Sleep(p.writeDelay)
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return 0, io.ErrClosedPipe // the deadline the writer armed has passed
+	}
+	return len(b), nil
+}
+
+func (p *progressConn) Close() error {
+	p.once.Do(func() { close(p.closed) })
+	return nil
+}
+
+func (p *progressConn) LocalAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+func (p *progressConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+}
+func (p *progressConn) SetDeadline(time.Time) error {
+	return nil
+}
+func (p *progressConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+func (p *progressConn) SetWriteDeadline(t time.Time) error {
+	p.mu.Lock()
+	p.deadline = t
+	p.mu.Unlock()
+	return nil
+}
+
+// A sink that reads slowly but STEADILY is reaped (audit N-2's second shape):
+// the first write-deadline fix armed a fresh now+timeout before each frame, so
+// a sink accepting a trickle of every frame made each write "succeed" and its
+// full queue stayed pinned past many timeout periods. The fix anchors the
+// deadline to the instant the queue became non-empty, so the whole backlog
+// must clear within one WriteTimeout whatever the trickle. This test
+// CONSTRUCTS that sink (no socket, no kernel buffer): every write takes
+// writeDelay and succeeds, the queue is 50 frames deep (1s of steady
+// progress), and the 100ms bound must still reap it. Under the pre-fix
+// (now+timeout) deadline the queue drains in ~1s and the connection is never
+// ended, so the wait below fails.
+func TestRelayASlowReadingSinkIsReapedByTheProgressDeadline(t *testing.T) {
+	const (
+		writeTimeout = 100 * time.Millisecond
+		writeDelay   = 20 * time.Millisecond
+		queued       = 50
+	)
+	r := New(Options{
+		MaxFrameBytes:    4096,
+		MaxConns:         8,
+		MaxConnsPerIP:    8,
+		WriteQueueBytes:  1 << 20,
+		WriteQueueFrames: 64,
+		WriteTimeout:     writeTimeout,
+	})
+	nc := &progressConn{writeDelay: writeDelay, closed: make(chan struct{})}
+	c := &conn{
+		nc:       nc,
+		q:        newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes, r.opts.WriteQueueFrames),
+		dead:     make(chan struct{}),
+		srcGroup: "192.0.2.0/24",
+	}
+	r.mu.Lock()
+	r.conns[c] = struct{}{}
+	r.perGroup[c.srcGroup]++
+	r.mu.Unlock()
+
+	for i := 0; i < queued; i++ {
+		if !c.q.push(c, []byte{byte(i)}) {
+			t.Fatalf("frame %d of %d was refused while the queue was far below its frame cap - the slow-sink state never formed", i, queued)
+		}
+	}
+	if d, ok := c.q.writeDeadline(writeTimeout); !ok || d.IsZero() {
+		t.Fatalf("the constructed non-empty queue reports no deadline (ok=%v): the progress scenario never formed", ok)
+	}
+
+	r.wg.Add(1)
+	go r.writer(c)
+	select {
+	case <-c.dead:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("the slow-reading sink was never reaped: its queue stayed non-empty and every write made progress, but the deadline did not account for that - a per-write now+timeout never fires for a trickle (audit N-2)")
+	}
+	if st := r.Stats(); st.Conns != 0 {
+		t.Fatalf("the sink's connection was finished but the registry still counts %d", st.Conns)
+	}
+}
+
+// THE N-2 memory measurement, made against the DERIVED bound rather than a
+// quoted number: MaxConnsPerIP connections from ONE source group - the
+// audit's "8 connections from one source IP" shape - each with its queue
+// filled to both caps by CONSTRUCTION with the smallest legal frame, which is
+// the case a byte budget cannot bound (a 2 MiB budget of one-byte frames is
+// ~2 million entries). The whole fan-out goes through the REAL forward path,
+// so the payload slices are shared exactly as the relay shares them. The
+// assertion is the derived per-group bound, not a hardcoded figure: measured
+// heap after GC must sit under it. Pre-fix the entry arrays alone reached
+// ~64 MiB per connection; here the frame cap holds them to 128 KiB each.
+func TestRelayPinnedHeapStaysWithinTheDerivedBound(t *testing.T) {
+	r := New(Options{}) // the shipped defaults
+	perConnBound := r.opts.MaxPinnedBytes() / r.opts.MaxConns
+	groupBound := perConnBound * r.opts.MaxConnsPerIP
+
+	// Baseline BEFORE the connections exist, so the measurement includes the
+	// entry rings each connection allocates at accept - the term the old
+	// accounting missed - and not just the frames pushed after.
+	runtime.GC()
+	var base runtime.MemStats
+	runtime.ReadMemStats(&base)
+
+	sender := &conn{
+		q:        newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes, r.opts.WriteQueueFrames),
+		dead:     make(chan struct{}),
+		srcGroup: "198.51.100.0/24",
+	}
+	r.mu.Lock()
+	r.conns[sender] = struct{}{}
+	r.mu.Unlock()
+	targets := make([]*conn, 0, r.opts.MaxConnsPerIP)
+	for i := 0; i < r.opts.MaxConnsPerIP; i++ {
+		c := &conn{
+			q:        newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes, r.opts.WriteQueueFrames),
+			dead:     make(chan struct{}),
+			srcGroup: "198.51.100.0/24",
+		}
+		r.mu.Lock()
+		r.conns[c] = struct{}{}
+		r.mu.Unlock()
+		targets = append(targets, c)
+	}
+
+	// One received frame per iteration, shared across the fan-out exactly as
+	// forward shares it; the frame cap is reached at WriteQueueFrames.
+	for i := 0; i < r.opts.WriteQueueFrames; i++ {
+		r.forward(sender, []byte{byte(i)})
+	}
+	for i, c := range targets {
+		if got := c.q.queued(); got != r.opts.WriteQueueFrames {
+			t.Fatalf("target %d holds %d entries, want the full frame cap %d - the constructed worst case never formed", i, got, r.opts.WriteQueueFrames)
+		}
+		// A further one-byte frame is refused: the byte budget alone would
+		// admit millions more, the frame cap is what bounds the entries.
+		if c.q.push(sender, []byte{0}) {
+			t.Fatalf("target %d admitted a frame past its %d-entry cap - a one-byte frame flood would pin the entry memory the bound is supposed to cover", i, r.opts.WriteQueueFrames)
+		}
+	}
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	measured := int64(after.HeapAlloc) - int64(base.HeapAlloc)
+	if measured < 0 {
+		measured = 0
+	}
+	t.Logf("MaxConnsPerIP=%d one-byte-frame queues with %d entries each: measured heap +%d bytes (%.2f MiB); derived group bound %d bytes (%.2f MiB)",
+		r.opts.MaxConnsPerIP, r.opts.WriteQueueFrames, measured, float64(measured)/(1<<20), groupBound, float64(groupBound)/(1<<20))
+	if measured > int64(groupBound) {
+		t.Fatalf("the MaxConnsPerIP connections pinned %d bytes of heap, over the derived group bound %d - the documented arithmetic does not cover what the relay can hold", measured, groupBound)
+	}
+}
+
+// The FULL registry is the other number the audit measured (1025.7 MiB
+// pre-fix against a 128 MiB claim): MaxConns connections, one-byte frames,
+// every queue filled to its frame cap by construction. Post-fix the entry
+// rings are 32 x 128 KiB and the aggregate the documents quote is
+// MaxPinnedBytes; the measurement must sit under it. The per-source-prefix
+// grouping - the reason one host cannot hold this registry - is pinned as a
+// pure function by TestConnGroupPrefixesTheSource above, and the accept cap's
+// use of that key over real sockets by
+// TestRelayPerSourcePrefixCapBitesAtAccept.
+func TestRelayFullRegistryStaysWithinTheDerivedBound(t *testing.T) {
+	r := New(Options{}) // the shipped defaults
+	bound := int64(r.opts.MaxPinnedBytes())
+
+	runtime.GC()
+	var base runtime.MemStats
+	runtime.ReadMemStats(&base)
+
+	sender := &conn{
+		q:        newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes, r.opts.WriteQueueFrames),
+		dead:     make(chan struct{}),
+		srcGroup: "198.51.100.0/24",
+	}
+	r.mu.Lock()
+	r.conns[sender] = struct{}{}
+	r.mu.Unlock()
+	targets := make([]*conn, 0, r.opts.MaxConns)
+	for i := 0; i < r.opts.MaxConns; i++ {
+		c := &conn{
+			q:        newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes, r.opts.WriteQueueFrames),
+			dead:     make(chan struct{}),
+			srcGroup: "198.51.100.0/24",
+		}
+		r.mu.Lock()
+		r.conns[c] = struct{}{}
+		r.mu.Unlock()
+		targets = append(targets, c)
+	}
+	for i := 0; i < r.opts.WriteQueueFrames; i++ {
+		r.forward(sender, []byte{byte(i)})
+	}
+	for i, c := range targets {
+		if got := c.q.queued(); got != r.opts.WriteQueueFrames {
+			t.Fatalf("target %d holds %d entries, want %d - the full-registry worst case never formed", i, got, r.opts.WriteQueueFrames)
+		}
+	}
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	measured := int64(after.HeapAlloc) - int64(base.HeapAlloc)
+	if measured < 0 {
+		measured = 0
+	}
+	t.Logf("MaxConns=%d one-byte-frame queues with %d entries each: measured heap +%d bytes (%.2f MiB); derived MaxPinnedBytes %d bytes (%.2f MiB)",
+		r.opts.MaxConns, r.opts.WriteQueueFrames, measured, float64(measured)/(1<<20), bound, float64(bound)/(1<<20))
+	if measured > bound {
+		t.Fatalf("the full registry pinned %d bytes of heap, over the derived MaxPinnedBytes %d - the documented aggregate does not cover what the relay can hold", measured, bound)
 	}
 }

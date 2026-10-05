@@ -301,52 +301,66 @@ with **structural bounds only** (byte budgets, socket deadlines, endpoint
 counts — the relay parses the frame length and nothing beyond it): a frame
 whose declared length exceeds the bound is refused before any allocation and
 its connection is ended; dials past the connection bound are closed at
-accept, in total (`--max-conns`) and per source IP (`--max-conns-per-ip`);
-every connection buffers at most a bounded **byte** queue (`--write-queue-bytes`),
-so a peer that stops reading cannot stall the relay for the others (dropped
-frames, never a blocked forwarder) and cannot occupy more than its fair
-share of another connection's queue; and three socket-level timers bound how
+accept, in total (`--max-conns`) and per source **prefix**
+(`--max-conns-per-ip` — IPv6 `/64`, IPv4 `/24`, so one routed prefix cannot
+rotate addresses past the cap); every connection buffers at most a bounded
+**byte** queue (`--write-queue-bytes`) **and** a bounded frame count
+(`--write-queue-frames`, because a byte budget cannot bound the queue's
+per-frame entry memory when the smallest legal frame is one byte), so a peer
+that stops reading cannot stall the relay for the others (dropped frames,
+never a blocked forwarder) and cannot occupy more than its fair share of
+another connection's queue — the share is keyed on the **sender's source
+group**, not the connection, so two connections from one host cannot split a
+receiver's budget between them; and two socket-level timers bound how
 long a connection may *hold* what it has taken — nothing is parsed to
 enforce them. The per-frame read timeout (`--read-timeout`, default 120
 seconds) is armed before each frame's 4-byte header and refreshed at every
-completed frame, so an actively sending peer is never cut off. The per-frame
-write timeout (`--write-timeout`, default 30 seconds) is what a
-never-reading sink runs against: a frame it cannot receive within the
-deadline closes its connection and releases the bytes queued behind its
-blocked writer — **keepalive frames refresh only the read deadline, so the
-write deadline is what bounds a sink's pin**; a sink cannot extend the
-deadline no matter what it keeps sending.
+completed frame, so an actively sending peer is never cut off. The write
+timeout (`--write-timeout`, default 30 seconds) is anchored to the instant a
+connection's queue became **non-empty**: the backlog must drain back to empty
+inside it, so a sink that never reads is ended — **keepalive frames refresh
+only the read deadline, so the write deadline is what bounds a sink's pin** —
+and so is a sink that merely reads too slowly for the backlog to clear, which
+a per-write deadline alone never caught because each individual write
+"succeeded". A peer that drains as it goes empties its queue constantly and
+is never cut off.
 
 **The memory arithmetic, derived rather than asserted.** One connection can
-hold, at one instant, at most: its full write-queue byte budget
-(`write-queue-bytes`), the single frame in its writer's hand (≤
-`max-frame-bytes`), and the single frame in its reader's hand (≤
-`max-frame-bytes`); the aggregate over the registry is therefore
-`max-conns × (write-queue-bytes + 2 × max-frame-bytes)`. At the defaults:
-**32 × (2 MiB + 2 × 1 MiB) = 32 × 4 MiB = 128 MiB**. (The pre-fix claim on
-this spot omitted the write-queue factor entirely: 256 conns could each
-queue 64 *frames* × 1 MiB = 64 MiB — **16 GiB**, not the 256 MiB documented —
-and hold it *indefinitely*, a sink that never reads having no write deadline
-to end it. Bytes behind a stalled writer are now reclaimed by
-`--write-timeout`; slots are additionally bounded per source IP by
-`--max-conns-per-ip`.) `relay.Options.MaxPinnedBytes` computes this bound
-from the option fields, and a test pins both the formula's output at the
-defaults and that a changed input moves it — the docs' number cannot drift
-from the code silently. TCP keepalive (`--keepalive`, default 15 seconds)
-reaps a half-open connection — a peer that vanished without closing, e.g. a
-power cut — after the kernel's unanswered probes, again without the relay
-looking at any byte. In production the access policy does not live in the
-relay at all — run it behind the VPS firewall allowlisting the validator
-IPs. Validators reconnect to a restarted relay with exponential backoff. Bandwidth is kilobytes per second.
+hold, at one instant, at most: its write-queue **payload** budget
+(`write-queue-bytes`); its write-queue **entry ring**, at most
+`write-queue-frames` entries of 32 bytes each; the single frame in its
+writer's hand (≤ `max-frame-bytes`); and the single frame in its reader's
+hand (≤ `max-frame-bytes`); the aggregate over the registry is therefore
+`max-conns × (write-queue-bytes + write-queue-frames × 32 + 2 × max-frame-bytes)`.
+At the defaults:
+**32 × (2 MiB + 4096 × 32 B + 2 × 1 MiB) = 32 × 4.125 MiB = 132 MiB**. (Two
+earlier claims on this spot were wrong. The first omitted the write-queue
+factor entirely: 256 conns could each queue 64 *frames* × 1 MiB = 64 MiB —
+**16 GiB**, not the 256 MiB documented — and hold it *indefinitely*, a sink
+that never reads having no write deadline to end it. The second omitted the
+queue's **per-frame entry cost**, so a 2 MiB byte budget admitted ~2 million
+one-byte entries: 8 connections from one source IP measured **231.6 MiB** of
+heap and the full registry over **1 GiB**, against a documented 128 MiB, and
+`MemoryMax=256M` was 4× too small. This derivation has all three terms, the
+frame cap is what bounds the entries structurally, and
+`relay.Options.MaxPinnedBytes` computes exactly it from the option fields.)
+`--max-conns-per-ip` additionally bounds slots per source prefix, and TCP
+keepalive (`--keepalive`, default 15 seconds) reaps a half-open connection —
+a peer that vanished without closing, e.g. a power cut — after the kernel's
+unanswered probes, again without the relay looking at any byte. In production
+the access policy does not live in the relay at all — run it behind the VPS
+firewall allowlisting the validator IPs. Validators reconnect to a restarted
+relay with exponential backoff. Bandwidth is kilobytes per second.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--addr ADDR` | `:7001` | listen address (all interfaces — validators must reach this one) |
 | `--max-frame-bytes N` | `1048576` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic) |
 | `--max-conns N` | `32` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
-| `--max-conns-per-ip N` | `8` | how many of those slots one source IP may hold (counted on the canonical IP, IPv4-mapped IPv6 unmapped); a dial from an IP at its cap is closed at accept |
-| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single sender may occupy more than half the budget (fair share) |
-| `--write-timeout SECONDS` | `30` | per-frame write deadline: a frame that cannot be written within it ends the connection and releases the bytes queued behind its blocked writer (the never-reading sink's bound) |
+| `--max-conns-per-ip N` | `8` | how many of those slots one source **prefix** may hold — the IPv6 `/64` or IPv4 `/24`, IPv4-mapped IPv6 unmapped, masked — so a routed prefix cannot bypass the cap by rotating addresses; a dial from a prefix at its cap is closed at accept |
+| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than half the budget (fair share; two connections from one host share one account) |
+| `--write-queue-frames N` | `4096` | per-connection write-queue bound in **frames**: the entry ring, so the queue's per-frame memory is structural (a byte budget alone admits ~2 million one-byte entries). Counted into `relay.Options.MaxPinnedBytes` at 32 bytes each |
+| `--write-timeout SECONDS` | `30` | per-connection write deadline, anchored to when the queue became non-empty: the backlog must drain to empty within it, so a never-reading sink **and** a slow-reading one are ended and their queued bytes and entry ring released |
 | `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |
 | `--keepalive SECONDS` | `15` | TCP keepalive probe period for every accepted connection; a half-open connection is reaped by the kernel after unanswered probes |
 

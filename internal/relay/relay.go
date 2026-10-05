@@ -23,17 +23,23 @@
 // that discipline. The bounds, in the order the traffic meets them:
 //
 //   - the frame-length cap, checked before any allocation;
-//   - per-frame READ and WRITE deadlines, each measuring only socket-level
-//     silence or stall: a peer that keeps speaking and reading is never cut
-//     off, and a peer that does either halfway is ENDED with its slot and
-//     its queued bytes released - nothing is pinned forever by a peer that
-//     keeps one five-byte frame alive (audit N-2);
-//   - a byte-bounded per-connection write queue with a per-sender fair
-//     share (Options.WriteQueueBytes, newSendQ): no wedge can hold more
-//     than the budget's bytes, and one sender cannot occupy all of a
-//     receiver's budget and thereby censor another sender's frames;
-//   - MaxConns and MaxConnsPerIP at accept: a stranger is bounded in how
-//     many slots it can hold, total and per source IP.
+//   - per-frame READ deadline, plus a per-connection WRITE deadline anchored
+//     to the instant the write queue became non-empty: a peer that keeps
+//     speaking is never cut off, but a peer that stops reading - or reads so
+//     slowly the backlog never clears - is ENDED with its slot, its queued
+//     bytes and its entry ring released, so nothing is pinned forever by a
+//     peer that keeps one five-byte frame alive (audit N-2);
+//   - a write queue bounded BOTH in payload bytes (Options.WriteQueueBytes)
+//     and in frame count (Options.WriteQueueFrames), with a fair share keyed
+//     on the SENDER's source group (newSendQ): no queued byte budget can
+//     bound the queue's per-frame entry memory, so the count is an explicit
+//     ring, and one sender - one source group, not one connection - cannot
+//     occupy all of a receiver's budget and thereby censor another sender's
+//     frames;
+//   - MaxConns and MaxConnsPerIP at accept, the latter grouped by source
+//     PREFIX (IPv6 /64, IPv4 /24): a stranger is bounded in how many slots it
+//     can hold, total and per group, so one routed prefix cannot bypass the
+//     cap by rotating addresses.
 //
 // Shape, mirroring the transport's answer to the same problem (one goroutine
 // per direction, a bounded write queue, never block the forwarding path):
@@ -105,30 +111,38 @@ const (
 	// allowlist, which is exactly the access policy the relay itself is too
 	// dumb to have.)
 	DefaultMaxConns = 32
-	// DefaultMaxConnsPerIP caps how many registry slots ONE source IP may
-	// hold (audit N-2's third attack: with no per-IP cap, one host held all
-	// the slots and pushed honest validators into RefusedConns). 8 covers a
-	// validator's flapping reconnects and a restart storm behind one NAT
-	// address with room to spare; a loopback-heavy test sets it explicitly,
-	// because every dial it makes is from one IP. Grouped by canonical IP -
-	// connHost - which examines no frame bytes.
+	// DefaultMaxConnsPerIP caps how many registry slots ONE SOURCE PREFIX may
+	// hold (audit N-2's third attack: with no per-source cap, one host held all
+	// the slots and pushed honest validators into RefusedConns; and with the
+	// cap keyed on the full address, a routed IPv6 /64 bypassed it by
+	// rotating addresses). 8 covers a validator's flapping reconnects and a
+	// restart storm behind one NAT address with room to spare; a
+	// loopback-heavy test sets it explicitly, because every dial it makes is
+	// from one group. Grouped by connGroup - IPv6 /64, IPv4 /24, or the host
+	// for an unparseable address - which examines no frame bytes.
 	DefaultMaxConnsPerIP = 8
-	// DefaultWriteTimeout is the per-frame WRITE deadline: the socket-level
-	// bound on how long ONE frame may remain unwritten before the connection
-	// is ended and its registry slot, queued bytes and goroutines are
-	// released. This is the timer a peer that stops reading runs against -
-	// pre-fix (audit N-2) the writer had no deadline, so a sink that never
-	// read backpressured the writer into an indefinite block while its full
-	// queue pinned its bytes forever, kept alive indefinitely by a five-byte
-	// keepalive frame refreshing the READ deadline. Now the pin is bounded:
-	// a queue backed up behind a non-reading peer ends the connection on
-	// this timer, whatever its keepalives say.
+	// DefaultWriteTimeout is the per-connection write deadline: the bound on
+	// how long a connection's QUEUE may stay backed up before the connection
+	// is ended and its registry slot, queued bytes, entry ring and goroutines
+	// are released. Two failures made this necessary (audit N-2): pre-fix the
+	// writer had no deadline at all, so a sink that never read backpressured
+	// the writer into an indefinite block while its full queue pinned its
+	// bytes forever, kept alive by a five-byte keepalive frame refreshing the
+	// READ deadline; and even the first write-deadline fix only covered a
+	// single write that stalled for the WHOLE timeout, so a sink that accepted
+	// a trickle of every frame made progress by the letter of that rule while
+	// its queue never drained. The deadline is therefore anchored to the
+	// instant the queue first became non-empty (sendQ.writeDeadline): a
+	// connection must get its queue back to EMPTY within WriteTimeout, whether
+	// the peer reads not at all or reads too slowly for the backlog to clear.
+	// A peer that drains as it goes empties the queue constantly and is never
+	// cut off; a queue that stays non-empty for the whole timeout is, by
+	// construction, a connection not keeping up.
 	//
-	// It parses nothing: the deadline is armed on the socket before the
-	// frame write and re-armed per frame, so the question it answers is only
-	// "has this connection stopped accepting ENTIRELY for this long?" - a
-	// peer keeping up is never cut off, and neither the payload nor the
-	// framing is inspected.
+	// It parses nothing: the deadline is a socket deadline plus a timestamp on
+	// an already-queued frame, so the question it answers is only "has this
+	// connection's backlog drained within the bound?" - and neither the
+	// payload nor the framing is inspected.
 	//
 	// 30 seconds sits well above any honest link: a full 1 MiB frame is
 	// written inside it at ~280 kbit/s, and every honest peer's write is a
@@ -149,6 +163,32 @@ const (
 	// queue's steady state is hundreds of bytes; a FULL budget is a wedged
 	// reader, and every byte of it is reclaimed by the write deadline.
 	DefaultWriteQueueBytes = 2 << 20
+	// DefaultWriteQueueFrames caps the FRAME COUNT of each connection's write
+	// queue, independently of the byte budget above, and it exists because a
+	// byte budget alone cannot bound a queue's ENTRY memory: the smallest
+	// legal frame is one payload byte (wire.ReadFrame refuses only zero), so
+	// a 2 MiB budget admits ~2,097,152 entries, and each entry in the queue's
+	// ring costs queuedFrameEntryBytes - about 64 MiB of entry array per
+	// connection for a queue the byte budget calls 2 MiB. That missing term
+	// is audit N-2's re-opened measurement: 8 connections from one source IP
+	// (within MaxConnsPerIP) reached ~231.6 MiB, and the full registry over
+	// 1 GiB, against the 128 MiB documented. The frame cap makes the entry
+	// memory structural: WriteQueueFrames x queuedFrameEntryBytes is counted
+	// into Options.MaxPinnedBytes, so the number the docs quote includes it.
+	//
+	// 4096 is a companion to the 2 MiB byte budget at the honest frame size
+	// (relaying hundreds of bytes to kilobytes per frame, a full 2 MiB
+	// backlog is a few thousand frames), and it leaves the byte budget the
+	// binding bound for any frame above ~512 bytes. The relay still parses
+	// nothing: this counts frames, never their content.
+	DefaultWriteQueueFrames = 4096
+	// queuedFrameEntryBytes is the exact in-memory cost of ONE entry in a
+	// connection's queue ring - a sender pointer plus a payload slice header.
+	// It is stated as a constant so the derivation can include it, and pinned
+	// against the real struct by a test (unsafe.Sizeof), so the documented
+	// arithmetic cannot drift from the type. The payload bytes themselves are
+	// counted separately by WriteQueueBytes.
+	queuedFrameEntryBytes = 32
 	// DefaultReadTimeout is the per-frame READ DEADLINE: the socket-level
 	// bound on how long ONE frame (its 4-byte header plus its full payload)
 	// may take to arrive before the connection is ended and its registry
@@ -201,17 +241,26 @@ type Options struct {
 	MaxFrameBytes int
 	// MaxConns is the registry bound. Default DefaultMaxConns.
 	MaxConns int
-	// MaxConnsPerIP is how many registry slots one source IP may hold,
+	// MaxConnsPerIP is how many registry slots one source PREFIX may hold,
 	// enforced at accept before registration. Default DefaultMaxConnsPerIP.
 	MaxConnsPerIP int
 	// WriteQueueBytes is the per-connection writer queue bound in payload
 	// bytes, which also floors itself at MaxFrameBytes (a queue smaller than
 	// one maximum frame could never forward a full frame at all). Default
 	// DefaultWriteQueueBytes; see Options.MaxPinnedBytes for the aggregate
-	// arithmetic this participates in.
+	// arithmetic this participates in. It is a budget on the PAYLOAD bytes
+	// only; WriteQueueFrames bounds the entry memory those bytes ride in.
 	WriteQueueBytes int
-	// WriteTimeout is the per-frame write deadline for the connection's
-	// writer. Default DefaultWriteTimeout.
+	// WriteQueueFrames is the per-connection FRAME COUNT bound on the writer
+	// queue. It exists because the byte budget above cannot bound the queue's
+	// entry memory: the minimum legal frame is one byte, so a byte budget
+	// admits as many entries as it has bytes. Default
+	// DefaultWriteQueueFrames; the entry cost is counted into
+	// Options.MaxPinnedBytes.
+	WriteQueueFrames int
+	// WriteTimeout is the per-connection write deadline for the connection's
+	// writer: the queue must drain to empty within it. Default
+	// DefaultWriteTimeout.
 	WriteTimeout time.Duration
 	// ReadTimeout is the per-frame read deadline: the longest a single frame
 	// (header plus full payload) may take to arrive before the connection is
@@ -244,6 +293,9 @@ func (o Options) withDefaults() Options {
 		// above, so an unset budget still lands at the default, not here.)
 		o.WriteQueueBytes = o.MaxFrameBytes
 	}
+	if o.WriteQueueFrames <= 0 {
+		o.WriteQueueFrames = DefaultWriteQueueFrames
+	}
 	if o.WriteTimeout <= 0 {
 		o.WriteTimeout = DefaultWriteTimeout
 	}
@@ -260,15 +312,24 @@ func (o Options) withDefaults() Options {
 // frames - the number the README, --help and the systemd unit's MemoryMax
 // all have to agree on, COMPUTED rather than asserted, because a documented
 // bound whose arithmetic a reader cannot re-run is not a documented bound.
-// (Audit N-2's origin: the old claim was max-conns x max-frame-bytes of
-// memory, which omitted the write-queue factor entirely - 256 MiB claimed
-// where 256 x 64 frames x 1 MiB = 16 GiB was reachable.)
+// (Audit N-2's history: the first claim was max-conns x max-frame-bytes of
+// memory, omitting the write-queue factor entirely - 256 MiB claimed where
+// 256 x 64 frames x 1 MiB = 16 GiB was reachable. The first correction still
+// omitted the queue's PER-FRAME ENTRY cost, so a byte budget of 2 MiB could
+// carry ~2 million entries - ~64 MiB of entry array - and 8 connections from
+// one source IP measured 231.6 MiB against a 128 MiB claim. This derivation
+// has all three terms.)
 //
-// The bound on one connection is the sum of what ONE hand can hold at the
-// same instant:
+// The bound on one connection is the sum of what it can hold at the same
+// instant:
 //
-//   - its write queue: at most WriteQueueBytes of queued payloads - the
-//     byte budget is the bound, whatever frame sizes the bytes ride in;
+//   - its write queue's PAYLOAD: at most WriteQueueBytes, whatever frame
+//     sizes the bytes ride in;
+//
+//   - its write queue's ENTRY RING: at most WriteQueueFrames entries, each
+//     exactly queuedFrameEntryBytes (a sender pointer plus a payload slice
+//     header). This is the term the byte budget cannot bound, because the
+//     minimum legal frame is one byte;
 //
 //   - the one frame in the writer's hand: at most MaxFrameBytes, possibly
 //     half-written into the kernel while a non-reading peer holds the rest
@@ -277,44 +338,64 @@ func (o Options) withDefaults() Options {
 //   - the one frame in the reader's hand: at most MaxFrameBytes, from the
 //     read that produced the most recent forward.
 //
-//     per conn <= WriteQueueBytes + 2 * MaxFrameBytes
-//     aggregate = MaxConns * (WriteQueueBytes + 2 * MaxFrameBytes)
+//     per conn  <= WriteQueueBytes + WriteQueueFrames*queuedFrameEntryBytes + 2*MaxFrameBytes
+//     aggregate  = MaxConns * that
 //
 // Payload slices are SHARED across a fan-out's targets (one allocation per
 // received frame, referenced by every target's queue), so this bound is an
 // upper bound, not an account of copies: the distinct bytes are never more
 // than one reader-plus-queue's worth per connection. At the DEFAULTS:
 //
-//	32 conns x (2 MiB queue + 2 x 1 MiB hands) = 32 x 4 MiB = 128 MiB.
+//	32 conns x (2 MiB payload + 4096 x 32 B entries + 2 x 1 MiB hands)
+//	  = 32 x (2 MiB + 128 KiB + 2 MiB)
+//	  = 32 x 4.125 MiB = 132 MiB.
 //
 // which is the figure the documents quote, derived from these very fields -
-// change a default and the documents' number moves with it.
+// change a default and the documents' number moves with it. The per-queue
+// sender-accounting map is bounded by the connections that can feed one
+// queue (at most MaxConns entries) and is covered by the MemoryMax headroom,
+// not itemised here.
 func (o Options) MaxPinnedBytes() int {
-	return o.MaxConns * (o.WriteQueueBytes + 2*o.MaxFrameBytes)
+	return o.MaxConns * (o.WriteQueueBytes + o.WriteQueueFrames*queuedFrameEntryBytes + 2*o.MaxFrameBytes)
 }
 
-// connHost extracts the canonical source-IP grouping key from a remote
-// address: its host part with IPv4-mapped IPv6 unmapped to plain IPv4, so
-// one host dialing over both stacks is ONE group, always. It reads no frame
-// bytes - the per-IP cap counts ENDPOINTS - and an address that fails to
-// parse falls through as its own group, so an unknown form can never hide
-// inside a real IP's budget.
-func connHost(ra net.Addr) string {
+// connGroup extracts the source GROUPING key from a remote address - the
+// input to both the per-group accept cap and the fair-share account, so the
+// two bounds group senders identically. It is the IPv6 /64 or IPv4 /24
+// network prefix, MASKED, with an IPv4-mapped IPv6 unmapped to plain IPv4
+// first, so one host dialing over both stacks is ONE group and a routed
+// prefix (the audit's bypass: an IPv6 /64 the attacker can rotate through)
+// is ONE group too. An address that fails to parse falls through as its own
+// group, so an unknown form can never hide inside a real group's budget. It
+// reads no frame bytes - the cap counts ENDPOINTS, the share counts LENGTHS -
+// and it never inspects a payload.
+func connGroup(ra net.Addr) string {
 	if ra == nil {
 		return ""
 	}
 	remote := ra.String()
 	if ap, err := netip.ParseAddrPort(remote); err == nil {
-		return ap.Addr().Unmap().String()
+		return groupOf(ap.Addr())
 	}
 	host, _, err := net.SplitHostPort(remote)
 	if err != nil {
 		host = remote
 	}
 	if ip, perr := netip.ParseAddr(host); perr == nil {
-		host = ip.Unmap().String()
+		return groupOf(ip)
 	}
 	return host
+}
+
+// groupOf renders one parsed address as its grouping prefix: the IPv4 /24,
+// or the IPv6 /64, masked so every address in the prefix maps to one string.
+func groupOf(ip netip.Addr) string {
+	ip = ip.Unmap()
+	bits := 64
+	if ip.Is4() {
+		bits = 24
+	}
+	return netip.PrefixFrom(ip, bits).Masked().String()
 }
 
 // Stats is a point-in-time reading of the relay's counters: the minimum an
@@ -344,57 +425,109 @@ type sentFrame struct {
 	b      []byte
 }
 
-// sendQ is the byte-bounded write queue: a FIFO of frames whose TOTAL queued
-// payload bytes never exceed limit, and in which no single sender ever
-// occupies more than share of those bytes (audit N-2: byte-bounded queues,
-// per-sender fair share). push never blocks and never allocates for the
-// drop decision - a frame that cannot fit is refused at the door - and pop
-// is non-blocking; the writer sleeps on ready, which fires exactly on an
-// empty-to-non-empty transition, so a push can never wake it to nothing nor
-// leave it asleep with frames waiting.
-type sendQ struct {
-	limit int // total queued payload bytes admitted
-	share int // per-sender cap on queued payload bytes
+// shareAccount is the fair-share identity a sender's queued bytes are charged
+// to. It is the sender's source GROUP - connGroup, so two connections from
+// one host (or one routed prefix) share ONE account and cannot split a
+// receiver's budget between them, which was audit N-2's censorship bypass: a
+// per-CONNECTION share let two attacker connections each stay inside their
+// own share and together fill the receiver's queue. A hand-built connection
+// with no source address (the socket-free queue tests) is its own account.
+type shareAccount struct {
+	group string // non-empty for an accepted connection: its source prefix
+	c     *conn  // identity fallback for a connection with no address
+}
 
-	mu    sync.Mutex
-	ents  []sentFrame
-	bytes int
-	from  map[*conn]int // queued bytes per sender, refunded on pop
-	ready chan struct{} // cap 1: signalled on empty -> non-empty
+// shareAccountOf returns the account sender's frames are charged to.
+func shareAccountOf(c *conn) shareAccount {
+	if c.srcGroup != "" {
+		return shareAccount{group: c.srcGroup}
+	}
+	return shareAccount{c: c}
+}
+
+// sendQ is the bounded write queue: a FIFO of frames whose TOTAL queued
+// payload bytes never exceed limit AND whose entry count never exceeds
+// maxFrames, and in which no single SENDER (shareAccount - a source group,
+// not a connection) ever occupies more than share of the bytes (audit N-2:
+// byte-bounded queues, per-frame entry bound, per-sender fair share).
+//
+// The queue is a fixed ring of maxFrames entries allocated once at accept, so
+// its entry memory is exactly maxFrames x queuedFrameEntryBytes - the term a
+// byte budget alone cannot bound, because the minimum legal frame is one
+// byte. push never blocks and never allocates for the drop decision - a frame
+// that cannot fit is refused at the door - and pop is non-blocking; the
+// writer sleeps on ready, which fires exactly on an empty-to-non-empty
+// transition, so a push can never wake it to nothing nor leave it asleep with
+// frames waiting.
+//
+// oldest records the instant the queue last became non-empty (zero while it
+// is empty). It anchors the writer's progress deadline: the queue must drain
+// back to empty within WriteTimeout of that instant, so a peer that accepts
+// a trickle of every frame - making each individual write "succeed" - is
+// still ended once its backlog has failed to clear (audit N-2's slow sink).
+type sendQ struct {
+	limit     int // total queued payload bytes admitted
+	share     int // per-sender (per-group) cap on queued payload bytes
+	maxFrames int // entry-ring length: the per-frame memory bound
+
+	mu     sync.Mutex
+	ents   []sentFrame // ring buffer, fixed length maxFrames
+	head   int         // index of the oldest entry
+	n      int         // live entries
+	bytes  int
+	from   map[shareAccount]int // queued bytes per sender account, refunded on pop
+	oldest time.Time            // when the queue became non-empty; zero when empty
+	ready  chan struct{}        // cap 1: signalled on empty -> non-empty
 }
 
 // newSendQ derives the bounds from the options: limit is the byte budget as
-// given (already floored at MaxFrameBytes by withDefaults); share is half
-// the budget with a floor of one maximum frame, so a legitimate largest
-// frame always has room to be admitted even when no other sender is queued.
-func newSendQ(limit, maxFrameBytes int) *sendQ {
+// given (already floored at MaxFrameBytes by withDefaults); maxFrames is the
+// frame-count bound (already defaulted); share is half the budget with a
+// floor of one maximum frame, so a legitimate largest frame always has room
+// to be admitted even when no other sender is queued.
+func newSendQ(limit, maxFrameBytes, maxFrames int) *sendQ {
 	share := limit / 2
 	if share < maxFrameBytes {
 		share = maxFrameBytes
 	}
+	if maxFrames < 1 {
+		// A non-positive entry bound would make the ring empty and every
+		// push a modulo-by-zero; floor it at one entry, the smallest queue
+		// that can carry anything at all.
+		maxFrames = 1
+	}
 	return &sendQ{
-		limit: limit,
-		share: share,
-		from:  make(map[*conn]int),
-		ready: make(chan struct{}, 1),
+		limit:     limit,
+		share:     share,
+		maxFrames: maxFrames,
+		ents:      make([]sentFrame, maxFrames),
+		from:      make(map[shareAccount]int),
+		ready:     make(chan struct{}, 1),
 	}
 }
 
-// push admits one frame from sender if it fits in the budget AND in the
-// sender's share of it, and returns whether it was admitted. It never
-// blocks: an admitted frame is appended and (only on the empty-to-non-empty
-// transition) signalled; a refused frame costs a boolean, which is what
-// keeps a wedged receiver from stalling the sender's forwarding path.
+// push admits one frame from sender if it fits in the byte budget, in the
+// frame-count bound, AND in the sender's share of the bytes, and returns
+// whether it was admitted. It never blocks: an admitted frame is placed in
+// the ring and (only on the empty-to-non-empty transition) signalled; a
+// refused frame costs a boolean, which is what keeps a wedged receiver from
+// stalling the sender's forwarding path.
 func (s *sendQ) push(sender *conn, b []byte) bool {
+	acct := shareAccountOf(sender)
 	s.mu.Lock()
 	ok := len(b) <= s.limit &&
 		s.bytes+len(b) <= s.limit &&
-		s.from[sender]+len(b) <= s.share
+		s.n < s.maxFrames &&
+		s.from[acct]+len(b) <= s.share
 	if ok {
-		s.ents = append(s.ents, sentFrame{sender: sender, b: b})
+		if s.n == 0 {
+			s.oldest = time.Now()
+		}
+		s.ents[(s.head+s.n)%s.maxFrames] = sentFrame{sender: sender, b: b}
+		s.n++
 		s.bytes += len(b)
-		s.from[sender] += len(b)
-		if len(s.ents) == 1 { // the transitions the writer can be asleep across
+		s.from[acct] += len(b)
+		if s.n == 1 { // the transitions the writer can be asleep across
 			select {
 			case s.ready <- struct{}{}:
 			default: // a token is already pending: the wake is not lost
@@ -406,23 +539,61 @@ func (s *sendQ) push(sender *conn, b []byte) bool {
 }
 
 // pop takes the oldest admitted frame, refunding its bytes to the budget and
-// to its sender's share. It is non-blocking: nothing to take returns false,
+// to its sender account. It is non-blocking: nothing to take returns false,
 // and the writer goes back to sleep on ready.
 func (s *sendQ) pop() (sentFrame, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.ents) == 0 {
+	if s.n == 0 {
 		return sentFrame{}, false
 	}
-	f := s.ents[0]
-	s.ents[0] = sentFrame{}
-	s.ents = s.ents[1:]
+	f := s.ents[s.head]
+	s.ents[s.head] = sentFrame{}
+	s.head = (s.head + 1) % s.maxFrames
+	s.n--
 	s.bytes -= len(f.b)
-	s.from[f.sender] -= len(f.b)
-	if s.from[f.sender] <= 0 {
-		delete(s.from, f.sender) // dead senders leave no map entries behind
+	acct := shareAccountOf(f.sender)
+	s.from[acct] -= len(f.b)
+	if s.from[acct] <= 0 {
+		delete(s.from, acct) // drained senders leave no map entries behind
+	}
+	if s.n == 0 {
+		s.oldest = time.Time{} // empty: the next push starts a new epoch
 	}
 	return f, true
+}
+
+// writeDeadline returns the absolute instant by which the queue must have
+// drained to EMPTY, and whether a frame is queued at all. The anchor is the
+// instant the queue became non-empty, NOT "now": re-arming a fresh
+// now+timeout per frame is precisely the hole audit N-2 re-opened, because a
+// sink that accepts a little of every frame makes each write "succeed" while
+// the backlog never clears. The writer arms the socket with this deadline and
+// refuses to write past it, so the whole backlog is bounded by one
+// WriteTimeout from its arrival however steadily the peer trickles.
+func (s *sendQ) writeDeadline(timeout time.Duration) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.n == 0 {
+		return time.Time{}, false
+	}
+	return s.oldest.Add(timeout), true
+}
+
+// queued reports the live entry count - the ring's length bound made readable
+// for the tests that assert a constructed full queue.
+func (s *sendQ) queued() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n
+}
+
+// occupancy reports how many queued bytes one sender is charged with, for the
+// tests that assert the fair share directly.
+func (s *sendQ) occupancy(sender *conn) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.from[shareAccountOf(sender)]
 }
 
 // conn is one accepted connection. The relay knows its peers by NOTHING but
@@ -436,10 +607,13 @@ type conn struct {
 	// its only consumer; push never blocks, which is the property that keeps
 	// a slow peer from stalling the relay for everyone else.
 	q *sendQ
-	// ip is the canonical source IP this connection came from, grouped for
-	// the per-IP cap at accept (audit N-2). Empty for a connection that
-	// never went through accept - only the queue-level tests build those.
-	ip string
+	// srcGroup is the canonical source PREFIX this connection came from
+	// (connGroup: IPv6 /64, IPv4 /24, or the host for an unparseable
+	// address), grouped for the accept-time cap AND used as the fair-share
+	// account so both bounds group senders identically (audit N-2). Empty for
+	// a connection that never went through accept - only the queue-level
+	// tests build those, and they are their own share account.
+	srcGroup string
 	// dead is closed exactly once, by finish, when the connection is over.
 	dead chan struct{}
 	// once makes finish idempotent: reader, writer and Close can all
@@ -449,17 +623,17 @@ type conn struct {
 
 // finish tears one connection down exactly once: close the socket (unblocking
 // every goroutine parked on it), close dead (unblocking the writer), and drop
-// the connection from the registry and from its IP's count.
+// the connection from the registry and from its source group's count.
 func (r *Relay) finish(c *conn) {
 	c.once.Do(func() {
 		close(c.dead)
 		_ = c.nc.Close()
 		r.mu.Lock()
 		delete(r.conns, c)
-		if r.perIP[c.ip] > 0 {
-			r.perIP[c.ip]-- // the accept-time cap sees the freed slot again
-			if r.perIP[c.ip] == 0 {
-				delete(r.perIP, c.ip)
+		if r.perGroup[c.srcGroup] > 0 {
+			r.perGroup[c.srcGroup]-- // the accept-time cap sees the freed slot again
+			if r.perGroup[c.srcGroup] == 0 {
+				delete(r.perGroup, c.srcGroup)
 			}
 		}
 		r.mu.Unlock()
@@ -475,9 +649,9 @@ type Relay struct {
 	mu    sync.Mutex
 	lsn   net.Listener
 	conns map[*conn]struct{}
-	// perIP counts live conns by canonical source IP - the accept-time cap's
-	// bookkeeping, decremented by finish.
-	perIP map[string]int
+	// perGroup counts live conns by canonical source PREFIX - the
+	// accept-time cap's bookkeeping, decremented by finish.
+	perGroup map[string]int
 
 	quit      chan struct{}
 	closed    atomic.Bool
@@ -497,10 +671,10 @@ type Relay struct {
 // open until Listen.
 func New(opts Options) *Relay {
 	return &Relay{
-		opts:  opts.withDefaults(),
-		conns: make(map[*conn]struct{}),
-		perIP: make(map[string]int),
-		quit:  make(chan struct{}),
+		opts:     opts.withDefaults(),
+		conns:    make(map[*conn]struct{}),
+		perGroup: make(map[string]int),
+		quit:     make(chan struct{}),
 	}
 }
 
@@ -585,7 +759,7 @@ func (r *Relay) acceptLoop(l net.Listener) {
 
 // admit applies the accept-time refusal rules in order - relay closed, then
 // MaxConns, then MaxConnsPerIP (audit N-2: no single source may hold every
-// slot; the per-IP count is kept under the same mutex the registry is) -
+// slot; the per-GROUP count is kept under the same mutex the registry is) -
 // and registers the accepted connection with its two goroutines. The
 // registration stays under the same lock Close's snapshot takes, so a Close
 // racing an accept either sees the connection (and finishes it) or finds
@@ -599,18 +773,18 @@ func (r *Relay) admit(nc net.Conn) error {
 	if len(r.conns) >= r.opts.MaxConns {
 		return fmt.Errorf("relay: registry full (%d)", r.opts.MaxConns)
 	}
-	host := connHost(nc.RemoteAddr())
-	if r.perIP[host] >= r.opts.MaxConnsPerIP {
-		return fmt.Errorf("relay: source %s holds %d slots already (cap %d)", host, r.perIP[host], r.opts.MaxConnsPerIP)
+	group := connGroup(nc.RemoteAddr())
+	if r.perGroup[group] >= r.opts.MaxConnsPerIP {
+		return fmt.Errorf("relay: source group %s holds %d slots already (cap %d)", group, r.perGroup[group], r.opts.MaxConnsPerIP)
 	}
 	c := &conn{
-		nc:   nc,
-		q:    newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes),
-		dead: make(chan struct{}),
-		ip:   host,
+		nc:       nc,
+		q:        newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes, r.opts.WriteQueueFrames),
+		dead:     make(chan struct{}),
+		srcGroup: group,
 	}
 	r.conns[c] = struct{}{}
-	r.perIP[host]++
+	r.perGroup[group]++
 	r.wg.Add(2)
 	go r.reader(c)
 	go r.writer(c)
@@ -708,13 +882,19 @@ func (r *Relay) forward(sender *conn, payload []byte) {
 }
 
 // writer is the per-connection write goroutine: drain the queue onto the
-// socket until the connection is over, every frame under its own write
+// socket until the connection is over, every frame under the queue's PROGRESS
 // deadline. A blocked write means a peer that has stopped reading; the
-// deadline is what turns that from "this goroutine is parked forever and
-// its queue's bytes are pinned forever" (the pre-fix state, audit N-2)
-// into a bounded stall: the frame that cannot be written within
-// WriteTimeout ends the connection, finish releases the slot, the queued
-// bytes and the IP's count, and the reader unblocks into the same teardown.
+// deadline is what turns that from "this goroutine is parked forever and its
+// queue's bytes are pinned forever" (the pre-fix state, audit N-2) into a
+// bounded stall - but the deadline is anchored to when the queue first became
+// non-empty, not re-armed from "now" on each frame, or a sink that accepts a
+// trickle of every frame would make each write succeed while never letting
+// the backlog clear (the second N-2 shape). The frame that cannot be written
+// within that deadline, or a queue still non-empty when the deadline has
+// passed, ends the connection: finish releases the slot, the queued bytes,
+// the entry ring and the group's count, and the reader unblocks into the same
+// teardown. A peer that drains as it goes empties the queue and starts a fresh
+// deadline on the next burst, so an honest flow is never cut off.
 func (r *Relay) writer(c *conn) {
 	defer r.wg.Done()
 	for {
@@ -723,18 +903,29 @@ func (r *Relay) writer(c *conn) {
 			return
 		case <-c.q.ready:
 			for {
-				f, ok := c.q.pop()
+				deadline, ok := c.q.writeDeadline(r.opts.WriteTimeout)
 				if !ok {
 					break // drained; sleep until the next push signals
 				}
-				if err := c.nc.SetWriteDeadline(time.Now().Add(r.opts.WriteTimeout)); err != nil {
+				if !time.Now().Before(deadline) {
+					// The backlog has failed to clear within WriteTimeout of
+					// its arrival, however steadily the peer trickled.
+					r.finish(c)
+					return
+				}
+				f, ok := c.q.pop()
+				if !ok {
+					break
+				}
+				if err := c.nc.SetWriteDeadline(deadline); err != nil {
 					r.finish(c)
 					return
 				}
 				if err := wire.WriteFrame(c.nc, f.b); err != nil {
-					// Socket failure or deadline expiry on a peer that has
-					// stopped reading - the same ending either way: nothing
-					// is parsed, nothing is retried, the slot is released.
+					// Socket failure, or the progress deadline expiring on a
+					// peer that has stopped reading - the same ending either
+					// way: nothing is parsed, nothing is retried, the slot is
+					// released.
 					r.finish(c)
 					return
 				}
