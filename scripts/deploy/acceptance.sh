@@ -552,7 +552,7 @@ elif [ "$AGREE_STATE" = "CHAIN-ID MISMATCH" ]; then
     echo "agreement   CHAIN-ID MISMATCH — $AGREE_DETAIL"
     echo
     echo "VERDICT: FAIL — DISAGREE (exit 3): validators are on DIFFERENT CHAINS: $AGREE_DETAIL."
-    echo "  Same binary build and same --validators value on every node — deploy README §8, failure 1."
+    echo "  Same binary build and byte-identical --genesis committee file on every node — deploy README §8, failure 1."
 elif [ -n "$NOT_ADVANCING" ]; then
     CODE=2
     echo "agreement   $AGREE_STATE — $AGREE_DETAIL"
@@ -563,14 +563,14 @@ elif [ -n "$NOT_ADVANCING" ]; then
         echo "  Re-probe from a validator: ssh <pi> 'bash -c \"exec 3<>/dev/tcp/$RELAY_HOST/$RELAY_PORT\" && echo open'"
     else
         echo "  Reachable-but-frozen: the relay can be down in a way this machine cannot see, or the committee"
-        echo "  cannot reach quorum — e.g. two machines on one --index seat (deploy README §8, failures 2 and 3)."
+        echo "  cannot reach quorum — e.g. two machines on one --key key file (deploy README §8, failures 2 and 3)."
     fi
 elif [ "$AGREE_STATE" = "BLOCK MISMATCH" ]; then
     CODE=3
     echo "agreement   BLOCK MISMATCH — $AGREE_DETAIL"
     echo
     echo "VERDICT: FAIL — DISAGREE (exit 3): every validator advanced on chain ${CH[0]}, but they did NOT finalise"
-    echo "  the same blocks: $AGREE_DETAIL. A fork, or two validators on one --index seat (same key) — deploy README §8, failure 3."
+    echo "  the same blocks: $AGREE_DETAIL. A fork, or two validators on one --key key file (one derived seat) — deploy README §8, failure 3."
 elif [ "$AGREE_STATE" = INCONCLUSIVE ]; then
     CODE=5
     echo "agreement   could not be read:$AGREE_DETAIL"

@@ -50,6 +50,15 @@ THE TRUST TRADE — read before running one
   design's mitigations are multiple relays and direct connections - never a
   smarter relay.
 
+  THAT TRADE HOLDS ONLY FOR COMMITTEES OF HELD KEYS: validators started with
+  --genesis (a shared committee file listing the members' public keys) and
+  --key (b10coin keygen). The development fixture committee
+  (--validators/--index) derives every member's private key from public
+  seeds inside the source, so with it anyone can sign as ANY validator - and
+  no property of the relay matters, because forging needs no relay at all.
+  Never point the fixture committee at a relay reachable beyond your own
+  machines.
+
   Because the relay authenticates nothing, it must bind everything a
   stranger controls: frame size (--max-frame-bytes, refused before
   allocation), connection count (--max-conns), per-connection buffering

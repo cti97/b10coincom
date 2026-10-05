@@ -1,0 +1,9 @@
+{
+  "chain_id": "example-testnet-1",
+  "note": "EXAMPLE committee file — copy, then replace every pubkey with the 'public key' line each Pi's `b10coin keygen` printed, and choose your own chain_id. The note never enters the genesis hash. Order matters: a validator's seat is its entry's position (pi-0 → seat 0). See scripts/deploy/README.md §3.",
+  "validators": [
+    { "name": "pi-0", "pubkey": "1111111111111111111111111111111111111111111111111111111111111111", "power": 1 },
+    { "name": "pi-1", "pubkey": "2222222222222222222222222222222222222222222222222222222222222222", "power": 1 },
+    { "name": "pi-2", "pubkey": "3333333333333333333333333333333333333333333333333333333333333333", "power": 1 }
+  ]
+}

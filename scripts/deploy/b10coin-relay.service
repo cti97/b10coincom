@@ -4,8 +4,10 @@
 # Assumes the machine already has (see scripts/deploy/README.md §§2, 6):
 #   - the binary at /opt/b10coin/b10coin-relay    (from scripts/deploy/build.sh, scp'd)
 #   - a system user and group "b10coin"
-#   - TCP port 7001 reachable from the internet: cloud/security-group rule,
-#     plus `ufw allow 7001/tcp` if a host firewall is in use
+#   - TCP port 7001 reachable ONLY from the validators: a cloud/security-group
+#     rule restricting the port plus, if a host firewall is in use, one ufw
+#     ALLOWLIST line per validator IP (§4) — NEVER `ufw allow 7001/tcp`, which
+#     opens the relay to the whole internet
 #
 # The relay persists nothing and reads no config; everything in /opt is read
 # as a static binary, so ProtectSystem=strict is exact, not aspirational.

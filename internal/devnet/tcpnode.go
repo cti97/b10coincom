@@ -84,20 +84,39 @@ const (
 	networkedMempoolCapacity = 1000
 )
 
-// ValidatorConfig configures one networked validator. There is no secret
-// anywhere in it: the committee (simnet.Committee) and seat keys
-// (simnet.ValidatorKey) are deterministic fixtures, which is what lets four
-// processes derive the same committee from one flag. Seats must be distinct -
-// two processes claiming one seat are refused each other's connections by the
-// transport's self-connection guard - and every member must name the same
-// committee size.
+// ValidatorConfig configures one networked validator. It has two modes:
+//
+//   - GENESIS-FILE MODE (real keys): Genesis names the shared committee
+//     document (public keys) and Key is THIS validator's held private key.
+//     The seat is the position its public key occupies in that document, and
+//     a key that is not in it REFUSES TO START (audit A-1): silently signing
+//     as a seat the key does not hold is the exact failure the committee
+//     file exists to prevent.
+//   - FIXTURE MODE (devnet only): Genesis nil. The committee is the derived
+//     simnet fixture (simnet.Committee(Validators), chain b10coin-simnet-N)
+//     and the seat key is derived from the Index — which means every member
+//     key is PUBLICLY DERIVABLE by anyone with the repository. This mode
+//     exists for local development and the acceptance runs; callers must
+//     mark it loudly (the CLI prints a warning) and never point it at a
+//     network whose reach extends beyond the operator's own machines.
+//
+// Seats must be distinct - two processes claiming one seat are refused each
+// other's connections by the transport's self-connection guard.
 type ValidatorConfig struct {
 	// Dir holds this validator's chain (its own directory; like simnet, one
 	// directory per member).
 	Dir string
-	// Index is this node's seat in the committee.
+	// Genesis is the shared committee document (nil: fixture mode). It
+	// replaces the committee-size flag as the committee's source of truth.
+	Genesis *genesis.Genesis
+	// Key is this validator's Ed25519 private key. Required in genesis-file
+	// mode; ignored (derived instead) in fixture mode.
+	Key ed25519.PrivateKey
+	// Index is this node's seat in the fixture committee (fixture mode
+	// only; in genesis-file mode the seat is derived from the key and a
+	// nonzero value here is refused as a contradiction).
 	Index int
-	// Validators is the committee size.
+	// Validators is the fixture committee size (fixture mode only).
 	Validators int
 	// Listen is the P2P listen address; empty means "dial only". A node
 	// behind NAT with a relay has no listener by design.
@@ -203,12 +222,41 @@ func (l *driverTP) OnMessage(fn func(transport.Message)) { l.msg.Store(&fn) }
 // committee's addresses are known (the CLI does it right after; the mesh
 // tests collect every listener's port first).
 func StartValidator(cfg ValidatorConfig) (*Validator, error) {
-	if cfg.Validators < 1 || cfg.Validators > 255 {
-		return nil, fmt.Errorf("devnet: committee size must be 1..255, got %d", cfg.Validators)
+	var g *genesis.Genesis
+	seat := cfg.Index
+	switch {
+	case cfg.Genesis != nil:
+		// Genesis-file mode. Contradictory fixture fields are refused, not
+		// ignored: a flag set alongside --genesis names a committee the file
+		// did not choose, and a flag that lies about which committee runs is
+		// worse than an error.
+		if cfg.Index != 0 || cfg.Validators != 0 {
+			return nil, fmt.Errorf("devnet: the committee comes from the genesis file; --index and --validators are fixture-mode flags and must not be set alongside it")
+		}
+		if cfg.Key == nil {
+			return nil, fmt.Errorf("devnet: a genesis-file committee needs this validator's key: give a key file's private key (see b10coin keygen)")
+		}
+		g = cfg.Genesis
+		pub, _ := cfg.Key.Public().(ed25519.PublicKey)
+		found := genesis.SeatOfPubKey(g.Validators, pub)
+		if found < 0 {
+			// THE refusal the audit asked for: a key outside the committee
+			// must not sign as any seat, and there is no seat-zero default
+			// to fall back to. Say what was checked and what fixes it.
+			return nil, fmt.Errorf("devnet: refusing to start: this validator's public key (%x) is not listed in the committee's genesis (%d seats named); a member key must be generated per machine (b10coin keygen) and its public key added to the file every validator shares",
+				pub, len(g.Validators))
+		}
+		seat = found
+		// Normalise the config so the seat reporting (Seat) reflects the
+		// DERIVED seat, not the fixture flag that was correctly zero.
+		cfg.Index = seat
+	case cfg.Validators >= 1 && cfg.Validators <= 255 && cfg.Index >= 0 && cfg.Index < cfg.Validators:
+		// Fixture mode, as before M4 A-1: derived committee, derived keys.
+		g = simnet.Committee(cfg.Validators)
+	default:
+		return nil, fmt.Errorf("devnet: fixture committee size must be 1..255 and the seat in range, got size %d seat %d", cfg.Validators, cfg.Index)
 	}
-	if cfg.Index < 0 || cfg.Index >= cfg.Validators {
-		return nil, fmt.Errorf("devnet: committee index %d out of range 0..%d", cfg.Index, cfg.Validators-1)
-	}
+	n := len(g.Validators)
 	if cfg.TickEvery <= 0 {
 		cfg.TickEvery = defaultTickEvery
 	}
@@ -216,17 +264,30 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		cfg.WaveEvery = defaultWaveEvery
 	}
 
-	g := simnet.Committee(cfg.Validators)
-	priv := simnet.ValidatorKey(cfg.Index)
+	priv := cfg.Key
+	if priv == nil {
+		priv = simnet.ValidatorKey(seat)
+	}
 	pub, _ := priv.Public().(ed25519.PublicKey)
-	if string(g.Validators[cfg.Index].PubKey) != string(pub) {
-		return nil, fmt.Errorf("devnet: committee seat %d holds a key that is not this validator's", cfg.Index)
+	// The belt over the seat selection: whatever mode chose the key, the
+	// engine signs with the key at this committee POSITION, so the position's
+	// listed public key must be this key's. (In fixture mode the derived key
+	// trivially matches; in genesis-file mode the seat was found BY the key,
+	// so this can only fire on a constructed-by-hand genesis. It is here so
+	// that no future seat-selection path can ever pair a position with a
+	// different key silently.)
+	if n <= seat {
+		return nil, fmt.Errorf("devnet: committee seat %d out of range 0..%d", seat, n-1)
+	}
+	if string(g.Validators[seat].PubKey) != string(pub) {
+		return nil, fmt.Errorf("devnet: committee seat %d holds a key that is not this validator's", seat)
 	}
 
-	// The simnet committee's power cap: the spec's 1/4 for four or more
-	// members, 1/1 below (small fixtures cannot satisfy 1/4).
+	// The committee's power cap: the spec's 1/4 for four or more members,
+	// 1/1 below (small fixtures cannot satisfy 1/4). Sized by the committee
+	// that actually runs, whatever named it.
 	capNum, capDen := uint64(1), uint64(4)
-	if cfg.Validators < 4 {
+	if n < 4 {
 		capNum, capDen = 1, 1
 	}
 	ccfg := consensus.Config{
@@ -322,6 +383,10 @@ func (v *Validator) Addr() string {
 
 // Height reports this validator's chain height (committed blocks only).
 func (v *Validator) Height() uint64 { return v.ch.Height() }
+
+// Seat reports this validator's committee index (genesis-file mode derives it
+// from the key's position; fixture mode stores it).
+func (v *Validator) Seat() int { return v.cfg.Index }
 
 // Chain exposes the validator's chain for tests and the CLI's RPC server.
 func (v *Validator) Chain() *chain.Chain { return v.ch }

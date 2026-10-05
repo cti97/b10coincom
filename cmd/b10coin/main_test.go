@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/cti97/b10coincom/internal/genesis"
 )
 
 // captureStdout runs fn with os.Stdout swapped for a pipe and returns what
@@ -542,5 +544,190 @@ func assertCliStatusesCommittee(t *testing.T, procs []*cliNodeProc) {
 		if st.Height < 2 {
 			t.Fatalf("node %d at height %d, want >= 2 %s", i, st.Height, p.tails())
 		}
+	}
+}
+
+// --- keygen and the genesis-file node path (audit A-1). ---
+//
+// These pin the A-1 fix at its two surfaces: the key file (written once,
+// owner-only, never overwritten) and the node flags that make a real
+// committee possible — the committee from a shared file of PUBLIC keys, the
+// seat key from a held file, and refusal at startup when the two disagree.
+
+// keygenKey runs cmdKeygen in-process and returns the key file path plus the
+// hex public key the command printed (the value an operator pastes into the
+// committee file — the tests assemble real committee files from it).
+func keygenKey(t *testing.T, dir, name string) (keyPath, pubHex string) {
+	t.Helper()
+	keyPath = filepath.Join(dir, name)
+	out := captureStdout(t, func() {
+		if err := cmdKeygen([]string{"--out", keyPath}); err != nil {
+			t.Fatalf("cmdKeygen: %v", err)
+		}
+	})
+	for _, line := range strings.Split(out, "\n") {
+		if fields := strings.Fields(line); len(fields) == 3 && fields[0] == "public" && fields[1] == "key" && len(fields[2]) == 64 {
+			return keyPath, fields[2]
+		}
+	}
+	t.Fatalf("keygen printed no 64-hex public key line; output:\n%s", out)
+	return "", ""
+}
+
+// writeCommitteeFile writes the shared committee JSON listing the given hex
+// public keys under chainID.
+func writeCommitteeFile(t *testing.T, dir, chainID string, pubHexes ...string) string {
+	t.Helper()
+	entries := make([]genesis.CommitteeEntry, 0, len(pubHexes))
+	for i, k := range pubHexes {
+		entries = append(entries, genesis.CommitteeEntry{Name: fmt.Sprintf("pi-%d", i), PubKey: k, Power: 1})
+	}
+	raw, err := json.Marshal(genesis.CommitteeFile{ChainID: chainID, Validators: entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "committee.json")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The keygen contract: created (0600), the public key and seat address are
+// printed, and a second call refuses to overwrite. Killing mutant: keygen
+// that truncates an existing file (O_EXCL dropped) would silently REPLACE a
+// live validator's key — the refusal test also proves the original bytes
+// survive untouched.
+func TestCmdKeygenWritesOwnerOnlyKeyFileAndRefusesOverwrite(t *testing.T) {
+	keyPath, pubHex := keygenKey(t, t.TempDir(), "b10coin.key")
+
+	if info, err := os.Stat(keyPath); err != nil {
+		t.Fatalf("stat key file: %v", err)
+	} else if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("key file mode %04o, want 0600 (owner-only)", info.Mode().Perm())
+	}
+	if len(pubHex) != 64 {
+		t.Fatalf("printed public key is %d hex chars, want 64: %q", len(pubHex), pubHex)
+	}
+
+	// A rerun must refuse: a second generation derives a DIFFERENT key, so
+	// an incautious overwrite orphans the key the committee file lists.
+	before, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdKeygen([]string{"--out", keyPath}); err == nil {
+		t.Fatal("a second keygen on the same path must fail, not overwrite")
+	} else if !strings.Contains(err.Error(), "refusing to overwrite") {
+		t.Fatalf("the refusal must say why: %v", err)
+	}
+	after, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("the refused overwrite still modified the key file")
+	}
+}
+
+// The genesis-file mode's flag contract, each refusal in-process (these all
+// fail before anything is started):
+//   - --genesis without --key must say who signs;
+//   - a key OUTSIDE the committee must be refused before any seat is claimed
+//     (the audit's refusal requirement, at the flag surface);
+//   - fixture flags alongside --genesis must be refused, not silently mixed;
+//   - --key on the single-node producer must be refused (the producer signs
+//     with the devnet fixture; a key flag there could only lie).
+func TestNodeGenesisModeFlagContract(t *testing.T) {
+	dir := t.TempDir()
+	k1, pub1 := keygenKey(t, dir, "validator-0.key")
+	k2, _ := keygenKey(t, dir, "validator-1.key")
+	cf := writeCommitteeFile(t, dir, "flag-contract-test", pub1)
+
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d1"), "--genesis", cf}); err == nil || !strings.Contains(err.Error(), "--key") {
+		t.Errorf("--genesis without --key must demand the key file, got: %v", err)
+	}
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d2"), "--genesis", cf, "--key", k2}); err == nil {
+		t.Fatal("a key that is not in the committee must refuse to start")
+	} else if !strings.Contains(err.Error(), "not listed") {
+		t.Fatalf("the refusal must be the membership refusal, got: %v", err)
+	}
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d3"), "--genesis", cf, "--key", k1, "--validators", "3", "--index", "0"}); err == nil || !strings.Contains(err.Error(), "fixture") {
+		t.Errorf("--validators/--index alongside --genesis must be refused as fixture flags, got: %v", err)
+	}
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d4"), "--key", k1}); err == nil || !strings.Contains(err.Error(), "single-node") {
+		t.Errorf("--key on the single-node producer must be refused, got: %v", err)
+	}
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d5"), "--genesis", filepath.Join(dir, "missing.json"), "--key", k1}); err == nil {
+		t.Error("a committee file that cannot be read must fail the command")
+	}
+}
+
+// The happy path through the REAL binary: a one-member committee from a
+// committee file, the seat key from a keygen file. This is the deployment
+// shape of the fixed deploy recipe in miniature — and it pins that:
+//   - the chain ID is the FILE's (no committee size was named on any flag;
+//     /status no longer derives identity from N);
+//   - the node refuses nothing about a key that IS listed, reaches height 1;
+//   - a real-key committee does NOT print the fixture warning.
+func TestCliNodeRunsAGenesisFileCommitteeWithItsHeldKey(t *testing.T) {
+	nodeBin, _ := buildCliBinaries(t)
+	ports := reservePorts(t, 1)
+	httpPort := ports[0]
+
+	cfgDir := filepath.Join(t.TempDir(), "cfg")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keyPath, pubHex := keygenKey(t, cfgDir, "b10coin.key")
+	cf := writeCommitteeFile(t, cfgDir, "cli-genesis-1", pubHex)
+
+	p := startCliNode(t, nodeBin, httpPort,
+		"node",
+		"--dir", t.TempDir(),
+		"--http", fmt.Sprintf("127.0.0.1:%d", httpPort),
+		"--genesis", cf,
+		"--key", keyPath,
+	)
+	defer p.stop(t)
+	waitForHeight(t, []*cliNodeProc{p}, 0, 1, 90*time.Second)
+
+	st, err := fetchStatus(p.statusURL())
+	if err != nil {
+		t.Fatalf("status: %v %s", err, p.tails())
+	}
+	if st.ChainID != "cli-genesis-1" {
+		t.Fatalf("chain %q, want the committee file's cli-genesis-1: the chain ID must come from the shared file %s", st.ChainID, p.tails())
+	}
+	if want := "committee of 1, seat 0, key file "; !strings.Contains(p.stdout.String(), want) {
+		t.Fatalf("the banner must name the committee, seat and key file (%q missing):\n%s", want, p.stdout.String())
+	}
+	if strings.Contains(p.stderr.String(), "FIXTURE COMMITTEE") {
+		t.Fatalf("a held-key committee printed the FIXTURE warning; the warning belongs to the derived-committee path only:\n%s", p.tails())
+	}
+}
+
+// The fixture node (--validators/--index) still runs exactly as before — the
+// acceptance runs depend on it — but it must now be LOUDLY marked: the
+// audit's bound on the fallback path. This subprocess test requires the
+// warning on stderr while the committee works, killing the mutant that
+// reports fixture keys as if they were safe.
+func TestCliFixtureNodeStillRunsButWarnsItsKeysArePublic(t *testing.T) {
+	nodeBin, _ := buildCliBinaries(t)
+	ports := reservePorts(t, 1)
+	p := startCliNode(t, nodeBin, ports[0],
+		"node",
+		"--dir", t.TempDir(),
+		"--http", fmt.Sprintf("127.0.0.1:%d", ports[0]),
+		"--validators", "1",
+		"--index", "0",
+	)
+	defer p.stop(t)
+	waitForHeight(t, []*cliNodeProc{p}, 0, 1, 90*time.Second)
+	if st, err := fetchStatus(p.statusURL()); err != nil || st.ChainID != "b10coin-simnet-1" {
+		t.Fatalf("fixture committee chain %q (err %v): the devnet fixture path must keep running", st.ChainID, err)
+	}
+	if !strings.Contains(p.stderr.String(), "FIXTURE COMMITTEE") {
+		t.Fatalf("a publicly derivable committee started without the fixture warning:\n%s", p.tails())
 	}
 }

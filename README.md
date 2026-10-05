@@ -140,7 +140,7 @@ rot silently and none ships unverified.
 
 ## The CLI
 
-`cmd/b10coin` implements five subcommands. With no subcommand, or with an
+`cmd/b10coin` implements six subcommands. With no subcommand, or with an
 unknown one, it prints the usage text and exits with code 2.
 
 ### `b10coin devnet`
@@ -152,7 +152,10 @@ a committee of `N` consensus validators driven through the simulated network,
 reported per validator, and failing unless the validators hold one history.
 The faucet-claim scenario is the single-node path's proof — a committee
 accepts no transactions — so `--claims` alongside an explicit `--validators`
-is refused rather than silently dropped.
+is refused rather than silently dropped. The `--validators` committee is the
+**fixture committee** (below): every seat's key is derivable from public
+seeds, which is exactly what makes these runs deterministic and reproducible
+— and what makes it development-only.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -161,23 +164,78 @@ is refused rather than silently dropped.
 | `--validators N` | *unset (single node)* | committee size; omitting the flag keeps the M0–M2 single-node run as it shipped, and any explicit value — `1` included — runs the consensus committee of that size |
 | `--dir PATH` | *fresh temporary directory* | data directory; a temporary one is deleted afterwards, an explicit path is kept (multi-validator runs lay out one chain per validator under `PATH/v0`, `PATH/v1`, …) |
 
+### `b10coin keygen`
+
+Generates one real validator key and writes it to a key file with owner-only
+permissions (`0600`). The command refuses to overwrite an existing key file —
+a careless rerun derives a *different* key, which would orphan the seat the
+committee file lists — and prints the **public** key (the value you paste into
+the committee file every validator shares) and the key's seat address.
+
+```text
+$ go run ./cmd/b10coin keygen --out /var/lib/b10coin/b10coin.key
+key file     /var/lib/b10coin/b10coin.key (owner-only 0600; regenerate elsewhere, never over this one)
+public key   a4198cc4f3ee076a810f62c3fa58502c3d13a1d5b54ca99a257ba9686c27853c
+seat address b10tleywhxwbe7uw54ty57hit34rf2pbjstmhk4j7i
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--out PATH` | `./b10coin.key` | key file to create; written with owner-only permissions and **never overwritten** (a second run on an existing path fails with `refusing to overwrite`) |
+
+The file is versioned JSON (`private_key`, `public_key`, creation time as
+hex key material in owner-readable form). Loading re-derives the public key
+and refuses a file whose two halves disagree, and refuses a file readable by
+group or others (`chmod 600` fixes it) — a key that leaks its permissions
+leaks its votes.
+
 ### `b10coin node`
 
-Runs a single-node chain serving HTTP RPC. In M1 a node produced blocks
-unilaterally, one block per tick, because a single node needs no agreement;
-the consensus engine exists since M3 and is exercised through the
-`devnet --validators` runs above, while `node` itself still runs the
-single-validator devnet fixture — a real committee of separate processes
-needs real networking, which is M4. Nodes currently run the
-**devnet** genesis and sign
-with a deterministic, public test key that is safe only because devnet coins
-are valueless; the testnet genesis has no validator keys yet.
+Runs a chain serving HTTP RPC. Without any networking flag it is the M1
+single-node producer: the devnet fixture chain, unilateral blocks, the
+fixture devnet key — safe only because devnet coins are valueless.
+
+With networking flags (`--peers`, `--relay`, `--listen`), a node joins the
+M4 consensus committee over real TCP. **How the committee is named decides
+whose keys sign, and that is the security boundary:**
+
+- **`--genesis PATH --key PATH` — the committee of held keys.** `--genesis`
+  names a small JSON committee file every validator shares, listing the
+  members' **public keys** and powers and the operators' chosen chain ID;
+  `--key` names this machine's key file (`b10coin keygen`). A node's seat is
+  the position of its public key in that list, and **a node whose key is not
+  in the committee refuses to start** with a message naming the problem —
+  it never silently signs as a seat it does not hold. Nothing about this
+  committee is derivable from the repository, and the chain ID comes from
+  the operators: no committee-size is published through it. The committee
+  file deliberately carries ONLY the committee section: the rest of the
+  genesis is the compiled-in fixture (trivial puzzle, 1 b10 claims), so a
+  shared chain remains valueless test currency and its economy cannot be
+  rewritten by whoever writes the file. This is the mode the
+  [deployment recipe](scripts/deploy/README.md) uses.
+- **`--validators N --index I` — the fixture committee, development only.**
+  This is the pre-A-1 path kept for local development: every seat's private
+  key is derived from the public seed `b10coin-simnet-validator` plus the
+  seat number, so **anyone with this repository can sign proposals, prevotes
+  and precommits for ANY seat of `b10coin-simnet-N`** — and the chain ID,
+  which `/status` reports, publishes the committee size. A node running this
+  mode prints a loud warning on stderr; `usage()` says the same; the deploy
+  recipe forbids it on any reachable network. It exists so the M3/M4
+  acceptance commands keep running unchanged with their legitimate,
+  deliberately-public fixture keys.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--dir PATH` | `./b10coin-data` | data directory |
-| `--http ADDR` | `127.0.0.1:8645` | HTTP RPC listen address |
-| `--block-time DURATION` | `2s` | target block interval |
+| `--http ADDR` | `127.0.0.1:8645` | HTTP RPC listen address (loopback-only by default; keep it that way) |
+| `--block-time DURATION` | `2s` | target block interval (single-node producer only; refused with networking) |
+| `--genesis PATH` | *unset* | shared committee file listing the validators' public keys; giving it runs the consensus committee that file names |
+| `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
+| `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
+| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode) |
+| `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
+| `--validators N` | *unset* | fixture committee size — development only, see the security note above |
+| `--index I` | *unset* | fixture seat number — development only |
 
 Ctrl-C (or, on Unix, SIGTERM) stops block production and the HTTP server
 cleanly. The graceful stop listens for both through one cancellation
@@ -213,14 +271,25 @@ forwards every frame it receives to every **other** peer. It parses nothing
 beyond the frame's 4-byte length prefix — it does not know what a vote is,
 and that is the design, not a shortcut.
 
-The trust trade it rests on: every consensus message is signed with the
-sender's Ed25519 key, so **a malicious relay can censor or delay, but it
-cannot forge a vote or a proposal**. Consensus safety is never at risk from
+The trust trade it rests on: every consensus message is signed with a key
+its sender actually holds, so **a malicious relay can censor or delay, but
+it cannot forge a vote or a proposal**. Consensus safety is never at risk from
 the relay; only liveness is (a relay that partitions the validator set stalls
 consensus, which the round protocol's rebroadcasts and the reconnection
-backoff pay for). If that ever stops being acceptable the answer is multiple
-relays and direct connections — never a smarter relay, because a relay that
-understood consensus would be a relay that could be wrong about it.
+backoff pay for).
+
+**That trade holds only for committees of held keys** — validators started
+with `--genesis` (the shared committee file of public keys) and `--key`
+(`b10coin keygen`), above. It does **not** hold for the development fixture
+committee (`--validators/--index`), whose keys are derived from public seeds
+anyone with this repository can reproduce: with a fixture committee, anyone
+can be every validator, and no property of the relay matters because forging
+needs no relay at all. That is why the deployment recipe's firewall step
+allowlists the validators' IPs and why the fixture committee must never reach
+a publicly reachable relay. If relay-only trust ever stops being acceptable
+the answer is multiple relays and direct connections — never a smarter relay,
+because a relay that understood consensus would be a relay that could be
+wrong about it.
 
 Because it authenticates nothing, it binds everything a stranger controls: a
 frame whose declared length exceeds the bound is refused before any
