@@ -1,5 +1,6 @@
 // Package store persists blocks as append-only segment files, a per-height
-// lock log and a per-height commit-certificate log, all over opaque payloads.
+// lock log, a per-height round log and a per-height commit-certificate log,
+// all over opaque payloads.
 //
 // Record layout, shared by every log here:
 //
@@ -32,6 +33,12 @@
 // lock's whole value is its mere existence, and a missing one reads as
 // unlocked, so its error policy is as strict as the framing allows: the node
 // staying down is the honest failure.
+//
+// The round log (roundLogName) records the consensus round a validator had
+// reached at a height (audit C-3), under the lock log's fixed-width framing;
+// the certificate log (certLogName, audit C-7) indexes one opaque certificate
+// per committed height and reads records back on demand rather than holding
+// them in memory.
 package store
 
 import (
@@ -64,6 +71,10 @@ const lockLogName = "locks.log"
 // certLogName holds the commit-certificate log (audit C-7). Like the lock log
 // its name avoids the ".seg" suffix for the same reason.
 const certLogName = "certs.log"
+
+// roundLogName holds the consensus-round log (audit C-3). Like the lock and
+// certificate logs its name avoids the ".seg" suffix for the same reason.
+const roundLogName = "rounds.log"
 
 // RecordHeaderLen and RecordTrailerLen are the on-disk framing's fixed sizes:
 // an 8-byte big-endian payload length plus the 4-byte CRC32C of those 8 bytes,
@@ -114,6 +125,26 @@ type LockRecord struct {
 	BlockID [32]byte
 }
 
+// roundPayloadLen is the fixed payload size of one round record: 8 bytes of
+// big-endian height followed by 4 bytes of big-endian round. The width is a
+// constant of the CODE, not data the file states, for exactly the reason the
+// lock record's is (see lockPayloadLen): scanRounds compares the framing's
+// length prefix against this constant and refuses any disagreement, so no
+// corruption can shape one record into a torn tail that gets "repaired" by
+// truncation.
+const roundPayloadLen = 8 + 4
+
+// RoundRecord is the persisted form of a validator's position at a height:
+// it had entered Round at Height when it last advanced. It is not a safety
+// promise - unlike a lock, losing it can only re-enter an earlier round, and
+// the lock still refuses every conflicting vote - so its value is liveness:
+// a validator that advanced through several timed-out rounds does not start
+// the whole capped ladder over from round 0 after a restart.
+type RoundRecord struct {
+	Height uint64
+	Round  uint32
+}
+
 // Store is an append-only block log over opaque payloads.
 type Store struct {
 	dir   string
@@ -133,6 +164,12 @@ type Store struct {
 	// lock heights are deliberately NOT required to be appended heights.
 	lockFile *os.File
 	locks    map[uint64]LockRecord
+
+	// roundFile is the append handle on the round log; rounds maps a height
+	// to the NEWEST round recorded for it (audit C-3). Like a lock, a round
+	// is recorded for a height that has not been appended yet.
+	roundFile *os.File
+	rounds    map[uint64]uint32
 
 	// certFile is the append-and-read handle on the commit-certificate log
 	// (audit C-7); certIndex maps a height to the offset of its record in
@@ -179,6 +216,7 @@ func Open(dir string) (*Store, error) {
 		dir:       dir,
 		index:     make(map[uint64]int64),
 		locks:     make(map[uint64]LockRecord),
+		rounds:    make(map[uint64]uint32),
 		certIndex: make(map[uint64]int64),
 		readers:   make(map[string]*os.File),
 		lock:      lock,
@@ -198,17 +236,26 @@ func Open(dir string) (*Store, error) {
 		lock.release()
 		return nil, err
 	}
-	// O_RDWR, unlike the append-only handles above: serving an adopted
-	// height's certificate reads the record back with ReadAt.
-	cf, err := os.OpenFile(filepath.Join(dir, certLogName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	rf, err := os.OpenFile(filepath.Join(dir, roundLogName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		_ = f.Close()
 		_ = lf.Close()
 		lock.release()
 		return nil, err
 	}
+	// O_RDWR, unlike the append-only handles above: serving an adopted
+	// height's certificate reads the record back with ReadAt.
+	cf, err := os.OpenFile(filepath.Join(dir, certLogName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	if err != nil {
+		_ = f.Close()
+		_ = lf.Close()
+		_ = rf.Close()
+		lock.release()
+		return nil, err
+	}
 	s.file = f
 	s.lockFile = lf
+	s.roundFile = rf
 	s.certFile = cf
 	return s, nil
 }
@@ -243,6 +290,14 @@ func (s *Store) scan() error {
 	// must be loaded in the same pass as the blocks it promises about, or a
 	// restarted validator would re-open unlocked.
 	if err := s.scanLocks(); err != nil {
+		return err
+	}
+	// The round log (audit C-3), scanned under the same policy as the lock
+	// log: the newest record per height stands, and a torn tail is the only
+	// shape Open may cut. It is read back in the same Open that replays the
+	// blocks, so the round a crashed validator had reached is available to
+	// the engine built over that replay.
+	if err := s.scanRounds(); err != nil {
 		return err
 	}
 	// Certificate records are indexed but their payloads are NOT loaded: a
@@ -629,6 +684,57 @@ func (s *Store) scanLocks() error {
 	return nil
 }
 
+// scanRounds rebuilds the round index from the round log (audit C-3).
+//
+// The error policy is the lock log's, record for record: a torn tail (the
+// file ending inside a record, or a valid header whose record runs past EOF)
+// is the one shape a crash mid-write leaves and is truncated; a header whose
+// length checksum fails, a valid header naming any length other than the
+// fixed roundPayloadLen this format always writes, or a complete record whose
+// checksum fails, is corruption and fails Open loudly. The round is not a
+// safety promise, so the strictness is a choice rather than a necessity: the
+// bytes after a corrupt record cannot be framed, and a log that cannot be
+// framed cannot be trusted to say which round stands. A NEWEST record per
+// height wins, so a height whose round advanced several times reads back the
+// furthest round that reached disk.
+func (s *Store) scanRounds() error {
+	path := filepath.Join(s.dir, roundLogName)
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // no round was ever recorded
+	}
+	if err != nil {
+		return err
+	}
+	off := int64(0)
+	for off < int64(len(raw)) {
+		n, recEnd, err := frame(raw, off, roundPayloadLen)
+		if err != nil {
+			if errors.Is(err, errTornRecord) {
+				// The tail a crash actually cuts: the file ends inside the
+				// record. Nothing from this offset on is intact.
+				return s.truncateTail(path, off)
+			}
+			return fmt.Errorf("%w: round record at offset %d of %s: %v", ErrCorruptRecord, off, roundLogName, err)
+		}
+		payStart := off + RecordHeaderLen
+		framed := raw[off : payStart+n : payStart+n]
+		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
+		if crc32.Checksum(framed, crcTable) != want {
+			return fmt.Errorf("%w: round record checksum mismatch at offset %d of %s", ErrCorruptRecord, off, roundLogName)
+		}
+		rec, err := decodeRoundRecord(raw[payStart : payStart+n])
+		if err != nil {
+			return fmt.Errorf("%w: round record at offset %d of %s: %v", ErrCorruptRecord, off, roundLogName, err)
+		}
+		// Newest wins: the round only ever advances at a height, so the last
+		// frame is the position that stands.
+		s.rounds[rec.Height] = rec.Round
+		off = recEnd
+	}
+	return nil
+}
+
 // scanCerts indexes the commit-certificate log (audit C-7): a height to the
 // offset of its record. The payloads are NOT kept in memory - see the Store
 // doc - so this pass rebuilds an index, not an archive.
@@ -814,15 +920,72 @@ func (s *Store) LockAt(height uint64) (LockRecord, bool) {
 	return rec, ok
 }
 
-// Close releases both handles - the block segment and the lock log - and
-// reports BOTH failures: an early return on the first error would leak the
-// other open descriptor every time one close fails. The fields are cleared
-// unconditionally (a close error can fire after the descriptor is really
-// gone - see Append's rollover), so a repeated Close cannot spin on the
-// same handle. The data-directory lock is released last, so the directory
-// admits a new writer only once this store's files are closed.
+// encodeRoundRecord renders a round as its fixed-size payload: 8 bytes of
+// big-endian height followed by 4 bytes of big-endian round - exactly
+// roundPayloadLen bytes, the payload the store's CRC framing wraps. The width
+// is fixed so scanRounds can compare the prefix against this constant, as the
+// lock log does.
+func encodeRoundRecord(rec RoundRecord) []byte {
+	out := make([]byte, roundPayloadLen)
+	binary.BigEndian.PutUint64(out[0:8], rec.Height)
+	binary.BigEndian.PutUint32(out[8:12], rec.Round)
+	return out
+}
+
+// decodeRoundRecord reads encodeRoundRecord's payload back. It is strict for
+// the same reason decodeLockRecord is: a payload that is not exactly the
+// fixed-width layout is corruption, and a misframed reading must never decode
+// into a round the validator never entered.
+func decodeRoundRecord(payload []byte) (RoundRecord, error) {
+	var rec RoundRecord
+	if len(payload) != roundPayloadLen {
+		return rec, fmt.Errorf("round record payload is %d bytes, want the fixed %d", len(payload), roundPayloadLen)
+	}
+	rec.Height = binary.BigEndian.Uint64(payload[0:8])
+	rec.Round = binary.BigEndian.Uint32(payload[8:12])
+	return rec, nil
+}
+
+// PutRound records that the validator entered rec.Round at rec.Height, and
+// appends it durably before returning. Like the lock log it is append-only
+// with the newest frame per height winning, so a crash mid-advance leaves the
+// previous round intact and a restart resumes from the furthest round whose
+// record reached disk. Round heights are NOT required to be appended block
+// heights: the round belongs to the height being judged, head+1.
+func (s *Store) PutRound(rec RoundRecord) error {
+	payload := encodeRoundRecord(rec)
+	off, err := s.roundFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if err := writeRecord(s.roundFile, payload); err != nil {
+		// Cut a partial record back off so later appends start clean; the
+		// next Open also self-heals if this truncate fails.
+		_ = s.roundFile.Truncate(off)
+		return err
+	}
+	s.rounds[rec.Height] = rec.Round
+	return nil
+}
+
+// RoundAt returns the newest round recorded for height, and whether one
+// exists. Absence - a height whose engine never advanced past round 0 - is
+// the legitimate zero value, not an error; corruption of the underlying log
+// already fails Open loudly, so absence can never hide a torn record.
+func (s *Store) RoundAt(height uint64) (uint32, bool) {
+	r, ok := s.rounds[height]
+	return r, ok
+}
+
+// Close releases every handle - the block segment, the lock log, the round log
+// and the certificate log - and reports ALL failures: an early return on the
+// first error would leak the other open descriptors every time one close
+// fails. The fields are cleared unconditionally (a close error can fire after
+// the descriptor is really gone - see Append's rollover), so a repeated Close
+// cannot spin on the same handle. The data-directory lock is released last, so
+// the directory admits a new writer only once this store's files are closed.
 func (s *Store) Close() error {
-	var fileErr, lockErr, certErr error
+	var fileErr, lockErr, roundErr, certErr error
 	if s.file != nil {
 		fileErr = s.file.Close()
 		s.file = nil
@@ -830,6 +993,10 @@ func (s *Store) Close() error {
 	if s.lockFile != nil {
 		lockErr = s.lockFile.Close()
 		s.lockFile = nil
+	}
+	if s.roundFile != nil {
+		roundErr = s.roundFile.Close()
+		s.roundFile = nil
 	}
 	if s.certFile != nil {
 		certErr = s.certFile.Close()
@@ -848,5 +1015,5 @@ func (s *Store) Close() error {
 		s.lock.release()
 		s.lock = nil
 	}
-	return errors.Join(fileErr, lockErr, certErr)
+	return errors.Join(fileErr, lockErr, roundErr, certErr)
 }

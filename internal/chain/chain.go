@@ -589,6 +589,27 @@ func (c *Chain) LockAt(height uint64) (store.LockRecord, bool) {
 	return c.store.LockAt(height)
 }
 
+// PutRound durably records that a validator entered rec.Round at rec.Height
+// (audit C-3). The chain exposes the store's round log for the same reason it
+// exposes the lock log: the position a validator had reached must survive a
+// restart, and it belongs in the one crash-tolerant directory the blocks
+// replay from. Write-locked: it appends, fsyncs and re-indexes the store.
+func (c *Chain) PutRound(rec store.RoundRecord) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.PutRound(rec)
+}
+
+// RoundAt returns the newest round recorded for height, and whether one
+// exists. A restarted validator reads its position back through here, so the
+// driver's fresh engine resumes at the round the crashed one had reached
+// instead of re-entering round 0 for an already-contested height.
+func (c *Chain) RoundAt(height uint64) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.store.RoundAt(height)
+}
+
 // PutCert durably records the opaque commit certificate for height (audit
 // C-7). The chain exposes the store's certificate log for the same reason it
 // exposes the lock log: the evidence a node serves for a block it holds must

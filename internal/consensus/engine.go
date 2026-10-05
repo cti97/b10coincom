@@ -11,6 +11,24 @@ import (
 	"github.com/cti97/b10coincom/internal/types"
 )
 
+// futureVoteRounds bounds the FUTURE window of the per-height vote buffer
+// (audit C-3): a vote for a round at most this many ahead of the engine's own
+// is retained and tallied as soon as the engine reaches that round, instead of
+// being dropped the moment it arrives. A follower that jumped or stepped to
+// round r+2 finds that round's prevotes already in hand, so it can precommit -
+// and, when the precommits are there too, commit - without waiting for a
+// retransmission the protocol never sends.
+const futureVoteRounds uint32 = 4
+
+// pastVoteRounds bounds how many rounds BEHIND the engine's own keep their
+// tallies (audit C-3). This is the window that makes commit-from-any-round
+// real: a precommit quorum that completes for round r after the engine has
+// already entered round r+1 still commits, because round r's set was not
+// discarded by the round change. Past rounds older than this are pruned; the
+// window is what bounds retention, so an unbounded buffer - a memory DoS - is
+// impossible.
+const pastVoteRounds uint32 = 4
+
 // Step is where a validator is in a round's four-phase protocol.
 type Step uint8
 
@@ -80,8 +98,29 @@ type Engine struct {
 	lk         lock
 	proposal   *types.Block // the block this validator is judging this round
 	proposalEn *Proposal    // the envelope it arrived in: carries ValidRound/Justification
+
+	// prevotes and precommits are the CURRENT round's tallies; they always
+	// point at the entry e.sets[e.round] (see bindRound).
 	prevotes   *VoteSet
 	precommits *VoteSet
+
+	// sets retains the per-round tallies this engine holds at this HEIGHT
+	// (audit C-3), keyed by round. The map is the whole of the multi-round
+	// vote buffer: a vote for a future round lands in its own set and is
+	// tallied the moment the engine enters that round; a precommit set for a
+	// round the engine has already LEFT stays here, so a quorum that
+	// completes late still commits (maybeCommit walks every other retained
+	// round). Retention is BOUNDED - see withinWindow/pruneRounds:
+	// rounds more than futureVoteRounds ahead or pastVoteRounds behind are
+	// dropped, and because a VoteSet counts each validator once per round,
+	// the whole buffer holds at most
+	//
+	//	(futureVoteRounds + pastVoteRounds + 1) x 2 x len(Committee)
+	//
+	// votes - an explicit cap, not a hope about how far rounds drift. A
+	// vote outside the window is not retained (it is still counted as
+	// round-ladder evidence in future, which is one entry per member).
+	sets map[uint32]*roundSets
 
 	// validate, when non-nil, is the block-validation seam the DRIVER fills:
 	// it reports whether the proposal's block is one this validator may
@@ -136,9 +175,10 @@ type Engine struct {
 	// future records, per committee member (index), the HIGHEST round this
 	// engine has seen that member sign a vote (prevote or precommit) for at
 	// this height, when that round was ahead of the round the engine was in
-	// at arrival. The engine drops wrong-round tallies (no multi-round vote
-	// sets yet - C-3), but the DISCARDED vote still carries the one piece of information the
-	// round ladder needs: the committee has already moved past this round. On
+	// at arrival. Since C-3 an in-window future vote is ALSO retained in its
+	// round's set; this map is what carries the evidence for rounds OUTSIDE
+	// the buffer, and the one piece of information the round ladder needs:
+	// the committee has already moved past this round. On
 	// timeout the engine JUMPS its round - bounded, evidence-gated resync:
 	// strictly more than ONE THIRD OF TOTAL POWER (the same Byzantine budget
 	// every power fraction in this package is measured against, and the same
@@ -169,9 +209,31 @@ type Engine struct {
 	// whose lock is in-memory only, exactly as before this field existed.
 	persistLock func(height uint64, round uint32, id [32]byte)
 
+	// persistRound, when non-nil, is called the instant the engine ENTERS a
+	// later round, before it emits any vote in that round (audit C-3). It is
+	// the round-persistence half of the same injected seam: a restart must
+	// resume at the round the crashed validator had reached, not re-enter
+	// round 0 for a height already contested. Nil for engine-only fixtures,
+	// exactly as persistLock is.
+	persistRound func(height uint64, round uint32)
+
 	committed    [32]byte
 	hasCommitted bool
-	out          []Outbound
+	// commitRound is the round whose precommit quorum committed committed.
+	// With multi-round sets the commit need not be the CURRENT round (a late
+	// quorum for a round already left), and the driver's certificate archive
+	// needs to know which round's votes are the evidence.
+	commitRound uint32
+	out         []Outbound
+}
+
+// roundSets is one round's two tallies at this engine's height. Keeping them
+// together is what lets a round change carry BOTH kinds of vote forward: a
+// buffered future round's prevotes and precommits become current the moment
+// the engine enters that round, with no re-add and no re-verify.
+type roundSets struct {
+	prevotes   *VoteSet
+	precommits *VoteSet
 }
 
 // errNoValidationSeam is what NewEngine's default seam returns. It is the
@@ -223,11 +285,14 @@ func NewEngine(cfg Config, height uint64, parent [32]byte, priv ed25519.PrivateK
 		// The lock's zero value is round 0, which is a REAL round, so "unlocked"
 		// must be set explicitly. Forgetting this makes a fresh validator believe
 		// it is locked on the zero block and prevote for nothing.
-		lk:         lock{lockedRound: -1},
-		step:       StepPropose,
-		prevotes:   NewVoteSet(cfg, height, 0, MsgPrevote),
-		precommits: NewVoteSet(cfg, height, 0, MsgPrecommit),
+		lk:   lock{lockedRound: -1},
+		step: StepPropose,
+		sets: make(map[uint32]*roundSets),
 	}
+	// Bind round 0's empty tallies through the same path every later round
+	// takes, so prevotes/precommits and sets[e.round] cannot disagree about
+	// which VoteSet is current.
+	e.bindRound(0)
 	return e
 }
 
@@ -432,17 +497,144 @@ func (e *Engine) jumpTarget() uint32 {
 	return 0
 }
 
+// setsFor returns the vote tallies for round, creating empty ones if this is
+// the first time the round is seen. It is total over the rounds the engine may
+// retain: callers that must not grow the buffer beyond its window check
+// withinWindow first. Every call for a round already in the set hands back the
+// SAME VoteSets, so votes buffered while the round was ahead survive the
+// engine's arrival in it.
+func (e *Engine) setsFor(round uint32) *roundSets {
+	s := e.sets[round]
+	if s == nil {
+		s = &roundSets{
+			prevotes:   NewVoteSet(e.cfg, e.height, round, MsgPrevote),
+			precommits: NewVoteSet(e.cfg, e.height, round, MsgPrecommit),
+		}
+		e.sets[round] = s
+	}
+	return s
+}
+
+// bindRound makes round current, pointing prevotes/precommits at its retained
+// tallies (creating empty ones on first use). It is the one place e.round and
+// the current VoteSets move together, so no caller can leave sets[e.round]
+// disagreeing with the fields the rest of the engine reads.
+func (e *Engine) bindRound(round uint32) {
+	e.round = round
+	s := e.setsFor(round)
+	e.prevotes = s.prevotes
+	e.precommits = s.precommits
+}
+
+// withinWindow reports whether a round's tallies are retained: at most
+// futureVoteRounds ahead of the engine's own, or pastVoteRounds behind it.
+// The two windows are the whole memory bound on the multi-round buffer (see
+// the sets field); a vote outside them is dropped rather than accumulated.
+func (e *Engine) withinWindow(round uint32) bool {
+	if round >= e.round {
+		return round-e.round <= futureVoteRounds
+	}
+	return e.round-round <= pastVoteRounds
+}
+
+// pruneRounds deletes the tallies of every round outside the retention
+// window. It runs on every round change - the only event that can move the
+// window - so the map can never hold a round the engine will not revisit.
+// The current round is always inside its own window and is never pruned.
+func (e *Engine) pruneRounds() {
+	for r := range e.sets {
+		if !e.withinWindow(r) {
+			delete(e.sets, r)
+		}
+	}
+}
+
 // enterRound moves to a later round, resetting the per-round tally. The lock
 // deliberately SURVIVES the round change: that is the whole point of it. The
 // future-round evidence survives too: it is per-HEIGHT observation, and the
 // rounds the ladder may still jump to are exactly the ones it records.
+//
+// Entering adopts any votes already buffered for the round (audit C-3): a
+// follower that jumped onto a live committee finds the round's prevotes and
+// precommits in hand, so the two decisions are re-run against them - a
+// buffered polka is precommitted (and locks), and a buffered precommit quorum
+// commits, immediately rather than on some further arrival. The round itself
+// is made durable BEFORE either emission (persist-before-emit, the same
+// ordering as the lock): a vote cast in round r must not outlive a crash that
+// forgets the validator ever reached r.
 func (e *Engine) enterRound(round uint32) {
-	e.round = round
+	e.bindRound(round)
 	e.step = StepPropose
 	e.proposal = nil
 	e.proposalEn = nil
-	e.prevotes = NewVoteSet(e.cfg, e.height, round, MsgPrevote)
-	e.precommits = NewVoteSet(e.cfg, e.height, round, MsgPrecommit)
+	e.pruneRounds()
+	if e.persistRound != nil {
+		e.persistRound(e.height, round)
+	}
+	e.maybePrecommit()
+	e.maybeCommit()
+}
+
+// restoreRound reinstates the round a previous life of this engine had
+// reached (audit C-3): the driver reads it from the store and hands it here
+// when a crashed validator must not re-enter round 0 for a height it had
+// already contested.
+//
+// It is deliberately NOT enterRound: a restore emits nothing, persists
+// nothing (the record already exists on disk) and runs no decision - a fresh
+// engine holds no votes to decide on. It goes through the same bindRound the
+// live path uses, so the restored round's tallies are empty in exactly the
+// way a fresh round's are. A persisted lock at a round LATER than the
+// persisted round - impossible on a healthy log, because the round is written
+// before the precommit that moves the lock, but possible if the round log's
+// tail was torn while the lock log's was not - raises the floor: the engine
+// never resumes BEHIND its own promise. Safety never depended on the round
+// (the lock carries it); this only avoids a needless stall.
+func (e *Engine) restoreRound(round uint32) {
+	if lr := e.lk.round(); lr >= 0 && int64(round) < lr {
+		round = uint32(lr)
+	}
+	if round == e.round {
+		return
+	}
+	e.bindRound(round)
+	e.pruneRounds()
+}
+
+// retainedRoundsOther returns every round with retained tallies except the
+// engine's own, in ascending order. Ascending is the deterministic choice: if -
+// impossibly for an honest committee - two rounds each held a precommit
+// quorum, the EARLIER one is the one the committee reached first, and every
+// validator reading its own sets in this order agrees on it. Future rounds are
+// included: a precommit quorum there is as decisive as one behind us, and
+// acting on it at formation is what keeps a later round jump from pruning the
+// quorum before it is noticed.
+func (e *Engine) retainedRoundsOther() []uint32 {
+	rounds := make([]uint32, 0, futureVoteRounds+pastVoteRounds)
+	for r := range e.sets {
+		if r != e.round {
+			rounds = append(rounds, r)
+		}
+	}
+	for i := 1; i < len(rounds); i++ {
+		for j := i; j > 0 && rounds[j-1] > rounds[j]; j-- {
+			rounds[j-1], rounds[j] = rounds[j], rounds[j-1]
+		}
+	}
+	return rounds
+}
+
+// committedPrecommits returns the precommit votes of the round whose quorum
+// committed this engine's block, or nil if there is none. It is the
+// certificate source the driver archives: with multi-round sets the committing
+// round need not be the current one, so reading e.precommits (which points at
+// the CURRENT round after a later enterRound) would hand the wrong votes -
+// or none - to whoever serves the certificate to a catching-up peer.
+func (e *Engine) committedPrecommits() []*Vote {
+	if s := e.sets[e.commitRound]; s != nil {
+		return s.precommits.Votes()
+	}
+	return nil
 }
 
 // emitVote signs the vote this validator owes for the current round, queues it
@@ -530,44 +722,87 @@ func (e *Engine) onProposal(p *Proposal) error {
 	return nil
 }
 
+// noteFuture records, per member, the highest round at which that member has
+// signed a vote at this height, for the round ladder's evidence gate. It is
+// only ever reached with a member index an IndexOf already returned.
+func (e *Engine) noteFuture(idx int, v *Vote) {
+	if idx < 0 {
+		return
+	}
+	if cur, seen := e.future[idx]; !seen || v.Round > cur.Round {
+		if e.future == nil {
+			e.future = make(map[int]*Vote)
+		}
+		e.future[idx] = v
+	}
+}
+
+// onVote tallies one vote, in its own round (audit C-3), when that round is
+// within the retention window; a future round's vote is buffered into that
+// round's set (and a precommit quorum there commits at once), and a past
+// round's precommit set is kept so a late quorum still commits. A vote outside
+// the window is dropped, but a FUTURE one is still recorded as round-ladder
+// evidence (the jump may name a round the buffer no longer holds).
+//
+// Membership is checked BEFORE any Ed25519 verification on every path (audit
+// C-8): VoteSet.Add is where an in-window vote is verified, and it checks the
+// committee first; the out-of-window path below checks IndexOf itself. A
+// non-member's frame therefore costs no signature evaluation and reaches no
+// tally, whether it names the current round, a buffered one, or one far ahead.
 func (e *Engine) onVote(v *Vote) error {
-	if v.Height != e.height || v.Round != e.round {
-		// Not this round. A vote from a round AHEAD of ours is still
-		// evidence for the ladder jump: record the member's highest attested
-		// round (membership checked FIRST - a free linear scan against a
-		// stranger's frame, the audit C-8 discipline; signature verification
-		// (Ed25519) runs only for a member's vote, so a non-member cannot
-		// force even one verification per frame - and this path makes a jump
-		// decision and must not trust unauthenticated input).
-		// Past-round votes need no record: the committee has left them behind
-		// and our own ladder never wants to enter one.
-		if v.Height == e.height && v.Round > e.round {
-			if idx := e.cfg.IndexOf(v.Validator); idx >= 0 && v.Verify() == nil {
-				if cur, seen := e.future[idx]; !seen || v.Round > cur.Round {
-					if e.future == nil {
-						e.future = make(map[int]*Vote)
-					}
-					e.future[idx] = v
-				}
-			}
+	if v.Height != e.height {
+		return nil // another height: behind us or not reached, not ours to judge
+	}
+	if v.Round > e.round && !e.withinWindow(v.Round) {
+		// Outside the buffer, ahead of us: the vote is not retained, but the
+		// member's claim is still evidence the committee has moved on.
+		// Membership first (audit C-8): a free linear scan against a
+		// stranger's frame, an Ed25519 verification only for a member's vote.
+		if idx := e.cfg.IndexOf(v.Validator); idx >= 0 && v.Verify() == nil {
+			e.noteFuture(idx, v)
 		}
 		return nil
 	}
+	if !e.withinWindow(v.Round) {
+		return nil // older than the retained window: the committee has left it
+	}
+	s := e.setsFor(v.Round)
 	switch v.Type {
 	case MsgPrevote:
-		added, err := e.prevotes.Add(v)
+		added, err := s.prevotes.Add(v)
 		if err != nil {
 			return err
 		}
-		if added {
+		if !added {
+			return nil // a duplicate: its weight is already counted
+		}
+		switch {
+		case v.Round > e.round:
+			e.noteFuture(e.cfg.IndexOf(v.Validator), v)
+		case v.Round == e.round:
+			// A polka at the round we are in is what we precommit. Votes
+			// buffered for a round we have ALREADY left cannot drive a
+			// precommit now; enterRound re-runs this when it adopts them.
 			e.maybePrecommit()
 		}
 	case MsgPrecommit:
-		added, err := e.precommits.Add(v)
+		added, err := s.precommits.Add(v)
 		if err != nil {
 			return err
 		}
-		if added {
+		if !added {
+			return nil
+		}
+		switch {
+		case v.Round > e.round:
+			// Buffered for a round we are not in yet: still ladder evidence,
+			// and a precommit quorum among these buffered votes is a commit
+			// like any other (audit C-3) - maybeCommit adopts the decided
+			// round so a late proposal for it can still be appended.
+			e.noteFuture(e.cfg.IndexOf(v.Validator), v)
+			e.maybeCommit()
+		default:
+			// Current OR past: a quorum here is a commit (audit C-3).
 			e.maybeCommit()
 		}
 	}
@@ -711,15 +946,77 @@ func (e *Engine) maybePrecommit() {
 	e.emitVote(MsgPrecommit, id)
 }
 
+// maybeCommit commits the first block with a precommit quorum, in the current
+// round or in ANY other retained round - earlier or buffered ahead (audit
+// C-3). Committing from an earlier round is the whole point of keeping past
+// precommit sets: a quorum can complete after the engine has already moved on
+// - enterRound no longer discards it - and a commit is a commit whether it is
+// noticed in round r or in round r+1. Committing from a buffered FUTURE round
+// is the same evidence seen from the other side: >2/3 precommitted there, so
+// the height is decided and the engine adopts that round (commitAt) rather
+// than waiting to be stepped into it - which also means a later jump can never
+// prune a decisive quorum before it is acted on.
+//
+// SAFETY: a commit is a quorum (>2/3 of power) of precommits for one block at
+// one round. Retaining other rounds and reading them here does not weaken
+// that: it changes WHEN the same evidence is noticed, not what it proves.
+// More than one third of the power is honest, so a quorum at any round means
+// more than one third of the power both prevoted and precommitted that exact
+// block at that round (maybePrecommit precommits only a block with a prevote
+// polka, and locks on it). A quorum for a CONFLICTING block must therefore
+// contain more than one third of the power that never joined the first, and
+// every honest validator it needs was locked on the first block and can
+// prevote the conflicting one only on a VERIFIED polka from a strictly later
+// round; that polka in turn needs the honest locked weight to have unlocked,
+// which is impossible for the first round at which a conflicting polka
+// appears. The engine-level pin is TestTwoBlocksCannotCommitAtOneHeight and
+// the lock rule itself is TestLockedValidatorPrevotesOnlyItsBlockOrANewerRound.
+//
+// The current round is checked first, then the others ascending: the order is
+// only for determinism, since two honest quorums for two different blocks at
+// one height cannot exist.
 func (e *Engine) maybeCommit() {
 	if e.hasCommitted {
 		return
 	}
-	id, ok := e.precommits.AnyQuorum()
-	if !ok {
+	if id, ok := e.precommits.AnyQuorum(); ok {
+		e.commitAt(id, e.round)
 		return
 	}
+	for _, r := range e.retainedRoundsOther() {
+		s := e.sets[r]
+		if s == nil {
+			continue
+		}
+		if id, ok := s.precommits.AnyQuorum(); ok {
+			e.commitAt(id, r)
+			return
+		}
+	}
+}
+
+// commitAt records the commit of id and the round whose precommit quorum
+// supplied it. The round is remembered because the commit certificate the
+// driver archives is that round's precommit votes - see committedPrecommits.
+//
+// When the quorum sits in a round AHEAD of the engine's own, the engine ADOPTS
+// that round: >2/3 of the power precommitted there, so that is where the
+// committee is, and adopting it lets a proposal for the decided round - which
+// may still be in flight and would otherwise be refused as the wrong round -
+// arrive and be appended. The adopted round is persisted like any other round
+// entry, before the commit is recorded. The step is set last, so nothing the
+// adoption touches can be overwritten by a post-commit transition; once
+// committed the engine emits no further vote for this height.
+func (e *Engine) commitAt(id [32]byte, round uint32) {
+	if round > e.round {
+		e.bindRound(round)
+		e.pruneRounds()
+		if e.persistRound != nil {
+			e.persistRound(e.height, round)
+		}
+	}
 	e.committed, e.hasCommitted = id, true
+	e.commitRound = round
 	e.step = StepCommit
 }
 

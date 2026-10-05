@@ -158,6 +158,7 @@ func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transpor
 func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
 	eng := NewEngine(d.cfg, height, parent, d.priv, d.build)
 	eng.persistLock = d.persistLock
+	eng.persistRound = d.persistRound
 	// The validation seam (audit C-1): every engine the driver builds judges
 	// proposals through ValidateNext - the chain's own pre-vote check, the
 	// same method Append's shared validation runs. A proposer's Build and a
@@ -184,7 +185,32 @@ func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
 	if rec, ok := d.ch.LockAt(height); ok {
 		eng.restoreLock(rec.Round, rec.BlockID)
 	}
+	// The round a previous life of this height had reached (audit C-3):
+	// restored AFTER the lock, because restoreRound floors itself at the
+	// lock's round - a torn round log must not resume the engine behind its
+	// own promise. Absence is round 0, the legitimate fresh-start value.
+	if r, ok := d.ch.RoundAt(height); ok {
+		eng.restoreRound(r)
+	}
 	return eng
+}
+
+// persistRound is the hook the engine calls the moment it enters a later
+// round, before it emits any vote in that round (audit C-3): the round must
+// be durable first, or a crash between the write and the vote leaves a
+// restarted validator re-entering round 0 for a height the committee has
+// already carried into round 3 - every proposal and vote wrong-round in both
+// directions until it times out its way back.
+//
+// A persistence failure PANICS deliberately, exactly as persistLock's does:
+// the engine is about to cast a vote in a round a restart could not
+// remember, and a node that cannot keep its position durable must stop rather
+// than vote from a state it cannot reproduce.
+func (d *Driver) persistRound(height uint64, round uint32) {
+	rec := store.RoundRecord{Height: height, Round: round}
+	if err := d.ch.PutRound(rec); err != nil {
+		panic(fmt.Sprintf("consensus: the round reached at height %d round %d could not be made durable: %v", height, round, err))
+	}
 }
 
 // persistLock is the hook the engine calls the moment its lock moves, before
@@ -430,9 +456,9 @@ func (d *Driver) flush() {
 	// evidence for this block and do not travel.
 	if w := d.CommitWitness; w != nil {
 		id, _ := d.eng.Committed()
-		round := d.eng.round
-		cert := make([]*Vote, 0, len(d.eng.precommits.Votes()))
-		for _, v := range d.eng.precommits.Votes() {
+		round := d.eng.commitRound
+		cert := make([]*Vote, 0, len(d.eng.committedPrecommits()))
+		for _, v := range d.eng.committedPrecommits() {
 			if v.BlockID == id {
 				cert = append(cert, v)
 			}

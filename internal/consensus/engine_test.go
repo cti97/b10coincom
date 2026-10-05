@@ -932,12 +932,17 @@ func TestAFutureRoundVoteFromANonMemberCostsNoSignatureVerification(t *testing.T
 	// Eight self-signed future-round votes from a key NOT in the committee:
 	// per frame, the old order paid one Ed25519 verification (each vote's
 	// signature is genuinely valid - the peer is just not a member), the new
-	// order pays none.
+	// order pays none. Rounds 1..4 are also inside the C-3 future buffer, so
+	// they reach the round's VoteSet and are refused there as ErrNotValidator;
+	// rounds 5..8 fall outside it and are refused by the out-of-window path's
+	// own membership check. Either way the frame is REFUSED - the error is the
+	// engine saying so, not a fatal condition - and neither verification nor
+	// evidence may move.
 	for r := uint32(1); r <= 8; r++ {
 		v := &Vote{Type: MsgPrevote, Height: h, Round: r, BlockID: someID, Validator: strangerPub}
 		hash := v.SigningHash()
 		v.Sig = crypto.Sign(strangerPriv, hash[:])
-		if err := e.OnMessage(EncodeVote(v)); err != nil {
+		if err := e.OnMessage(EncodeVote(v)); err != nil && !errors.Is(err, ErrNotValidator) {
 			t.Fatal(err)
 		}
 	}
