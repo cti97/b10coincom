@@ -22,6 +22,7 @@ import (
 	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/transport/sim"
+	"github.com/cti97/b10coincom/internal/wire"
 )
 
 // The clock defaults a caller gets by leaving the fields zero. These are the
@@ -52,16 +53,15 @@ type Options struct {
 	// DropPercent is the percentage of deliveries the network drops (0-100),
 	// applied per delivery after the partition cut.
 	//
-	// MILESTONE LIMIT (M3): DropPercent cannot be used for any liveness
-	// scenario. A validator whose quorum-committing proposal is lost never
-	// holds the block bytes, so when the quorum's precommits arrive it cannot
-	// APPEND - and the driver parks at that undecided height permanently,
-	// because M3 has no catch-up, rejoin or block-sync path to adopt a peer's
-	// block. Any "everyone reaches target" run with drops enabled therefore
-	// parks the first time a commit-critical proposal is lost and stalls for
-	// the rest of its budget. Until a milestone gives a node a way to adopt a
-	// peer's block, run liveness scenarios at DropPercent 0 with only latency
-	// and jitter; drops are honest only where liveness is not asserted.
+	// Drops CAN drive a liveness scenario since M4: a validator whose
+	// quorum-committing proposal is lost holds no block bytes and parks at
+	// that height, exactly as under M3 - but CatchUp now lets it PULL the
+	// missed certified blocks from a peer that is ahead and rejoin, so the
+	// stall is recoverable. TestScenarioLossAndReorderStillFinalises drives
+	// DropPercent 15 with reordering, asserts a served BLOCK_SYNC request
+	// (the loss was real) and converges the committee. A run that never
+	// catches up still stalls, which is why that scenario retries through the
+	// pull rather than expecting bare gossip to recover a lost commit.
 	DropPercent int
 	TimeoutBase int64 // virtual ms before a round expires; 0 takes the default
 	TimeoutStep int64 // virtual ms added per further round; 0 takes the default
@@ -225,7 +225,7 @@ func New(n int, opts Options) (*Net, error) {
 		// The driver's commit witness archives each commit's certificate, so
 		// the chain this harness drives is pullable by a catching-up peer
 		// (Design Decision 8): without it Answer would refuse every range.
-		sy := consensus.NewSyncer(c, tp, priv)
+		sy := out.newSyncer(i, c, tp)
 		rt := consensus.NewMessageRouter(sy)
 		rt.SendReply = func(to transport.PeerID, frame []byte) error { return tp.Send(to, frame) }
 		tp.router = rt
@@ -250,6 +250,37 @@ func (n *Net) newDriver(i int, tpOverride transport.Transport) *consensus.Driver
 	d := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
 	d.CommitWitness = n.syncs[i].RecordCommit
 	return d
+}
+
+// newSyncer builds validator i's BLOCK_SYNC syncer over tp and installs the
+// harness's VIRTUAL-TIME ReplyWait seam. It is the ONE syncer-build path (New
+// and reseat both go through it), so a rebuilt syncer can never fall back to
+// the wall-clock deadline the harness exists to remove: the pull's wait must
+// be measured on the same virtual clock that delivers its answer.
+func (n *Net) newSyncer(i int, c *chain.Chain, tp transport.Transport) *consensus.Syncer {
+	sy := consensus.NewSyncer(c, tp, n.keys[i].priv)
+	sy.WaitReply = n.awaitReplyVirtual
+	return sy
+}
+
+// awaitReplyVirtual is the simnet ReplyWait seam (audit T-2). It measures the
+// pull's deadline on the simulator's VIRTUAL clock: advancing by `wait`
+// delivers everything due in that window - including the request itself and
+// the answer the responder files while handling it - and the answer is then
+// read. A pull that was answered can therefore never read as silence because
+// a loaded runner starved the goroutine that advances virtual time: there is
+// no wall-clock timer in the path at all, and advancement and delivery happen
+// on the caller's goroutine. Genuine virtual silence (no filed answer after
+// `wait` of virtual time) still reads as nil, the caught-up-or-lost branch
+// the pull's stop rules define.
+func (n *Net) awaitReplyVirtual(ch <-chan *wire.BlockSyncResp, wait time.Duration) *wire.BlockSyncResp {
+	n.sim.Advance(wait)
+	select {
+	case got := <-ch:
+		return got
+	default:
+		return nil
+	}
 }
 
 // genesis returns the genesis every validator in this network was opened with. The
@@ -461,11 +492,12 @@ func (n *Net) AssertSameChain() error {
 // not stand above the longest chain's head (a validator taller than everyone else
 // holds blocks nobody else committed, which is a fork by definition).
 //
-// This is the honest safety assertion for a LAGGING validator under the M3
-// milestone limits: with no block catch-up, a validator isolated behind the
-// quorum cannot adopt the blocks it missed, so the strongest claim a scenario can
-// make about it is "behind, never forked". Requiring it to reconverge would
-// assert a mechanism M3 does not have.
+// This is the divergence-refusing assertion a LAGGING validator is still held
+// to: a validator behind the quorum must be behind, never forked. Since M4 it
+// can also CATCH UP (CatchUp), so a scenario that wants convergence asserts it
+// through CatchUp and the identical-block helpers; AssertPrefix remains the
+// weaker claim for the window in which a validator is legitimately behind,
+// where a fork - not a lag - is the failure that must be caught.
 //
 // It lives in the non-test half of the package (moved out of the scenarios at
 // review): the plan's interface list ships AssertPrefix, and a helper defined
@@ -540,10 +572,12 @@ func (n *Net) Heal() { n.sim.Heal() }
 // committee, total power and quorum threshold are all left untouched by design -
 // silencing a validator must never be a way to lower the bar.
 //
-// The cut is one-way by design: M3 has no catch-up or rejoin, so a validator
-// cannot merely be marked online again. Coming back means a restart - reopen
-// the chain from disk and build a fresh driver over transportFor(i); the new
-// driver's OnMessage registration restores the link.
+// The cut is one-way by design: TakeOffline models a MACHINE that is off, and
+// there is no TakeOnline - a validator cannot merely be marked live again.
+// Coming back means a restart - reopen the chain from disk and build a fresh
+// driver over transportFor(i), the shape the restart scenario takes; a
+// validator that was only briefly unreachable instead heals a partition
+// (Partition/Heal) and catches up through CatchUp (M4).
 func (n *Net) TakeOffline(i int) {
 	if n.offline[i] {
 		return
@@ -636,15 +670,15 @@ func (n *Net) installEquivocator(i int, typ consensus.MsgType) error {
 // iteration are exactly the sim's own.
 type tap struct {
 	inner transport.Transport
-	// mu guards the two recording logs below. Two writers can be live at the
-	// same time on ONE validator: the catch-up pull runs Syncer.PullAndAdopt
-	// on its own goroutine (its request goes out through tap.Send), and
-	// CatchUp's own goroutine keeps advancing the sim while it waits, whose
-	// deliveries drive the engine's broadcasts through tap.Broadcast (and
-	// inbound frames through the OnMessage append). The two appends — and the
-	// snapshots the scenarios read afterwards — must not run against each
-	// other; unlocked slices appended from two goroutines are a latent data
-	// race exactly hidden from scheduling (Task 6 review carry-forward, low).
+	// mu guards the two recording logs below. The harness's own paths are
+	// single-goroutine: CatchUp runs its pull on the caller's goroutine and
+	// resolves its wait by advancing the sim on that same goroutine (audit
+	// T-1/T-2), so a production scenario never has two writers. The lock is
+	// kept anyway, because Transport is a concurrent-interface and this
+	// wrapper must be safe for a caller that uses it that way:
+	// TestTapRecordingLogsAreRaceFreeUnderConcurrentSendAndBroadcast drives
+	// the racing pair deliberately, and unlocked slices appended from two
+	// goroutines would be a latent data race exactly hidden from scheduling.
 	mu sync.Mutex
 	// router splits consensus frames from wire (HELLO/BLOCK_SYNC) frames -
 	// the two message unions share the numeric tag range 1-3, so routing
@@ -682,8 +716,8 @@ func (t *tap) Send(peer transport.PeerID, data []byte) error {
 }
 
 // keepSent appends a copy of the payload to the send log under the log's
-// mutex: Broadcast and Send can run on different goroutines (the pull and
-// the delivery path), and an unsynchronised append there is a data race.
+// mutex: a concurrent caller may drive Broadcast and Send at once (the race
+// test does), and an unsynchronised append there is a data race.
 func (t *tap) keepSent(data []byte) {
 	t.mu.Lock()
 	t.sent = append(t.sent, append([]byte(nil), data...))
@@ -711,8 +745,8 @@ func (t *tap) OnMessage(fn func(transport.Message)) {
 }
 
 // keepRecv appends a copy of the delivered frame to the receive log under
-// the same mutex as the send log — the OnMessage callback can run while the
-// pull goroutine's Send records, so the logs share one lock.
+// the same mutex as the send log — a delivery callback can run while a
+// concurrent caller records a send, so the logs share one lock.
 func (t *tap) keepRecv(data []byte) {
 	t.mu.Lock()
 	t.recv = append(t.recv, append([]byte(nil), data...))
@@ -823,12 +857,6 @@ func (n *Net) Close() {
 	}
 }
 
-// catchUpStepBudget bounds the network advance a CatchUp drives while its
-// pull is in flight. A healthy window round-trips in a handful of steps
-// (the sim delivers on the next Advance); the budget is a ceiling for a
-// pull over many full windows, far past anything an honest committee needs.
-const catchUpStepBudget = 200_000
-
 // CatchUp drives validator i's BLOCK_SYNC pull from the tallest OTHER online
 // validator, advancing the network until the pull settles. It is the harness
 // half of the M3 carry-forward the scenarios now assert: a validator that
@@ -844,14 +872,22 @@ const catchUpStepBudget = 200_000
 // as parent, and any lock it persisted for a still-undecided height is
 // restored from the store.
 //
-// The pull runs on its own goroutine because Syncer.PullAndAdopt BLOCKS on
-// its ReplyWait: deliveries must keep happening while it waits, which is why
-// the sim's Advance moved under an internal lock (semantics unchanged - see
-// sim's package comment). Everything here stays on the caller's goroutine
-// otherwise, and the pull is fully SETTLED (its goroutine has returned)
-// before CatchUp does. Offline validators are refused: a powered-off machine
-// cannot pull, and letting one pass would put sync traffic on the wire of a
-// validator whose scenarios assert frozen taps.
+// DETERMINISM (audit T-1). The pull runs ENTIRELY ON THE CALLER'S GOROUTINE.
+// Syncer.PullAndAdopt blocks on its ReplyWait, but simnet's ReplyWait seam
+// (Net.awaitReplyVirtual) resolves that wait by ADVANCING THE SIMULATOR on
+// virtual time and then reading the answer it delivered - there is no second
+// goroutine and no wall-clock timer anywhere in the path. The request is
+// therefore stamped at the virtual `now` the caller stands at when it sends,
+// every delivery happens in the sim's fixed (at, seq) order, and every rng
+// draw downstream is a function of the seed alone. The earlier shape ran the
+// pull on its own goroutine while this caller advanced virtual time, so the
+// request landed at whatever `now` Go scheduling reached and the run was no
+// longer replayable from its seed; the identical-blocks-through-CatchUp test
+// in simnet_test.go pins the replayed property.
+//
+// Offline validators are refused: a powered-off machine cannot pull, and
+// letting one pass would put sync traffic on the wire of a validator whose
+// scenarios assert frozen taps.
 func (n *Net) CatchUp(i int) error {
 	if i < 0 || i >= len(n.drv) {
 		return fmt.Errorf("simnet: CatchUp: validator index %d out of range 0..%d", i, len(n.drv)-1)
@@ -880,48 +916,16 @@ func (n *Net) CatchUp(i int) error {
 	// (round 7, F1). The transport name is `v<seat>`; the identity is the
 	// committee key at that seat.
 	n.syncs[i].Expect = n.g.Validators[ref].PubKey
-	done := make(chan error, 1)
-	go func() { done <- n.syncs[i].PullAndAdopt(start + 1) }()
-	for step := 0; ; step++ {
-		select {
-		case err := <-done:
-			// The pull's goroutine has RETURNED: no syncer or chain access
-			// on it survives this point, so everything below is the
-			// scenario's alone.
-			if err != nil {
-				return err
-			}
-			if n.ch[i].Height() > start {
-				n.rebuildDriver(i)
-			}
-			return nil
-		default:
-		}
-		if step >= catchUpStepBudget {
-			// The pull is (or should be) settled by its own ReplyWait
-			// deadline; wait for it to end rather than orphan a goroutine
-			// that still owns the syncer, then report the stall.
-			select {
-			case err := <-done:
-				if err != nil {
-					return err
-				}
-				if n.ch[i].Height() > start {
-					n.rebuildDriver(i)
-				}
-				return nil
-			case <-time.After(replacePullWait):
-				return fmt.Errorf("simnet: CatchUp: validator %d's pull did not settle within %d advanced steps (height %d, peers' head %d)",
-					i, catchUpStepBudget, n.ch[i].Height(), refH)
-			}
-		}
-		n.sim.Advance(ms(1))
+	// Synchronous by design: the pull's sends and its virtual-time waits both
+	// happen here, in the caller's fixed order (see DETERMINISM above).
+	if err := n.syncs[i].PullAndAdopt(start + 1); err != nil {
+		return err
 	}
+	if n.ch[i].Height() > start {
+		n.rebuildDriver(i)
+	}
+	return nil
 }
-
-// replacePullWait is the wall-clock grace a wedged pull gets to return after
-// the advance budget ran out before CatchUp reports it wedged.
-const replacePullWait = 10 * time.Second
 
 // reseat rebinds validator i to a reopened chain: the restart scenario closes
 // the old chain and reopens the same directory from disk. The syncer's chain
@@ -931,7 +935,7 @@ const replacePullWait = 10 * time.Second
 // for the first build.
 func (n *Net) reseat(i int, c *chain.Chain) {
 	n.ch[i] = c
-	n.syncs[i] = consensus.NewSyncer(c, n.transportFor(i), n.keys[i].priv)
+	n.syncs[i] = n.newSyncer(i, c, n.transportFor(i))
 	n.rts[i].Sync = n.syncs[i]
 	n.rebuildDriver(i)
 }

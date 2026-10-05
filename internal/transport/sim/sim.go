@@ -11,15 +11,17 @@
 //   - THE SEED IS THE ONLY RANDOMNESS. Every jitter, drop and reorder decision comes
 //     from one explicitly seeded *rand.Rand stored on the Net.
 //
-// M4 Task 6 added the one concurrency the simulator has ever needed, without
-// surrendering either property: BLOCK_SYNC's pull is a blocking call
-// (Syncer.awaitReply waits for the filed response), and a blocking pull must
-// not freeze the network it is waiting ON. Net therefore grew a mutex so a
-// scenario can advance the network from a second goroutine while one
-// validator's pull is parked in its await - the delivery ORDER is still the
-// (at, seq) total order, every rng draw still happens in the same place, and
-// a single-threaded scenario (the M3 shape) contends on nothing and replays
-// byte-identically. The lock is internal discipline, not a delivery policy.
+// A blocking pull (BLOCK_SYNC's Syncer.awaitReply waits for the filed response)
+// must not force the network it waits on onto a second goroutine: that is
+// exactly the scheduling dependence the first property forbids. The harness
+// therefore resolves the pull's deadline on THIS clock instead - simnet's
+// WaitReply seam advances virtual time and then reads the answer it delivered,
+// all on the caller's goroutine (audit T-1/T-2) - so a delivery and the
+// deadline that decides whether it arrived are measured by the same clock in
+// the same order. Net keeps its mutex, but as defensive discipline for a
+// public type whose Transport handles may be called concurrently, not because
+// any shipped path has two owners: a single-threaded run contends on nothing
+// and replays byte-identically.
 package sim
 
 import (
@@ -60,10 +62,11 @@ type pending struct {
 // Net is a deterministic network over virtual time.
 type Net struct {
 	// mu guards every field of the net and of its endpoints that delivery or
-	// sending can touch. The M3 scenarios never contend: one goroutine owns
-	// the net, so the lock costs a uncontended acquire per send and changes
-	// nothing else. Catch-up (Task 6) is the second owner: a pull goroutine
-	// parked in its await while the scenario's drive loop advances.
+	// sending can touch. No shipped path has two owners (the harness is
+	// single-threaded; a pull's wait advances the net on the caller's own
+	// goroutine), so the lock costs an uncontended acquire per send and
+	// changes nothing observable. It stays because Transport handles are a
+	// concurrent-interface and tests may exercise them that way.
 	mu    sync.Mutex
 	opts  Options
 	rng   *rand.Rand
@@ -142,11 +145,13 @@ func (n *Net) Heal() {
 // The lock is held to pick and to pop a delivery — never across the delivery
 // itself. A message's handler may legitimately send (the BLOCK_SYNC server
 // answering a request does exactly that), and the send must be able to take
-// the lock while the advance loop is mid-flight. Delivering outside the lock
+// the lock while the advance loop is mid-flight; holding the lock across the
+// callback would deadlock on that re-entry. Delivering outside the lock
 // cannot change the total order: the next pick chooses the minimum (at, seq)
 // over the queue as it stands, and a Send that happened during the handler
 // competes for the next pick exactly as its at/seq dictate — the same set of
-// messages is due, in the same order, as the old single-threaded loop chose.
+// messages is due, in the same order, as a loop that held the lock throughout
+// would choose.
 func (n *Net) Advance(d time.Duration) {
 	target := n.now + d
 	for {
@@ -170,8 +175,8 @@ func (n *Net) Advance(d time.Duration) {
 		n.now = m.at
 		// The callback is read under the lock; the call happens after it.
 		// e.fn is only ever replaced from the scenario goroutine, but the
-		// read-then-release shape keeps the race detector silent for the
-		// catch-up's second goroutine too.
+		// read-then-release shape keeps a concurrent OnMessage registration
+		// from racing the delivery that reads it.
 		var fn func(transport.Message)
 		var from transport.PeerID
 		var data []byte

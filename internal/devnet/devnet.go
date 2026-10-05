@@ -82,8 +82,9 @@ type Options struct {
 	// two-thirds-of-TOTAL-power bar is unmoved. It is the devnet surface's
 	// liveness dial: with Validators 4 and one validator offline, the three
 	// online validators hold exactly the bar and the chain must still
-	// advance. An offline validator has no catch-up path in M3, so its
-	// height stays frozen wherever it stood when the run began; its frozen
+	// advance. RunMulti never pulls for an offline validator - it models a
+	// powered-off machine and drives only the online set - so its height
+	// stays frozen wherever it stood when the run began; its frozen
 	// history must remain a strict prefix of the longest chain. Run/Replay
 	// ignore it.
 	OfflineValidators []int
@@ -356,10 +357,14 @@ func RunMulti(o Options) (Summary, error) {
 		TempDir:   o.Dir,
 		Seed:      runMultiSeed,
 		LatencyMS: runMultiLatencyMS,
-		// DropPercent stays 0 on purpose: a validator whose quorum-committing
+		// DropPercent stays 0 on purpose: RunMulti advances only through
+		// RunBlocks and never pulls, so a validator whose quorum-committing
 		// proposal is dropped holds no block bytes and parks at that height
-		// forever (M3 has no catch-up), so any run asserting "the chain
-		// advanced" must be drop-free. Latency alone is the honest fixture.
+		// for the rest of the run; any run asserting "the chain advanced"
+		// must therefore be drop-free. Latency alone is the honest fixture.
+		// (The simnet harness CAN recover dropped commits through CatchUp -
+		// TestScenarioLossAndReorderStillFinalises does - but this CLI fixture
+		// deliberately does not pull.)
 	})
 	if err != nil {
 		return Summary{}, err

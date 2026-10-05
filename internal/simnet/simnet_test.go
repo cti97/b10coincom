@@ -91,6 +91,92 @@ func TestSameSeedReproducesIdenticalBlocks(t *testing.T) {
 	}
 }
 
+// runCatchUpReplay drives one deterministic partition/heal/catch-up run and
+// returns the net plus the height the lagging validator held when CatchUp
+// adopted. It exists so the identical-blocks test can run the SAME scenario
+// twice from one seed; validator 0 is isolated, the majority advances past it,
+// the network heals, and validator 0 must PULL the missed certified blocks.
+func runCatchUpReplay(t *testing.T, seed int64) (*Net, uint64) {
+	t.Helper()
+	n, err := New(4, Options{TempDir: t.TempDir(), Seed: seed, LatencyMS: 5, JitterMS: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(n.Close)
+	if _, err := n.RunBlocks(4); err != nil {
+		t.Fatalf("initial run stalled: %v", err)
+	}
+	n.Partition([]int{0}, []int{1, 2, 3})
+	if _, err := n.RunBlocksAmong(10, []int{1, 2, 3}); err != nil {
+		t.Fatalf("majority partition stalled: %v", err)
+	}
+	n.Heal()
+	lagged := n.ch[0].Height()
+	if err := n.CatchUp(0); err != nil {
+		t.Fatalf("catch-up pull failed: %v", err)
+	}
+	if n.ch[0].Height() <= lagged {
+		t.Fatalf("CatchUp adopted nothing: validator 0 stayed at height %d (peers' head %d) - the test would not exercise a pull", lagged, n.maxHeight())
+	}
+	if _, err := n.RunBlocksAmong(14, []int{0, 1, 2, 3}); err != nil {
+		t.Fatalf("the committee did not advance after catch-up: %v", err)
+	}
+	return n, lagged
+}
+
+// TestSameSeedReproducesIdenticalBlocksThroughCatchUp is the T-1 regression.
+// TestSameSeedReproducesIdenticalBlocks above never calls CatchUp, so it could
+// not observe the defect the audit found: with the pull on its own goroutine
+// while the caller advanced virtual time, the request landed at whatever
+// virtual `now` Go scheduling reached and every downstream rng draw moved with
+// it. This test drives the SAME partition/heal/catch-up scenario on two
+// independently built nets from one seed and requires every committed block -
+// including the ones adopted through the pull - to be byte-identical. It also
+// asserts the pull actually happened, so a broken CatchUp cannot make it pass
+// vacuously by never exercising one.
+//
+// Killing mutant (compile-confirmed, behaviour-changing): make CatchUp return
+// nil before PullAndAdopt. runCatchUpReplay's adoption assertion then fires
+// ("CatchUp adopted nothing ... the test would not exercise a pull") on the
+// FIRST net, before any block comparison, so the mutant cannot pass by
+// coincidence. The determinism property itself is pinned by the fact that the
+// pull is on the caller's goroutine with a virtual-time ReplyWait; a mutant
+// that restores a wall-clock wait is caught by TestWaitReplySeam (consensus)
+// and by the repeated race runs recorded in the round-13 report.
+func TestSameSeedReproducesIdenticalBlocksThroughCatchUp(t *testing.T) {
+	n1, lagged1 := runCatchUpReplay(t, 13)
+	n2, lagged2 := runCatchUpReplay(t, 13)
+	if lagged1 != lagged2 {
+		t.Fatalf("same seed, different lagging height before catch-up: %d then %d", lagged1, lagged2)
+	}
+	for i := 0; i < 4; i++ {
+		h1, h2 := n1.ch[i].Height(), n2.ch[i].Height()
+		if h1 != h2 {
+			t.Fatalf("same seed through CatchUp, different heights: validator %d reached %d then %d", i, h1, h2)
+		}
+		for h := uint64(0); h <= h1; h++ {
+			b1, err := n1.ch[i].BlockAt(h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b2, err := n2.ch[i].BlockAt(h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if b1.ID() != b2.ID() {
+				id1, id2 := b1.ID(), b2.ID()
+				t.Fatalf("same seed through CatchUp, different blocks: validator %d at height %d has %x then %x", i, h, id1[:8], id2[:8])
+			}
+		}
+	}
+	// Prove the adopted range really is above the pre-pull head, so the blocks
+	// this test compares at that height came through the pull and not from the
+	// validators' own pre-partition run.
+	if _, err := n1.ch[0].BlockAt(lagged1 + 1); err != nil {
+		t.Fatalf("validator 0 does not hold the first block above its pre-pull height %d: %v", lagged1, err)
+	}
+}
+
 // AssertSameChain must actually detect disagreement, or Task 9's safety
 // scenarios rest on a function nothing proves works. Four validators are moved
 // onto DIFFERENT blocks at height 1 straight from genesis (each chain builds its
