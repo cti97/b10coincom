@@ -882,3 +882,130 @@ func TestTransfersDoNotCountAgainstTheClaimBound(t *testing.T) {
 		t.Fatalf("height after the transfers-only block = %d, want 1", c.Height())
 	}
 }
+
+// ---- Pre-vote block validation (audit C-1) ----
+//
+// The consensus engine's validation seam calls ValidateNext before prevoting
+// a proposal. The seam's content must be EXACTLY what Append demands, so this
+// test pins the two against each other: every way a block can be refused at
+// append time must already be refused by ValidateNext, the valid case must
+// pass, and no refusal may mutate the chain.
+
+// pristineHeadPlusOne builds a block that is valid for this chain's head+1:
+// signed by the devnet validator through the chain's own Build. It is the
+// table's shared base; each case corrupts exactly one thing of its own, so a
+// corruptor that does nothing fails loudly against the valid-case expectation.
+func pristineHeadPlusOne(t *testing.T, c *Chain) *types.Block {
+	t.Helper()
+	_, priv := devKey()
+	b, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatalf("fixture Build: %v", err)
+	}
+	return b
+}
+
+func TestValidateNextAcceptsExactlyWhatAppendAccepts(t *testing.T) {
+	c, _ := devChain(t)
+
+	// The valid case: the block Build produces must pass ValidateNext
+	// unchanged, and passing must not move the chain.
+	valid := pristineHeadPlusOne(t, c)
+	heightBefore, headBefore := c.Height(), c.Head().ID()
+	if err := c.ValidateNext(valid); err != nil {
+		t.Fatalf("ValidateNext refused a block Build signed for head+1: %v", err)
+	}
+	if c.Height() != heightBefore || c.Head().ID() != headBefore {
+		t.Fatal("ValidateNext mutated the chain on a passing block")
+	}
+
+	// Case table: every refusal Append makes. Each case asserts the REFUSAL
+	// by its named sentinel (not any error), so a wrong check failing on the
+	// wrong defect cannot pass as this test's evidence.
+	cases := []struct {
+		name    string
+		corrupt func(b *types.Block)
+		want    error
+	}{
+		{
+			name:    "wrong parent",
+			corrupt: func(b *types.Block) { b.Header.ParentHash = crypto.HashParts([]byte("not-the-parent")) },
+			want:    ErrBadParent,
+		},
+		{
+			name:    "wrong height",
+			corrupt: func(b *types.Block) { b.Header.Height = b.Header.Height + 7 },
+			want:    ErrBadHeight,
+		},
+		{
+			name:    "tx root mismatch",
+			corrupt: func(b *types.Block) { b.Header.TxRoot = crypto.HashParts([]byte("not-the-tx-root")) },
+			want:    types.ErrTxRootMismatch,
+		},
+		{
+			name: "non-validator proposer",
+			corrupt: func(b *types.Block) {
+				_, strangerKey, _ := crypto.GenerateKey()
+				b.Header.Proposer = strangerKey.Public().(ed25519.PublicKey)
+				hh := b.Header.SigningHash()
+				b.Sig = crypto.Sign(strangerKey, hh[:])
+			},
+			want: ErrNotValidator,
+		},
+		{
+			name:    "missing proposer signature",
+			corrupt: func(b *types.Block) { b.Sig = nil },
+			want:    ErrBadProposerSig,
+		},
+		{
+			name: "bad proposer signature",
+			corrupt: func(b *types.Block) {
+				b.Sig = append([]byte(nil), b.Sig...)
+				b.Sig[3] ^= 0xff
+			},
+			want: ErrBadProposerSig,
+		},
+		{
+			name: "garbage state root",
+			corrupt: func(b *types.Block) {
+				// The attack exactly as audit C-1 describes it: the proposer
+				// builds a normal block, overwrites Header.StateRoot with
+				// garbage and RE-SIGNS. The signature then verifies - it was
+				// made over the tampered header - and the refusal must come
+				// from the recomputed root, not from the signature.
+				b.Header.StateRoot = [32]byte{0xde, 0xad, 0xbe, 0xef}
+				_, key := devKey()
+				hh := b.Header.SigningHash()
+				b.Sig = crypto.Sign(key, hh[:])
+			},
+			want: ErrBadStateRoot,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := pristineHeadPlusOne(t, c)
+			tc.corrupt(b)
+			heightBefore, headBefore := c.Height(), c.Head().ID()
+			if err := c.ValidateNext(b); !errors.Is(err, tc.want) {
+				t.Fatalf("ValidateNext err = %v, want %v", err, tc.want)
+			}
+			// For the re-signed case the signature must genuinely verify: a
+			// refusal named for the state-root sentinel would not name it if
+			// the block were merely unsigned - this pins the attack shape.
+			if tc.name == "garbage state root" {
+				hh := b.Header.SigningHash()
+				if !crypto.Verify(b.Header.Proposer, hh[:], b.Sig) {
+					t.Fatal("fixture: the re-signed attack block does not verify; the case would not name the state-root check")
+				}
+			}
+			if c.Height() != heightBefore || c.Head().ID() != headBefore {
+				t.Fatal("ValidateNext mutated the chain on a refused block")
+			}
+			// Append must refuse the SAME block with the SAME sentinel: the
+			// two entries to the one policy cannot drift apart.
+			if err := c.Append(b); !errors.Is(err, tc.want) {
+				t.Fatalf("Append err = %v, want %v (the seam and the gate disagree)", err, tc.want)
+			}
+		})
+	}
+}

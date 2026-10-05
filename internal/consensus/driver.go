@@ -148,6 +148,15 @@ func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transpor
 func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
 	eng := NewEngine(d.cfg, height, parent, d.priv, d.build)
 	eng.persistLock = d.persistLock
+	// The validation seam (audit C-1): every engine the driver builds judges
+	// proposals through ValidateNext - the chain's own pre-vote check, the
+	// same method Append's shared validation runs. A proposer's Build and a
+	// validator's seam and the final Append all run one policy, so a block
+	// this engine would prevote is a block the chain must accept: the case
+	// where they could disagree (a garbage state root carrying a polka to a
+	// commit and then refusing at Append, parking the whole committee) is
+	// closed before any vote is cast.
+	eng.validate = func(b *types.Block) error { return d.ch.ValidateNext(b) }
 	if rec, ok := d.ch.LockAt(height); ok {
 		eng.restoreLock(rec.Round, rec.BlockID)
 	}

@@ -82,6 +82,19 @@ type Engine struct {
 	prevotes   *VoteSet
 	precommits *VoteSet
 
+	// validate, when non-nil, is the block-validation seam the DRIVER fills:
+	// it reports whether the proposal's block is one this validator may
+	// honestly vote for, judged against the chain exactly as the chain's
+	// Append will judge it at commit time - structure, height, parent and
+	// the state root recomputed through the real transition (audit C-1).
+	// It runs in maybePrevote BEFORE the lock check, so an invalid proposal
+	// is prevoted NIL and can never gather the polka that would lock every
+	// honest validator onto block bytes the chain refuses. Nil (engines built
+	// without a driver) means no validation beyond the envelope's own:
+	// production engines always carry the seam, because they always carry a
+	// chain; a driver-less engine has no chain to disagree with.
+	validate func(*types.Block) error
+
 	// persistLock, when non-nil, is called the instant the lock moves: the
 	// driver installs it after construction so the promise is made durable
 	// BEFORE the precommit that records it is signed or shipped (a promise
@@ -268,6 +281,17 @@ func (e *Engine) onProposal(p *Proposal) error {
 	if p.Height != e.height || p.Round != e.round {
 		return nil // another height or round: not ours to judge here
 	}
+	// A block whose header claims a height other than the envelope's own is a
+	// protocol error, refused here (audit C-1). Appending such a block is
+	// impossible (the chain demands head+1), and prevoting it would stake a
+	// lock on bytes the chain must refuse - the parked-everyone failure the
+	// proposal-validation seam exists to prevent. The check needs no chain
+	// state, so it runs on every engine, driverless ones included; the rest
+	// of the block's validity is judged by the seam before any prevote.
+	if p.Block.Header.Height != p.Height {
+		return fmt.Errorf("%w: header claims height %d, envelope names height %d",
+			ErrBadProposalHeight, p.Block.Header.Height, p.Height)
+	}
 	if err := p.Verify(); err != nil {
 		return err
 	}
@@ -308,7 +332,22 @@ func (e *Engine) onVote(v *Vote) error {
 	return nil
 }
 
-// maybePrevote prevotes the current proposal if the lock permits it.
+// maybePrevote prevotes the current proposal if it is valid and the lock permits it.
+//
+// The proposal is JUDGED before it is voted on, in this order (audit C-1):
+//
+//  1. verifyJustification: a proposal claiming a polka it does not carry is
+//     unusable evidence - not prevoted at all, not even nil: no vote of this
+//     validator may rest on evidence that does not exist.
+//  2. validate (the driver's seam): the block itself - structure, height,
+//     parent, state root through the real transition - exactly what the
+//     chain's Append will demand at commit time. A failing block is prevoted
+//     NIL, Tendermint's valid(v) rule: the validator will not vote for block
+//     bytes it could not accept, and nil, unlike silence, still lets the
+//     round end. This check is what closes the halt: with an invalid block
+//     prevoted, the polka, the lock, the commit and the append refusal that
+//     previously parked every honest node forever can no longer form.
+//  3. canPrevote: the lock.
 func (e *Engine) maybePrevote() {
 	if e.step != StepPropose && e.step != StepPrevote {
 		return
@@ -321,6 +360,19 @@ func (e *Engine) maybePrevote() {
 	if err != nil {
 		return // an unjustified proposal is not prevoted at all - not even nil: no
 		// vote of this validator may rest on evidence that does not exist.
+	}
+	if e.validate != nil {
+		if verr := e.validate(e.proposal); verr != nil {
+			// The block is not one this validator could accept: prevote NIL.
+			// The step is recorded BEFORE the emission, exactly as the lock
+			// branch below: emitVote tallies the engine's own vote, and the
+			// self-tally may synchronously re-enter maybePrecommit while this
+			// frame is on the stack. Writing the step after the emission
+			// would clobber the deeper transition.
+			e.step = StepPrevote
+			e.emitVote(MsgPrevote, [32]byte{})
+			return
+		}
 	}
 	if !e.lk.canPrevote(e.round, id, validRound) {
 		// The lock refuses this block. Prevote NIL rather than staying silent: a

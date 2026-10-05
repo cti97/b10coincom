@@ -351,6 +351,78 @@ func (c *Chain) applyValidatedLocked(b *types.Block) error {
 	return nil
 }
 
+// validateLocked runs every check Append runs for a block over the chain's
+// CURRENT head, and returns the state a valid block would produce.
+//
+// This is the ONE validation policy for what makes a block acceptable at
+// head+1: Append (the durable write) and ValidateNext (the consensus engine's
+// pre-vote seam) both call it, so a block the engine prevotes is, by
+// construction, a block Append would accept - and a proposer's Build (which
+// signs exactly the same transition) cannot disagree with either. Two
+// validators can only disagree about the chain, never about the rules.
+//
+// The checks, in Append's order: parent link, head+1 height, block structure
+// (types), proposer membership, proposer signature, then the whole state
+// transition through advanceLocked - height set, emission credited,
+// transactions applied - whose recomputed root must equal the header's claim.
+// That last check is the state-root probe: the same Probe-style transition a
+// peer who never saw the block would run to judge it.
+//
+// Read-lock sufficient: nothing here mutates the chain (advanceLocked works
+// on a clone). The caller must hold c.mu.
+func (c *Chain) validateLocked(b *types.Block) (*state.State, error) {
+	if b.Header.ParentHash != c.head.ID() {
+		return nil, ErrBadParent
+	}
+	if b.Header.Height != c.head.Header.Height+1 {
+		return nil, fmt.Errorf("%w: got %d, want %d", ErrBadHeight, b.Header.Height, c.head.Header.Height+1)
+	}
+	if err := b.ValidateStructure(); err != nil {
+		return nil, err
+	}
+	if !c.isValidator(b.Header.Proposer) {
+		return nil, ErrNotValidator
+	}
+	if b.Sig == nil {
+		return nil, ErrBadProposerSig
+	}
+	headerHash := b.Header.SigningHash()
+	if !crypto.Verify(b.Header.Proposer, headerHash[:], b.Sig) {
+		return nil, ErrBadProposerSig
+	}
+	next, err := c.advanceLocked(b.Header.Height, b.Txs)
+	if err != nil {
+		return nil, err
+	}
+	if computed := next.Root(); computed != b.Header.StateRoot {
+		return nil, fmt.Errorf("%w: computed %x, header claims %x",
+			ErrBadStateRoot, computed[:8], b.Header.StateRoot[:8])
+	}
+	return next, nil
+}
+
+// ValidateNext reports whether b is a valid block for head+1, WITHOUT
+// appending or mutating anything: it runs exactly the checks Append runs -
+// they live in one shared method so the two cannot drift - and returns the
+// first failure.
+//
+// This is the audit C-1 seam's chain half: the consensus engine must judge a
+// proposal BEFORE prevoting it, and the check it makes must be the one a peer
+// (and the chain itself) would make at append time. A validator that lets a
+// proposal reach a polka, a lock and a commit before the chain sees it risks
+// every node parking on the chain's refusal, with no one able to move on -
+// the halt one Byzantine proposer can otherwise inflict with a garbage state
+// root.
+//
+// Like Append, validation is all-or-nothing against the current head: a
+// refusal leaves height, state and store untouched.
+func (c *Chain) ValidateNext(b *types.Block) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, err := c.validateLocked(b)
+	return err
+}
+
 // Append validates a block against the current head and state, then stores
 // it. Validation happens before any mutation, so a rejected block leaves the
 // chain untouched.
@@ -363,35 +435,13 @@ func (c *Chain) applyValidatedLocked(b *types.Block) error {
 func (c *Chain) Append(b *types.Block) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if b.Header.ParentHash != c.head.ID() {
-		return ErrBadParent
-	}
-	if b.Header.Height != c.head.Header.Height+1 {
-		return fmt.Errorf("%w: got %d, want %d", ErrBadHeight, b.Header.Height, c.head.Header.Height+1)
-	}
-	if err := b.ValidateStructure(); err != nil {
-		return err
-	}
-	if !c.isValidator(b.Header.Proposer) {
-		return ErrNotValidator
-	}
-	if b.Sig == nil {
-		return ErrBadProposerSig
-	}
-	headerHash := b.Header.SigningHash()
-	if !crypto.Verify(b.Header.Proposer, headerHash[:], b.Sig) {
-		return ErrBadProposerSig
-	}
-
-	next, err := c.advanceLocked(b.Header.Height, b.Txs)
+	// The full validation runs first (validateLocked), so a rejected block
+	// never reaches the store: a refusal leaves the chain byte-identical to
+	// what ValidateNext would have observed.
+	next, err := c.validateLocked(b)
 	if err != nil {
 		return err
 	}
-	if computed := next.Root(); computed != b.Header.StateRoot {
-		return fmt.Errorf("%w: computed %x, header claims %x",
-			ErrBadStateRoot, computed[:8], b.Header.StateRoot[:8])
-	}
-
 	if err := c.store.Append(b.Header.Height, b.Encode()); err != nil {
 		return err
 	}

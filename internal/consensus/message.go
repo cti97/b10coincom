@@ -28,8 +28,17 @@ const (
 var (
 	ErrBadVoteSignature     = errors.New("consensus: bad vote signature")
 	ErrBadProposalSignature = errors.New("consensus: bad proposal signature")
-	ErrUnknownMsgType       = errors.New("consensus: unknown message type")
-	ErrBadValidatorKey      = errors.New("consensus: validator key cannot derive its address")
+	// ErrBadProposalHeight reports a proposal whose BLOCK HEADER claims a
+	// different height than the envelope that carries it. It is a protocol
+	// error, not merely an unusable proposal (audit C-1): the chain refuses
+	// any block whose header names a position other than the one the
+	// committee is deciding, so a proposal in this shape could only reach a
+	// polka and a lock on block bytes the chain would reject for certain -
+	// parking every member. The envelope/header agreement is checkable
+	// without chain state, so the engine refuses it outright.
+	ErrBadProposalHeight = errors.New("consensus: proposal's block header height does not match the envelope")
+	ErrUnknownMsgType    = errors.New("consensus: unknown message type")
+	ErrBadValidatorKey   = errors.New("consensus: validator key cannot derive its address")
 	// ErrBadJustification reports a proposal whose claimed ValidRound is not
 	// backed by the prevotes it carries: no prevotes at all, prevotes that fail
 	// to decode or verify, prevotes for another (height, round), or prevotes

@@ -5,7 +5,9 @@ import (
 	"math"
 	"testing"
 
+	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -794,5 +796,180 @@ func TestValidRoundAboveUint32IsRejected(t *testing.T) {
 	got, err := e.verifyJustification(pMax)
 	if err != nil || got != math.MaxUint32 {
 		t.Fatalf("a ValidRound of exactly MaxUint32 fits a uint32 and must verify, got round %d, err %v", got, err)
+	}
+}
+
+// sealedChainFixture opens a REAL chain under cfg's committee so an engine can
+// carry the driver's validation seam: the seam's judgement is the chain's own
+// ValidateNext - the same policy Append runs - against a chain whose head the
+// engine actually judges. The returned parent is the engine's parent (the
+// chain's genesis head) and the height is head+1.
+func sealedChainFixture(t *testing.T, cfg Config) (*chain.Chain, uint64, [32]byte) {
+	t.Helper()
+	g := genesis.Devnet()
+	g.Validators = cfg.Committee
+	g.Params.CommitteeSize = len(cfg.Committee)
+	ch, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ch.Close() })
+	parent := ch.Head().ID()
+	return ch, ch.Head().Header.Height + 1, parent
+}
+
+// attackProposalForStateRoot builds the audit C-1 attack at (height, round):
+// an envelope whose every authenticity check is honest - the real round
+// proposer's key signed it, the header height matches the envelope, the
+// parent matches the engine's - carrying a block whose StateRoot is garbage.
+// The proposer in the attack "builds a normal block, overwrites Header.
+// StateRoot with garbage, re-signs": the re-sign means the ENVELOPE'S
+// signature is a perfectly valid one. What cannot be honest is the root.
+func attackProposalForStateRoot(t *testing.T, cfg Config, height uint64, round uint32, parent [32]byte) (*Proposal, [32]byte) {
+	t.Helper()
+	pPub := cfg.Proposer(height, round, parent)
+	b := types.Block{Header: types.Header{
+		Height:     height,
+		ParentHash: parent,
+		StateRoot:  [32]byte{0xde, 0xad, 0xbe, 0xef},
+		TxRoot:     types.ComputeTxRoot(nil),
+		Timestamp:  int64(1_700_000_000 + height),
+		Proposer:   pPub,
+	}}
+	if err := b.ValidateStructure(); err != nil {
+		t.Fatalf("fixture: the attack block must be structurally valid: %v", err)
+	}
+	p := &Proposal{Height: height, Round: round, Block: b, ValidRound: -1, Validator: pPub}
+	p.Sig = signProposal(t, cfg, p)
+	return p, b.ID()
+}
+
+// The audit C-1 attack, at the engine level: a fresh validator receives a
+// correctly signed proposal from the round's proposer whose block claims a
+// garbage state root. Before the seam existed, this proposal was prevoted,
+// the polka formed, the lock was taken - and the chain then refused the
+// block, parking the node forever. Now the seam judges the block BEFORE any
+// vote: the engine prevotes NIL and never locks.
+//
+// Non-vacuity is structural: maybePrevote only runs when the engine ACCEPTED
+// the proposal (stored it), so the emitted nil prevote itself proves the
+// attack travelled past the envelope and proposer checks. The refusal is
+// therefore attributable to the block content alone.
+func TestGarbageStateRootProposalIsNilPrevotedAndNeverLocked(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	ch, height, parent := sealedChainFixture(t, cfg)
+	e := newTestEngine(t, cfg, 1, height, parent)
+	e.validate = ch.ValidateNext
+
+	attack, attackID := attackProposalForStateRoot(t, cfg, height, 0, parent)
+	if err := e.OnMessage(EncodeProposal(attack)); err != nil {
+		t.Fatalf("the attack proposal must pass the envelope checks as protocol data, got %v", err)
+	}
+
+	// The refusal must SPEAK: exactly one nil prevote, so the round can end
+	// and the committee can move to a later round's honest proposal.
+	outs := e.Drain()
+	if got := drainTypes(outs); got[MsgPrevote] != 1 {
+		t.Fatalf("the garbage-root proposal produced %v prevote emission(s); want exactly one (the nil prevote)", got)
+	}
+	for _, o := range outs {
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote {
+			if !v.IsNil() {
+				t.Fatalf("the engine prevoted %x for a block whose state root it cannot accept; want nil", v.BlockID[:8])
+			}
+			if v.Height != height || v.Round != 0 {
+				t.Fatalf("the refusal prevote sits at (h=%d, r=%d), want (h=%d, r=0)", v.Height, v.Round, height)
+			}
+		}
+	}
+	// And the lock must never have been taken on the garbage block - the
+	// persisted promise the old behaviour wrote was what made every restart
+	// re-pin the halt.
+	if e.Locked() {
+		locked := e.lk.blockID()
+		if locked == attackID {
+			t.Fatalf("the engine locked on %x: a garbage-root proposal must not reach a lock", locked[:8])
+		}
+		t.Fatalf("the engine locked (on %x) without a usable evidence path", locked[:8])
+	}
+}
+
+// The positive control over the C-1 seam, from the SAME fixture shape: a
+// legitimately valid proposal - block built by the round's proposer through
+// the chain's own Build, real state root included - MUST still be prevoted.
+// This kills the failure mode where the fix refuses everything: a seam that
+// rejects a block Chain.Build signed would show nothing here but a stalled
+// committee.
+func TestAValidBlockIsStillPrevotedThroughTheSeam(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	ch, height, parent := sealedChainFixture(t, cfg)
+	e := newTestEngine(t, cfg, 1, height, parent)
+	e.validate = ch.ValidateNext
+
+	pPub := cfg.Proposer(height, 0, parent)
+	b, err := ch.Build(testCommitteeKey(cfg.IndexOf(pPub)), nil, ch.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatalf("fixture: chain.Build must produce the valid proposal block: %v", err)
+	}
+	p := &Proposal{Height: height, Round: 0, Block: *b, ValidRound: -1, Validator: pPub}
+	p.Sig = signProposal(t, cfg, p)
+	if err := e.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatal(err)
+	}
+
+	outs := e.Drain()
+	prevoted := false
+	for _, o := range outs {
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote && v.BlockID == b.ID() {
+			prevoted = true
+		}
+	}
+	if !prevoted {
+		t.Fatal("a valid proposal was not prevoted through the seam: the engine must not refuse blocks its own chain policy accepts")
+	}
+	if e.Locked() {
+		// Only the engine's own prevote is tallied so far (1 of the quorum
+		// of 3): the lock must NOT have formed. This pins that the control
+		// case ends in the same mid-round state the attack case refused
+		// from, and that prevoting did not itself take a lock.
+		locked := e.lk.blockID()
+		t.Fatalf("the control engine locked without a polka (on %x): the fixture drifted from one self prevote", locked[:8])
+	}
+}
+
+// The envelope/header height disagreement is a PROTOCOL ERROR refused at the
+// proposal's face (audit C-1): the block a polka would carry must be the
+// block at the height being decided. The proposal is not stored, nothing is
+// prevoted, and no lock forms.
+func TestProposalHeaderHeightMismatchIsAProtocolError(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, true, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+
+	blk := testProposer(t, cfg, h, 0, parent)
+	// The block claims the NEXT height while the envelope names the round's
+	// own: exactly the shape a commit-would-fail-forever proposal has if it
+	// were allowed past the face checks.
+	blk.Header.Height = h + 1
+	p := &Proposal{Height: h, Round: 0, Block: blk, ValidRound: -1, Validator: cfg.Proposer(h, 0, parent)}
+	p.Sig = signProposal(t, cfg, p)
+
+	err := e.OnMessage(EncodeProposal(p))
+	if !errors.Is(err, ErrBadProposalHeight) {
+		t.Fatalf("a header-height mismatch must be refused as a protocol error, got %v", err)
+	}
+	if e.proposal != nil {
+		t.Fatal("the mismatched proposal was stored as this round's proposal")
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("a refused proposal must not be prevoted, got %d message(s)", len(left))
+	}
+	if e.lk.locked() {
+		locked := e.lk.blockID()
+		zero := [32]byte{}
+		if locked != zero {
+			t.Fatal("the lock moved without any evidence")
+		}
 	}
 }

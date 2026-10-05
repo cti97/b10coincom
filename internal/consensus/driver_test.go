@@ -364,68 +364,113 @@ func TestDriverLeavesChainUntouchedWithoutQuorum(t *testing.T) {
 }
 
 // A rejected Append must leave the driver at the same height rather than
-// advancing or corrupting state. The engine cannot validate a block's state
-// root (it holds no state by design), so the realistic way a commit fails is
-// exactly this: a block the engine accepted that the chain refuses. The driver
-// must not swap in a new engine for the next height - the height is not
-// decided for THIS node, and silently moving on would diverge it from every
-// peer that did accept the block.
+// advancing or corrupting state (Design Decision 8: a refused block is never
+// silently skipped).
+//
+// Since the pre-vote validation seam (audit C-1), the COMMON way a commit
+// would fail - a proposal whose bytes the chain cannot accept - now ends
+// earlier: the engine nil-prevotes it and no commit ever forms (see
+// TestDriverNilPrevotesAGarbageRootProposal). What remains reachable is the
+// race against a chain that moved under the engine: a peer's committed block
+// adopted mid-round (exactly what a catch-up wave does, before the driver is
+// rebuilt) leaves the engine judging a height the head has already passed.
+// The engine's commit of its own proposal then fails Append honestly, and
+// this test pins the refusal's consequences: same height, no engine swap, no
+// retry.
+//
+// The harness stages exactly that over the blocked-quorum fixture (quorum 2,
+// the peer a ghost whose only participation is the votes the test injects by
+// hand): one valid proposal prevoted by this validator, a foreign block
+// appended straight to the chain (the adopted peer block), then the ghost's
+// prevote and precommit completing the polka and the precommit quorum for
+// the - now stale - proposal.
 func TestDriverRejectedAppendStaysAtSameHeight(t *testing.T) {
-	d, ch, _, net, pub, priv, _, _, _ := oneValidatorFixture(t)
+	d, ch, _, net, _, _ := blockedQuorumFixture(t)
 
-	// A proposal whose state root is a lie. It passes every engine-level check
-	// (envelope signature, membership, justification) because the engine owns
-	// no state to check it against; chain.Append rejects it on the root.
-	head0 := ch.Head()
-	lied := &types.Block{Header: types.Header{
-		Height:     head0.Header.Height + 1,
-		ParentHash: head0.ID(),
-		StateRoot:  [32]byte{0xde, 0xad, 0xbe, 0xef},
-		TxRoot:     types.ComputeTxRoot(nil),
-		Timestamp:  head0.Header.Timestamp + 1,
-		Proposer:   pub,
-	}}
-	liedHeaderHash := lied.Header.SigningHash()
-	lied.Sig = crypto.Sign(priv, liedHeaderHash[:])
-	prop := &Proposal{
-		Height:     lied.Header.Height,
-		Round:      0,
-		Block:      *lied,
-		ValidRound: -1,
-		Validator:  pub,
-	}
-	propHash := prop.SigningHash()
-	prop.Sig = crypto.Sign(priv, propHash[:])
-
+	parentID := ch.Head().ID()
 	engAtStart := d.eng
-	d.OnMessage(transport.Message{From: "v0", Data: EncodeProposal(prop)})
+	heightJudged := d.eng.Height()
+	roundJudged := d.eng.Round()
 
-	drive(t, d, net, 50, func() bool { return d.eng.hasCommitted })
+	// The proposal P this validator will judge: built by the ROUND proposer
+	// through the chain itself, so it carries a genuine state root and passes
+	// the seam while the head still stands where P was built for.
+	proposerPub := d.cfg.Proposer(heightJudged, roundJudged, parentID)
+	proposerIdx := d.cfg.IndexOf(proposerPub)
+	prop, err := ch.Build(testCommitteeKey(proposerIdx), nil, ch.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &Proposal{
+		Height: heightJudged, Round: roundJudged, Block: *prop, ValidRound: -1,
+		Validator: proposerPub,
+	}
+	env.Sig = signProposal(t, d.cfg, env)
+
+	// Deliver P: the engine accepts and prevotes it (its own weight only -
+	// the quorum of 2 needs the peer too, so nothing commits yet).
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeProposal(env)})
+	if d.eng.proposal == nil || d.eng.proposal.ID() != prop.ID() {
+		t.Fatal("fixture: the engine did not accept the staged proposal")
+	}
+
+	// The chain moves under the engine, the way an adopted peer block does:
+	// a DIFFERENT valid block at the same height, carried by a genuine
+	// transfer transaction so it cannot byte-match P.
+	foreign, err := ch.Build(testCommitteeKey(0), []types.Tx{transferTx(0, 1, 0, 1)}, ch.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ch.Append(foreign); err != nil {
+		t.Fatalf("fixture: the foreign block must append against the pre-move head: %v", err)
+	}
+	if ch.Height() != 1 {
+		t.Fatalf("fixture: the foreign block did not move the chain (height %d)", ch.Height())
+	}
+
+	// The peer's prevote and precommit for P arrive; the polka and the
+	// precommit quorum (2 of 2) complete, the engine commits P, and flush
+	// offers the block bytes to a head that has already moved on.
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeVote(voteFrom(t, d.cfg, 1, MsgPrevote, heightJudged, roundJudged, prop.ID()))})
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeVote(voteFrom(t, d.cfg, 1, MsgPrecommit, heightJudged, roundJudged, prop.ID()))})
 	if !d.eng.hasCommitted {
-		t.Fatal("the engine never reached its own commit: the test did not exercise the real append path")
+		t.Fatalf("fixture: the engine did not commit the staged proposal (the polka needed the peer's own precommit)")
 	}
-	if ch.Height() != 0 {
-		t.Fatalf("the chain advanced to height %d although Append must reject the lied-about block", ch.Height())
+	if !d.appendRefused {
+		t.Fatal("the refused append was not recorded; the harness did not reach the refusal path")
 	}
-	if d.Height() != 0 {
-		t.Fatalf("driver height is %d, want 0", d.Height())
-	}
-	if _, err := ch.BlockAt(1); err == nil {
-		t.Fatal("the rejected block was durably stored")
+
+	// The refusal's consequences: the driver stays at the height whose commit
+	// was refused and never swaps in a next-height engine.
+	if d.Height() != 1 {
+		t.Fatalf("driver height is %d, want 1 (the chain's only adopted height)", d.Height())
 	}
 	if d.eng != engAtStart {
 		t.Fatal("the driver swapped in a new engine although Append rejected the block: the next height would start from a chain state the validator never agreed to")
 	}
-	if d.eng.Height() != 1 {
+	if d.eng.Height() != heightJudged {
 		t.Fatalf("the driver moved to height %d; a rejected append must stay at the undecided height", d.eng.Height())
+	}
+	// The refused block is not on disk either: height 1 holds the foreign
+	// block, exactly once, and nothing exists at height 2.
+	stored, err := ch.BlockAt(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignID := foreign.ID()
+	if stored.ID() != foreignID {
+		t.Fatal("the refused append found its way into the store")
+	}
+	if _, err := ch.BlockAt(2); err == nil {
+		t.Fatalf("a block exists at height %d: the refused commit appended after all", ch.Height()+1)
 	}
 
 	// The stall is stable, not a pending retry that leaks an append: keep
 	// driving and the chain stays exactly where it was.
 	drive(t, d, net, 20, nil)
-	if ch.Height() != 0 || d.eng != engAtStart || !d.eng.hasCommitted {
-		t.Fatalf("the driver did not stay put after the rejected append: height %d, engine swapped %v, still committed %v",
-			ch.Height(), d.eng != engAtStart, !d.eng.hasCommitted)
+	if !d.appendRefused || d.eng != engAtStart || d.eng.Height() != heightJudged {
+		t.Fatalf("the driver did not stay put after the rejected append: refused %v, engine swapped %v, height %d",
+			d.appendRefused, d.eng != engAtStart, d.eng.Height())
 	}
 }
 
@@ -829,12 +874,22 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	}
 
 	// ---- The conflicting block, with NO justification, at the height held. ----
-	badBlock := conflictingBlock(t, cfg, 1, 0, parent, 0xB7)
+	// Since the pre-vote validation seam, a driver-level conflicting proposal
+	// must be a block the chain would genuinely accept - a real state root,
+	// built through the chain by the round's proposer - so the refusal below
+	// is the LOCK's refusal and not the seam's (the seam's refusal has its
+	// own test): the lock must still refuse a VALID conflicting block that
+	// carries no evidence.
+	badRound0Proposer := cfg.Proposer(1, 0, parent)
+	badBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(badRound0Proposer)), []types.Tx{transferTx(0, 1, 0, 1)}, ch2.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	badProp := &Proposal{
-		Height: 1, Round: 0, Block: badBlock,
+		Height: 1, Round: 0, Block: *badBlock,
 		ValidRound:    -1,
 		Justification: nil, // NO justification: a claim with no evidence behind it
-		Validator:     cfg.Proposer(1, 0, parent),
+		Validator:     badRound0Proposer,
 	}
 	badProp.Sig = signProposal(t, cfg, badProp)
 
@@ -883,7 +938,18 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 			d2.eng.lk.locked(), d2.eng.lk.round(), survivedID[:8])
 	}
 
-	newBlock := conflictingBlock(t, cfg, 1, 1, parent, 0xA7)
+	// The justified proposal's block is a REAL block too - built through the
+	// chain by the round's actual proposer, so it passes the seam and reaches
+	// the lock rule: persistence must not revoke liveness (the unlock is
+	// exactly what a justified, strictly-newer-polka proposal exists to do).
+	// Only dev account 0 is funded on this genesis, so the second block keeps
+	// the same nonce but a different amount - a different tx, hence a
+	// different block ID from the bad block's.
+	p1 := cfg.Proposer(1, 1, parent)
+	newBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(p1)), []types.Tx{transferTx(0, 1, 0, 5)}, ch2.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	newID := newBlock.ID()
 	if newID == lockID || newID == badBlock.ID() {
 		t.Fatal("the justified block must genuinely differ from both the locked and the refused one")
@@ -895,7 +961,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	// evidence the verification gate will accept.
 	propRound := lockRound + 1
 	goodProp := &Proposal{
-		Height: 1, Round: 1, Block: newBlock, ValidRound: int64(propRound), Validator: cfg.Proposer(1, 1, parent),
+		Height: 1, Round: 1, Block: *newBlock, ValidRound: int64(propRound), Validator: cfg.Proposer(1, 1, parent),
 		Justification: encodeJustification([]*Vote{
 			voteFrom(t, cfg, 0, MsgPrevote, 1, propRound, newID),
 			voteFrom(t, cfg, 1, MsgPrevote, 1, propRound, newID),
@@ -1563,4 +1629,226 @@ func fourValCommitteeGenesis(t *testing.T, vals []genesis.Validator) *genesis.Ge
 	g.Validators = vals
 	g.Params.CommitteeSize = len(vals)
 	return g
+}
+
+// fourValidatorFixture brings up a four-equal-power committee, all four with
+// live drivers over one sim, plus a genesis whose Time is searched just enough
+// that the round-1 proposer differs from the round-0 proposer at height 1 (the
+// mutant-kill condition of the recovery test: a reverted re-proposal shows
+// itself as a fresh, different block the moment a locked non-builder is drawn).
+func fourValidatorFixture(t *testing.T) (ds []*Driver, chs []*chain.Chain, recs []*recordingTransport, net *sim.Net, cfg Config, g *genesis.Genesis, parent [32]byte) {
+	t.Helper()
+	vals := make([]genesis.Validator, 0, 4)
+	for i := 0; i < 4; i++ {
+		vals = append(vals, testValidator(i, 1))
+	}
+	var chosen *genesis.Genesis
+	var chosenCfg Config
+	for try := 0; try < 64; try++ {
+		gg := genesis.Devnet()
+		gg.Validators = append([]genesis.Validator(nil), vals...)
+		gg.Params.CommitteeSize = 4
+		gg.Time += int64(try)
+		ccfg := Config{Committee: gg.Validators, TimeoutBase: roundBase, TimeoutStep: roundStep, PowerCapNum: 1, PowerCapDen: 4}
+		if err := ccfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		parent = chainGenesisParent(t, gg)
+		if string(ccfg.Proposer(1, 1, parent)) != string(ccfg.Proposer(1, 0, parent)) {
+			chosen, chosenCfg = gg, ccfg
+			break
+		}
+		if try == 63 {
+			t.Fatal("fixture: no genesis time split the round-0 and round-1 proposers")
+		}
+	}
+	cfg, g = chosenCfg, chosen
+
+	net = sim.New(sim.Options{Seed: 1, Latency: 1})
+	for i := 0; i < 4; i++ {
+		net.AddPeer(fmt.Sprintf("v%d", i))
+	}
+	for i := 0; i < 4; i++ {
+		ch, err := chain.Open(g, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp := mempool.New(1000)
+		rec := &recordingTransport{Transport: net.TransportFor(fmt.Sprintf("v%d", i))}
+		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), rec, mp))
+		chs = append(chs, ch)
+		recs = append(recs, rec)
+	}
+	return ds, chs, recs, net, cfg, g, parent
+}
+
+// chainGenesisParent reports the genesis block ID a chain opened from g would
+// carry: open a throwaway chain and read its head.
+func chainGenesisParent(t *testing.T, g *genesis.Genesis) [32]byte {
+	t.Helper()
+	c, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := c.Head().ID()
+	_ = c.Close()
+	return parent
+}
+
+// THE C-1 ATTACK, AT THE COMMITTEE: the validator drawn as proposer at height 1
+// round 0 is Byzantine: it builds a normal block, overwrites StateRoot with
+// garbage, re-signs the envelope, and proposes. Pre-fix every honest validator
+// prevoted it (the envelope and proposer checks all pass), the polka formed,
+// every validator LOCKED on the garbage block and committed it, every node's
+// Append refused it, and the whole committee parked forever - restart included,
+// because the lock on the garbage block was durable.
+//
+// Post-fix: every honest validator's pre-vote seam judges the block - state
+// root included - BEFORE voting. The attack collects only nil prevotes from
+// the honest members, never a polka (the attacker's own vote is 1 of the
+// quorum of 3), never a lock, never a commit.
+//
+// The height MUST still commit in a later round: an honest proposer's honest
+// block reaches the same quorum of three live validators. The halt was the
+// finding; one round of delay is the honest cost of refusing.
+func TestCommitteeNilPrevotesAGarbageRootProposalAndStillCommits(t *testing.T) {
+	ds, chs, recs, net, cfg, g, parent := fourValidatorFixture(t)
+	defer func() {
+		for _, ch := range chs {
+			_ = ch.Close()
+		}
+	}()
+
+	// The attacker is whoever the committee draws at (1, 0); the honest
+	// validators are the other three.
+	attackPub := cfg.Proposer(1, 0, parent)
+	attackIdx := cfg.IndexOf(attackPub)
+	attPriv := testCommitteeKey(attackIdx)
+	attackID := [32]byte{}
+	{
+		// The attack block: structurally valid, garbage state root.
+		b := types.Block{Header: types.Header{
+			Height:     1,
+			ParentHash: parent,
+			StateRoot:  [32]byte{0xde, 0xad, 0xbe, 0xef},
+			TxRoot:     types.ComputeTxRoot(nil),
+			Timestamp:  1_700_000_001,
+			Proposer:   attackPub,
+		}}
+		if err := b.ValidateStructure(); err != nil {
+			t.Fatalf("fixture: the attack block must be structurally valid: %v", err)
+		}
+		p := &Proposal{Height: 1, Round: 0, Block: b, ValidRound: -1, Validator: attackPub}
+		h := p.SigningHash()
+		p.Sig = crypto.Sign(attPriv, h[:])
+		attackID = b.ID()
+		// Broadcast through the attacker's own sim peer, exactly one proposal.
+		_ = net.TransportFor(fmt.Sprintf("v%d", attackIdx)).Broadcast(EncodeProposal(p))
+	}
+
+	// The attacker also prevotes its own block (a Byzantine proposer helps its
+	// proposal along); the honest validators must outvote it with nils.
+	attackPrevote := voteFrom(t, cfg, attackIdx, MsgPrevote, 1, 0, attackID)
+	_ = net.TransportFor(fmt.Sprintf("v%d", attackIdx)).Broadcast(EncodeVote(attackPrevote))
+
+	// Drive the three honest drivers in lockstep: the attack round must end
+	// with exactly one nil prevote from each of them and NOT ONE prevote for
+	// the garbage block; the height must then commit in a later round.
+	commit := false
+	for i := 0; i < 600 && !commit; i++ {
+		now := int64(i) * driveStep
+		for idx, d := range ds {
+			if idx == attackIdx {
+				continue
+			}
+			d.Tick(now)
+		}
+		net.Advance(netStep)
+		for idx, d := range ds {
+			if idx == attackIdx {
+				continue
+			}
+			d.Tick(now + driveStep/2)
+		}
+		commit = true
+		for idx, ch := range chs {
+			if idx == attackIdx {
+				continue
+			}
+			if ch.Height() < 1 {
+				commit = false
+			}
+		}
+	}
+	if !commit {
+		t.Fatalf("the committee never recovered past the attack: the honest validators stalled below height 1 after 600 ticks - refusing a garbage proposal must not halt the chain")
+	}
+
+	for idx, ch := range chs {
+		if idx == attackIdx {
+			continue // the attacker's chain is not part of the committee's truth
+		}
+		if _, err := ch.BlockAt(1); err == nil && ch.Height() >= 1 {
+			blk, err := ch.BlockAt(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if blk.ID() == attackID {
+				t.Fatalf("validator %d committed the ATTACK block: the polka reached a lock on a garbage-root block", idx)
+			}
+		}
+		if rec, ok := ch.LockAt(1); ok && rec.BlockID == attackID {
+			t.Fatalf("validator %d has a DURABLE lock naming the attack block %x: the halt now survives restarts, which is the finding's exact claim", idx, attackID[:8])
+		}
+	}
+
+	// Evidence the refusal spoke: every honest validator emitted exactly one
+	// NIL prevote at the attack round (1, 0), and no honest validator emitted
+	// a non-nil prevote for the attack block at that round.
+	for idx, rec := range recs {
+		if idx == attackIdx {
+			continue
+		}
+		nils, forAttack := 0, 0
+		for _, raw := range rec.broadcasts {
+			v, err := DecodeVote(raw)
+			if err != nil || v.Type != MsgPrevote || v.Height != 1 || v.Round != 0 {
+				continue
+			}
+			if v.IsNil() {
+				nils++
+			}
+			if v.BlockID == attackID {
+				forAttack++
+			}
+		}
+		if forAttack != 0 {
+			t.Fatalf("honest validator %d prevoted the garbage-root block %d time(s): the attack reached a prevote", idx, forAttack)
+		}
+		if nils != 1 {
+			t.Fatalf("honest validator %d emitted %d nil prevote(s) at the attack round, want exactly 1: the refusal must speak, not stay silent", idx, nils)
+		}
+	}
+
+	// And the recovered chain is one history: the committed height-1 block is
+	// identical at every honest validator.
+	_ = g // the fixture's searched genesis; the parent draw is what matters
+	ref, err := chs[0].BlockAt(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idx, ch := range chs {
+		if idx == attackIdx {
+			continue
+		}
+		blk, err := ch.BlockAt(1)
+		if err != nil {
+			continue // this validator may still be a height behind; agreement is asserted below through its shared heights
+		}
+		blkID, refID := blk.ID(), ref.ID()
+		if blkID != refID {
+			t.Fatalf("honest validators disagree at height 1: %x vs %x", blkID[:8], refID[:8])
+		}
+	}
+	_ = g
 }
