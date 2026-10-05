@@ -87,6 +87,11 @@ type Store struct {
 	have  bool
 	index map[uint64]int64 // height -> record offset within its segment
 
+	// lock is the exclusive data-directory lock, held from Open until Close.
+	// See dirlock.go: it keeps a second process (or a second open Store in
+	// this process) from interleaving writes into these files.
+	lock *dirLock
+
 	// lockFile is the append handle on the lock log; locks maps a height to
 	// the NEWEST lock record for it. A height may legitimately carry a lock
 	// and no block: the lock points at head+1, the height being judged, so
@@ -104,22 +109,32 @@ func segmentName(height uint64) string {
 }
 
 // Open prepares dir for use, rebuilds the in-memory height and lock indexes,
-// and discards any partial trailing record.
+// and discards any partial trailing record. It takes the directory's
+// exclusive single-writer lock first and holds it until Close; a directory
+// already owned by a live process (or by another open Store in this process)
+// is refused with ErrDataDirInUse before any file is scanned or truncated.
 func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, index: make(map[uint64]int64), locks: make(map[uint64]LockRecord)}
+	lock, err := acquireDirLock(dir)
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{dir: dir, index: make(map[uint64]int64), locks: make(map[uint64]LockRecord), lock: lock}
 	if err := s.scan(); err != nil {
+		lock.release()
 		return nil, err
 	}
 	f, err := os.OpenFile(s.segmentPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
+		lock.release()
 		return nil, err
 	}
 	lf, err := os.OpenFile(filepath.Join(dir, lockLogName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		_ = f.Close()
+		lock.release()
 		return nil, err
 	}
 	s.file = f
@@ -466,7 +481,8 @@ func (s *Store) LockAt(height uint64) (LockRecord, bool) {
 // other open descriptor every time one close fails. The fields are cleared
 // unconditionally (a close error can fire after the descriptor is really
 // gone - see Append's rollover), so a repeated Close cannot spin on the
-// same handle.
+// same handle. The data-directory lock is released last, so the directory
+// admits a new writer only once this store's files are closed.
 func (s *Store) Close() error {
 	var fileErr, lockErr error
 	if s.file != nil {
@@ -476,6 +492,10 @@ func (s *Store) Close() error {
 	if s.lockFile != nil {
 		lockErr = s.lockFile.Close()
 		s.lockFile = nil
+	}
+	if s.lock != nil {
+		s.lock.release()
+		s.lock = nil
 	}
 	return errors.Join(fileErr, lockErr)
 }
