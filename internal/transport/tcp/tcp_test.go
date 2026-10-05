@@ -1899,3 +1899,79 @@ func TestAPeerThatStopsReadingIsCutOffByTheWriteDeadline(t *testing.T) {
 		}
 	})
 }
+
+// TestTheRateLimiterShedsAFloodUnderAConstructedClock pins audit N-6's token
+// bucket with NO sleeping and no socket: refill is driven by a constructed
+// instant, so the burst, the cap and the sub-token boundary are exact.
+func TestTheRateLimiterShedsAFloodUnderAConstructedClock(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := newRateLimiter(10, 5)
+	l.now = func() time.Time { return now }
+	l.last = now
+
+	for i := 0; i < 5; i++ {
+		if !l.allow() {
+			t.Fatalf("burst token %d was refused", i)
+		}
+	}
+	if l.allow() {
+		t.Fatal("a sixth frame in the same instant was admitted past the burst")
+	}
+	now = now.Add(time.Second) // 10 tokens earned, capped at the burst
+	for i := 0; i < 5; i++ {
+		if !l.allow() {
+			t.Fatalf("refilled token %d was refused", i)
+		}
+	}
+	if l.allow() {
+		t.Fatal("the refill admitted more than the burst")
+	}
+	now = now.Add(50 * time.Millisecond) // half a token: not enough
+	if l.allow() {
+		t.Fatal("half a token admitted a frame")
+	}
+	now = now.Add(50 * time.Millisecond) // the second half: exactly one
+	if !l.allow() {
+		t.Fatal("a full token after refill was refused")
+	}
+}
+
+// TestTheReaderShedsFramesOverThePerConnectionRateLimit places the limiter
+// where it changes behaviour: the reader. With a tiny rate the reader admits
+// the burst and sheds the rest - over a synchronous pipe, so the frame count
+// is exact and no timing race decides the outcome. A mutant that removes the
+// allow() call dispatches all 50 and fails the upper bound.
+func TestTheReaderShedsFramesOverThePerConnectionRateLimit(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	var got atomic.Uint64
+	a, err := New(Options{LocalID: "validator", RateLimitPerSec: 1, RateLimitBurst: 4, IdleReadTimeout: time.Hour, WriteTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	a.OnMessage(func(transport.Message) { got.Add(1) })
+	c, err := a.install(server, "pipe-peer", true, "pipe-peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for i := 0; i < 50; i++ {
+			if err := wire.WriteFrame(client, []byte{0xAA}); err != nil {
+				return
+			}
+		}
+	}()
+	waitFor(t, "all 50 frames to be read and either dispatched or shed", 10*time.Second, func() bool {
+		return got.Load()+c.rateLimited.Load() >= 50
+	})
+	// The burst is 4; a rate of 1/s can add at most a handful over the
+	// sub-second the loop takes. 8 is slack, and far below the 50 a missing
+	// limiter dispatches.
+	if n := got.Load(); n > 8 {
+		t.Fatalf("the rate limiter admitted %d of 50 frames; the burst is 4", n)
+	}
+	if c.rateLimited.Load() == 0 {
+		t.Fatal("no frame was shed: the reader did not consult the rate limiter")
+	}
+}

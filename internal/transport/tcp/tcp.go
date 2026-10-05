@@ -170,6 +170,17 @@ const (
 	// 1 MiB bound writes inside it at ~280 kbit/s; honest frames are
 	// hundreds of bytes.
 	DefaultWriteTimeout = 30 * time.Second
+	// DefaultRateLimitPerSec and DefaultRateLimitBurst are the per-connection
+	// frame-rate bound (audit N-6). dispatch serialises every reader behind
+	// one user callback, so pre-fix one flooder could delay honest vote
+	// dispatch on a whole validator (and, over a relay, every member shares
+	// one connection). The limit is a token bucket: a frame over the rate is
+	// DROPPED (not the connection), because consensus tolerates a lost frame
+	// far better than a lost peer. 2000 frames/s per connection is orders of
+	// magnitude above honest traffic (a few frames per block per peer) and
+	// still bounds a flooder's share of the dispatch lock.
+	DefaultRateLimitPerSec = 2000
+	DefaultRateLimitBurst  = 4000
 )
 
 // RelayPeerName returns the registry name a relay-mode connection to addr
@@ -265,6 +276,12 @@ type Options struct {
 	// WriteTimeout is the longest one frame's write may block before the
 	// connection is ended. Default DefaultWriteTimeout.
 	WriteTimeout time.Duration
+	// RateLimitPerSec and RateLimitBurst bound the frames one connection may
+	// deliver per second, as a token bucket; a frame over the rate is
+	// dropped, not the peer. Defaults DefaultRateLimitPerSec and
+	// DefaultRateLimitBurst.
+	RateLimitPerSec int
+	RateLimitBurst  int
 	// Admit authenticates an INBOUND connection before it becomes a peer
 	// (audit N-3/N-7). When non-nil, an accepted connection is held PENDING:
 	// its frames are offered to Admit and, until one is accepted, they are
@@ -317,12 +334,69 @@ func (o Options) withDefaults() Options {
 	if o.WriteTimeout <= 0 {
 		o.WriteTimeout = DefaultWriteTimeout
 	}
+	if o.RateLimitPerSec <= 0 {
+		o.RateLimitPerSec = DefaultRateLimitPerSec
+	}
+	if o.RateLimitBurst <= 0 {
+		o.RateLimitBurst = DefaultRateLimitBurst
+	}
 	if o.Rand == nil {
 		o.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 	return o
 }
 
+// rateLimiter is the per-connection token bucket behind audit N-6: the
+// transport-side bound on how many frames one connection may push through the
+// single dispatch callback. dispatch serialises every reader (the consensus
+// engine is single-threaded), so without it one flooder delays honest vote
+// dispatch for the whole transport - and over a relay every member shares one
+// connection, so a stranger's frames contend with all of them.
+//
+// It is deliberately a DROP, not a disconnect: a frame is cheap to lose
+// (gossip is redundant and the driver ignores Broadcast errors), while a
+// severed honest peer is a liveness loss. The clock is a field so a test can
+// drive refill by a constructed instant instead of sleeping (the project rule:
+// never provoke state through a timing race).
+type rateLimiter struct {
+	mu     sync.Mutex
+	perSec float64
+	burst  float64
+	tokens float64
+	last   time.Time
+	now    func() time.Time
+}
+
+func newRateLimiter(perSec, burst int) *rateLimiter {
+	now := time.Now()
+	return &rateLimiter{
+		perSec: float64(perSec),
+		burst:  float64(burst),
+		tokens: float64(burst),
+		last:   now,
+		now:    time.Now,
+	}
+}
+
+// allow refills the bucket for the time since the last call and admits one
+// frame if a token is available. It never blocks and never allocates.
+func (l *rateLimiter) allow() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if elapsed := now.Sub(l.last); elapsed > 0 {
+		l.tokens += elapsed.Seconds() * l.perSec
+		if l.tokens > l.burst {
+			l.tokens = l.burst
+		}
+		l.last = now
+	}
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens--
+	return true
+}
 
 // conn is one live TCP connection. Its immutable fields (remote, nc, tq,
 // dead) are fixed before the reader and writer goroutines start; mutable
@@ -380,10 +454,14 @@ type conn struct {
 	// release the accept-time slot it holds against MaxConns. Outbound
 	// connections are not capped and release nothing.
 	inbound bool
+	// rl is the per-connection frame-rate bucket (audit N-6).
+	rl *rateLimiter
 	// gated counts frames dropped because the connection was not yet
-	// admitted. An observable for the tests, and the number an operator
-	// would want if a listener is being probed.
-	gated atomic.Uint64
+	// admitted; rateLimited counts frames dropped by rl. Observables for the
+	// tests, and the numbers an operator would want if a listener is being
+	// probed.
+	gated       atomic.Uint64
+	rateLimited atomic.Uint64
 }
 
 // finish tears the connection down exactly once: unblock the maintainer, make
@@ -930,6 +1008,7 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled bool, id transp
 		addr:    addr,
 		dialled: dialled,
 		inbound: !dialled,
+		rl:      newRateLimiter(t.opts.RateLimitPerSec, t.opts.RateLimitBurst),
 	}
 	// Admission (audit N-3): an INBOUND connection is a peer only after the
 	// node's Admit callback has accepted a frame from it. A dialled
@@ -1063,6 +1142,10 @@ func (t *TcpTransport) reader(c *conn) {
 			// begins), so the connection ends. A reconnecting peer redials
 			// through its maintainer; the consensus layer tolerates the loss.
 			break
+		}
+		if !c.rl.allow() {
+			c.rateLimited.Add(1)
+			continue // the frame is consumed, so framing stays intact
 		}
 		if !c.admitted.Load() {
 			if t.opts.Admit == nil || !t.opts.Admit(payload) {
@@ -1254,9 +1337,10 @@ func (t *TcpTransport) Peers() []transport.PeerID {
 func (t *TcpTransport) RefusedConns() uint64 { return t.refusedConns.Load() }
 
 // GatedFrames reports how many frames were dropped because their connection
-// had not passed Options.Admit (audit N-3/N-7). It is a diagnostic: a steady
-// nonzero value on a healthy committee means something is dialing the
-// listener without a committee HELLO.
+// had not passed Options.Admit (audit N-3/N-7); RateLimitedFrames reports the
+// frames the per-connection rate limit dropped (audit N-6). Both are
+// diagnostics: a steady nonzero GatedFrames on a healthy committee means
+// something is dialing the listener without a committee HELLO.
 func (t *TcpTransport) GatedFrames() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1267,6 +1351,16 @@ func (t *TcpTransport) GatedFrames() uint64 {
 	return n
 }
 
+// RateLimitedFrames reports the frames the per-connection rate limit dropped.
+func (t *TcpTransport) RateLimitedFrames() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var n uint64
+	for _, c := range t.conns {
+		n += c.rateLimited.Load()
+	}
+	return n
+}
 
 // Close idempotently shuts the transport down. What it STOPS and WAITS for:
 // the listener, every live connection, and every goroutine that can be blocked
