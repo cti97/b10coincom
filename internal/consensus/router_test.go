@@ -7,6 +7,8 @@ package consensus
 // only as a committee that stopped committing.
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -18,6 +20,57 @@ import (
 	"github.com/cti97/b10coincom/internal/types"
 	"github.com/cti97/b10coincom/internal/wire"
 )
+
+// TestDedupIsConsultedOnlyAfterVerify is audit N-7's ordering proof: the
+// seen-set must record a key only for a message whose signature ALREADY
+// verified. The attack it closes is censorship, not forgery: a stranger who
+// reaches the port sends a frame carrying an honest validator's key and the
+// honest vote's (validator, height, round, type), signed by nobody. If Seen
+// ran before Verify, that frame would record the key and the honest vote -
+// arriving a moment later - would be dropped as a duplicate, so anyone who
+// can reach the port could silence any vote. The test drives exactly that
+// sequence: a forged frame with the honest key's shape, then the honest
+// signed vote with the SAME key, then a genuine duplicate.
+func TestDedupIsConsultedOnlyAfterVerify(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	honest := &Vote{Type: MsgPrevote, Height: 9, Round: 2, Validator: pub}
+	h := honest.SigningHash()
+	honest.Sig = crypto.Sign(priv, h[:])
+
+	// The forgery: the SAME tuple (validator, height, round, type) with a
+	// signature the stranger cannot produce.
+	forged := &Vote{Type: MsgPrevote, Height: 9, Round: 2, Validator: pub, Sig: []byte("forged")}
+
+	r := &MessageRouter{Dedup: transport.NewDedup(0)}
+	if r.Route(transport.Message{From: "stranger", Data: EncodeVote(forged)}) {
+		t.Fatal("a vote with a bad signature was routed as consensus")
+	}
+	if r.Dedup.Has(voteDedupKey(honest)) {
+		t.Fatal("the forged frame pre-seeded the honest vote's dedup key: Seen ran BEFORE Verify")
+	}
+	// The honest vote over the same key must still be delivered.
+	if !r.Route(transport.Message{From: "v1", Data: EncodeVote(honest)}) {
+		t.Fatal("the honest vote was dropped: a forged frame recorded its dedup key (Seen before Verify)")
+	}
+	// And a genuine duplicate is now dropped, which is the dedup working.
+	if r.Route(transport.Message{From: "v1", Data: EncodeVote(honest)}) {
+		t.Fatal("a duplicate honest vote was routed twice")
+	}
+	if got := r.DuplicatesDropped(); got != 1 {
+		t.Fatalf("DuplicatesDropped = %d, want 1", got)
+	}
+	// A proposal's key is its own: the same validator/height/round under the
+	// proposal type must not collide with the prevote key.
+	p := &Proposal{Height: 9, Round: 2, Validator: pub}
+	ph := p.SigningHash()
+	p.Sig = crypto.Sign(priv, ph[:])
+	if !r.Route(transport.Message{From: "v1", Data: EncodeProposal(p)}) {
+		t.Fatal("a proposal collided with a vote's dedup key")
+	}
+}
 
 // TestWireTagsAreDisjointFromConsensusTags pins audit N-5: no wire message
 // tag may equal a consensus message tag, and every wire tag must sit at or

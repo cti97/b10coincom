@@ -76,17 +76,49 @@ type MessageRouter struct {
 	SendReply  func(peer transport.PeerID, frame []byte) error
 	OnHello    func(peer transport.PeerID, h *wire.Hello)
 	AsyncServe func(m transport.Message)
+	// Dedup, when non-nil, is the seen-set for verified consensus messages
+	// (audit N-7). It is consulted STRICTLY AFTER Verify, inside the branch
+	// that already decoded and verified the frame: a key is recorded only for
+	// a message whose signature checked out, so a stranger cannot pre-seed an
+	// honest vote's (validator, height, round, type) key with a forged frame
+	// and have the honest vote dropped. The set is height-sharded and
+	// bounded, so a node that never calls Forget still cannot grow it without
+	// limit.
+	Dedup *transport.Dedup
 
 	unknown   atomic.Uint64
 	hellos    atomic.Uint64
 	servedReq atomic.Uint64
 	filed     atomic.Uint64
+	dups      atomic.Uint64
 }
 
 // NewMessageRouter builds a router with the given server half. The optional
 // callbacks stay nil until the node layer fills them.
 func NewMessageRouter(sync *Syncer) *MessageRouter {
 	return &MessageRouter{Sync: sync}
+}
+
+// voteDedupKey is the dedup key a decoded vote records.
+func voteDedupKey(v *Vote) transport.VoteKey {
+	return transport.VoteKey{
+		Validator: string(v.Validator),
+		Height:    v.Height,
+		Round:     v.Round,
+		Type:      uint8(v.Type),
+	}
+}
+
+// proposalDedupKey is the dedup key a decoded proposal records. Proposals
+// share the seen-set with votes but never collide with them: their Type is
+// MsgProposal (1), which no vote carries (votes are prevote/precommit).
+func proposalDedupKey(p *Proposal) transport.VoteKey {
+	return transport.VoteKey{
+		Validator: string(p.Validator),
+		Height:    p.Height,
+		Round:     p.Round,
+		Type:      uint8(MsgProposal),
+	}
 }
 
 // Route classifies one received frame and dispatches it.
@@ -101,10 +133,22 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 	// fails this branch on its first byte; a forged frame with a consensus tag
 	// can only pass by carrying a signature over a domain-separated hash the
 	// attacker cannot forge.
+	//
+	// Dedup is consulted AFTER Verify, never before (audit N-7): a frame that
+	// fails Verify must not record a key, or a stranger could poison the key
+	// of an honest vote it cannot sign and silence it.
 	if v, err := DecodeVote(m.Data); err == nil && v.Verify() == nil {
+		if r.Dedup != nil && r.Dedup.Seen(voteDedupKey(v)) {
+			r.dups.Add(1)
+			return false
+		}
 		return true
 	}
 	if p, err := DecodeProposal(m.Data); err == nil && p.Verify() == nil {
+		if r.Dedup != nil && r.Dedup.Seen(proposalDedupKey(p)) {
+			r.dups.Add(1)
+			return false
+		}
 		return true
 	}
 	if r.Sync != nil {
@@ -169,6 +213,12 @@ func (r *MessageRouter) NoteServed() { r.servedReq.Add(1) }
 // SyncRepliesFiled reports how many BLOCK_SYNC responses were routed into the
 // local syncer's reply slot.
 func (r *MessageRouter) SyncRepliesFiled() uint64 { return r.filed.Load() }
+
+// DuplicatesDropped reports how many VERIFIED consensus messages were refused
+// because their dedup key had already been recorded. Zero is healthy in the
+// star topology (no loops); a nonzero count means a message arrived twice, as
+// a mesh would produce.
+func (r *MessageRouter) DuplicatesDropped() uint64 { return r.dups.Load() }
 
 // UnknownDropped reports how many frames decoded as nothing. A steady nonzero
 // count on a healthy committee means a peer is speaking a language this node

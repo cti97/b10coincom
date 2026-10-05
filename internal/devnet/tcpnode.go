@@ -191,6 +191,10 @@ type Validator struct {
 	drvTP *driverTP
 	cfgC  consensus.Config
 	drv   *consensus.Driver
+	// dedup is the router's seen-set (audit N-7): the wave loop Forget()s
+	// below the committed height so a long-lived node does not accumulate
+	// keys for every height it ever decided.
+	dedup *transport.Dedup
 
 	// mu serialises every driver operation (see the package-level rules above).
 	mu sync.Mutex
@@ -429,6 +433,12 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	sy := consensus.NewSyncer(ch, tp, priv)
 	rt := consensus.NewMessageRouter(sy)
 	rt.SendReply = tp.Send
+	// The seen-set for VERIFIED consensus messages (audit N-7). The router
+	// consults it strictly after verification, so a forged frame cannot
+	// poison an honest vote's key; the wave loop Forget()s below the committed
+	// height so the set stays bounded, and the set itself is height-sharded.
+	dedup := transport.NewDedup(0)
+	rt.Dedup = dedup
 	// The driver sees the DRIVER transport (sends go straight to tcp; the
 	// OnMessage registration is swallowed into the atomic slot route()
 	// invokes), never the raw transport, or NewDriver's registration would
@@ -453,6 +463,7 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		drvTP: dtp,
 		cfgC:  ccfg,
 		drv:   drv,
+		dedup: dedup,
 		peerH: make(map[string]*peerAttestation),
 		syncQ: make(chan transport.Message, syncQueueDepth),
 		stop:  make(chan struct{}),
@@ -586,7 +597,9 @@ func (v *Validator) tickLoop() {
 }
 
 // waveLoop is the catch-up heartbeat: announce this node's height, then pull
-// from the tallest peer known to be ahead of us.
+// from the tallest peer known to be ahead of us. It also prunes the dedup
+// seen-set below the committed height (audit N-7): Forget is bucket-grained,
+// so this is O(live heights) and the set cannot grow with the run.
 func (v *Validator) waveLoop() {
 	defer v.wg.Done()
 	ticker := time.NewTicker(v.cfg.WaveEvery)
@@ -598,6 +611,9 @@ func (v *Validator) waveLoop() {
 		case <-ticker.C:
 			v.broadcastHello()
 			v.maybeCatchUp()
+			if v.dedup != nil {
+				v.dedup.Forget(v.ch.Height())
+			}
 		}
 	}
 }

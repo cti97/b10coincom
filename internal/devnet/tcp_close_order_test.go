@@ -47,27 +47,34 @@ func TestValidatorCloseOrderingBlocksInFlightDispatchAndRefusesLaterOnes(t *test
 		t.Fatalf("starting the idle validator: %v", err)
 	}
 
-	// One honest prevote, signed by THIS validator's seat key: the frame the
-	// router must verify and classify as consensus (Route() true).
-	vote := &consensus.Vote{
-		Type:      consensus.MsgPrevote,
-		Height:    7,
-		Round:     3,
-		Validator: v.pub,
+	// A signed prevote by THIS validator's seat key: the frame the router must
+	// verify and classify as consensus (Route() true). Each dispatch below
+	// uses a DISTINCT height because the node now installs the dedup seen-set
+	// (audit N-7): re-routing one identical frame would be refused as a
+	// duplicate and never reach the callback this test exists to block, which
+	// would make the close-gate assertions vacuous.
+	probe := func(height uint64) transport.Message {
+		vote := &consensus.Vote{
+			Type:      consensus.MsgPrevote,
+			Height:    height,
+			Round:     3,
+			Validator: v.pub,
+		}
+		sig := vote.SigningHash()
+		vote.Sig = crypto.Sign(v.priv, sig[:])
+		return transport.Message{From: transport.PeerID("close-ordering-probe"), Data: consensus.EncodeVote(vote)}
 	}
-	sig := vote.SigningHash()
-	vote.Sig = crypto.Sign(v.priv, sig[:])
-	msg := transport.Message{From: transport.PeerID("close-ordering-probe"), Data: consensus.EncodeVote(vote)}
+	msg, msg2, msg3 := probe(7), probe(8), probe(9)
 
 	// setDispatch swaps the driver's registered callback for a test one. The
 	// seam is production state (the atomic slot rebuildDriver also swaps), so
 	// a dispatched frame lands somewhere observable.
 	var dispatched atomic.Int32
 	setDispatch := func(fn func(transport.Message)) { v.drvTP.msg.Store(&fn) }
-	runRoute := func() <-chan struct{} {
+	runRoute := func(m transport.Message) <-chan struct{} {
 		done := make(chan struct{})
 		go func() {
-			v.route(msg)
+			v.route(m)
 			close(done)
 		}()
 		return done
@@ -83,7 +90,7 @@ func TestValidatorCloseOrderingBlocksInFlightDispatchAndRefusesLaterOnes(t *test
 
 	// CONTROL: the gate open. The frame must trace check -> router -> dispatch.
 	setDispatch(func(transport.Message) { dispatched.Add(1) })
-	waitRouteDone(runRoute(), "the control dispatch")
+	waitRouteDone(runRoute(msg), "the control dispatch")
 	if dispatched.Load() != 1 {
 		t.Fatalf("control dispatch reached the callback %d times - the probe frame is not passing the router, so the refusal assertions would be vacuous", dispatched.Load())
 	}
@@ -99,7 +106,7 @@ func TestValidatorCloseOrderingBlocksInFlightDispatchAndRefusesLaterOnes(t *test
 		<-release
 		dispatched.Add(1)
 	})
-	go v.route(msg)
+	go v.route(msg2)
 	<-inFlight
 
 	closeErr := make(chan error, 1)
@@ -126,7 +133,7 @@ func TestValidatorCloseOrderingBlocksInFlightDispatchAndRefusesLaterOnes(t *test
 	// refused by the closing gate - never dispatched, and route returns.
 	before := dispatched.Load()
 	setDispatch(func(transport.Message) { dispatched.Add(1) })
-	waitRouteDone(runRoute(), "the post-Close dispatch")
+	waitRouteDone(runRoute(msg3), "the post-Close dispatch")
 	if got := dispatched.Load(); got != before {
 		t.Fatalf("a dispatch ran AFTER Close (%d -> %d at the callback) - the closing gate is gone and the chain was already closed", before, got)
 	}
