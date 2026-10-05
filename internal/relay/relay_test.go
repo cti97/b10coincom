@@ -352,6 +352,16 @@ func TestRelayForwardsFramesItCannotParse(t *testing.T) {
 // total in-flight volume, so no queue here can ever fill - a budget ≥ the
 // in-flight bytes drops nothing BY CONSTRUCTION, on every host and under
 // any schedule - and the counters pin that premise at the end.
+//
+// The construction also FORCES the contention the fair share is about, so
+// the premise is not merely asserted: A and C dial from 127.0.0.1 and B from
+// ::1, so every receiver's queue sees TWO registered sender accounts (the
+// idle sibling in its own prefix and B) while only ONE of them - B - ever
+// sends. The flat division the share used to be (shareFor == limit/2 here)
+// would cap B at half the queue and drop half the flood, host-independently;
+// the contention-relative allowance gives B the whole queue because no other
+// account holds a byte. Reverting push to `shareFor` makes the premise check
+// below fail deterministically, which is the point of the construction.
 func TestRelayASlowPeerDoesNotStallTheOtherPeers(t *testing.T) {
 	// Both numbers are this test's own constants, coupled on purpose. The
 	// volume carries no threshold and no wedge - the frame count is small
@@ -364,13 +374,19 @@ func TestRelayASlowPeerDoesNotStallTheOtherPeers(t *testing.T) {
 		queueBytesBound = frames * frameSize // budget ≥ in-flight: no queue can fill here
 	)
 
-	r := startRelay(t, Options{MaxFrameBytes: 4096, MaxConns: 64, MaxConnsPerIP: 64, WriteQueueBytes: queueBytesBound})
+	r := New(Options{MaxFrameBytes: 4096, MaxConns: 64, MaxConnsPerIP: 64, WriteQueueBytes: queueBytesBound})
+	// Dual-stack, so the two source PREFIXES the construction needs (127.0.0.0/24
+	// and ::/64) reach one listener; the per-prefix cap test listens the same way.
+	if err := r.Listen("[::]:0"); err != nil {
+		t.Fatalf("relay listen on [::]:0: %v", err)
+	}
+	t.Cleanup(r.Close)
 	// A reads nothing for the whole test. Whether its silent socket ever
 	// backs the relay up is a host matter this test does not observe. (The
 	// dial's own t.Cleanup closes A's end.)
-	dial(t, r.Addr().String())
-	b := dial(t, r.Addr().String())
-	c := dial(t, r.Addr().String())
+	dialFrom(t, r.Addr().String(), "127.0.0.1") // A: the silent peer, C's prefix sibling
+	b := dialFrom(t, r.Addr().String(), "::1")  // B: the one sender, a different account
+	c := dialFrom(t, r.Addr().String(), "127.0.0.1")
 	waitRegistered(t, r, 3, "a dial completed while its connection sat unregistered")
 
 	got := make([]int, 0, frames)
@@ -920,30 +936,34 @@ func TestRelayAWedgedPeerDoesNotDelayTheSenders(t *testing.T) {
 // fully deterministic - NO socket, NO flood, every state built by hand:
 //
 //   - the receiver's queue has a 300-byte budget and TWO contending sender
-//     accounts, so its capacity-relative share is 300/2 = 150 bytes
-//     (shareFor(2), MaxFrameBytes set at 32 so the floor is the fraction);
-//   - the flooder's first 100-byte frame is ADMITTED (it fits its share);
-//     its second is REFUSED at the share (100+100 > 150) - a flooder that is
-//     sharing the queue can never fill it, which is the property;
-//   - the honest sender's 100-byte frame is then admitted into the space
-//     the share guaranteed - under a mutant that drops the share check, the
-//     flooder's frames keep flowing until the BUDGET is full, the honest
-//     frame drops at the budget, and the test fails on exactly that
-//     admission with the counters naming who was refused;
-//   - the share refunds on pop: after the flooder's frame is taken out, the
-//     flooder can enqueue again - the share caps what a sender HOLDS, not
-//     what it has ever sent.
+//     accounts, so the equal-division allowance is 300/2 = 150 bytes
+//     (shareFor(2); MaxFrameBytes set at 32 so the floor is the fraction);
+//   - the HONEST sender queues its 150 bytes (three 50-byte frames) FIRST,
+//     through the real fan-out. It is admitted because no other account holds
+//     anything yet: the allowance is the whole budget while the queue is
+//     uncontended;
+//   - the flooder then queues its own 150 bytes by direct push. Once the
+//     honest sender holds its share the queue is contended, so the flooder's
+//     allowance is its equal 150, and its next 50-byte frame is REFUSED
+//     (150+50 > 150) - a flooder sharing the queue can never hold more than
+//     its share, which is the property this test exists for;
+//   - THE property: the honest sender's 150 bytes survive the flood intact
+//     and pop out in FIFO order ahead of the flooder's;
+//   - the allowance refunds on pop: after the popped frames the flooder can
+//     enqueue again - the share caps what a sender HOLDS, not what it has
+//     ever sent.
 //
-// The 2-account contention is supplied explicitly (the pushes below pass the
-// divisor the relay's fan-out computes from the registry) because these
-// queues are hand-built with no relay fan-out behind them. A single
-// UNCONTENDED sender is the other half of the invariant, and it is not
-// throttled: TestRelayASingleSenderMayUseTheWholeQueue constructs exactly
-// that state, and the socket-level TestRelayASlowPeerDoesNotStallTheOtherPeers
-// exercises it through the real reader, queue and writer machinery.
+// The contention is CONSTRUCTED, not waited for: the honest sender holds its
+// share before the flood begins, so the flooder's cap comes from queued
+// bytes, never from a kernel buffer or a schedule. The divisor is the same
+// sendersFor the relay's fan-out computes from this registry (the flooder and
+// the voter are two distinct accounts). A single UNCONTENDED sender is the
+// other half of the invariant and is not throttled:
+// TestRelayASingleSenderMayUseTheWholeQueue, TestRelayASingleSenderAmongIdlePeers,
+// and the socket-level TestRelayASlowPeerDoesNotStallTheOtherPeers.
 func TestRelayPerSenderShareStopsAFloodFromCensoring(t *testing.T) {
 	const (
-		frameBytes = 100
+		frameBytes = 50
 		queueBytes = 300
 		// senders is the contending-account count the relay would derive for
 		// this registry: the flooder and the voter are two distinct accounts.
@@ -962,50 +982,60 @@ func TestRelayPerSenderShareStopsAFloodFromCensoring(t *testing.T) {
 	r.mu.Unlock()
 
 	frame := make([]byte, frameBytes)
-	vote := []byte("the honest vote")
-	// The flooder's first frame goes through the REAL fan-out: admitted
-	// (100 <= its 150-byte share) into the wedged receiver's queue. Note the
-	// voter is ALSO a non-sender of this frame: the flood reaches it too -
-	// flooders are not special, the share binds every sender identically.
-	r.forward(flooder, frame)
-	if st := r.Stats(); st.Forwarded != 2 || st.Dropped != 0 {
-		t.Fatalf("after the flooder's first frame the counters read Forwarded=%d/Dropped=%d, want 2/0 - the fan-out path lost an admission", st.Forwarded, st.Dropped)
+	vote := make([]byte, frameBytes)
+	for i := range vote {
+		vote[i] = 'v'
 	}
-	if wedged.q.bytes != frameBytes || wedged.q.occupancy(flooder) != frameBytes {
-		t.Fatalf("the flooder's occupancy of the wedged queue reads %d/%d - the first admission never landed", wedged.q.bytes, wedged.q.occupancy(flooder))
+	// The honest sender's whole share, through the REAL fan-out: the relay
+	// must admit it while no other account is queueing. (The flooder is also
+	// a non-sender of these frames; the flood reaches it too - flooders are
+	// not special, the share binds every sender identically.)
+	honestFrames := shareBytes / frameBytes
+	for i := 0; i < honestFrames; i++ {
+		r.forward(voter, vote)
 	}
-	// Its second: refused at the SHARE (100+100 > 150) - a flooder sharing the
-	// queue can never fill the budget, which is the property this test exists
-	// for.
+	if got := wedged.q.occupancy(voter); got != shareBytes {
+		t.Fatalf("the honest sender holds %d bytes after %d x %d-byte forwards, want its whole %d-byte share - the uncontended admission the share must never take away", got, honestFrames, frameBytes, shareBytes)
+	}
+	if st := r.Stats(); st.Forwarded != uint64(2*honestFrames) || st.Dropped != 0 {
+		t.Fatalf("after the honest sender's share the counters read Forwarded=%d/Dropped=%d, want %d/0 - the fan-out path lost an admission", st.Forwarded, st.Dropped, 2*honestFrames)
+	}
+	// The flooder may hold exactly its own share, no more: the honest
+	// sender's queued bytes are the contention the cap is measured against.
+	for i := 0; i < honestFrames; i++ {
+		if !wedged.q.push(flooder, frame, senders) {
+			t.Fatalf("the flooder's frame %d was refused while it held only %d of its %d-byte share (queue %d/%d bytes) - the allowance bit before the share did", i, wedged.q.occupancy(flooder), shareBytes, wedged.q.bytes, queueBytes)
+		}
+	}
 	if wedged.q.push(flooder, frame, senders) {
-		t.Fatalf("the flooder's second frame was admitted (queue %d bytes, flooder share %d): the share holds nothing, so the flood's own frames would fill the queue and the honest frame below would drop with them", wedged.q.bytes, wedged.q.occupancy(flooder))
+		t.Fatalf("the flooder's frame past its %d-byte share was admitted (queue %d bytes, flooder %d) - the flood's own frames would fill the queue and the honest sender would drop with them", shareBytes, wedged.q.bytes, wedged.q.occupancy(flooder))
 	}
-	// THE property: the honest sender's frame is ADMITTED into the space the
-	// share guarantees - under a mutant that drops the share check, the
-	// flooder's frames flow until the 300-byte BUDGET is full and this push
-	// is the one that drops, named by the message.
-	if !wedged.q.push(voter, vote, senders) {
-		t.Fatalf("the honest sender's frame was refused with the flooder holding only %d of its %d-byte share (queue %d/%d bytes) - one sender's flood censored another sender's frame",
-			wedged.q.occupancy(flooder), shareBytes, wedged.q.bytes, queueBytes)
+	// THE property: the honest sender's share survived the flood intact.
+	if got := wedged.q.occupancy(voter); got != shareBytes {
+		t.Fatalf("after the flood the honest sender holds %d bytes, want its whole %d-byte share - one sender's flood censored another sender's queue", got, shareBytes)
 	}
-	// Order: flooder's frame first, honest second - FIFO per (sender,
-	// receiver); the share is keyed by sender conn, so the pops name them.
-	f, ok := wedged.q.pop()
-	if !ok || f.sender != flooder {
-		t.Fatalf("the first pop is from %p (present %v), want the flooder's conn - FIFO per pair broken", f.sender, ok)
+	// FIFO per (sender, receiver): the honest sender's frames come out first,
+	// in order, then the flooder's - the share is keyed by sender account, so
+	// the pops name them.
+	for i := 0; i < honestFrames; i++ {
+		f, ok := wedged.q.pop()
+		if !ok || f.sender != voter || string(f.b) != string(vote) {
+			t.Fatalf("pop %d is %q from %p (present %v), want the honest frame - the flood was interleaved into the honest sender's share", i, f.b, f.sender, ok)
+		}
 	}
-	f, ok = wedged.q.pop()
-	if !ok || f.sender != voter || string(f.b) != string(vote) {
-		t.Fatalf("the second pop is %q from %p (present %v), want the honest frame - it was admitted into the wrong place or not at all", f.b, f.sender, ok)
+	for i := 0; i < honestFrames; i++ {
+		if f, ok := wedged.q.pop(); !ok || f.sender != flooder {
+			t.Fatalf("pop %d after the honest frames is from %p (present %v), want the flooder's - the flood's order broke", i, f.sender, ok)
+		}
 	}
-	// The refunds: after both pops the budget and the flooder's share are
-	// fully free, so the flooder can enqueue again - the share caps what a
-	// sender HOLDS, never what it has sent in its life.
-	if wedged.q.bytes != 0 || wedged.q.occupancy(flooder) != 0 {
-		t.Fatalf("after draining, the queue holds %d bytes and the flooder's occupancy is %d - the pop refund leaked", wedged.q.bytes, wedged.q.occupancy(flooder))
+	// The refunds: after draining, every occupancy and the budget are free,
+	// so the flooder can enqueue again - the share caps what a sender HOLDS,
+	// never what it has sent in its life.
+	if wedged.q.bytes != 0 || wedged.q.occupancy(flooder) != 0 || wedged.q.occupancy(voter) != 0 {
+		t.Fatalf("after draining, the queue holds %d bytes with occupancies flooder=%d voter=%d - the pop refund leaked", wedged.q.bytes, wedged.q.occupancy(flooder), wedged.q.occupancy(voter))
 	}
 	if !wedged.q.push(flooder, frame, senders) {
-		t.Fatalf("the flooder's frame after a full drain was refused - the share did not refund its popped occupancy")
+		t.Fatalf("the flooder's frame after a full drain was refused - the allowance did not refund its popped occupancy")
 	}
 }
 
@@ -1056,6 +1086,56 @@ func TestRelayASingleSenderMayUseTheWholeQueue(t *testing.T) {
 	}
 	if st := r.Stats(); st.Forwarded != frames || st.Dropped != 0 {
 		t.Fatalf("a single uncontended sender read Forwarded=%d/Dropped=%d, want %d/0 - the share throttled a healthy flow (the defect two earlier attempts shipped)", st.Forwarded, st.Dropped, frames)
+	}
+}
+
+// The SAME lone-sender invariant, but with the divisor a flat division would
+// have made fatal: TWO registered sender accounts (a peer that dialled and
+// never sent, plus the sender) and only one of them sending. The relay's
+// fan-out derives sendersFor == 2 for the receiver, so shareFor is half the
+// queue - but the idle peer holds zero bytes, so the queue is uncontended and
+// the lone sender's allowance is the whole budget. The
+// premise is pinned: sendersFor is 2 and shareFor is half the queue, so a push
+// capped at shareFor (the flat division this replaces) refuses frame 65 of
+// 128 and this test names it.
+func TestRelayASingleSenderAmongIdlePeersUsesTheWholeQueue(t *testing.T) {
+	const (
+		frames    = 128
+		frameSize = 256
+		limit     = frames * frameSize // capacity == in-flight, by construction
+	)
+	r := New(Options{MaxFrameBytes: frameSize, MaxConns: 8, MaxConnsPerIP: 8, WriteQueueBytes: limit})
+	sender := &conn{q: newSendQ(limit, frameSize, frames), dead: make(chan struct{}), srcGroup: "198.51.100.0/24"}
+	idle := &conn{q: newSendQ(limit, frameSize, frames), dead: make(chan struct{}), srcGroup: "203.0.113.0/24"}
+	wedged := &conn{q: newSendQ(limit, frameSize, frames), dead: make(chan struct{}), srcGroup: "192.0.2.0/24"}
+	r.mu.Lock()
+	for _, c := range []*conn{sender, idle, wedged} {
+		r.conns[c] = struct{}{}
+	}
+	r.mu.Unlock()
+
+	// The premise: the registered-but-silent peer is counted, so the flat
+	// division really would be a half-queue cap.
+	accounts := make(map[shareAccount]int, 3)
+	for c := range r.conns {
+		accounts[shareAccountOf(c)]++
+	}
+	if got := sendersFor(wedged, accounts); got != 2 {
+		t.Fatalf("sendersFor(wedged) = %d for two registered sender accounts, want 2 - the idle-peer contention the test needs never formed", got)
+	}
+	if got := wedged.q.shareFor(2); got != limit/2 {
+		t.Fatalf("shareFor(2) = %d, want the half-queue flat division %d - the test no longer pins what it replaces", got, limit/2)
+	}
+
+	frame := make([]byte, frameSize)
+	for i := 0; i < frames; i++ {
+		r.forward(sender, frame)
+	}
+	if got := wedged.q.bytes; got != limit {
+		t.Fatalf("after %d frames of %d bytes the queue holds %d of its %d-byte capacity - the lone sender was capped at the flat share of an idle peer (frame %d of %d refused)", frames, frameSize, got, limit, got/frameSize+1, frames)
+	}
+	if st := r.Stats(); st.Forwarded != 2*frames || st.Dropped != 0 {
+		t.Fatalf("a lone sender among idle registered peers read Forwarded=%d/Dropped=%d, want %d/0 - the flat division throttled the flow while no other account held a byte", st.Forwarded, st.Dropped, 2*frames)
 	}
 }
 
@@ -1470,19 +1550,25 @@ func TestRelayAFrameCapBoundsTheQueueEntries(t *testing.T) {
 // group, so the second connection of one host lands in the same account as
 // the first and cannot open a fresh share. The construction is fully
 // deterministic and socket-free - the sender groups are set on hand-built
-// connections - so no host's notion of "same IP" gets a vote. Under the
-// mutant that keys the share on the connection, the second attacker frame is
-// admitted, the queue reaches the byte budget, and the honest sender's frame
-// is refused: the exact censorship the share exists to prevent.
+// connections - so no host's notion of "same IP" gets a vote.
+//
+// The contention is CONSTRUCTED: the honest sender queues its whole 150-byte
+// share FIRST, so the two attacker connections are measured against a queue
+// that already holds another account's bytes. The first attacker connection
+// may then hold its own 150-byte share; the second connection of the SAME
+// group is REFUSED, because the group already holds its share, and the
+// honest sender's 150 bytes are untouched. That is the censorship the share
+// exists to prevent: a host cannot use two sockets to buy itself two shares
+// and crowd out a third party.
 //
 // The divisor is not written by hand: it is the SAME sendersFor the relay's
-// fan-out calls, applied to this test's registry, so the share is charged
+// fan-out calls, applied to this test's registry, so the allowance is charged
 // exactly the contending-account count the real path would derive (the two
 // attacker connections are ONE account and the honest sender a second).
 func TestRelayTwoConnectionsFromOneHostCannotSplitTheShare(t *testing.T) {
 	const (
-		frameBytes    = 100
-		queueBytes    = 250
+		frameBytes    = 50
+		queueBytes    = 300
 		maxFrameBound = 32
 	)
 	newConn := func(group string) *conn {
@@ -1504,23 +1590,43 @@ func TestRelayTwoConnectionsFromOneHostCannotSplitTheShare(t *testing.T) {
 	if senders != 2 {
 		t.Fatalf("sendersFor(wedged) = %d for this registry, want 2 - the constructed contention never formed", senders)
 	}
-	shareBytes := wedged.q.shareFor(senders) // 250/2 = 125
+	shareBytes := wedged.q.shareFor(senders) // 300/2 = 150
+	shareFrames := shareBytes / frameBytes
 
 	frame := make([]byte, frameBytes)
-	if !wedged.q.push(attacker1, frame, senders) {
-		t.Fatalf("the first attacker frame was refused with the queue empty (budget %d, share %d) - the test's premise never formed", queueBytes, shareBytes)
+	// The honest sender's share lands first, while it is the only account
+	// holding anything: uncontended, it is not throttled below the queue.
+	for i := 0; i < shareFrames; i++ {
+		if !wedged.q.push(honest, frame, senders) {
+			t.Fatalf("the honest sender's frame %d was refused with the queue at %d/%d bytes - the honest share never formed", i, wedged.q.bytes, queueBytes)
+		}
 	}
+	// One attacker CONNECTION may hold its own share.
+	for i := 0; i < shareFrames; i++ {
+		if !wedged.q.push(attacker1, frame, senders) {
+			t.Fatalf("the first attacker frame %d was refused while its group held only %d of its %d-byte share (queue %d/%d bytes)", i, wedged.q.occupancy(attacker1), shareBytes, wedged.q.bytes, queueBytes)
+		}
+	}
+	// The second connection of the SAME host: refused, because the group
+	// already holds its one share.
 	if wedged.q.push(attacker2, frame, senders) {
-		t.Fatalf("a second connection from the SAME host was admitted on its own share (queue %d bytes, attacker1 %d): two attacker connections split a receiver's budget between them", wedged.q.bytes, wedged.q.occupancy(attacker1))
+		t.Fatalf("a second connection from the SAME host was admitted on its own share (queue %d bytes, attacker group %d): two attacker connections split a receiver's budget between them", wedged.q.bytes, wedged.q.occupancy(attacker1))
 	}
-	if !wedged.q.push(honest, frame, senders) {
-		t.Fatalf("the honest sender's frame was refused with the attackers holding only %d of %d bytes (share %d) - two connections from one host censored another sender", wedged.q.bytes, queueBytes, shareBytes)
+	// The honest sender's share survived both attacker connections intact.
+	if got := wedged.q.occupancy(honest); got != shareBytes {
+		t.Fatalf("after both attacker connections the honest sender holds %d bytes, want its whole %d-byte share - two connections from one host censored another sender", got, shareBytes)
 	}
 	// The refused connection's account is the SAME account as the first
-	// attacker's (one host, one share), and it holds only the first frame:
-	// the second was refused cleanly, charged nothing and enqueued nothing.
-	if got := wedged.q.occupancy(attacker2); got != frameBytes {
-		t.Fatalf("after the refusal the shared sender account holds %d bytes, want only the first attacker's %d - the refused frame was charged anyway", got, frameBytes)
+	// attacker's (one host, one share), and it holds only the first
+	// connection's frames: the second was refused cleanly, charged nothing
+	// and enqueued nothing. Under a mutant that keys the account on the
+	// CONNECTION, this reads 0 (the sibling has its own, empty account) and
+	// the two sockets have split one host's share.
+	if got := wedged.q.occupancy(attacker2); got != shareBytes {
+		t.Fatalf("the sibling connection's account holds %d bytes, want the first connection's %d - the two connections did not share one account (one host, one share)", got, shareBytes)
+	}
+	if wedged.q.bytes != queueBytes {
+		t.Fatalf("the queue holds %d bytes after two shares were admitted, want its %d-byte budget exactly", wedged.q.bytes, queueBytes)
 	}
 }
 

@@ -308,13 +308,24 @@ rotate addresses past the cap); every connection buffers at most a bounded
 (`--write-queue-frames`, because a byte budget cannot bound the queue's
 per-frame entry memory when the smallest legal frame is one byte), so a peer
 that stops reading cannot stall the relay for the others (dropped frames,
-never a blocked forwarder) and cannot occupy more than its fair share of
-another connection's queue — a share of the **receiver's own queue capacity**
-divided among the sender accounts contending for it, so one uncontended sender
-may use the whole queue and loses nothing while the receiver has room, while
-the share bounds any single sender to `limit/senders` of a receiver's queue, so one host is capped at half of it at the shipped defaults; note that the per-frame floor means the equal-division reservation only binds below three sender accounts, so three or more accounts can still fill a queue between them. The share is keyed on the
+never a blocked forwarder) and cannot occupy more than its allowance of
+another connection's queue — the allowance is the sender's equal share of the
+**receiver's own queue capacity** (`limit/senders`, over the sender accounts
+registered for it) once another account is actually holding bytes, and the
+**whole budget** while none is. A lone sender — even among registered peers
+that are not sending — therefore uses the whole queue and loses nothing while
+the receiver has room; a sender that is actually sharing the queue is held to
+its equal share, and its allowance is never below `limit/senders`, so a host
+that queues frames cannot crowd another account below that share, nor displace
+bytes that account already holds (queued bytes are only removed by that
+receiver's writer). The share is keyed on the
 **sender's source group**, not the connection, so two connections from one host
-cannot split a receiver's budget between them; and two socket-level timers
+share one account and cannot split a receiver's budget between them. The
+residual is stated rather than glossed: a flooder that fills the queue
+*before* another sender has queued anything can still occupy all of it, and
+that late sender's frames drop until the backlog drains; a receiver too slow
+to drain it is ended by the write timeout below, which is what bounds the pin.
+And two socket-level timers
 bound how long a connection may *hold* what it has taken — nothing is parsed to
 enforce them. The per-frame read timeout (`--read-timeout`, default 120
 seconds) is armed before each frame's 4-byte header and refreshed at every
@@ -361,7 +372,7 @@ relay with exponential backoff. Bandwidth is kilobytes per second.
 | `--max-frame-bytes N` | `1048576` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic) |
 | `--max-conns N` | `32` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
 | `--max-conns-per-ip N` | `8` | how many of those slots one source **prefix** may hold — the IPv6 `/64` or IPv4 `/24`, IPv4-mapped IPv6 unmapped, masked — so a routed prefix cannot bypass the cap by rotating addresses; a dial from a prefix at its cap is closed at accept |
-| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than its capacity-relative fair share — the queue budget divided among the sender accounts contending for it, so one uncontended sender may use the whole budget and two connections from one host share one account |
+| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than its contention-relative allowance — its equal share of the queue budget (`limit/senders`) once another account holds bytes there, and the whole budget while none does, so a lone sender uses the whole budget, a sharing sender is held to its share, and two connections from one host share one account. Residual: a flooder that fills the queue before another sender queues anything can occupy all of it until the write timeout reaps a slow receiver |
 | `--write-queue-frames N` | `4096` | per-connection write-queue bound in **frames**: the entry ring, so the queue's per-frame memory is structural (a byte budget alone admits ~2 million one-byte entries). Counted into `relay.Options.MaxPinnedBytes` at 32 bytes each |
 | `--write-timeout SECONDS` | `30` | per-connection write deadline, anchored to when the queue became non-empty: the backlog must drain to empty within it, so a never-reading sink **and** a slow-reading one are ended and their queued bytes and entry ring released |
 | `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |

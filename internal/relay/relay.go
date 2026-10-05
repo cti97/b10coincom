@@ -452,12 +452,19 @@ func shareAccountOf(c *conn) shareAccount {
 // sendQ is the bounded write queue: a FIFO of frames whose TOTAL queued
 // payload bytes never exceed limit AND whose entry count never exceeds
 // maxFrames, and in which no single SENDER (shareAccount - a source group,
-// not a connection) ever occupies more than its share of the bytes (audit
+// not a connection) ever occupies more than its allowance of the bytes (audit
 // N-2: byte-bounded queues, per-frame entry bound, per-sender fair share).
-// The share is capacity-relative, not an absolute in-flight budget: it is the
-// queue's OWN limit divided among the sender accounts contending for it
-// (shareFor), so a queue with one sender admits up to its whole budget, and
-// the cap bites only where the queue's room is actually shared.
+// The allowance is contention-relative, not a flat division: while no OTHER
+// account holds a byte the sender may use the whole budget, and once another
+// account is holding bytes the sender is held to its equal share of the
+// queue's OWN limit (shareFor). A queue with one sender therefore admits up to
+// its whole budget and loses nothing while the receiver has room; the equal
+// share reserves room for the other registered senders only once the queue is
+// really shared, which is the crowding-out the share exists to stop. What this
+// does NOT bound is a flooder that fills the queue before another sender has
+// queued anything: that sender's first frames drop until the backlog drains,
+// and a receiver too slow to drain it is ended by the WriteTimeout reaper (see
+// writer).
 //
 // The queue is a fixed ring of maxFrames entries allocated once at accept, so
 // its entry memory is exactly maxFrames x queuedFrameEntryBytes - the term a
@@ -511,20 +518,22 @@ func newSendQ(limit, maxFrameBytes, maxFrames int) *sendQ {
 	}
 }
 
-// shareFor returns the most queued payload bytes one sender account may hold
-// in this queue when `senders` distinct accounts can contend for it: an equal
-// fraction (1/senders) of the queue's OWN byte capacity, floored at one
-// maximum frame so a legitimate largest frame always has room even when the
-// division would round it below a frame, and never above the queue's own
-// budget.
+// shareFor returns the allowance one sender account is held to when
+// `senders` distinct accounts can contend for this queue: an equal fraction
+// (1/senders) of the queue's OWN byte capacity, floored at one maximum frame
+// so a legitimate largest frame always has room even when the division would
+// round it below a frame, and never above the queue's own budget. push applies
+// this only once another account is actually holding bytes; while none is, the
+// lone sender's allowance is the whole budget, so a sender is not throttled by
+// peers that are registered but not queueing.
 //
 // Dividing the receiver's capacity - rather than capping a sender at a fixed
 // in-flight number - is what keeps the share from throttling a healthy flow:
 // with one sender the fraction is the whole budget, so a sender loses nothing
 // while the receiver has room; the fraction bites only where two or more
-// sender accounts actually share that room, which is the contention the share
-// exists to bound. It still parses nothing: the count is endpoint identities,
-// not payload.
+// sender accounts actually hold bytes in that room, which is the contention
+// the share exists to bound. It still parses nothing: the count is endpoint
+// identities, not payload.
 func (s *sendQ) shareFor(senders int) int {
 	if senders < 1 {
 		senders = 1
@@ -540,21 +549,35 @@ func (s *sendQ) shareFor(senders int) int {
 }
 
 // push admits one frame from sender if it fits in the byte budget, in the
-// frame-count bound, AND in the sender's share of the bytes - where the share
-// is `senders`' equal fraction of the queue's own capacity (shareFor), passed
-// in by the fan-out that knows the receiver's contending sender accounts. It
-// never blocks: an admitted frame is placed in the ring and (only on the
-// empty-to-non-empty transition) signalled; a refused frame costs a boolean,
-// which is what keeps a wedged receiver from stalling the sender's forwarding
-// path.
+// frame-count bound, AND in the sender's contention-relative allowance of the
+// bytes. The allowance is the sender's equal share (shareFor, over the
+// `senders` the fan-out derived from the registry) once another account is
+// actually holding bytes in this queue, and the whole budget while none is -
+// so a lone sender among registered-but-idle peers gets the whole queue, and
+// the share reserves room for the other registered senders only once the
+// queue is really shared. (The naive "max(share, limit - bytesByOthers)" is
+// NOT used: since the byte budget already caps the total at limit, that bound
+// reduces to "whatever room others are not holding", and the share never
+// binds at all.) It never blocks: an admitted frame is placed in the ring and
+// (only on the empty-to-non-empty transition) signalled; a refused frame
+// costs a boolean, which is what keeps a wedged receiver from stalling the
+// sender's forwarding path.
 func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 	acct := shareAccountOf(sender)
 	share := s.shareFor(senders)
 	s.mu.Lock()
+	// Actual contention is the bytes another account is holding in this
+	// queue. While there are none, the one sender using the queue may take
+	// the whole budget; the equal share is what it is held to only once the
+	// queue is really shared.
+	allow := share
+	if s.bytes-s.from[acct] == 0 {
+		allow = s.limit
+	}
 	ok := len(b) <= s.limit &&
 		s.bytes+len(b) <= s.limit &&
 		s.n < s.maxFrames &&
-		s.from[acct]+len(b) <= share
+		s.from[acct]+len(b) <= allow
 	if ok {
 		if s.n == 0 {
 			s.oldest = time.Now()
