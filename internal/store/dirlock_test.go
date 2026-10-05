@@ -367,3 +367,54 @@ func TestStaleRecoveryRefusesToRemoveALockThatBecameLive(t *testing.T) {
 		t.Fatalf("the break mutex was not released after refusing to remove a live lock: %v", err)
 	}
 }
+
+// A breaker SIGKILLed inside its critical section leaves LOCK.break behind.
+// That marker is the one artifact this package refuses to delete, because
+// remove-after-read of a marker is how two recoverers could each destroy the
+// other's fresh lock. The recovery path is therefore operator-mediated: Open
+// must fail with a message naming the marker (and the stale LOCK), must not
+// touch it, and must recover once the operator removes it.
+func TestCrashedRecoveryMarkerIsReportedForOperatorRemoval(t *testing.T) {
+	dir := t.TempDir()
+	dead := deadChildPid(t)
+	if processAlive(dead) {
+		t.Fatalf("test setup: pid %d is alive; the marker would not be a crash artifact", dead)
+	}
+	lockPath := filepath.Join(dir, lockFileName)
+	breakPath := filepath.Join(dir, breakFileName)
+	marker := fmt.Sprintf("%s\npid %d\nproc 00112233445566778899aabbccddeeff\n", lockFileMagic, dead)
+	if err := os.WriteFile(lockPath, []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(breakPath, []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Open(dir)
+	if err == nil {
+		t.Fatal("a crashed recovery marker was silently cleared: Open succeeded, and a second recoverer could have raced it")
+	}
+	if !strings.Contains(err.Error(), breakPath) {
+		t.Fatalf("the refusal does not name the marker %q: %v", breakPath, err)
+	}
+	if !strings.Contains(err.Error(), lockPath) {
+		t.Fatalf("the refusal does not name the stale lock %q: %v", lockPath, err)
+	}
+	if _, err := os.Stat(breakPath); err != nil {
+		t.Fatalf("the refusal removed the marker anyway: %v", err)
+	}
+
+	// Operator recovery: remove the marker; the stale LOCK is then broken
+	// automatically and the directory opens and accepts writes.
+	if err := os.Remove(breakPath); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("after removing the marker the directory must recover: %v", err)
+	}
+	defer s.Close()
+	if err := s.Append(1, []byte("recovered")); err != nil {
+		t.Fatalf("the recovered store cannot write: %v", err)
+	}
+}

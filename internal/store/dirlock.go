@@ -29,8 +29,11 @@
 //     second link-created file, LOCK.break. The breaker re-reads LOCK while
 //     holding that mutex and refuses to remove a lock that has meanwhile
 //     become live: recovery must never delete the winner another process
-//     just installed. A break mutex left by a crash carries a PID too, and
-//     is cleared by the same liveness rule.
+//     just installed. A break mutex left by a SIGKILL is NOT auto-cleared:
+//     only the process that created a marker may unlink it, because
+//     remove-after-read of a marker is precisely how two recoverers could
+//     each destroy the other's fresh lock. It is reported for operator
+//     removal instead.
 //   - The lock is NOT re-entrant, within a process or across processes: two
 //     *Store handles on one directory would interleave exactly as two
 //     processes would, so a second Open is refused and told why. Close
@@ -42,6 +45,11 @@
 //     process, its stale lock looks live and Open refuses until an operator
 //     removes <dir>/LOCK. This implementation catches the one reuse it can
 //     see (the PID is ours but the token is not) and documents the rest.
+//   - A breaker SIGKILLed inside its tiny recovery critical section. Its
+//     <dir>/LOCK.break is left behind and the next recovery refuses with a
+//     message naming both files for the operator to remove. This is the one
+//     automatic-recovery gap, and it is deliberate: silently deleting a
+//     marker is the only way two recoverers could both become writers.
 //   - A filesystem without hard links (some FAT/exFAT volumes, some network
 //     filesystems). os.Link fails there and Open fails loudly rather than
 //     running unsynchronised.
@@ -281,24 +289,49 @@ func breakStaleLock(dir, path, token string) error {
 		if !errors.Is(linkErr, fs.ErrExist) {
 			return fmt.Errorf("store: taking the stale-lock break mutex %s: %w", breakPath, linkErr)
 		}
-		if h, ok := readLockHolder(breakPath); ok {
-			if h.pid == os.Getpid() && h.token == token {
-				// A previous break of ours leaked the mutex (its remove
-				// failed mid-way); dirLockMu means no sibling of ours can
-				// hold it, so we may take it over and finish.
-				return removeStaleUnderBreakMutex(path, breakPath, token)
-			}
-			if h.pid != os.Getpid() && processAlive(h.pid) {
-				time.Sleep(lockBreakWait)
+		h, ok := readLockHolder(breakPath)
+		if !ok {
+			// The holder released it between our link and our read: retry.
+			if _, statErr := os.Stat(breakPath); errors.Is(statErr, fs.ErrNotExist) {
 				continue
 			}
+			// Present but not one of ours: a foreign or corrupt marker. Do
+			// not remove it - see below.
+			return staleMarkerError(dir, path, breakPath, 0)
 		}
-		// The mutex holder is dead, is us, or is unreadable: clear it and
-		// retry.
-		_ = os.Remove(breakPath)
+		if h.pid == os.Getpid() && h.token == token {
+			// A previous break of ours leaked the mutex (its remove failed
+			// mid-way); dirLockMu means no sibling of ours can hold it, so
+			// we may take it over and finish.
+			return removeStaleUnderBreakMutex(path, breakPath, token)
+		}
+		if h.pid != os.Getpid() && processAlive(h.pid) {
+			time.Sleep(lockBreakWait)
+			continue
+		}
+		// A foreign holder that is not alive: a breaker was killed inside
+		// its critical section. Auto-removing the marker here would be a
+		// remove-after-read race in which two recoverers each delete the
+		// other's fresh marker and then each delete the other's fresh LOCK -
+		// two writers on one directory, the exact failure this lock exists
+		// to prevent. Refuse loudly and name the marker for the operator.
+		return staleMarkerError(dir, path, breakPath, h.pid)
 	}
 	return fmt.Errorf("store: data directory %s: could not clear the stale lock %s after %d attempts",
 		dir, path, lockBreakAttempts)
+}
+
+// staleMarkerError reports a LOCK.break that no live process owns and that
+// this package refuses to delete: only the process that created a marker may
+// remove it, because remove-after-read of a marker is exactly how two
+// recoverers could each destroy the other's fresh lock.
+func staleMarkerError(dir, lockPath, breakPath string, pid int) error {
+	owner := "an unreadable owner"
+	if pid > 0 {
+		owner = fmt.Sprintf("pid %d", pid)
+	}
+	return fmt.Errorf("store: data directory %s: a crashed process left the stale-recovery marker %s (%s); remove it and retry (the stale %s is then recovered automatically)",
+		dir, breakPath, owner, lockPath)
 }
 
 // removeStaleUnderBreakMutex removes path and then always releases the break
