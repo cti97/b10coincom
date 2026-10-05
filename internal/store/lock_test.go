@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -121,17 +122,17 @@ func TestOpenFailsOnCorruptLockRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Flip a byte inside the record's payload - the length stays intact, so
-	// only the checksum can catch this.
+	// Flip a byte inside the record's payload - the framing stays intact, so
+	// only the record checksum can catch this.
 	logPath := filepath.Join(dir, lockLogName)
 	raw, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 1+lockPayloadLen+4 {
-		t.Fatalf("lock log is %d bytes; expected the 1-byte length prefix, the fixed %d-byte payload (8-byte height, 4-byte round, 32-byte ID) and 4-byte CRC", len(raw), lockPayloadLen)
+	if len(raw) != RecordHeaderLen+lockPayloadLen+RecordTrailerLen {
+		t.Fatalf("lock log is %d bytes; expected the %d-byte framed header, the fixed %d-byte payload (8-byte height, 4-byte round, 32-byte ID) and the %d-byte CRC", len(raw), RecordHeaderLen, lockPayloadLen, RecordTrailerLen)
 	}
-	raw[3] ^= 0xFF // a byte inside the record's fixed-width height field
+	raw[RecordHeaderLen+3] ^= 0xFF // a byte inside the record's fixed-width height field
 	if err := os.WriteFile(logPath, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -158,17 +159,34 @@ func TestOpenFailsOnCorruptLockRecord(t *testing.T) {
 // could not tell a crashed-half-written tail from bit rot in the length byte,
 // so a flipped bit led it to destroy the intact record - Open returned nil,
 // the log went to 0 bytes on disk, and a validator that had precommitted came
-// back UNLOCKED, the exact unsafe direction. The framing's length prefix is
-// now checked against the record's constant size, so any other value is
-// corruption and fails Open; the destructive truncate is gone, the bytes
-// (the evidence) stay on disk.
+// back UNLOCKED, the exact unsafe direction. Two independent guards now stand
+// in the way, and each is exercised by its own case:
+//
+//   - the fixed-width header's checksum covers the length, so a flipped bit
+//     anywhere in it is caught before the length is used; and
+//   - a header that DOES check out must still name the one constant this
+//     record format writes, so even a hand-consistent wrong length (the shape
+//     a writer bug would produce) is refused rather than read as a torn tail
+//     and truncated.
 func TestOpenFailsOnCorruptLengthPrefixLoudly(t *testing.T) {
-	// bit 7 turns the single-byte constant prefix into a MULTI-BYTE varint
-	// (the scanner reads the next payload byte as continuation data); bit 0
-	// leaves it single-byte but with a different value. Both are exactly the
-	// one flipped bit the review demands cannot degrade a validator to
-	// unlocked, and they exercise both bad-prefix shapes.
-	for name, mask := range map[string]byte{"bit7": 0x80, "bit0": 0x01} {
+	cases := map[string]func(raw []byte){
+		"flipped-bit-overruns-EOF": func(raw []byte) {
+			// The most significant byte of the length: the record now
+			// appears to run past EOF - the exact shape that used to be
+			// truncated away as a torn tail.
+			raw[0] ^= 0x80
+		},
+		"valid-header-wrong-constant": func(raw []byte) {
+			// A length one byte too long, with the header checksum recomputed
+			// so the framing check agrees with it. Only the constant rule can
+			// tell this apart from a crash - and without it the record would
+			// be truncated away as torn.
+			binary.BigEndian.PutUint64(raw[:lengthFieldLen], lockPayloadLen+1)
+			binary.BigEndian.PutUint32(raw[lengthFieldLen:RecordHeaderLen],
+				crc32.Checksum(raw[:lengthFieldLen], crcTable))
+		},
+	}
+	for name, corrupt := range cases {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			s, err := Open(dir)
@@ -188,17 +206,17 @@ func TestOpenFailsOnCorruptLengthPrefixLoudly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(raw) != 1+lockPayloadLen+4 {
-				t.Fatalf("lock log is %d bytes, want one whole 49-byte record", len(raw))
+			if len(raw) != RecordHeaderLen+lockPayloadLen+RecordTrailerLen {
+				t.Fatalf("lock log is %d bytes, want one whole %d-byte record", len(raw), RecordHeaderLen+lockPayloadLen+RecordTrailerLen)
 			}
 			sizeBefore, err := fileSize(logPath)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if raw[0] != byte(lockPayloadLen) {
-				t.Fatalf("the length prefix is %#x, want the constant %#x the writer emits", raw[0], byte(lockPayloadLen))
+			if got := binary.BigEndian.Uint64(raw[:lengthFieldLen]); got != lockPayloadLen {
+				t.Fatalf("the length field is %d, want the constant %d the writer emits", got, lockPayloadLen)
 			}
-			raw[0] ^= mask // corrupt ONLY the length prefix
+			corrupt(raw)
 			if err := os.WriteFile(logPath, raw, 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -247,11 +265,12 @@ func TestTornLockTailIsTruncatedNotReadAsALock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate a crash inside the next record: the framing byte (the ONLY
-	// byte this format's length prefix can be), then the start of a payload
-	// for height 6 round 1 - and no checksum, because the write never
-	// completed. A tail of this shape is what a crash actually costs, and
-	// truncating it is what the repair is for.
+	// Simulate a crash inside the next record: a COMPLETE, VALID framing
+	// header, then the start of a payload for height 6 round 1 - and no
+	// checksum, because the write never completed. A tail of this shape is
+	// what a crash actually costs, and truncating it is what the repair is
+	// for. (The checksummed header is what tells the scanner the record was
+	// cut rather than corrupted: a corrupt length would fail its own check.)
 	logPath := filepath.Join(dir, lockLogName)
 	intactLen, err := fileSize(logPath)
 	if err != nil {
@@ -261,8 +280,13 @@ func TestTornLockTailIsTruncatedNotReadAsALock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tear := make([]byte, 0, 1+8+4+2)
-	tear = append(tear, byte(lockPayloadLen))
+	tear := make([]byte, 0, RecordHeaderLen+8+4+2)
+	var lb [lengthFieldLen]byte
+	binary.BigEndian.PutUint64(lb[:], lockPayloadLen)
+	tear = append(tear, lb[:]...)
+	var hc [RecordTrailerLen]byte
+	binary.BigEndian.PutUint32(hc[:], crc32.Checksum(tear[:lengthFieldLen], crcTable))
+	tear = append(tear, hc[:]...)
 	var hb [8]byte
 	binary.BigEndian.PutUint64(hb[:], 6)
 	var rb [4]byte

@@ -1,30 +1,37 @@
-// Package store persists blocks as append-only segment files and a
-// per-height lock log, both over opaque payloads.
+// Package store persists blocks as append-only segment files, a per-height
+// lock log and a per-height commit-certificate log, all over opaque payloads.
 //
-// Record layout: uvarint(len(payload)) || payload || uint32be(crc32c(payload)).
+// Record layout, shared by every log here:
 //
-// Open scans the final segment and truncates any partial trailing record:
-// that is what makes a crash mid-write survivable. The node restarts,
-// re-syncs from the last good block, and loses nothing already committed. A
-// structurally complete record whose checksum fails is indexed but never
-// trusted: Read reports it as ErrCorruptRecord instead of silently dropping
-// committed heights. A damaged record in any non-final segment is genuine
-// corruption and fails Open.
+//	uint64be(len(payload)) || uint32be(crc32c(len)) || payload || uint32be(crc32c(len || payload))
+//
+// The header is FIXED WIDTH and checksummed so that the length prefix is
+// trustworthy BEFORE it is used to find the record's end. That is the fix
+// audit S-2 asks for. Before it, the checksum covered only the payload, so a
+// single flipped bit in a length prefix was indistinguishable from a crash:
+// the scanner would read the corrupt length, conclude the record ran past
+// EOF, and "repair" by truncating the file - silently deleting committed
+// blocks and reporting Open success. Here a corrupt length fails its own
+// checksum and Open FAILS loudly without touching a byte.
+//
+// The scan STOPS at the first corruption, in the final segment too: a
+// complete record whose payload checksum fails is corruption, not a torn
+// tail, and the bytes after it cannot be framed (the corrupt record's own
+// length is what would say where they start). Truncating there would delete
+// exactly what a repair must preserve, so both logs refuse instead. Truncation
+// is confined to what only a crash can produce: the file ends inside a
+// record - an incomplete header, or a complete, VALID header whose record
+// runs past EOF. A crash cannot invent a different length, because a written
+// record's header checksum travels with the length it describes.
 //
 // The lock log (separate file, same framing) holds one validator's own
-// lockedRound/lockedBlock per height. Its records have a FIXED payload
-// (see lockPayloadLen), so a frame's length prefix can only ever be one
-// exact byte - and it is checked against the constant instead of trusted.
-// That closes a hole a length-prefix repair would leave: without the check,
-// a single flipped bit in an intact record's length byte is indistinguishable
-// from a crash for the scanner, and "repairing" it truncates the log and the
-// promise with it - degrading a validator to unlocked, the exact unsafe
-// direction the lock exists to refuse. So here the truncate is confined to
-// what only a crash can produce: a complete length prefix whose record runs
-// past EOF. Everything else is corruption and FAILS Open. Blocks are judged
-// content-based through their state roots, so a bad block can only stall a
-// Read; a lock's whole value is its mere existence, and a missing one reads
-// as unlocked.
+// lockedRound/lockedBlock per height. Its records have a FIXED payload (see
+// lockPayloadLen), so a valid header claiming any other length is corruption
+// by construction and is refused on top of the framing checks - the same
+// guarantee as the block log, without having to trust a length at all. A
+// lock's whole value is its mere existence, and a missing one reads as
+// unlocked, so its error policy is as strict as the framing allows: the node
+// staying down is the honest failure.
 package store
 
 import (
@@ -33,6 +40,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -46,10 +54,30 @@ const BlocksPerSegment = 1000
 // renumber the chain.
 const lockLogName = "locks.log"
 
+// certLogName holds the commit-certificate log (audit C-7). Like the lock log
+// its name avoids the ".seg" suffix for the same reason.
+const certLogName = "certs.log"
+
+// RecordHeaderLen and RecordTrailerLen are the on-disk framing's fixed sizes:
+// an 8-byte big-endian payload length plus the 4-byte CRC32C of those 8 bytes,
+// and a 4-byte CRC32C of the header and the payload. They are exported because
+// they are part of the file format, and a tool that walks a segment (or a test
+// that rewrites one) must be able to frame records exactly as Open does.
+const (
+	RecordHeaderLen  = 8 + 4
+	RecordTrailerLen = 4
+	lengthFieldLen   = 8
+)
+
 var (
 	ErrNotFound      = errors.New("store: height not found")
 	ErrBadHeight     = errors.New("store: heights must be appended sequentially")
 	ErrCorruptRecord = errors.New("store: record checksum mismatch")
+	// errTornRecord reports a record the file ends inside. It is not
+	// corruption: it is the one shape a crash mid-write can leave, and it is
+	// the only shape Open may truncate. It is unexported because callers
+	// outside this package must treat it as ErrCorruptRecord.
+	errTornRecord = errors.New("store: record is incomplete")
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
@@ -98,6 +126,15 @@ type Store struct {
 	// lock heights are deliberately NOT required to be appended heights.
 	lockFile *os.File
 	locks    map[uint64]LockRecord
+
+	// certFile is the append-and-read handle on the commit-certificate log
+	// (audit C-7); certIndex maps a height to the offset of its record in
+	// that file. The certificate BYTES are not held in memory: one record
+	// per committed height would grow without bound over a long run, and the
+	// log exists precisely so a restarted node can serve history it no
+	// longer remembers. CertAt reads one record back through this handle.
+	certFile  *os.File
+	certIndex map[uint64]int64
 }
 
 // segmentName maps a height to the segment file holding it. Names are
@@ -121,7 +158,13 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, index: make(map[uint64]int64), locks: make(map[uint64]LockRecord), lock: lock}
+	s := &Store{
+		dir:       dir,
+		index:     make(map[uint64]int64),
+		locks:     make(map[uint64]LockRecord),
+		certIndex: make(map[uint64]int64),
+		lock:      lock,
+	}
 	if err := s.scan(); err != nil {
 		lock.release()
 		return nil, err
@@ -137,8 +180,18 @@ func Open(dir string) (*Store, error) {
 		lock.release()
 		return nil, err
 	}
+	// O_RDWR, unlike the append-only handles above: serving an adopted
+	// height's certificate reads the record back with ReadAt.
+	cf, err := os.OpenFile(filepath.Join(dir, certLogName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	if err != nil {
+		_ = f.Close()
+		_ = lf.Close()
+		lock.release()
+		return nil, err
+	}
 	s.file = f
 	s.lockFile = lf
+	s.certFile = cf
 	return s, nil
 }
 
@@ -171,15 +224,65 @@ func (s *Store) scan() error {
 	// The lock log is scanned with the blocks: a lock that survived the crash
 	// must be loaded in the same pass as the blocks it promises about, or a
 	// restarted validator would re-open unlocked.
-	return s.scanLocks()
+	if err := s.scanLocks(); err != nil {
+		return err
+	}
+	// Certificate records are indexed but their payloads are NOT loaded: a
+	// cert log carries one record per committed height, so keeping it all in
+	// memory is the unbounded archive audit C-7 names. CertAt reads the one
+	// record it needs.
+	return s.scanCerts()
+}
+
+// frame validates the fixed-width header of the record starting at off in raw
+// and returns the payload length and the offset of the record's end.
+//
+// It separates the two things a record can be: errTornRecord means the file
+// ends inside the record (an incomplete header, or a header that is complete
+// and VALID but whose payload and trailer do not all fit) - the only shape a
+// crash can leave. Any other error means the bytes disagree with themselves,
+// which corruption alone produces. The order matters and is the whole fix: the
+// header's checksum is verified BEFORE its length is used, so a corrupt length
+// can never be mistaken for a torn tail and truncated away.
+//
+// A non-negative exact demands that length: for a log whose records all carry
+// the same fixed payload, a header that checks out but names any other length
+// is corruption by construction, not a tear, and must be refused before the
+// overrun test can call it one.
+func frame(raw []byte, off int64, exact int64) (int64, int64, error) {
+	rem := int64(len(raw)) - off
+	if rem < int64(RecordHeaderLen) {
+		return 0, 0, errTornRecord
+	}
+	header := raw[off : off+RecordHeaderLen]
+	if crc32.Checksum(header[:lengthFieldLen], crcTable) != binary.BigEndian.Uint32(header[lengthFieldLen:]) {
+		return 0, 0, errors.New("length-prefix checksum mismatch (the length is not trustworthy)")
+	}
+	n := binary.BigEndian.Uint64(header[:lengthFieldLen])
+	if exact >= 0 && n != uint64(exact) {
+		return 0, 0, fmt.Errorf("length prefix names %d bytes, but this record format writes only the constant %d", n, exact)
+	}
+	// The header is trustworthy, so its length needs no further validation
+	// beyond keeping the arithmetic below in range: bound it by what is left.
+	if n > uint64(rem) {
+		return 0, 0, errTornRecord
+	}
+	payStart := off + RecordHeaderLen
+	recEnd := payStart + int64(n) + RecordTrailerLen
+	if recEnd > int64(len(raw)) {
+		return 0, 0, errTornRecord
+	}
+	return int64(n), recEnd, nil
 }
 
 // scanSegment walks one segment record by record. Earlier segments are
 // closed, so a damaged record there is real corruption and fails Open; the
-// final segment is the only place a crash could have cut a record, so its
-// tail is repaired instead: a partial trailing record is truncated away, and
-// a complete record with a bad checksum keeps its index slot for Read to
-// reject.
+// final segment is the only place a crash could have cut a record, so a torn
+// tail there is truncated away. A COMPLETE record whose checksum fails is
+// corruption in either case, and the scan STOPS there (audit S-2): its length
+// cannot be trusted to find the next record's start, so indexing past it would
+// invent heights, and truncating there would delete the very bytes a repair
+// must preserve.
 func (s *Store) scanSegment(name string, final bool) error {
 	path := filepath.Join(s.dir, name)
 	raw, err := os.ReadFile(path)
@@ -188,27 +291,20 @@ func (s *Store) scanSegment(name string, final bool) error {
 	}
 	off := int64(0)
 	for off < int64(len(raw)) {
-		n, m := binary.Uvarint(raw[off:])
-		// A length prefix beyond the file cannot be a valid record and
-		// would overflow the arithmetic below.
-		if m <= 0 || n > uint64(len(raw)) {
-			if final {
+		n, recEnd, err := frame(raw, off, -1)
+		if err != nil {
+			if final && errors.Is(err, errTornRecord) {
 				return s.truncateTail(path, off)
 			}
-			return fmt.Errorf("%w: bad length prefix in %s at offset %d", ErrCorruptRecord, name, off)
+			return fmt.Errorf("%w: %s in %s at offset %d", ErrCorruptRecord, err, name, off)
 		}
-		recEnd := off + int64(m) + int64(n) + 4
-		if recEnd > int64(len(raw)) {
-			if final {
-				return s.truncateTail(path, off)
-			}
-			return fmt.Errorf("%w: truncated record in %s at offset %d", ErrCorruptRecord, name, off)
-		}
-		payStart := off + int64(m)
-		payload := raw[payStart : payStart+int64(n) : payStart+int64(n)]
-		want := binary.BigEndian.Uint32(raw[payStart+int64(n) : recEnd])
-		corrupt := crc32.Checksum(payload, crcTable) != want
-		if corrupt && !final {
+		payStart := off + RecordHeaderLen
+		// The checksum covers the length prefix AND the payload: a length
+		// that disagrees with the bytes it frames cannot pass, whether or not
+		// the header's own checksum already caught it.
+		framed := raw[off : payStart+n : payStart+n]
+		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
+		if crc32.Checksum(framed, crcTable) != want {
 			return fmt.Errorf("%w: checksum mismatch in %s at offset %d", ErrCorruptRecord, name, off)
 		}
 		h := s.last + 1
@@ -220,12 +316,9 @@ func (s *Store) scanSegment(name string, final bool) error {
 	return nil
 }
 
-// truncateTail cuts a partial trailing record off the file. It deliberately
-// does NOT rewind s.last or drop index slots: every indexed record starts
-// BEFORE size (the partial record was never indexed), so a complete-but-corrupt
-// record keeps its height and Read reports ErrCorruptRecord for it. Rewinding
-// here would leave that record's bytes on disk while claiming a lower height,
-// and the next reopen would re-read them and renumber every height after.
+// truncateTail cuts a torn trailing record off the file. It is reached only
+// for errTornRecord - the file ending inside a record - so nothing a crash did
+// not cut can be lost here.
 func (s *Store) truncateTail(path string, size int64) error {
 	return os.Truncate(path, size)
 }
@@ -278,14 +371,24 @@ func (s *Store) Append(height uint64, payload []byte) error {
 	return nil
 }
 
+// writeRecord renders one framed record and appends it durably.
+//
+// The fixed-width header (a big-endian length plus the CRC32C of that length)
+// comes first so the scanner can decide whether the length is trustworthy
+// BEFORE it uses it. The trailing checksum then covers the header AND the
+// payload. A single write(2) of the whole buffer keeps a crash from leaving
+// any shape other than a prefix of it.
 func writeRecord(f *os.File, payload []byte) error {
-	var hdr [binary.MaxVarintLen64]byte
-	m := binary.PutUvarint(hdr[:], uint64(len(payload)))
-	rec := make([]byte, 0, m+len(payload)+4)
-	rec = append(rec, hdr[:m]...)
+	rec := make([]byte, 0, RecordHeaderLen+len(payload)+RecordTrailerLen)
+	var lenbuf [lengthFieldLen]byte
+	binary.BigEndian.PutUint64(lenbuf[:], uint64(len(payload)))
+	rec = append(rec, lenbuf[:]...)
+	var hsum [RecordTrailerLen]byte
+	binary.BigEndian.PutUint32(hsum[:], crc32.Checksum(rec, crcTable))
+	rec = append(rec, hsum[:]...)
 	rec = append(rec, payload...)
-	var sum [4]byte
-	binary.BigEndian.PutUint32(sum[:], crc32.Checksum(payload, crcTable))
+	var sum [RecordTrailerLen]byte
+	binary.BigEndian.PutUint32(sum[:], crc32.Checksum(rec, crcTable))
 	rec = append(rec, sum[:]...)
 	if _, err := f.Write(rec); err != nil {
 		return err
@@ -308,29 +411,20 @@ func (s *Store) Read(height uint64) ([]byte, error) {
 	}
 	// The index offsets come from the store's own scan, but the segment file
 	// can be rewritten underneath an open store: nothing here may panic on
-	// those bytes.
-	if int64(len(raw)) <= off {
+	// those bytes. frame re-validates the framing - the length prefix AND its
+	// checksum - before any offset arithmetic, exactly as scanSegment does
+	// before indexing; a torn or corrupt record is reported, never trusted.
+	if off < 0 || off >= int64(len(raw)) {
 		return nil, fmt.Errorf("%w: index offset %d is past the end of %s", ErrCorruptRecord, off, segmentName(height))
 	}
-	n, m := binary.Uvarint(raw[off:])
-	// A length prefix is stored data, not a trusted size: Uvarint legally
-	// yields up to 2^64-1, and int(n) overflows for anything above MaxInt64
-	// (end would wrap negative, so the truncation guard below would pass).
-	// Bound BEFORE any offset arithmetic, exactly as scanSegment does before
-	// indexing.
-	if m <= 0 || n > uint64(len(raw)) {
-		return nil, fmt.Errorf("%w: bad length at %d", ErrCorruptRecord, off)
+	n, recEnd, err := frame(raw, off, -1)
+	if err != nil {
+		return nil, fmt.Errorf("%w: at height %d: %v", ErrCorruptRecord, height, err)
 	}
-	start := int(off) + m
-	end := start + int(n)
-	// Defensive: end may not fall below start, and the record's trailing
-	// checksum must still lie inside the segment.
-	if end < start || end+4 > len(raw) {
-		return nil, fmt.Errorf("%w: truncated record at %d", ErrCorruptRecord, off)
-	}
-	payload := raw[start:end]
-	want := binary.BigEndian.Uint32(raw[end : end+4])
-	if crc32.Checksum(payload, crcTable) != want {
+	payStart := off + RecordHeaderLen
+	payload := raw[payStart : payStart+n]
+	want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
+	if crc32.Checksum(raw[off:payStart+n], crcTable) != want {
 		return nil, fmt.Errorf("%w: at height %d", ErrCorruptRecord, height)
 	}
 	out := make([]byte, len(payload))
@@ -344,20 +438,24 @@ func (s *Store) Height() (uint64, bool) { return s.last, s.have }
 // scanLocks rebuilds the lock index from the lock log.
 //
 // The error policy is deliberately asymmetric with the block segments' and
-// is the whole point of the log. What may be truncated is ONLY the one
-// signature a crash mid-write can leave here: a complete, correct length
-// prefix whose record runs past EOF. Everything else fails Open loudly,
-// never truncates:
+// is the whole point of the log. What may be truncated is ONLY what a crash
+// mid-write can leave here: the file ending inside a record - an incomplete
+// header, or a complete and VALID header whose record runs past EOF.
+// Everything else fails Open loudly, never truncates:
 //
-//   - A length prefix that is not exactly the record's constant size is
-//     corruption. A write of this record format can emit one byte - the
-//     constant - and nothing else, so a torn tail cannot produce a different
-//     one, while a single flipped bit in an intact record's length byte can.
-//     Truncating it would be how a corrupt log "repairs" itself into
-//     unlocked: the destroyed record is replaced by silence, and silence
-//     here is a validator free to prevote the very conflicting block its
-//     lock exists to refuse. The evidence is also preserved - the file is
-//     not rewritten, so what bit rot happened stays readable afterwards.
+//   - A header whose checksum does not match its length is corruption, not a
+//     torn tail: a written header's checksum travels with the length it
+//     describes, so a flipped bit in either makes the two disagree, while a
+//     crash can only fail to write them at all. Truncating it would be how a
+//     corrupt log "repairs" itself into unlocked: the destroyed record is
+//     replaced by silence, and silence here is a validator free to prevote
+//     the very conflicting block its lock exists to refuse. The evidence is
+//     also preserved - the file is not rewritten, so what bit rot happened
+//     stays readable afterwards.
+//   - A VALID header naming any length other than the constant this record
+//     format always writes is corruption too, for the same reason: a torn
+//     tail cannot produce a different length, and a corrupt one no longer
+//     escapes the framing check that catches it before it is read.
 //   - A COMPLETE record whose checksum fails means the bytes on disk changed
 //     under us or were written badly: again loud, for the same reason.
 //   - Decode is strict on top (a fixed-width payload that is not exactly
@@ -377,31 +475,22 @@ func (s *Store) scanLocks() error {
 	}
 	off := int64(0)
 	for off < int64(len(raw)) {
-		n, m := binary.Uvarint(raw[off:])
-		// A length prefix this record format cannot have written - because
-		// it always writes exactly the one-byte constant - is corruption,
-		// not a torn tail: fail loudly, never truncate here. Both parts of
-		// the check matter: one flipped bit can turn the constant prefix
-		// into either a different single byte (m stays 1) or a multi-byte
-		// varint whose DECODED value happens to equal the constant again
-		// (m becomes 2) - so a value check alone is not enough; the varint
-		// must be exactly as wide as the constant is.
-		if m != 1 || n != lockPayloadLen {
-			return fmt.Errorf("%w: lock record length prefix at offset %d of %s is not the constant %d (corruption, not a torn tail); got length %d, %d varint bytes", ErrCorruptRecord, off, lockLogName, lockPayloadLen, n, m)
+		n, recEnd, err := frame(raw, off, lockPayloadLen)
+		if err != nil {
+			if errors.Is(err, errTornRecord) {
+				// The tail a crash actually cuts: the file ends inside the
+				// record. Nothing from this offset on is intact.
+				return s.truncateTail(path, off)
+			}
+			return fmt.Errorf("%w: lock record at offset %d of %s: %v", ErrCorruptRecord, off, lockLogName, err)
 		}
-		recEnd := off + int64(m) + int64(n) + 4
-		if recEnd > int64(len(raw)) {
-			// The tail a crash actually cuts: the framing byte completed,
-			// the record never did. Nothing from this offset on is intact.
-			return s.truncateTail(path, off)
-		}
-		payStart := off + int64(m)
-		payload := raw[payStart : payStart+int64(n) : payStart+int64(n)]
-		want := binary.BigEndian.Uint32(raw[payStart+int64(n) : recEnd])
-		if crc32.Checksum(payload, crcTable) != want {
+		payStart := off + RecordHeaderLen
+		framed := raw[off : payStart+n : payStart+n]
+		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
+		if crc32.Checksum(framed, crcTable) != want {
 			return fmt.Errorf("%w: lock record checksum mismatch at offset %d of %s", ErrCorruptRecord, off, lockLogName)
 		}
-		rec, err := decodeLockRecord(payload)
+		rec, err := decodeLockRecord(raw[payStart : payStart+n])
 		if err != nil {
 			return fmt.Errorf("%w: lock record at offset %d of %s: %v", ErrCorruptRecord, off, lockLogName, err)
 		}
@@ -411,6 +500,128 @@ func (s *Store) scanLocks() error {
 		off = recEnd
 	}
 	return nil
+}
+
+// scanCerts indexes the commit-certificate log (audit C-7): a height to the
+// offset of its record. The payloads are NOT kept in memory - see the Store
+// doc - so this pass rebuilds an index, not an archive.
+//
+// The error policy is the block log's, not the lock log's: what a torn tail
+// can destroy here is archival evidence for one height, never a safety
+// promise. A certificate that never completed means this node cannot serve
+// that height until it re-adopts it, which is exactly the state persistence
+// exists to narrow; the node must not refuse to start over it. Corruption in a
+// complete record still stops the scan and fails Open, because the bytes after
+// a record whose length cannot be trusted cannot be framed at all.
+func (s *Store) scanCerts() error {
+	path := filepath.Join(s.dir, certLogName)
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // no certificate was ever recorded
+	}
+	if err != nil {
+		return err
+	}
+	off := int64(0)
+	for off < int64(len(raw)) {
+		n, recEnd, err := frame(raw, off, -1)
+		if err != nil {
+			if errors.Is(err, errTornRecord) {
+				return s.truncateTail(path, off)
+			}
+			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, certLogName, err)
+		}
+		if n < certHeightLen {
+			return fmt.Errorf("%w: certificate record at offset %d of %s carries %d bytes, too few for its height", ErrCorruptRecord, off, certLogName, n)
+		}
+		payStart := off + RecordHeaderLen
+		framed := raw[off : payStart+n : payStart+n]
+		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
+		if crc32.Checksum(framed, crcTable) != want {
+			return fmt.Errorf("%w: certificate record checksum mismatch at offset %d of %s", ErrCorruptRecord, off, certLogName)
+		}
+		height := binary.BigEndian.Uint64(raw[payStart : payStart+certHeightLen])
+		// Newest wins: a height is certified once, and the store's PutCert
+		// refuses to append a second record for it, so only a hand-written
+		// file can present two.
+		s.certIndex[height] = off
+		off = recEnd
+	}
+	return nil
+}
+
+// certHeightLen is the key the certificate log frames its payload with: the
+// height the certificate commits, big-endian, fixed width. The store does not
+// interpret the rest of the payload - the consensus package owns that
+// encoding - it only needs to find a height's record again.
+const certHeightLen = 8
+
+// PutCert appends an opaque certificate payload for height. An entry already
+// recorded for that height is kept: a committed height never changes its
+// block, so the first certificate this node proved and persisted for it is the
+// one that stands, and re-recording would only grow the log.
+func (s *Store) PutCert(height uint64, payload []byte) error {
+	if _, have := s.certIndex[height]; have {
+		return nil
+	}
+	rec := make([]byte, 0, certHeightLen+len(payload))
+	var key [certHeightLen]byte
+	binary.BigEndian.PutUint64(key[:], height)
+	rec = append(rec, key[:]...)
+	rec = append(rec, payload...)
+	off, err := s.certFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if err := writeRecord(s.certFile, rec); err != nil {
+		// Cut a partial record back off so later appends start clean; the
+		// next Open also self-heals if this truncate fails.
+		_ = s.certFile.Truncate(off)
+		return err
+	}
+	s.certIndex[height] = off
+	return nil
+}
+
+// CertAt returns a copy of the certificate payload recorded for height, and
+// whether one exists. It reads the one record, so the cert log costs memory
+// only for the record being served, however long the chain runs.
+func (s *Store) CertAt(height uint64) ([]byte, bool) {
+	off, ok := s.certIndex[height]
+	if !ok {
+		return nil, false
+	}
+	// The record was framed by scanCerts/PutCert, but the file lives on disk:
+	// re-validate rather than trusting the offset, and report absence (never
+	// a panic, never a short read) if it no longer holds.
+	header := make([]byte, RecordHeaderLen)
+	if _, err := s.certFile.ReadAt(header, off); err != nil {
+		return nil, false
+	}
+	if crc32.Checksum(header[:lengthFieldLen], crcTable) != binary.BigEndian.Uint32(header[lengthFieldLen:]) {
+		return nil, false
+	}
+	n := binary.BigEndian.Uint64(header[:lengthFieldLen])
+	if n < certHeightLen || n > uint64(math.MaxInt) {
+		return nil, false
+	}
+	body := make([]byte, n)
+	if _, err := s.certFile.ReadAt(body, off+RecordHeaderLen); err != nil {
+		return nil, false
+	}
+	framed := make([]byte, 0, RecordHeaderLen+int(n))
+	framed = append(framed, header...)
+	framed = append(framed, body...)
+	var trailer [RecordTrailerLen]byte
+	if _, err := s.certFile.ReadAt(trailer[:], off+RecordHeaderLen+int64(n)); err != nil {
+		return nil, false
+	}
+	if crc32.Checksum(framed, crcTable) != binary.BigEndian.Uint32(trailer[:]) {
+		return nil, false
+	}
+	out := make([]byte, n-certHeightLen)
+	copy(out, body[certHeightLen:])
+	return out, true
 }
 
 // encodeLockRecord renders a lock as its fixed-size payload: 8 bytes of
@@ -484,7 +695,7 @@ func (s *Store) LockAt(height uint64) (LockRecord, bool) {
 // same handle. The data-directory lock is released last, so the directory
 // admits a new writer only once this store's files are closed.
 func (s *Store) Close() error {
-	var fileErr, lockErr error
+	var fileErr, lockErr, certErr error
 	if s.file != nil {
 		fileErr = s.file.Close()
 		s.file = nil
@@ -493,9 +704,13 @@ func (s *Store) Close() error {
 		lockErr = s.lockFile.Close()
 		s.lockFile = nil
 	}
+	if s.certFile != nil {
+		certErr = s.certFile.Close()
+		s.certFile = nil
+	}
 	if s.lock != nil {
 		s.lock.release()
 		s.lock = nil
 	}
-	return errors.Join(fileErr, lockErr)
+	return errors.Join(fileErr, lockErr, certErr)
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/state"
+	"github.com/cti97/b10coincom/internal/store"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -399,12 +400,14 @@ func TestOpenRejectsRenumberedStoredChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Skip record 1 entirely: uvarint length prefix, payload, uint32be CRC.
-	recLen, m := binary.Uvarint(raw)
-	if m <= 0 || m+int(recLen)+4 > len(raw) {
+	// Skip record 1 entirely: framed header (length || its checksum), payload,
+	// trailer checksum.
+	recLen := binary.BigEndian.Uint64(raw)
+	span := store.RecordHeaderLen + int(recLen) + store.RecordTrailerLen
+	if len(raw) < span {
 		t.Fatalf("malformed first record in %s; cannot drop it", seg)
 	}
-	if err := os.WriteFile(seg, raw[m+int(recLen)+4:], 0o644); err != nil {
+	if err := os.WriteFile(seg, raw[span:], 0o644); err != nil {
 		t.Fatal(err)
 	}
 
