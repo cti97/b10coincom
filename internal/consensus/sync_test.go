@@ -1979,3 +1979,50 @@ func TestCertificatesSurviveARestartAndAreServedAgain(t *testing.T) {
 		}
 	}
 }
+
+// TestAwaitReplyHonoursTheInjectedWait pins the T-2 seam contract: when
+// WaitReply is set, awaitReply calls it with the RESOLVED ReplyWait and
+// returns its result verbatim, so a harness whose transport runs on a virtual
+// clock can supply the pull's deadline itself. It also pins the default the
+// seam receives when ReplyWait is left at zero, so the two cannot drift.
+//
+// Killing mutant (compile-confirmed, behaviour-changing): delete the
+// `if s.WaitReply != nil` branch from awaitReply. The seam is then never
+// called, gotWait stays zero and the test fails on the first assertion -
+// while the production wall-clock path still compiles and works, which is
+// exactly what makes the mutant a silent regression rather than a build
+// error. (The simnet virtual implementation this seam exists for is proven by
+// the identical-blocks-through-CatchUp test and the repeated -race runs in
+// the round-13 report.)
+func TestAwaitReplyHonoursTheInjectedWait(t *testing.T) {
+	s := &Syncer{ReplyWait: 3 * time.Second}
+	canned := &wire.BlockSyncResp{}
+	var gotWait time.Duration
+	var calls int
+	s.WaitReply = func(_ <-chan *wire.BlockSyncResp, wait time.Duration) *wire.BlockSyncResp {
+		calls++
+		gotWait = wait
+		return canned
+	}
+	ch := make(chan *wire.BlockSyncResp, 1)
+	if got := s.awaitReply(ch); got != canned {
+		t.Fatalf("awaitReply returned the seam's result as %p, want %p", got, canned)
+	}
+	if calls != 1 || gotWait != 3*time.Second {
+		t.Fatalf("the seam was called %d time(s) with wait %v, want 1 call with 3s", calls, gotWait)
+	}
+
+	// Zero ReplyWait must reach the seam as the documented default, never as
+	// a zero deadline that would reinstall the synchronous read.
+	s.ReplyWait = 0
+	s.WaitReply = func(_ <-chan *wire.BlockSyncResp, wait time.Duration) *wire.BlockSyncResp {
+		gotWait = wait
+		return nil
+	}
+	if got := s.awaitReply(make(chan *wire.BlockSyncResp, 1)); got != nil {
+		t.Fatalf("the seam's nil (silence) was returned as %p, want nil", got)
+	}
+	if gotWait != DefaultReplyWait {
+		t.Fatalf("a zero ReplyWait reached the seam as %v, want DefaultReplyWait %v", gotWait, DefaultReplyWait)
+	}
+}

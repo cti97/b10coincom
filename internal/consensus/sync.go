@@ -236,6 +236,22 @@ type Syncer struct {
 	// this deadline is the pull's, not consensus protocol time.
 	ReplyWait time.Duration
 
+	// WaitReply, when non-nil, is the requester's wait for the one response
+	// frame of the request it has in flight: it replaces the wall-clock
+	// select in awaitReply WHOLE, receiving the resolved ReplyWait. It exists
+	// because "wait for a response for ReplyWait" is a policy that belongs to
+	// the clock the transport runs on, and the simnet harness's transport runs
+	// on the simulator's VIRTUAL clock. A harness whose deadlines live on the
+	// wall clock while its deliveries live on virtual time can read a
+	// legitimately answered pull as silence whenever the goroutine advancing
+	// virtual time is starved - exactly the class of timing-dependent test the
+	// audit's T-2 names. simnet installs a virtual-time implementation
+	// (Net.awaitReplyVirtual) so the deadline and the delivery it waits for
+	// are measured on the SAME clock, and a pull that was answered can never
+	// be mistaken for one that was not. Production leaves it nil: the default
+	// in awaitReply is the real-clock wait, and the node's wiring owns retry.
+	WaitReply func(ch <-chan *wire.BlockSyncResp, wait time.Duration) *wire.BlockSyncResp
+
 	// RateLimit is how many authenticated requests one requester may be
 	// served per RateWindow; zero takes DefaultSyncRateLimit. A request costs
 	// a window of disk reads and quorum-many verifies per height, so an
@@ -878,6 +894,11 @@ func (s *Syncer) awaitReply(ch <-chan *wire.BlockSyncResp) *wire.BlockSyncResp {
 	wait := s.ReplyWait
 	if wait <= 0 {
 		wait = DefaultReplyWait
+	}
+	if s.WaitReply != nil {
+		// The harness owns the clock: it may measure `wait` on virtual time
+		// and return the answer it delivered, or nil for genuine silence.
+		return s.WaitReply(ch, wait)
 	}
 	select {
 	case got := <-ch:
