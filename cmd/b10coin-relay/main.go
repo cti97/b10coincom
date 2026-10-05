@@ -6,10 +6,15 @@
 // does nothing else. It does not know what a vote is. That is the design, and
 // the safety case for the whole topology: because every consensus message is
 // signed with the sender's Ed25519 key, a malicious relay can censor or delay
-// but cannot forge anything - safety is never at risk from the relay, only
-// liveness is. If the relay ever "understood" the traffic it would become a
-// place where consensus could be wrongly interpreted, so it is kept exactly
-// as smart as a length prefix.
+// but cannot forge a vote or a proposal - safety is never at risk from the
+// relay, only liveness is. THAT TRADE HOLDS ONLY FOR COMMITTEES OF HELD KEYS
+// (--genesis + --key): the development fixture committee derives every
+// member's private key from public seeds, so with it the claim is vacuous -
+// anyone can sign as any seat, no relay required - and a fixture committee
+// must never meet a relay reachable beyond the operator's own machines. If
+// the relay ever "understood" the traffic it would become a place where
+// consensus could be wrongly interpreted, so it is kept exactly as smart as a
+// length prefix.
 package main
 
 import (

@@ -1,5 +1,15 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # The audit's B-1 also asked that govulncheck see the LIVE vulnerability
+  # database periodically, not only on pushes: a newly published advisory
+  # about a pinned dependency should fail the gate in days, not when someone
+  # next pushes. A twice-a-week schedule (and the lint job below runs ALL its
+  # checks on it - cheap) re-checks this tree against vuln.go.dev on every
+  # pass, without anyone touching the repository.
+  schedule:
+    - cron: '23 5 * * 2,5'
 
 # The workflow's token can do nothing but read: neither vet, test, release nor
 # lint needs write access to the repository (artifacts stay un-uploaded; B-2
@@ -29,9 +39,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          # The version comes from go.mod — whose `toolchain` line names the
-          # exact toolchain — so the CI Go version and the module's demand
-          # cannot drift apart (the audit's B-1: '1.23' was end-of-life).
+          # The version comes from go.mod (its `go` floor and `toolchain`
+          # minimum), so the CI Go version and the module's demand cannot
+          # drift apart (the audit's B-1: '1.23' was end-of-life).
           go-version-file: go.mod
       # -count=1 forces real test execution: without it cached results make a
       # flaky test report green from a previous run.

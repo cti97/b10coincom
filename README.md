@@ -32,10 +32,12 @@ claim in seconds — never a consensus mechanism.
 
 ## Quick start
 
-Requires a supported Go — the `go` directive in `go.mod` is the floor
-(currently **1.26**) and the `toolchain` line names the exact toolchain the
-project builds with (currently **1.27.1**), so a plain `go` command uses
-exactly that toolchain, on every machine, automatically. Two direct external
+Requires a supported Go — the `go` directive in `go.mod` sets the language
+floor (currently **1.26**), and the `toolchain` line names a toolchain
+(currently **1.27.1**) which is the **minimum toolchain version the go
+command switches to**, not an exact pin: an install older than it downloads
+and uses that toolchain automatically (GOTOOLCHAIN=auto, the default); an
+installed newer toolchain is kept. Two direct external
 dependencies: `lukechampine.com/blake3` (v1.4.1) and `golang.org/x/crypto`
 (v0.41.0, for Argon2id). From the repository root:
 

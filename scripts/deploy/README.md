@@ -37,11 +37,18 @@ rule**. Outbound is almost never blocked; inbound is almost never possible.
 The relay itself is deliberately dumb: it forwards signed frames between
 connected peers and understands nothing. Because every consensus message is
 signed with the sender's key, a malicious relay can censor or delay, but
-cannot forge a vote — liveness is what depends on it, never safety. (`b10coin-relay --help` after install prints this trade in full.)
+cannot forge a **vote or a proposal** — safety is never at risk from the
+relay, only liveness. That trade holds only for committees of **held keys**:
+validators started with `--genesis` (the shared committee file of public
+keys) and `--key` (`b10coin keygen`). The development fixture committee
+(`--validators/--index`) derives every member's private key from public
+seeds, so with it anyone can sign as any seat, and no property of the relay
+matters — never point a fixture committee at a relay reachable beyond your
+own machines. (`b10coin-relay --help` after install prints this trade in full.)
 
 ## 2. Build the binaries and copy them over
 
-On the build machine (any OS with Go 1.23+ and `git` installed), get the
+On the build machine (any OS with Go 1.26+ and `git` installed), get the
 source and build inside it:
 
 ```sh
