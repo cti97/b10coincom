@@ -181,9 +181,17 @@ func (p *Proposal) Verify() error {
 	if len(p.Validator) == 0 {
 		return fmt.Errorf("%w: missing proposer key", ErrBadProposalSignature)
 	}
-	if string(p.Validator) != string(p.Block.Header.Proposer) {
-		return fmt.Errorf("%w: key does not match the header's proposer", ErrBadProposalSignature)
-	}
+	// The envelope's signer is the ROUND's proposer, which onProposal checks
+	// against the committee draw. It is deliberately NOT required to be the
+	// block header's proposer: the proof-of-lock re-proposal (audit C-2) is a
+	// locked proposer offering the block it is locked on - a block proposed
+	// possibly by a different validator in an earlier round - with the polka
+	// that locked it as justification. Demanding the keys match would make
+	// every such re-proposal wire-dead (dropped by every peer exactly here),
+	// which is the stall C-2 closes. The BLOCK stays authenticated on its
+	// own: the header carries the original proposer's signature, and the
+	// chain's validation (the pre-vote seam, then Append) checks that
+	// signature before any block content is trusted.
 	h := p.SigningHash()
 	if !crypto.Verify(p.Validator, h[:], p.Sig) {
 		return ErrBadProposalSignature

@@ -1631,6 +1631,34 @@ func fourValCommitteeGenesis(t *testing.T, vals []genesis.Validator) *genesis.Ge
 	return g
 }
 
+// ---- The committee-level proofs for the two consensus liveness findings ----
+//
+// C-1: a Byzantine proposer who signs an otherwise-honest envelope carrying a
+// block with a garbage state root gets, from every honest validator, a NIL
+// prevote; no polka, no lock, no parked committee; the height commits in a
+// later round on an honest proposal.
+//
+// C-2: a committee whose round-0 precommit quorum is lost (everyone locked on
+// B, nobody commits) recovers in the very next round through the locked
+// proposer re-proposing B with the proof-of-lock.
+
+// dropFirstTP wraps a transport and silently discards the first frame matching
+// pred. It is how the tests model one specific loss (a commit-critical
+// delivery) with nothing else changed: deterministic, one-shot, recorded.
+type dropFirstTP struct {
+	transport.Transport
+	pred    func(raw []byte) bool
+	dropped [][]byte
+}
+
+func (d *dropFirstTP) Broadcast(data []byte) error {
+	if d.pred != nil && len(d.dropped) == 0 && d.pred(data) {
+		d.dropped = append(d.dropped, append([]byte(nil), data...))
+		return nil // swallow: the frame never leaves this validator
+	}
+	return d.Transport.Broadcast(data)
+}
+
 // fourValidatorFixture brings up a four-equal-power committee, all four with
 // live drivers over one sim, plus a genesis whose Time is searched just enough
 // that the round-1 proposer differs from the round-0 proposer at height 1 (the
@@ -1851,4 +1879,329 @@ func TestCommitteeNilPrevotesAGarbageRootProposalAndStillCommits(t *testing.T) {
 		}
 	}
 	_ = g
+}
+
+// THE C-2 SCENARIO, AT THE COMMITTEE: round 0's polka for block B reached
+// every validator (every one locked on B and precommitted it), but the wire
+// lost three OF THE FOUR PRECOMMITS, so no validator saw the quorum of three
+// and nobody committed. Every validator is therefore locked on B at round 0
+// with B's bytes.
+//
+// Pre-fix behaviour (the audit's exact claim): every later round's proposer -
+// locked - proposed a FRESH block (a different block: its own key is the
+// header's proposer), which it then nil-prevoted itself; every other locked
+// validator nil-prevoted it too; no polka ever formed again; nobody ever
+// unlocked; the height stalled while the timeouts grew without bound.
+//
+// Post-fix: the very next round's proposer re-proposes B - the locked block,
+// with the round-0 polka as its justification - every locked validator
+// prevotes it (it is their own promise), the polka re-forms, the precommit
+// quorum completes, and B commits.
+//
+// The genesis's Time is chosen by the fixture so the round-1 proposer is NOT
+// the block's original builder: a reverted (pre-fix) re-proposal shows itself
+// as a fresh, different block the moment the locked non-builder proposes - the
+// mutant's first proposal is on the wire and dies on the assertion below.
+func TestALostPrecommitQuorumRecoversThroughTheLockedReProposal(t *testing.T) {
+	// The fixture guarantees the height-1 round-1 proposer is NOT the round-0
+	// proposer's builder (it searched genesis times for that) - the
+	// mutant-kill condition the wire assertions below lean on.
+	ds, chs, recs, net, cfg, _, _ := fourValidatorFixture(t)
+	defer func() {
+		for _, ch := range chs {
+			_ = ch.Close()
+		}
+	}()
+
+	// The loss: validators 1, 2 and 3 each lose their FIRST precommit cast at
+	// (height 1, round 0). With three of four precommits gone, the tallies are
+	// {v0's + own} = 2 at v1/v2/v3 and {own} = 1 at v0: the quorum of 3 is
+	// unreachable, at every validator, in round 0. The PREVOTES fly untouched,
+	// so the round-0 polka completes at every validator and every one of them
+	// LOCKS on the round-0 block - the exact mid-height state the audit names.
+	for idx := 1; idx < 4; idx++ {
+		wrapped := &dropFirstTP{Transport: net.TransportFor(fmt.Sprintf("v%d", idx))}
+		wrapped.pred = func(raw []byte) bool {
+			v, err := DecodeVote(raw)
+			return err == nil && v.Type == MsgPrecommit && v.Height == 1 && v.Round == 0
+		}
+		recs[idx].Transport = wrapped
+	}
+	// The wrappers must be installed over the drivers' transports: the driver
+	// was built over the recordingTransport, so re-point the recording layer's
+	// inner transport at the dropping wrapper. (recordingTransport forwards to
+	// its Transport - now the wrapper - and keeps recording what reached it;
+	// dropped frames do NOT appear in its log, which the fixture guards use.)
+
+	// Drive all four: round 0 commits for nobody (the loss), then the locked
+	// re-proposal must commit in a later round.
+	committedAt := -1
+	for i := 0; i < 600 && committedAt < 0; i++ {
+		now := int64(i) * driveStep
+		for _, d := range ds {
+			d.Tick(now)
+		}
+		net.Advance(netStep)
+		for _, d := range ds {
+			d.Tick(now + driveStep/2)
+		}
+		all := true
+		for _, ch := range chs {
+			if ch.Height() < 1 {
+				all = false
+			}
+		}
+		if all {
+			committedAt = i
+		}
+	}
+	if committedAt < 0 {
+		t.Fatalf("a committee locked on B with a lost round-0 precommit quorum never recovered: no height committed in 600 ticks - the locked proposer did not re-propose, or the justification does not travel")
+	}
+
+	// The committed height-1 block is the ONE everyone locked on: the
+	// round-0 block's ID must be on every chain, one history.
+	var bID [32]byte
+	for idx, ch := range chs {
+		blk, err := ch.BlockAt(1)
+		if err != nil {
+			t.Fatalf("validator %d committed past height 1 without the height-1 block in place: %v", idx, err)
+		}
+		if idx == 0 {
+			bID = blk.ID()
+			continue
+		}
+		if blkID := blk.ID(); blkID != bID {
+			t.Fatalf("validator %d holds a different height-1 block: %x vs %x", idx, blkID[:8], bID[:8])
+		}
+	}
+
+	// The C-2 property on the wire: EVERY proposal ever broadcast at height 1
+	// carried the locked block B - never a fresh conflicting one. (Round 0's
+	// proposer proposed B first; every later round's proposer re-proposed the
+	// locked B with its justification.) A reverted re-proposal proposes the
+	// proposer's own fresh build - an immediately different block - and this
+	// assertion fails on the mutant's first such proposal.
+	for idx, rec := range recs {
+		for _, raw := range rec.broadcasts {
+			p, err := DecodeProposal(raw)
+			if err != nil || p.Height != 1 {
+				continue
+			}
+			pid := p.Block.ID()
+			if pid != bID {
+				t.Fatalf("validator %d (locked, drawn as proposer) proposed %x at height 1; it is locked on %x and must re-propose THAT", idx, pid[:8], bID[:8])
+			}
+		}
+	}
+
+	// The round-1 re-proposal must have been ACCEPTED by a peer: at least one
+	// validator emitted a non-nil prevote for B at (1, round 1). This is what
+	// kills the "envelope validator must equal the block header's proposer"
+	// mutant: the locked proposer at round 1 re-proposes B built by a
+	// DIFFERENT validator, so a rule demanding the two keys match drops the
+	// re-proposal at every peer, no (1,1) prevote exists, and the recovery
+	// waits for the original builder's redraw instead.
+	pvR1 := 0
+	for _, rec := range recs {
+		for _, raw := range rec.broadcasts {
+			v, err := DecodeVote(raw)
+			if err == nil && v.Type == MsgPrevote && v.Height == 1 && v.Round == 1 && !v.IsNil() && v.BlockID == bID {
+				pvR1++
+			}
+		}
+	}
+	// At least TWO: the re-proposer's own prevote always exists (it self-tallies
+	// before shipping), so one alone would pass even if every PEER dropped the
+	// re-proposal - the acceptance this asserts is a peer's, not a formality.
+	if pvR1 < 2 {
+		t.Fatal("only the re-proposer itself prevoted B at (1, round 1); a peer's acceptance is what this recovery runs on")
+	}
+
+	// The proof-of-lock must be present from round 1 on: at least one re-proposal
+	// in a later round carries a justification that decodes to a verified quorum
+	// of prevotes for B at the claimed round.
+	var polkaSeen bool
+	for _, rec := range recs {
+		for _, raw := range rec.broadcasts {
+			p, err := DecodeProposal(raw)
+			if err != nil || p.Height != 1 || p.Round == 0 {
+				continue
+			}
+			if len(p.Justification) == 0 || p.ValidRound < 0 {
+				continue
+			}
+			vs := NewVoteSet(cfg, 1, uint32(p.ValidRound), MsgPrevote)
+			for _, vraw := range decodeVotes(p.Justification) {
+				v, err := DecodeVote(vraw)
+				if err != nil {
+					break
+				}
+				if _, err := vs.Add(v); err != nil {
+					break
+				}
+			}
+			pid := p.Block.ID()
+			if vs.HasQuorum(pid) {
+				polkaSeen = true
+			}
+		}
+	}
+	if !polkaSeen {
+		t.Fatal("no re-proposal ever carried a verified proof-of-lock: the recovery ran on something other than the retained polka")
+	}
+
+	// And the height-1 commit came AFTER round 0 (the loss was real): the
+	// round that committed is at least round 1. The precommits of the
+	// deciding round fly at that round; v0's round-0 precommit was the only
+	// one to leave - the record shows the recovery, not an instant round-0
+	// commit.
+	if committedAt == 0 {
+		t.Fatal("the height committed in round 0: the fixture's lost precommits did not actually prevent the round-0 commit")
+	}
+}
+
+// The round ladder must be CAPPED (audit C-2): an undecided height's rounds
+// end on the ladder, and an uncapped ladder makes every succeeding round
+// linearly slower forever - recovery latency grows without bound. With the
+// cap the ladder saturates: every round past maxRoundEscalation runs at the
+// same fixed cadence.
+//
+// The fixture is the blocked-quorum pair (quorum 2, one live validator): the
+// height can never commit, so the ladder rides out to the cap on its own. The
+// ghost never votes, so no future-round evidence ever accumulates and the raw
+// ladder is what this measures.
+func TestRoundTimeoutsAreCapped(t *testing.T) {
+	d, _, _, _, _, _ := blockedQuorumFixture(t)
+
+	now := int64(5) // below the first deadline: arms the ladder at +TimeoutBase
+	maxDelta := int64(0)
+	for r := uint32(0); r < maxRoundEscalation+8; r++ {
+		d.Tick(now)
+		if d.eng.Round() != r {
+			t.Fatalf("fixture: the engine is at round %d, want %d", d.eng.Round(), r)
+		}
+		delta := d.timeoutAt - d.now
+		want := roundBase + int64(minInt64(r, maxRoundEscalation))*roundStep
+		if delta != want {
+			t.Fatalf("round %d's deadline is TimeoutBase+%d*TimeoutStep = %d, want %d: the ladder %s",
+				r, minInt64(r, maxRoundEscalation), delta, want,
+				func() string {
+					if delta > want {
+						return "grew past its cap"
+					}
+					return "fell short of the ladder"
+				}())
+		}
+		if delta > maxDelta {
+			maxDelta = delta
+		}
+		now = d.timeoutAt
+	}
+	// Saturation is real, not asserted: the sampled deltas stopped growing and
+	// the maximum sits exactly at the capped cadence.
+	if maxDelta != roundBase+int64(maxRoundEscalation)*roundStep {
+		t.Fatalf("the ladder's maximum delta %d != the capped TimeoutBase+%d*TimeoutStep: the cap would not have bound", maxDelta, maxRoundEscalation)
+	}
+}
+
+func minInt64(a, b uint32) int64 {
+	if int64(b) < int64(a) {
+		return int64(b)
+	}
+	return int64(a)
+}
+
+// A timeout must JUMP the ladder when f+1 committee members signed prevotes at
+// rounds ahead of the current one (the minimal round-resync the capped ladder
+// needs): the committee is that far ahead, and a +1 step would keep this
+// validator permanently one round behind, dropping every proposal as
+// wrong-round in both directions.
+//
+// The engine holds no future evidence for the first two firings (one attesting
+// member is below the bar of f+1 = 2 for four validators) and the ladder
+// escalates by one each time; the third firing has two members' future
+// prevotes and jumps straight to the attested round.
+func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+	if e.step != StepPropose || e.proposal != nil {
+		t.Fatal("fixture: the engine must start unproposing at round 0")
+	}
+
+	// One attesting member: below f+1 = 2. The ladder escalates by one.
+	v0 := voteFrom(t, cfg, 0, MsgPrevote, h, 3, crypto.HashParts([]byte("some-later-block")))
+	if err := e.OnMessage(EncodeVote(v0)); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 1 {
+		t.Fatalf("one future-round vote must not move the ladder bar: engine at round %d, want 1", e.Round())
+	}
+
+	// A second attesting member at a further round: f+1 = 2 evidence. The next
+	// timeout jumps to the f+1-th LARGEST attested round - the smallest round
+	// at which the evidence's bulk sits, here 3 of {5, 3} sorted [5, 3].
+	v2 := voteFrom(t, cfg, 2, MsgPrevote, h, 5, crypto.HashParts([]byte("some-later-block")))
+	if err := e.OnMessage(EncodeVote(v2)); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 3 {
+		t.Fatalf("f+1 members' future rounds must jump the ladder: engine at round %d, want 3 (the f+1-th largest of rounds 5, 3)", e.Round())
+	}
+	if p := e.future[2]; p == nil || p.Round != 5 {
+		t.Fatal("fixture: the recorded future evidence is wrong")
+	}
+
+	// The jump lands the honest way: a NEW round at StepPropose waiting for
+	// that round's proposal, the (none-here) lock and the future evidence
+	// intact.
+	if e.Step() != StepPropose {
+		t.Fatalf("after the jump the engine is at step %s, want propose", e.Step())
+	}
+	// The evidence survives the round change and a further member attests
+	// round 9: rounds {3, 5, 9}, f+1-th largest = 5, so the next timeout
+	// advances only to 5. The engine rides the evidence's bulk forward, not
+	// any single member's furthest claim.
+	v1 := voteFrom(t, cfg, 1, MsgPrevote, h, 9, crypto.HashParts([]byte("some-later-block")))
+	if err := e.OnMessage(EncodeVote(v1)); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 5 {
+		t.Fatalf("the jump target is the f+1-th largest attested round, not the furthest: engine at round %d, want 5", e.Round())
+	}
+}
+
+// The jump's gate is f+1, not one: a single signed future-round vote (at most
+// one Byzantine member's claim) must never move the ladder. A committee that
+// jumped on any single attestation would follow one Byzantine member into
+// rounds nobody else is in - and never come back, because the votes its
+// laggards see are all past-rounds relative to the jumped validator.
+//
+// For four validators f+1 = 2: two attestations from the SAME member (its
+// highest wins) still count as one. The jump fires only when a second,
+// distinct member attests.
+func TestTimeoutJumpNeedsDistinctMembersNotOneByzantine(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+
+	// One member, repeatedly attesting absurd rounds: still one entry.
+	for _, r := range []uint32{4, 100, 1 << 30} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 0, MsgPrevote, h, r, crypto.HashParts([]byte("some-later-block"))))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(e.future) != 1 || e.future[0].Round != 1<<30 {
+		t.Fatalf("fixture: one member must hold exactly one (its highest) entry, got %d entries", len(e.future))
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	if e.Round() != 1 {
+		t.Fatalf("a single member's future rounds must not jump the ladder (want +1 step, engine at round %d)", e.Round())
+	}
 }

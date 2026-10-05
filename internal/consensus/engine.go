@@ -95,6 +95,53 @@ type Engine struct {
 	// chain; a driver-less engine has no chain to disagree with.
 	validate func(*types.Block) error
 
+	// lockedBlock retains the bytes of the proposal the lock names, and
+	// lockedVotes the prevotes that formed the polka the lock rests on,
+	// lockedVoteRound the round those votes were cast in (audit C-2's
+	// proof-of-lock). The lock itself records only the block ID and round -
+	// enough to REFUSE conflicting proposals, not enough to RE-propose the
+	// promised one. A validator that is drawn as proposer while locked must
+	// propose its locked block with that polka as its justification - the
+	// justification proves to every peer that the block once carried a
+	// quorum, which is what lets conflicting locks from strictly earlier
+	// rounds unlock and what gives unlocked validators reason to prevote a
+	// block they never saw. Proposing a fresh block instead would be
+	// nil-prevoted by the proposer itself and every other locked validator,
+	// stalling the height for as long as timeouts grow.
+	//
+	// All three fields are empty/-1 when the engine holds no bytes for its
+	// locked ID: a polka can reach quorum over prevotes alone (with the
+	// proposal itself lost), and a lock restored from the store after a
+	// restart is an ID alone. In that state the engine must not even try -
+	// see StartProposing - until a proposal that can rebuild the evidence
+	// arrives.
+	lockedBlock     *types.Block
+	lockedVotes     []*Vote
+	lockedVoteRound int64
+
+	// future records, per committee member (index), the HIGHEST round this
+	// engine has seen that member sign a vote (prevote or precommit) for at
+	// this height, when that round was ahead of the round the engine was in
+	// at arrival. The engine drops wrong-round tallies (no multi-round vote
+	// sets yet - C-3), but the DISCARDED vote still carries the one piece of information the
+	// round ladder needs: the committee has already moved past this round. On
+	// timeout the engine JUMPS its round - bounded, evidence-gated resync:
+	// strictly more than the Byzantine budget (f+1 members) must have
+	// attested a higher round, so at least one honest validator truly was
+	// there. A committee whose round counters drift apart (rebuilt engines
+	// re-arm their ladders mid-height) resynchronises through this; without
+	// it a follower can sit one round behind forever, dropping every proposal
+	// as wrong-round while every leader drops its vote back the same way - a
+	// fully live committee that never polkas again (observed with the capped
+	// round ladder the audit's C-2 asks for).
+	//
+	// One entry per member, replaced only forward: bounded memory, Byzantine
+	// claims contained (f members can attest at most f slots), and the f+1-th
+	// largest entry is then always the highest round AN honest member
+	// attested. Reset only by a new engine (per height); a round change
+	// deliberately keeps it.
+	future map[int]*Vote
+
 	// persistLock, when non-nil, is called the instant the lock moves: the
 	// driver installs it after construction so the promise is made durable
 	// BEFORE the precommit that records it is signed or shipped (a promise
@@ -207,12 +254,63 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) {
 	// The vote, if any, is cast: StepPrevote and StepPrecommit validators voted
 	// earlier through maybePrevote / maybePrecommit, and a validator holding a
 	// proposal whose justification failed stays silent by the gate's rule (no
-	// vote may rest on evidence that does not exist). Leave the round behind.
+	// vote may rest on evidence that does not exist).
+	//
+	// Jump the ladder on evidence before entering the next round: if f+1
+	// committee members signed prevotes at rounds ahead of the one that just
+	// ended, the committee IS that far ahead, and stepping +1 would only keep
+	// this validator exactly one round behind a committee it can never catch -
+	// its own votes and every peer's proposal for the rounds it keeps missing
+	// are dropped as wrong-round in BOTH directions, forever. The target is
+	// the highest round at least one honest member attested (the f+1-th
+	// largest observed member round; f Byzantine slots cannot reach that
+	// position). Without evidence the ladder escalates by one, as before.
+	if target := e.jumpTarget(); target > e.round {
+		e.enterRound(target)
+		return
+	}
 	e.enterRound(e.round + 1)
 }
 
+// jumpTarget reports the round the engine should enter on a timeout when its
+// future-round evidence says the committee has moved beyond the next round,
+// and 0 when there is none (0 is never a valid target: the engine is at round
+// >= 0 and only jumps strictly forward).
+//
+// The criterion is f+1 distinct members' signed votes at rounds ahead of the
+// current one - strictly more than the Byzantine budget can supply. Each
+// member is counted once, at its highest attested round, and the target is
+// the f+1-th LARGEST of those: the highest round the evidence shows bulk at,
+// always SOME honest member's own attested round (f Byzantine claims cannot
+// reach the f+1-th slot). Jumping to the furthest claim would follow one
+// Byzantine member wherever it said; stepping by one would never close a
+// drifted round gap under a flat (capped) cadence. One jump moves to the
+// evidence's bulk; further evidence, on later timeouts, moves further.
+func (e *Engine) jumpTarget() uint32 {
+	fplus1 := len(e.cfg.Committee)/3 + 1
+	if e.future == nil || len(e.future) < fplus1 {
+		return 0
+	}
+	rounds := make([]uint32, 0, len(e.future))
+	for _, v := range e.future {
+		rounds = append(rounds, v.Round)
+	}
+	// Sort descending; index fplus1-1 is the f+1-th largest.
+	for i := 1; i < len(rounds); i++ {
+		for j := i; j > 0 && rounds[j-1] < rounds[j]; j-- {
+			rounds[j-1], rounds[j] = rounds[j], rounds[j-1]
+		}
+	}
+	if int64(rounds[fplus1-1]) <= int64(e.round) {
+		return 0
+	}
+	return rounds[fplus1-1]
+}
+
 // enterRound moves to a later round, resetting the per-round tally. The lock
-// deliberately SURVIVES the round change: that is the whole point of it.
+// deliberately SURVIVES the round change: that is the whole point of it. The
+// future-round evidence survives too: it is per-HEIGHT observation, and the
+// rounds the ladder may still jump to are exactly the ones it records.
 func (e *Engine) enterRound(round uint32) {
 	e.round = round
 	e.step = StepPropose
@@ -309,7 +407,23 @@ func (e *Engine) onProposal(p *Proposal) error {
 
 func (e *Engine) onVote(v *Vote) error {
 	if v.Height != e.height || v.Round != e.round {
-		return nil // not this round
+		// Not this round. A vote from a round AHEAD of ours is still
+		// evidence for the ladder jump: record the member's highest attested
+		// round (signature and membership verified here, because this path
+		// makes a jump decision and must not trust unauthenticated input).
+		// Past-round votes need no record: the committee has left them behind
+		// and our own ladder never wants to enter one.
+		if v.Height == e.height && v.Round > e.round && v.Verify() == nil {
+			if idx := e.cfg.IndexOf(v.Validator); idx >= 0 {
+				if cur, seen := e.future[idx]; !seen || v.Round > cur.Round {
+					if e.future == nil {
+						e.future = make(map[int]*Vote)
+					}
+					e.future[idx] = v
+				}
+			}
+		}
+		return nil
 	}
 	switch v.Type {
 	case MsgPrevote:
@@ -418,6 +532,7 @@ func (e *Engine) maybePrecommit() {
 	// Precommitting IS locking: this is the promise the lock records. Doing it
 	// anywhere else, or only on commit, would leave the safety rule unenforced
 	// for exactly the window it exists to cover.
+	prev := e.lk
 	e.lk.lockOn(e.round, id)
 	// The promise is made durable the moment it moves, before the precommit
 	// that records it leaves this process. Skipping this hook would leave the
@@ -425,6 +540,45 @@ func (e *Engine) maybePrecommit() {
 	// the exact unsafe re-vote the lock exists to prevent.
 	if e.persistLock != nil {
 		e.persistLock(e.height, e.round, id)
+	}
+	// When the lock MOVED, rebind the retained proof-of-lock evidence (audit
+	// C-2): the block bytes this validator holds for the locked ID, the
+	// prevotes that formed the polka it rests on, and the round those votes
+	// were cast in - the round the re-proposal must claim as its ValidRound,
+	// because a justification is tallied in its OWN round.
+	//
+	// The rebinding never leaves an earlier lock's evidence under a new lock
+	// (it would name a block other than the promise), and it keeps evidence
+	// whose block still matches: a lock that moved to the same ID at a later
+	// round keeps the older polka's votes - they are genuine evidence for
+	// the promised block, taken in the round the polka actually formed.
+	// When the polka's own proposal is in hand this round, the fresher
+	// evidence replaces it. A lock whose bytes this engine never held - a
+	// polka reached quorum over prevotes alone, or the lock was restored
+	// from the store as an ID after a restart - is retained as nothing,
+	// which StartProposing treats as "locked, cannot propose".
+	//
+	// An equal-round relock of the same ID (prev == new) binds nothing: any
+	// evidence already retained for that lock still stands, taken in the
+	// round the polka was actually formed.
+	if e.lk.lockedRound != prev.lockedRound || e.lk.lockedBlock != prev.lockedBlock {
+		switch {
+		case e.proposal != nil && e.proposal.ID() == id:
+			e.lockedBlock = e.proposal
+			e.lockedVotes = nil
+			for _, v := range e.prevotes.Votes() {
+				if v.BlockID == id {
+					e.lockedVotes = append(e.lockedVotes, v)
+				}
+			}
+			e.lockedVoteRound = int64(e.round)
+		case e.lockedBlock != nil && e.lockedBlock.ID() == e.lk.blockID():
+			// keep: the retained block is still the one the lock names
+		default:
+			e.lockedBlock = nil
+			e.lockedVotes = nil
+			e.lockedVoteRound = -1
+		}
 	}
 	e.emitVote(MsgPrecommit, id)
 }
@@ -441,8 +595,33 @@ func (e *Engine) maybeCommit() {
 	e.step = StepCommit
 }
 
-// StartProposing is called by the driver when this engine is the proposer for the
-// current round: it builds and broadcasts a proposal.
+// StartProposing is called by the driver when this engine is the proposer for
+// the current round: it builds and broadcasts a proposal.
+//
+// A LOCKED proposer proposes its locked block, not a fresh one (audit C-2).
+// Building a fresh block would be protocol self-contradiction: the proposer
+// itself is locked on another block, so it would nil-prevote its own
+// proposal, and so would every other locked validator - the round dies by
+// construction and every further proposer redraw burns another round. The
+// locked block is re-proposed with ValidRound set to the round its polka was
+// formed in and the polka's prevotes as the justification: the proof-of-lock.
+// That evidence is what makes the re-proposal prevotable everywhere - locked
+// validators prevote their own promise, and any validator locked on a
+// CONFLICTING block from a strictly earlier round unlocks on the verified
+// polka and follows the promise.
+//
+// A locked proposer that holds NO complete proof-of-lock evidence for its
+// locked ID - the polka reached this engine over prevotes alone while the
+// proposal was lost, or the lock was persisted and restored as an ID alone
+// after a restart - cannot construct the re-proposal. It falls through to the
+// fresh build: when that rebuild reproduces the locked block byte-for-byte
+// (deterministic builds: this validator rebuilding its own earlier proposal,
+// and the round-0 draw of a whole-committee restart is exactly that
+// validator), the locked peers prevote it by ID-match and the height
+// proceeds; when it differs, the lock rule makes the proposer itself
+// nil-prevote it, and the round ends inside the capped ladder like any
+// undecided round. Recovery in every other case belongs to a locked proposer
+// that does hold the evidence.
 func (e *Engine) StartProposing() error {
 	if !e.IsProposer() {
 		return ErrNoProposer
@@ -450,16 +629,58 @@ func (e *Engine) StartProposing() error {
 	if e.proposal != nil {
 		return nil
 	}
-	b, err := e.propose(e.height, e.round, e.parent)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrProposeFn, err)
+	var b types.Block
+	var validRound int64
+	var justification []byte
+	if e.lk.locked() && e.lockedBlock != nil && e.lockedBlock.ID() == e.lk.blockID() && len(e.lockedVotes) > 0 {
+		// The lock names a block whose bytes AND polka this engine holds:
+		// re-propose THAT block with the polka as its justification (the
+		// proof-of-lock). This is the audit C-2 fix proper: a locked proposer
+		// proposing anything else would be nil-prevoted by itself - its lock
+		// refuses the fresh block - and by every other locked validator, so
+		// the round dies by construction while every later redraw burns the
+		// same time. The carried justification is what also lets validators
+		// locked on a CONFLICTING block from a strictly earlier round unlock
+		// and follow the promise.
+		b = *e.lockedBlock
+		// The ValidRound is the round the retained polka was VOTED in, not the
+		// current proposing round and not necessarily the lock's current
+		// round: verifyJustification tallies the carried evidence in its own
+		// round, so the claim must name the votes' true origin.
+		validRound = e.lockedVoteRound
+		justification = encodeJustification(e.lockedVotes)
+	} else {
+		if e.lk.locked() {
+			// Locked, but holding no complete proof-of-lock evidence - the
+			// lock names a block whose bytes never arrived (a quorum of
+			// prevotes reached this engine without the proposal) or were lost
+			// in a restart (the store records the lock as an ID alone). No
+			// re-proposal is constructible; the honest fallback is the fresh
+			// build below, which the proposer's own lock then judges: when
+			// the rebuild reproduces the locked block byte-for-byte - the
+			// deterministic-build case, and THE round-0 recovery of a
+			// whole-committee restart - the locked peers prevote it by
+			// ID-match and the height proceeds; when it differs, the lock
+			// rule nil-prevotes it (below in maybePrevote), exactly the
+			// refused-promise shape the lock exists to enforce. A fresh build
+			// that differs from the lock cannot commit anything conflicting:
+			// no quorum of locked validators can gather behind it, and this
+			// validator itself votes nil.
+		}
+		nb, err := e.propose(e.height, e.round, e.parent)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrProposeFn, err)
+		}
+		b = nb
+		// ValidRound -1: a fresh block carries no polka yet. It must be SET, not left
+		// at the zero value, because 0 CLAIMS a polka at round 0 - which no one has
+		// given and this engine could not honestly prove.
+		validRound = -1
 	}
-	// ValidRound -1: a fresh block carries no polka yet. It must be SET, not left
-	// at the zero value, because 0 CLAIMS a polka at round 0 - which no one has
-	// given and this engine could not honestly prove.
 	p := &Proposal{
-		Height: e.height, Round: e.round, Block: b, ValidRound: -1,
-		Validator: e.pub,
+		Height: e.height, Round: e.round, Block: b, ValidRound: validRound,
+		Justification: justification,
+		Validator:     e.pub,
 	}
 	// The signature must cover the envelope's own SigningHash(): that is the
 	// exact hash Proposal.Verify checks on every peer, over the envelope fields

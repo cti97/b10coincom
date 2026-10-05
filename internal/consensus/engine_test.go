@@ -973,3 +973,240 @@ func TestProposalHeaderHeightMismatchIsAProtocolError(t *testing.T) {
 		}
 	}
 }
+
+// roundProposerHeight returns the first height in 1..99 at which wantIdx's key
+// is the proposer at the given ROUND (round0ProposerHeight is the round-0
+// special case).
+func roundProposerHeight(t *testing.T, cfg Config, wantIdx int, round uint32, parent [32]byte) uint64 {
+	t.Helper()
+	for h := uint64(1); h < 100; h++ {
+		if string(cfg.Proposer(h, round, parent)) == string(cfg.Committee[wantIdx].PubKey) {
+			return h
+		}
+	}
+	t.Fatalf("fixture: no height in 1..99 has validator %d proposer at round %d", wantIdx, round)
+	return 0 // unreachable
+}
+
+// engineLockedAtRoundN is a proposal-receiving engine (idx idx, NOT the round-0
+// proposer at the returned height) locked on blkA.ID() in round 0 - via a
+// proposal it received and a quorum of prevotes it tallied - and then parked in
+// the round the proposer will be drawn for. The propose function is caller
+// supplied so the locked-proposing tests can record whether a fresh block was
+// ever built at all.
+func engineLockedAtRound0(t *testing.T, cfg Config, idx int, height uint64, parent [32]byte, blkA types.Block, propose ProposeFn) *Engine {
+	t.Helper()
+	e := NewEngine(cfg, height, parent, testCommitteeKey(idx), propose)
+	if e.Locked() {
+		t.Fatal("fixture: a fresh engine must not be locked")
+	}
+	p := &Proposal{Height: height, Round: 0, Block: blkA, ValidRound: -1, Validator: cfg.Proposer(height, 0, parent)}
+	p.Sig = signProposal(t, cfg, p)
+	if err := e.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < len(cfg.Committee) && cfg.Quorum() > uint64(i); i++ {
+		if i == idx {
+			continue // the engine's own prevote already sits in its tally
+		}
+		if uint64(i) >= cfg.Quorum() && !e.Locked() {
+			break
+		}
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, i, MsgPrevote, height, 0, blkA.ID()))); err != nil {
+			t.Fatal(err)
+		}
+		if e.Locked() {
+			break
+		}
+	}
+	if !e.Locked() || e.lk.round() != 0 || e.lk.blockID() != blkA.ID() {
+		t.Fatalf("fixture: the engine must be locked on the polka'd block at round 0 (locked=%v round=%d)",
+			e.Locked(), e.lk.round())
+	}
+	if out := e.Drain(); len(out) == 0 {
+		t.Fatal("fixture: locking should have produced output; the outbox must be drained here")
+	}
+	if e.lockedBlock == nil || e.lockedBlock.ID() != blkA.ID() {
+		t.Fatal("fixture: the lock must retain the locked block's bytes for the re-proposal")
+	}
+	return e
+}
+
+// A validator locked on block B and later drawn as proposer must propose B -
+// with the polka that locked it as the justification - and must NOT build a
+// fresh block (audit C-2). A fresh block would be nil-prevoted by the proposer
+// itself, which is exactly why the pre-fix rounds never ended once a third of
+// power had locked.
+func TestLockedProposerReProposesItsLockedBlock(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	idx := 1
+	h := roundProposerHeight(t, cfg, idx, 1, parent)
+	blkA := testProposer(t, cfg, h, 0, parent)
+
+	built := false
+	propose := func(hh uint64, r uint32, p [32]byte) (types.Block, error) {
+		built = true
+		return testProposer(t, cfg, hh, r, p), nil
+	}
+	e := engineLockedAtRound0(t, cfg, idx, h, parent, blkA, propose)
+	e.enterRound(1)
+
+	if err := e.StartProposing(); err != nil {
+		t.Fatalf("the locked proposer must re-propose, got error: %v", err)
+	}
+	if built {
+		t.Fatal("the locked proposer built a FRESH block: it must re-propose its locked one")
+	}
+
+	// Exactly one proposal was emitted (plus the proposer's own prevote of
+	// it): scan ONE drained batch - Drain clears, so a second drain here
+	// would find nothing that the first one already took.
+	var prop *Proposal
+	prevoted := false
+	for _, o := range e.Drain() {
+		if p := tryProposal(o.Data); p != nil {
+			if prop != nil {
+				t.Fatal("more than one proposal was emitted")
+			}
+			prop = p
+		}
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote && !v.IsNil() && v.BlockID == blkA.ID() {
+			prevoted = true
+		}
+	}
+	if prop == nil {
+		t.Fatal("no proposal was emitted")
+	}
+	proposedID := prop.Block.ID()
+	lockedID := blkA.ID()
+	if proposedID != lockedID {
+		t.Fatalf("the proposer proposed %x; it is locked on %x and must propose that", proposedID[:8], lockedID[:8])
+	}
+	if prop.ValidRound != 0 {
+		t.Fatalf("the re-proposal claims ValidRound %d; the locked polka was formed at round 0", prop.ValidRound)
+	}
+	// The carried justification must be the polka itself: a quorum of real
+	// prevotes for the locked block at the claimed round, re-tallied through
+	// the same gate a peer runs.
+	if len(prop.Justification) == 0 {
+		t.Fatal("the re-proposal carries no justification - no proof-of-lock")
+	}
+	vs := NewVoteSet(cfg, h, uint32(prop.ValidRound), MsgPrevote)
+	for _, raw := range decodeVotes(prop.Justification) {
+		v, err := DecodeVote(raw)
+		if err != nil {
+			t.Fatalf("the carried justification holds an undecodable vote: %v", err)
+		}
+		if _, err := vs.Add(v); err != nil {
+			t.Fatalf("the carried justification holds a vote that fails verification: %v", err)
+		}
+	}
+	if !vs.HasQuorum(blkA.ID()) {
+		t.Fatal("the carried justification does not reach quorum for the locked block")
+	}
+
+	// The proposer must also prevote its own re-proposal - nil-prevoting its
+	// own proposal was the other half of the C-2 defect.
+	if !prevoted {
+		t.Fatal("the proposer did not prevote its own re-proposal")
+	}
+
+	// And the proof must WORK on a peer: a validator that never saw this
+	// proposal before - unlocked, holding nothing - prevotes the locked block
+	// on the carried evidence alone. This is the justification doing its job:
+	// what the proposer asserts, an honest peer can check.
+	// A peer judges the re-proposal in the round it names: like every honest
+	// validator it has moved through the timeout into round 1 (the round the
+	// re-proposal is proposed in), so the round-match onProposal requires
+	// holds.
+	peer := newTestEngine(t, cfg, 2, h, parent)
+	peer.enterRound(1)
+	if err := peer.OnMessage(EncodeProposal(prop)); err != nil {
+		t.Fatal(err)
+	}
+	peerPrevoted := false
+	for _, o := range peer.Drain() {
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote && v.BlockID == blkA.ID() {
+			peerPrevoted = true
+		}
+	}
+	if !peerPrevoted {
+		t.Fatal("a peer refused the justified re-proposal: the proof-of-lock does not unlock or convince")
+	}
+	if peer.Locked() {
+		t.Fatal("the peer's PREVOTE must not take a lock on its own")
+	}
+}
+
+// The inverse half of the locked-proposer rule: a locked proposer holding NO
+// bytes for its locked ID - the lock restored from the store as an ID alone,
+// or taken over prevotes whose proposal never arrived - has nothing to
+// re-propose. It falls through to the fresh build, and its own lock then
+// judges the result: it must nil-prevote its own fresh proposal (a differing
+// block is refused), and the fresh build must go out through the propose seam.
+// What it must never do is prevote a block its lock does not name.
+func TestLockedProposerWithoutBytesFallsThroughToARefusedFreshBuild(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	idx := 1
+	h := round0ProposerHeight(t, cfg, idx, true, parent)
+
+	built := false
+	propose := func(hh uint64, r uint32, p [32]byte) (types.Block, error) {
+		built = true
+		return conflictingBlock(t, cfg, hh, r, p, 0x5E), nil
+	}
+	e := NewEngine(cfg, h, parent, testCommitteeKey(idx), propose)
+	// The restart shape: the promise comes back from the store as (round, ID)
+	// alone - no block bytes, no votes.
+	e.restoreLock(0, crypto.HashParts([]byte("locked-block-id")))
+	if !e.Locked() || e.lockedBlock != nil || len(e.lockedVotes) != 0 {
+		t.Fatalf("fixture: the restored lock must exist and carry no bytes")
+	}
+
+	if err := e.StartProposing(); err != nil {
+		t.Fatalf("a byte-less locked proposer falls through to its fresh build, got error: %v", err)
+	}
+	if !built {
+		t.Fatal("the fresh build never ran through the propose seam")
+	}
+	// Exactly one proposal; and its own prevote of it MUST BE NIL - the lock
+	// refuses a block it does not name, and the proposer is as bound by that
+	// as any peer.
+	var prop *Proposal
+	selfPrevoteNil := false
+	for _, o := range e.Drain() {
+		if p := tryProposal(o.Data); p != nil {
+			if prop != nil {
+				t.Fatal("more than one proposal was emitted")
+			}
+			prop = p
+		}
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote {
+			if v.IsNil() {
+				selfPrevoteNil = true
+			} else {
+				vID := v.BlockID
+				t.Fatalf("the byte-less locked proposer PREVOTED its own fresh block %x: its lock must refuse it", vID[:8])
+			}
+		}
+	}
+	if prop == nil {
+		t.Fatal("no proposal was emitted")
+	}
+	if prop.Block.ID() == crypto.HashParts([]byte("locked-block-id")) {
+		t.Fatal("the emitted proposal is the locked block: the fixture must hold no bytes for it")
+	}
+	if !selfPrevoteNil {
+		t.Fatal("the proposer did not nil-prevote its own fresh proposal through the lock rule")
+	}
+	if e.proposalEn == nil || e.proposalEn.ValidRound != -1 {
+		t.Fatalf("the fallback fresh proposal must claim no polka, got vr %d", func() int64 {
+			if e.proposalEn != nil {
+				return e.proposalEn.ValidRound
+			}
+			return -999
+		}())
+	}
+}

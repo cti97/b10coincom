@@ -91,6 +91,16 @@ type Driver struct {
 	appendRefused bool
 }
 
+// maxRoundEscalation caps the timeout ladder (audit C-2): a round's deadline
+// is TimeoutBase + min(round, maxRoundEscalation)*TimeoutStep from the clock
+// reading, so an undecided height settles into a FIXED round cadence instead
+// of growing its timeouts without bound. The escalation exists to let slow
+// committees converge; past this many rounds it has done all the good it can
+// and only makes recovery after a stall linearly slower. With the shipped
+// defaults (200ms base, 100ms step) rounds top out at 1.8s; a testnet keeps
+// proposing steadily instead of crawling to multi-second rounds.
+const maxRoundEscalation = uint32(16)
+
 // NewDriver starts a driver that will extend ch from its current head.
 //
 // pool is the driver's transaction source and may be nil: a validator with no
@@ -321,11 +331,20 @@ func (d *Driver) Tick(nowMillis int64) {
 	} else if d.now >= d.timeoutAt {
 		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
 		// The round the engine is in NOW, after OnTimeout advanced it, gets
-		// the base timeout plus its own step. Each round therefore runs
-		// longer than the one before it, and a new round's propose phase
-		// runs before the next timer can fire: the deadline is at least
-		// TimeoutBase from a clock reading taken this tick.
-		d.timeoutAt = d.now + d.cfg.TimeoutBase + int64(d.eng.Round())*d.cfg.TimeoutStep
+		// the base timeout plus its own step - CAPPED at maxRoundEscalation
+		// steps (audit C-2): each round therefore runs longer than the one
+		// before it until the cap, after which every round runs the same
+		// fixed cadence. A height that cannot decide must not grow its
+		// timeouts without bound: unbounded growth made every later round
+		// linearly slower forever, so a committee that recovered late would
+		// still crawl. A new round's propose phase still runs before the
+		// next timer can fire: the deadline is at least TimeoutBase from a
+		// clock reading taken this tick.
+		escalation := d.eng.Round()
+		if escalation > maxRoundEscalation {
+			escalation = maxRoundEscalation
+		}
+		d.timeoutAt = d.now + d.cfg.TimeoutBase + int64(escalation)*d.cfg.TimeoutStep
 	}
 	d.flush()
 }
