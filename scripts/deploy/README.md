@@ -52,12 +52,13 @@ On the build machine (any OS with Go 1.26+ and `git` installed), get the
 source and build inside it:
 
 ```sh
-git clone -b m4-real-networking https://github.com/cti97/b10coincom
+git clone https://github.com/cti97/b10coincom
 cd b10coincom
 ```
 
-(`-b` checks out the branch this recipe ships on — the deployment files are
-not on `main` until the milestone merges.)
+(The deployment files are on the repository's default branch now that M4 has
+merged. To follow an unreleased revision instead, clone it explicitly with
+`git clone -b <branch> …`.)
 
 Build the two Linux/ARM64 **Pi** binaries:
 

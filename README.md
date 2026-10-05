@@ -25,8 +25,9 @@ keyless claim faucet, with consensus treated as a solved problem instead of an
 invention (Tendermint-style BFT; implemented in M3 — see
 [Consensus](#consensus)). The accepted trade-off is the
 design's, stated honestly in §3: *permissionless + fairly distributed + no-PoW
-— pick two*. b10coin begins federated (genesis validators are hardcoded) with
-staking-based admission on the roadmap. Where PoW does survive, in the M2
+— pick two*. b10coin begins federated — a genesis committee of held public
+keys (`--genesis`/`--key`), or the public fixture set for development only —
+with staking-based admission on the roadmap. Where PoW does survive, in the M2
 faucet, it is only a rate limiter on coin claims — tuned so a Pi completes a
 claim in seconds — never a consensus mechanism.
 
@@ -112,6 +113,7 @@ dist/b10coin-0.1.0-linux-arm64             dist/b10coin-relay-0.1.0-linux-arm64
 dist/b10coin-0.1.0-windows-amd64.exe       dist/b10coin-relay-0.1.0-windows-amd64.exe
 dist/b10coin-0.1.0-windows-arm64.exe       dist/b10coin-relay-0.1.0-windows-arm64.exe
 dist/SHA256SUMS
+dist/BUILD-INFO
 ```
 
 Guarantees a release keeps (all enforced by `scripts/build-release.sh`, the
@@ -122,26 +124,43 @@ is swapped in only after everything succeeds — the builds, the architecture
 assertions AND the checksums — so a failure at any of those steps leaves no
 `dist/` at all to be mistaken for a release; the artifact count must equal
 the target count, so a build that silently produced only the host platform
-fails instead of shipping a hole; and every artifact is `file(1)`-checked to
+fails instead of shipping a hole; every artifact is `file(1)`-checked to
 report its own architecture — its format and architecture tokens (`Mach-O`,
 `ELF` or `PE32+`, plus `x86_64`, `arm64`, `x86-64` or `aarch64`) must appear
 wherever they sit in `file`'s output, so the check holds for Apple's `file`
 word order ("Mach-O 64-bit executable arm64") and upstream libmagic's ("Mach-O
 64-bit arm64 executable", which the Linux CI runners emit) alike, and `Mach-O`
-/ `PE32+` names never appear except where they belong. On the target machine,
-verify what you copied:
+/ `PE32+` names never appear except where they belong; and the build is
+**reproducible**: every artifact is built with `-trimpath -buildvcs=false`
+(no checkout path, no VCS revision or dirty flag), and `dist/BUILD-INFO`
+records the toolchain the go command actually ran and those exact flags, so
+two builds of one clean tree on one toolchain are byte-identical.
+On the target machine, verify what you copied:
 
 ```sh
 ( cd dist && sha256sum -c SHA256SUMS )    # or: shasum -a 256 -c SHA256SUMS
+# with a signed release, also verify the signature against the published key:
+# minisign -Vm SHA256SUMS -p b10coin.pub
 ```
+
+**Signing boundary.** `SHA256SUMS` is signed only when the operator supplies a
+[`minisign`](https://jedisct1.github.io/minisign/) secret key — an external
+tool, never a Go dependency and never committed here. Generate a key out of
+band (`minisign -G -p b10coin.pub -s b10coin.key`), publish `b10coin.pub`,
+then run `B10COIN_RELEASE_SIGN_KEY=/abs/path/to/b10coin.key make release`; the
+script writes `dist/SHA256SUMS.minisig` and says so. With no key it still
+produces a complete, verified release and states loudly that the checksums are
+**UNSIGNED**. The user supplies the key and the published public key; the
+repository supplies neither, and a committed signing key would be worthless as
+a signature anyway.
 
 CI (`.github/workflows/ci.yml`) runs a matrix over all six targets on every
 push: each one is cross-compiled with `go build ./...` **and** `go vet
 ./...` — vet, not the build, is what caught this milestone's one
 cross-platform defect (a Unix-only syscall in the relay's test code, which
 made `GOOS=windows go vet` fail while every build stayed green) — plus a
-release job that builds and asserts all twelve artifacts, so no platform can
-rot silently and none ships unverified.
+release job that builds, asserts and **uploads** all twelve artifacts, so no
+platform can rot silently and none is verified-then-discarded.
 
 ## The CLI
 
@@ -200,7 +219,8 @@ Runs a chain serving HTTP RPC. Without any networking flag it is the M1
 single-node producer: the devnet fixture chain, unilateral blocks, the
 fixture devnet key — safe only because devnet coins are valueless.
 
-With networking flags (`--peers`, `--relay`, `--listen`), a node joins the
+With networking flags (`--genesis`/`--key`, `--peers`, `--relay`, `--listen`,
+or the development-only `--validators`/`--index`), a node joins the
 M4 consensus committee over real TCP. **How the committee is named decides
 whose keys sign, and that is the security boundary:**
 
@@ -261,10 +281,11 @@ bails out if the node it is talking to runs a different chain.
 | `--node URL` | `http://127.0.0.1:8645` | HTTP RPC of the node to submit the claim to |
 | `--dir PATH` | `./b10coin-data` | accepted for uniformity with the other commands, and deliberately **never read**: the claim command reads nothing from disk and writes nothing |
 
-There is **no key file and no keystore**: `claim` signs with an ephemeral
+The **claim command** has no key file and no keystore: it signs with an ephemeral
 fresh key, and prints that key once — copy it out immediately if you plan a
-follow-up transfer, because it cannot be recovered later. The claim is only
-queued by this command; the node pays it when its next block applies it.
+follow-up transfer, because it cannot be recovered later. (This is about the
+`claim` command only; validator keys are real files, see `keygen`.) The claim
+is only queued by this command; the node pays it when its next block applies it.
 
 ### `b10coin-relay`
 
@@ -564,38 +585,45 @@ satisfiable. Validator-set changes by stake arrive with M5.
 
 **How this is verified.** The `devnet --validators 4 --blocks 100` acceptance
 command above is the milestone's own check — four validators, one history, or
-the run fails. Behind it sit the six failure scenarios of the design's
-verification plan (`internal/simnet`), every one driven from a fixed seed over
-a clock-free simulated network, so a failure replays exactly: the 1,000-block
+the run fails. Behind it sit eight seeded scenarios in `internal/simnet` (the
+design's verification plan named six; the harness adds a precommit-equivocation
+arm and a loss-and-reorder run), every one driven from a fixed seed over a
+clock-free simulated network, so a failure replays exactly: the 1,000-block
 happy path; one validator powered off while the chain advances at exactly the
 two-thirds bar; two offline — below two thirds — so the chain stalls without
-forking; a partition healed with the isolated validator left strictly behind,
-never forked; a Byzantine validator equivocating on the wire while the
-committee still agrees; and a mid-epoch restart whose replayed state root
-matches its peers'. M3's honest limits are recorded with the scenarios: a
-validator that falls behind cannot catch up yet (block sync is M4's
-networking work), and a lost proposal parks a validator permanently, so
-liveness scenarios run drop-free. The persisted lock has its own limits,
-recorded here rather than hidden: no scenario injects message reordering, so
-the restart-time refusal is exercised with in-order delivery only; the
-justification gate's unlock path is unreachable from any shipped driver —
-honest proposals never carry a polka for a conflicting block, so in
-production the gate is refusal-only and the unlock-on-evidence half is
-exercised by tests alone; and consensus blocks carry no transactions, so the
-claim bound's motivating threat (a proposer stuffing a block with heavy
-faucet claims) never arises on the consensus path in M3. None of these are
-defects in what M3 built; all three are the boundary of what it claims.
+forking; a partition healed with the isolated validator PULLING the missed
+certified blocks (BLOCK_SYNC), rejoining the committee and holding the
+majority's exact history at every height; a Byzantine validator equivocating on
+prevotes, and another on precommits, while the committee still agrees; a
+mid-epoch restart whose replayed state root matches its peers'; and a lossy,
+reordering network that recovers through catch-up. Since M4 a validator that
+falls behind can catch up, so a lost proposal is recoverable rather than a
+permanent park — which is exactly what lets the loss/reorder scenario assert
+liveness. The persisted lock's own limits are recorded here rather than hidden:
+the restart-time refusal is exercised with in-order delivery; the justification
+gate's unlock path is unreachable from any shipped driver — honest proposals
+never carry a polka for a conflicting block, so in production the gate is
+refusal-only and the unlock-on-evidence half is exercised by tests alone; and
+the seeded scenarios submit no transactions, so the claim bound's motivating
+threat (a proposer stuffing a block with heavy faucet claims) is not exercised
+through consensus. None of these are defects in what the milestones built; they
+are the boundary of what they claim.
 
 ## Architecture
 
-Sixteen Go packages under `internal/` (the simulated transport is one of them,
+Twenty Go packages under `internal/` (the simulated transport is one of them,
 at `internal/transport/sim`), and the CLI in `cmd/b10coin`. Import direction is
-`cmd → devnet → {chain, node, simnet}` — the RPC layer is brought in by `cmd`
-alone, not by `devnet` — and
+`cmd → devnet → {chain, node, simnet, consensus, transport, transport/tcp,
+relay, wire}` — the RPC layer is brought in by `cmd` alone, not by `devnet` —
+and
 `chain → {store, state, genesis, types, crypto, faucet}`; `types` never imports
 `state`, `state` never imports `chain`, `chain` never imports `rpc`, and
 `internal/faucet` (the puzzle and emission arithmetic) sits under `state` and
 `chain` — it is imported by them and by `devnet` and `cmd`, never the reverse.
+The M4 networking layer runs the other way: `devnet` dials through
+`transport/tcp`, which depends on `relay` and `wire`, and `wire` depends only
+on `types`; `internal/keystore` (the `keygen`/`--key` file format) is imported
+by `cmd` alone.
 
 | Package | Responsibility |
 |---|---|
@@ -612,10 +640,14 @@ alone, not by `devnet` — and
 | `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters. M4 adds BLOCK_SYNC catch-up and a certificate log: a commit certificate is persisted to the data directory, so a restarted validator still serves the evidence for blocks it adopted before it restarted |
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
-| `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, and prefix-agreement assertions — the harness the six seeded scenarios drive, and the multi-validator devnet with it |
-| `internal/devnet` | The in-process devnet driver used by both the CLI acceptance commands and the tests: the single-node transfer, claim and double-claim-refusal scenario with replay verification, and — since M3 — the multi-validator committee run reporting per-validator heights and agreement |
+| `internal/transport/tcp` | The real TCP transport: a framed reader/writer with socket deadlines, direct dial/listen, a relay-aware dial mode registered under `relay:<addr>`, and reconnect backoff |
+| `internal/relay` | The dumb frame forwarder (`cmd/b10coin-relay`): a peer registry, per-receiver byte- and frame-bounded queues, per-source-prefix connection caps, socket deadlines and an optional pre-shared access-token first frame; it decodes nothing beyond the length prefix |
+| `internal/wire` | The wire envelopes shared with the transport and the consensus syncer: HELLO and BLOCK_SYNC request/response codecs with their own signed hashes |
+| `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, catch-up and prefix-agreement assertions — the harness the eight seeded scenarios drive, and the multi-validator devnet with it |
+| `internal/devnet` | The in-process devnet driver used by both the CLI acceptance commands and the tests: the single-node transfer, claim and double-claim-refusal scenario with replay verification, the multi-validator committee run reporting per-validator heights and agreement, and the real-TCP node (`tcpnode.go`) the `node` command's committee mode runs |
+| `internal/keystore` | The versioned JSON validator key file `keygen` writes and `--key` loads: owner-only permissions, public key re-derived and checked against the file, refusing a group- or world-readable key |
 | `internal/version` | The semantic version constant (`0.1.0`) |
-| `cmd/b10coin` | CLI entrypoint: `devnet`, `node`, `claim`, `version`, `help` |
+| `cmd/b10coin` | CLI entrypoint: `devnet`, `node`, `keygen`, `claim`, `version`, `help` |
 
 ## Key design decisions
 
@@ -699,7 +731,7 @@ differences are in the table below.
 | | `genesis/devnet.json` | `genesis/testnet.json` |
 |---|---|---|
 | `chain_id` | `b10coin-devnet-1` | `b10coin-testnet-1` |
-| Validators | 1, from a deterministic public test key | 0 (validator keys arrive with real networking, M4) |
+| Validators | 1, from a deterministic public test key | 0 — the compiled-in testnet chain names no validator; a real committee comes from a shared `--genesis` committee file of held public keys (M4, see [The CLI](#the-cli)) |
 | Dev accounts | 1 funded account plus 1 zero-balance recipient, for transfers before the M2 faucet exists | **none** |
 | Committee size | 1 | 21 |
 | Faucet claim amount | 1 b10 (100,000,000 sparks) | 100 b10 (10,000,000,000 sparks) |
@@ -790,7 +822,7 @@ toolchain go.mod pins: currently Go 1.27.1 over language version 1.26.
 | Test suite | `go test ./...` |
 | Build | `go build ./...` |
 | Cross-platform, per target | `GOOS=<os> GOARCH=<arch> go build ./...` and `go vet ./...` for each of the six targets (the matrix job) |
-| Release, all six targets | `make release` (12 artifacts + `SHA256SUMS`, all asserted) |
+| Release, all six targets | `make release` (12 reproducible artifacts + `SHA256SUMS` + `BUILD-INFO`, all asserted; `SHA256SUMS.minisig` when `B10COIN_RELEASE_SIGN_KEY` names a minisign key) |
 | Acceptance check, default run | `go run ./cmd/b10coin devnet --blocks 100` |
 | Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
@@ -802,13 +834,14 @@ Actions weekly (`.github/dependabot.yml`).
 
 Makefile targets: `make test`, `make race`, `make build` (produces
 `bin/b10coin`), `make release` (both binaries for all six targets into
-`dist/` with `SHA256SUMS` — [platforms](#platforms-and-releases)), `make
+`dist/` with `SHA256SUMS` and `BUILD-INFO`, signed when
+`B10COIN_RELEASE_SIGN_KEY` is set — [platforms](#platforms-and-releases)), `make
 vet`, `make fmt`, and `make devnet` (build followed by the acceptance
 check).
 
 ## Status and roadmap
 
-Implemented — modules M0, M1, M2 and M3:
+Implemented — modules M0 through M4:
 
 - **M0** — repository skeleton, canonical encoding, crypto wrappers, CI.
 - **M1** — single-node chain: account state machine, block production,
@@ -822,26 +855,28 @@ Implemented — modules M0, M1, M2 and M3:
   locking unlockable only on evidence, over a deterministic in-process
   simulated network; a block over `max_claims_per_block` faucet claims is
   invalid before any puzzle is verified (the per-block claim bound, derived
-  together with the testnet tuning); verified by the six seeded failure scenarios in
-  `internal/simnet` — safety under partition, outage and equivocation,
-  liveness at and above the two-thirds bar — and by the four-validator
-  `devnet --validators 4 --blocks 100` acceptance command.
+  together with the testnet tuning); verified by the eight seeded scenarios in
+  `internal/simnet` — safety under partition, outage and equivocation, plus
+  liveness under loss and reordering through catch-up — and by the
+  four-validator `devnet --validators 4 --blocks 100` acceptance command.
+- **M4** — real networking: the real TCP transport, a small outbound relay so
+  home validators need no port forwarding (with an optional pre-shared access
+  token for CGNAT hosts), BLOCK_SYNC catch-up backed by a persisted
+  commit-certificate log so a validator that fell behind pulls its peers'
+  certified blocks and rejoins the committee, durable validator keys and a
+  shared committee file (`keygen` / `--key` / `--genesis`), and reproducible
+  release builds for all six OS/arch targets. The three-Pi deployment recipe
+  is [`scripts/deploy/README.md`](scripts/deploy/README.md).
 
 Pending:
 
-- **M4** — real networking (TCP transport plus a small outbound relay so home
-  validators need no port forwarding), release builds for all six OS/arch
-  targets (macOS, Linux and Windows — see
-  [Platforms and releases](#platforms-and-releases)), and validators on
-  actual Raspberry Pis. Block catch-up — letting a validator that fell behind
-  adopt its peers' blocks — arrives with real networking too.
-
-The design's milestone table defines further stages beyond M4 — staking and
-committee rotation (M5), and a wallet CLI with a minimal explorer and faucet
-web UI (M6). One honest limitation carries over from the design: until M4
-passes, the Raspberry Pi thesis is unproven; the deterministic simulator
-cannot catch real-network failures, and only real hardware validates the
-transport.
+- **M4 acceptance on real hardware** — three Raspberry Pis on separate home
+  networks plus a relay VPS, checked end-to-end by
+  `scripts/deploy/acceptance.sh`. The code and the recipe are in place; the
+  deterministic simulator cannot catch real-network failures, so this run is
+  what validates the transport on real hardware.
+- **M5** — staking and committee rotation. **M6** — a wallet CLI with a
+  minimal explorer and faucet web UI.
 
 ## Documentation
 
@@ -856,3 +891,8 @@ transport.
 - `docs/plans/2026-10-03-m3-bft-consensus.md` — the M3 consensus
   implementation plan: the engine and its locking rule, the simulated network,
   the six verification scenarios and this milestone's acceptance gate.
+- `docs/plans/2026-10-04-m4-real-networking.md` — the M4 real-networking
+  implementation plan: the TCP transport and relay, BLOCK_SYNC catch-up, the
+  committee/key files and this milestone's acceptance gate.
+- `scripts/deploy/README.md` — the three-Pi plus relay deployment recipe, and
+  `scripts/deploy/acceptance.sh` — the end-to-end verdict it is checked with.
