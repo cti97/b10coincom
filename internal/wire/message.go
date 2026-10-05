@@ -181,11 +181,22 @@ type BlockSyncResp struct {
 	// the syncer's Receive is what insists it matches the in-flight request.
 	Nonce uint64
 	Units []BlockSyncUnit
+	// Responder is the Ed25519 public key of the committee member that
+	// answered, and Sig is its signature over the consensus layer's
+	// domain-separated syncRespHash. They are the responder AUTHENTICATION
+	// (audit round 7, F1): a transport name is a routing key, not an identity,
+	// and through a relay every member - and every stranger - shares one name.
+	// The puller requires the answer to be signed by the member it selected,
+	// so a stranger with no committee key cannot produce a response it will
+	// accept. The wire layer only frames the two fields; the consensus layer
+	// signs and verifies them.
+	Responder []byte
+	Sig       []byte
 }
 
 // EncodeBlockSyncResp renders r canonically:
 //
-//	tag(1) | Nonce(8) | count | count x (len block | round(4) | count votes | count x (len vote))
+//	tag(1) | Nonce(8) | count | count x (len block | round(4) | count votes | count x (len vote)) | len Responder | len Sig
 func EncodeBlockSyncResp(r *BlockSyncResp) []byte {
 	e := types.NewEncoder()
 	e.U8(uint8(MsgBlockSyncResp))
@@ -199,6 +210,8 @@ func EncodeBlockSyncResp(r *BlockSyncResp) []byte {
 			e.VarBytes(v)
 		}
 	}
+	e.VarBytes(r.Responder)
+	e.VarBytes(r.Sig)
 	return e.Bytes()
 }
 
@@ -241,6 +254,12 @@ func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 			u.Votes = append(u.Votes, v)
 		}
 		r.Units = append(r.Units, u)
+	}
+	if r.Responder, err = d.VarBytes(); err != nil {
+		return nil, err
+	}
+	if r.Sig, err = d.VarBytes(); err != nil {
+		return nil, err
 	}
 	if err := d.Done(); err != nil {
 		return nil, err

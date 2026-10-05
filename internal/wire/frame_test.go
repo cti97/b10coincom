@@ -203,7 +203,7 @@ func TestBlockSyncRespRoundTrips(t *testing.T) {
 		{Block: []byte{0xAA, 0xBB}, Round: 4, Votes: [][]byte{{0x01, 0x02}, {0x03}}},
 		{}, // a fully empty unit still round-trips: the wire frames bytes, it refuses nothing
 		{Block: []byte{0xCC}, Round: 0},
-	}}
+	}, Responder: []byte{0x11, 0x22}, Sig: []byte{0x33, 0x44, 0x55}}
 	enc := EncodeBlockSyncResp(resp)
 	if len(enc) == 0 || MsgType(enc[0]) != MsgBlockSyncResp {
 		t.Fatalf("the encoded BLOCK_SYNC response must open with its tag byte, got %v", enc)
@@ -214,6 +214,10 @@ func TestBlockSyncRespRoundTrips(t *testing.T) {
 	}
 	if dec.Nonce != resp.Nonce {
 		t.Fatalf("the response's echoed nonce was lost: want %d, got %d", resp.Nonce, dec.Nonce)
+	}
+	if !bytes.Equal(dec.Responder, resp.Responder) || !bytes.Equal(dec.Sig, resp.Sig) {
+		t.Fatalf("the response's responder authentication was lost: want %x/%x, got %x/%x",
+			resp.Responder, resp.Sig, dec.Responder, dec.Sig)
 	}
 	if len(dec.Units) != len(resp.Units) {
 		t.Fatalf("want %d units, got %d", len(resp.Units), len(dec.Units))

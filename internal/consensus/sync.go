@@ -38,19 +38,25 @@ package consensus
 // pull stops rather than skipping ahead, because a skipped block leaves a hole
 // no later block can link across.
 //
-// A RESPONSE BELONGS TO ONE REQUEST. A request carries a nonce, the signed
-// challenge covers it, and the answer echoes it. A pull registers the ONE
-// request it has in flight (peer, nonce, and a private reply channel) and files
-// a response only when the sender is that peer AND the nonce is that request's:
-// a response for an earlier request - a late answer arriving after a retry - is
-// dropped, never consumed as the current request's answer. Every served unit
-// must also fall inside the requested window [start, end], so a peer cannot
-// answer a one-window request with a block from somewhere else. Requesting is
-// itself bounded three ways: a served (requester, nonce) is remembered for a
-// short window so the SAME signed request cannot be replayed for another
-// answer; a per-requester token bucket caps how many requests one asker can
-// make the node serve; and each request authenticates as a signed committee
-// member.
+// A RESPONSE BELONGS TO ONE REQUEST, AND TO ONE MEMBER. A request carries a
+// nonce, the signed challenge covers it, and the answer echoes it. A pull
+// registers the ONE request it has in flight (peer, nonce, and a private reply
+// channel) and files a response only when the sender is that peer AND the
+// nonce is that request's: a response for an earlier request - a late answer
+// arriving after a retry - is dropped, never consumed as the current request's
+// answer. The response ENVELOPE is itself signed by the answering member
+// (signSyncResp/verifySyncResp), and the pull requires that member to be the
+// one selection chose: this is what a transport name cannot express, because
+// through a relay every member - and every stranger - arrives under the one
+// relay:<addr> name, so the name check alone is vacuous there. A stranger with
+// no committee key cannot produce an answer the pull accepts. Every served
+// unit must also fall inside the requested window [start, end], so a peer
+// cannot answer a one-window request with a block from somewhere else.
+// Requesting is itself bounded three ways: a served (requester, nonce) is
+// remembered for a short window so the SAME signed request cannot be replayed
+// for another answer; a per-requester token bucket caps how many requests one
+// asker can make the node serve; and each request authenticates as a signed
+// committee member.
 //
 // DELIVERY IS ASYNCHRONOUS. Neither shipped transport delivers inside Send -
 // sim and tcp enqueue (a transport that re-entered its caller mid-send would
@@ -150,6 +156,12 @@ var (
 	// ErrBadSyncResp reports a response frame that decodes but carries bytes
 	// no block can be read out of.
 	ErrBadSyncResp = errors.New("consensus: peer served a block that does not decode")
+	// ErrBadSyncRespAuth reports a response envelope with no responder key, a
+	// signature that does not verify, or a responder other than the committee
+	// member the pull asked. It is the answer-side authentication (round 7,
+	// F1): a transport name cannot distinguish peers behind a relay, so the
+	// response itself must carry a signature by the member that was selected.
+	ErrBadSyncRespAuth = errors.New("consensus: BLOCK_SYNC response is not signed by the requested committee member")
 	// ErrSyncUnitOutOfRange reports a response unit whose block stands outside
 	// the window the request asked for. A peer that answers a range it was not
 	// asked about is refused before its certificate is even considered: the
@@ -196,6 +208,24 @@ type Syncer struct {
 	// ordered, so this stays reproducible, and a two-node run needs no
 	// configuration at all.
 	Peer transport.PeerID
+
+	// Expect is the committee member the in-flight pull requires as its
+	// responder: the Ed25519 public key selection chose. A response is
+	// accepted only when its Responder equals Expect AND its signature
+	// verifies (see Receive). On a relay every member shares Expect's
+	// transport name, so this identity - not the name - is what attributes an
+	// answer (round 7, F1). Nil accepts any signed committee member: that
+	// still refuses a stranger, and callers that can pin (devnet's wave loop,
+	// simnet's CatchUp) always do.
+	Expect ed25519.PublicKey
+
+	// afterSend, when non-nil, runs after a window's request has been
+	// registered and handed to the transport, immediately before the pull
+	// blocks on its answer. It exists so tests can deliver the answer by
+	// CONSTRUCTING it (advancing the simulated network inside this hook)
+	// instead of racing ReplyWait against a pump goroutine; production leaves
+	// it nil. See the de-raced tests in sync_test.go.
+	afterSend func()
 
 	// ReplyWait is how long one window's request waits for a filed response
 	// before the pull reads silence; zero takes DefaultReplyWait. The clock
@@ -267,11 +297,14 @@ type Syncer struct {
 }
 
 // pendingReply is the ONE request a pull has in flight. Receive files into ch
-// only a response whose nonce equals nonce and whose sender equals peer.
+// only a response whose nonce equals the request's, whose sender is the
+// transport name the request went to, and whose envelope is signed by expect -
+// the committee member selection chose.
 type pendingReply struct {
-	nonce uint64
-	peer  transport.PeerID
-	ch    chan *wire.BlockSyncResp
+	req    *wire.BlockSyncReq
+	peer   transport.PeerID
+	expect ed25519.PublicKey
+	ch     chan *wire.BlockSyncResp
 }
 
 type commitRecord struct {
@@ -369,6 +402,84 @@ func verifySyncReq(req *wire.BlockSyncReq, vals []genesis.Validator) error {
 	h := syncReqHash(req)
 	if !crypto.Verify(req.Requester, h[:], req.Sig) {
 		return fmt.Errorf("%w: signature does not verify", ErrBadSyncAuth)
+	}
+	return nil
+}
+
+// syncRespHash is the canonical challenge a BLOCK_SYNC response signature
+// covers (round 7, F1): the request's OWN correlation fields - the range it
+// asked for, its nonce, and the requester key - together with the responder
+// key and every unit's exact served bytes. Binding the request means an answer
+// proves it answers THAT request; a peer cannot move it to another window or
+// nonce. Binding the responder key means the signature names the member that
+// produced it, which is what a relay's shared transport name cannot. Domain
+// separation keeps a response signature from ever being replayed as a vote,
+// proposal, request or HELLO.
+func syncRespHash(req *wire.BlockSyncReq, resp *wire.BlockSyncResp) [32]byte {
+	e := types.NewEncoder()
+	e.U64(req.From)
+	e.U64(req.To)
+	e.U64(req.Nonce)
+	e.VarBytes(req.Requester)
+	e.VarBytes(resp.Responder)
+	e.Len(len(resp.Units))
+	for _, u := range resp.Units {
+		e.VarBytes(u.Block)
+		e.U32(u.Round)
+		e.Len(len(u.Votes))
+		for _, v := range u.Votes {
+			e.VarBytes(v)
+		}
+	}
+	return crypto.HashParts([]byte("b10coin-sync-resp"), e.Bytes())
+}
+
+// signSyncResp fills in the response envelope Answer sends: the responder's
+// key and its signature over syncRespHash. It is the answer half of the
+// authentication; verifySyncResp is the puller's half.
+func signSyncResp(priv ed25519.PrivateKey, req *wire.BlockSyncReq, resp *wire.BlockSyncResp) {
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	resp.Responder = pub
+	h := syncRespHash(req, resp)
+	resp.Sig = crypto.Sign(priv, h[:])
+}
+
+// verifySyncResp is the puller's authentication gate for a response envelope.
+// It refuses, before any unit is looked at:
+//
+//   - a response with no responder key (ErrBadSyncRespAuth);
+//   - a responder that is not a committee member (ErrBadSyncRespAuth) - the
+//     stranger case, which needs no committee key of its own to be excluded;
+//   - a responder other than expect, when expect is set (ErrBadSyncRespAuth) -
+//     the member-pin case, which is what a relay needs: every member shares the
+//     transport name, so the signature is the only attribution;
+//   - a signature that does not verify over the request and the served bytes
+//     (ErrBadSyncRespAuth).
+//
+// The certificate gate above chain.Append is unchanged and still the authority
+// on what may be adopted; this gate only decides who may ANSWER. A refusal
+// here is silence (Receive drops the frame), which the pull already reads as
+// "nothing came back".
+func verifySyncResp(req *wire.BlockSyncReq, resp *wire.BlockSyncResp, expect ed25519.PublicKey, vals []genesis.Validator) error {
+	if len(resp.Responder) == 0 {
+		return fmt.Errorf("%w: response carries no responder key", ErrBadSyncRespAuth)
+	}
+	member := false
+	for i := range vals {
+		if bytes.Equal(vals[i].PubKey, resp.Responder) {
+			member = true
+			break
+		}
+	}
+	if !member {
+		return fmt.Errorf("%w: responder %s is not in the validator set", ErrBadSyncRespAuth, requesterLabel(resp.Responder))
+	}
+	if len(expect) > 0 && !bytes.Equal(resp.Responder, expect) {
+		return fmt.Errorf("%w: responder %s is not the selected member %s", ErrBadSyncRespAuth, requesterLabel(resp.Responder), requesterLabel(expect))
+	}
+	h := syncRespHash(req, resp)
+	if !crypto.Verify(resp.Responder, h[:], resp.Sig) {
+		return fmt.Errorf("%w: response signature does not verify", ErrBadSyncRespAuth)
 	}
 	return nil
 }
@@ -627,7 +738,13 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 		}
 		units = append(units, wire.BlockSyncUnit{Block: blk.Encode(), Round: rec.round, Votes: rec.encoded})
 	}
-	return &wire.BlockSyncResp{Nonce: req.Nonce, Units: units}, nil
+	resp := &wire.BlockSyncResp{Nonce: req.Nonce, Units: units}
+	// The response envelope is signed as the answering committee member
+	// (round 7, F1): on a relay every member shares the one transport name,
+	// so this signature is what lets the puller attribute the answer to the
+	// member it selected and refuse a stranger's.
+	signSyncResp(s.priv, req, resp)
+	return resp, nil
 }
 
 // requesterLabel renders a requester key for an error message without pulling
@@ -666,11 +783,17 @@ func (s *Syncer) Handle(reqFrame []byte) (respFrame []byte, ok bool) {
 
 // Receive files a BLOCK_SYNC_RESP frame for the pull in flight, and ONLY that
 // pull's frame. A response is accepted when a request is in flight, when it
-// arrived from the peer that request was sent to, and when its nonce equals
-// that request's. Anything else is dropped: a response for a different request
-// (including a late answer to an earlier retry), a response from a peer that
-// was never asked, and a frame arriving while no pull waits all read the same
-// silence. A frame that does not decode is dropped for the same reason.
+// arrived from the transport name that request was sent to, when its nonce
+// equals that request's, AND when its envelope is signed by the committee
+// member selection chose (expect). Anything else is dropped: a response for a
+// different request (including a late answer to an earlier retry), a response
+// from a name that was never asked, a forged or foreign-signed envelope, and a
+// frame arriving while no pull waits all read the same silence. A frame that
+// does not decode is dropped for the same reason.
+//
+// The name check (`w.peer != from`) is necessary but NOT sufficient on a
+// relay, where every member and every stranger arrives under the one
+// relay:<addr> name; verifySyncResp is what closes that hole (round 7, F1).
 func (s *Syncer) Receive(from transport.PeerID, data []byte) {
 	resp, err := wire.DecodeBlockSyncResp(data)
 	if err != nil {
@@ -683,13 +806,20 @@ func (s *Syncer) Receive(from transport.PeerID, data []byte) {
 		return // no request in flight: nothing this frame could answer
 	}
 	if w.peer != from {
-		// The sender check: a peer that was not asked cannot answer.
+		// The sender check: a transport name that was not asked cannot answer
+		// (meaningful on a direct link; vacuous behind a relay).
 		return
 	}
-	if resp.Nonce != w.nonce {
+	if w.req == nil || resp.Nonce != w.req.Nonce {
 		// The correlation check: a reply to another request - an earlier one
 		// that timed out, or one never sent by us - is not this request's
 		// answer.
+		return
+	}
+	if verifySyncResp(w.req, resp, w.expect, s.chain.Genesis().Validators) != nil {
+		// The authentication check: an unsigned envelope, a non-member's, a
+		// different member's, or a signature that does not cover exactly this
+		// request and these bytes. Dropped, never filed.
 		return
 	}
 	select {
@@ -815,7 +945,7 @@ func (s *Syncer) PullAndAdopt(from uint64) error {
 		// Register the one request in flight BEFORE Send: a transport that
 		// delivers on its own goroutine must find the slot already armed, or
 		// its answer would be filed as a frame for no request and dropped.
-		pending := &pendingReply{nonce: nonce, peer: peer, ch: make(chan *wire.BlockSyncResp, 1)}
+		pending := &pendingReply{req: req, peer: peer, expect: s.Expect, ch: make(chan *wire.BlockSyncResp, 1)}
 		s.reqMu.Lock()
 		s.waiting = pending
 		s.reqMu.Unlock()
@@ -829,6 +959,12 @@ func (s *Syncer) PullAndAdopt(from uint64) error {
 		if err := s.tp.Send(peer, wire.EncodeBlockSyncReq(req)); err != nil {
 			clear()
 			return err
+		}
+		// The test seam: deliver the answer by construction before the wait
+		// begins, so a test's outcome cannot depend on a pump goroutine
+		// winning a race against ReplyWait. Nil in production.
+		if s.afterSend != nil {
+			s.afterSend()
 		}
 		// The answer is whatever Receive files on this request's channel
 		// while the request is on the wire; awaitReply waits for it up to

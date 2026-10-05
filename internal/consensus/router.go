@@ -105,12 +105,16 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 		// over and returns, so a slow Answer cannot hold the transport's
 		// dispatch lock.
 		if _, err := wire.DecodeBlockSyncReq(m.Data); err == nil {
-			r.servedReq.Add(1)
 			if r.AsyncServe != nil {
+				// Handed to the bounded worker pool; the request is SERVED
+				// (and counted) there, off this dispatch goroutine (audit
+				// C-4). Counting it here would over-report: a request shed by
+				// a full queue was never served (round 7, F4).
 				r.AsyncServe(m)
 				return false
 			}
 			if frame, ok := r.Sync.Handle(m.Data); ok {
+				r.servedReq.Add(1) // SERVED, not queued: Handle returned an answer (round 7, F4)
 				if r.SendReply != nil {
 					_ = r.SendReply(m.From, frame) // a lost reply is the pull's retry, not an error here
 				}
@@ -139,10 +143,17 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 // node-level wiring tests.
 func (r *MessageRouter) HellosSeen() uint64 { return r.hellos.Load() }
 
-// SyncRequestsServed reports how many BLOCK_SYNC requests this node was asked
-// to answer: the wire evidence that SOME peer pulled from it (a loss scenario
-// reads it to prove catch-up was actually needed, not asserted).
+// SyncRequestsServed reports how many BLOCK_SYNC requests this node actually
+// ANSWERED: the wire evidence that SOME peer pulled from it (a loss scenario
+// reads it to prove catch-up was actually needed, not asserted). A request
+// handed to the async server is counted by the server once Handle returns an
+// answer, never at handoff, so a shed request is not counted (round 7, F4).
 func (r *MessageRouter) SyncRequestsServed() uint64 { return r.servedReq.Load() }
+
+// NoteServed records that one BLOCK_SYNC request was answered. The inline path
+// calls it itself; a node with AsyncServe installed calls it from the worker
+// that ran Handle, so the counter means served rather than queued.
+func (r *MessageRouter) NoteServed() { r.servedReq.Add(1) }
 
 // SyncRepliesFiled reports how many BLOCK_SYNC responses were routed into the
 // local syncer's reply slot.

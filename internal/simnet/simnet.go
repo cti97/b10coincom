@@ -876,6 +876,10 @@ func (n *Net) CatchUp(i int) error {
 	}
 	start := n.ch[i].Height()
 	n.syncs[i].Peer = transport.PeerID(fmt.Sprintf("v%d", ref))
+	// The answer this pull accepts must be signed by the selected member
+	// (round 7, F1). The transport name is `v<seat>`; the identity is the
+	// committee key at that seat.
+	n.syncs[i].Expect = n.g.Validators[ref].PubKey
 	done := make(chan error, 1)
 	go func() { done <- n.syncs[i].PullAndAdopt(start + 1) }()
 	for step := 0; ; step++ {

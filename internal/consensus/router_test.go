@@ -256,8 +256,18 @@ func TestTheRouterDefersSyncServingToItsAsyncServer(t *testing.T) {
 	if got := handed.Load(); got != 1 {
 		t.Fatalf("the async server received %d requests, want 1", got)
 	}
+	// The request was handed over, not served: the counter must read 0 until
+	// the worker that ran Handle reports an answer (round 7, F4). Pre-fix the
+	// increment sat before the handoff, so a shed request was counted as
+	// served.
+	if got := rig.rt.SyncRequestsServed(); got != 0 {
+		t.Fatalf("a merely QUEUED request was counted as served (%d): the counter must mean served, not queued", got)
+	}
+	// The node's worker reports the answer it produced; that is what moves the
+	// counter.
+	rig.rt.NoteServed()
 	if got := rig.rt.SyncRequestsServed(); got != 1 {
-		t.Fatalf("the served-request counter reads %d, want 1", got)
+		t.Fatalf("after the worker served the request the counter reads %d, want 1", got)
 	}
 	if got := len(rig.replies[transport.PeerID("v0")]); got != 0 {
 		t.Fatalf("the router served the request INLINE (%d reply frame(s) sent): a slow answer on the dispatch goroutine would stall every consensus frame behind it", got)

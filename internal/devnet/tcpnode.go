@@ -53,6 +53,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -163,13 +164,15 @@ type ValidatorConfig struct {
 // peerAttestation is what one peer's HELLO leaves behind (audit C-6): the
 // height it last announced, the highest height a pull from it actually
 // reached, whether any pull has proven it at all, the wave it was last
-// refreshed in, and the wave until which selection skips it.
+// refreshed in, the wave until which selection skips it, and the transport
+// name its latest HELLO arrived on (the address a pull is sent to).
 type peerAttestation struct {
-	height        uint64 // latest announced height
-	substantiated uint64 // highest height a pull from this peer reached
-	proven        bool   // a pull from this peer has completed (successfully or not)
-	seen          uint64 // wave of the latest HELLO
-	demoted       uint64 // skip selection while demoted > the current wave
+	height        uint64           // latest announced height
+	substantiated uint64           // highest height a pull from this peer reached (a HIGH-WATER mark: a transient failure never lowers it - F3)
+	proven        bool             // a pull from this peer has completed (successfully or not)
+	seen          uint64           // wave of the latest HELLO
+	demoted       uint64           // skip selection while demoted > the current wave
+	via           transport.PeerID // transport name the latest HELLO arrived on
 }
 
 // Validator is one running networked validator.
@@ -190,22 +193,30 @@ type Validator struct {
 	// mu serialises every driver operation (see the package-level rules above).
 	mu sync.Mutex
 
-	// peerH is the state each peer's HELLO leaves behind, keyed by the
-	// transport-level name. On a DIRECT link that name is the peer's own
-	// handshake ID (forgeable - it is a routing key, not a proof). Through a
-	// relay every frame arrives under the ONE fixed connection name
-	// tcp.RelayPeerName(addr), which announces nothing about who is behind
-	// it and is stable across reconnects (audit N-1: never derived from any
-	// frame's bytes). Either way it is a signed hint only: it decides
-	// whether to pull and from whom - nothing else.
+	// peerH is the state each peer's HELLO leaves behind, keyed by the SIGNED
+	// MEMBER IDENTITY (the HELLO's validator public key) - never by the
+	// transport name (round 7, F1/F2). On a DIRECT link the transport name is
+	// the peer's own handshake ID (forgeable - it is a routing key, not a
+	// proof). Through a relay every frame arrives under the ONE fixed
+	// connection name tcp.RelayPeerName(addr), which announces nothing about
+	// who is behind it and is stable across reconnects (audit N-1: never
+	// derived from any frame's bytes). Either way the name is shared - a relay
+	// stranger and every honest member behind that relay carry it - so keying
+	// selection or demotion on it attributes one member's failure to all of
+	// them. A HELLO is signed and member-checked before it reaches here, so
+	// the key is authenticated and a member can only ever own one entry: the
+	// map is bounded by the committee size (F2), and demoting one member
+	// leaves the honest members behind the same relay name untouched (F1's
+	// granularity). Each entry remembers the transport name its latest HELLO
+	// arrived on, which is where a pull for that member is sent.
 	//
 	// The state remembers more than the latest height (audit C-6): when the
 	// announcement was last refreshed (so a vanished peer expires), how far a
-	// pull from that peer ever substantiated (so an announcement above what
-	// the peer can serve is capped for selection), and until when the peer is
-	// demoted (so a peer whose pull proved nothing is rotated away from).
+	// pull from that member ever substantiated (so an announcement above what
+	// it can serve is capped for selection), and until when the member is
+	// demoted (so a member whose pull proved nothing is rotated away from).
 	peerHMu sync.Mutex
-	peerH   map[transport.PeerID]*peerAttestation
+	peerH   map[string]*peerAttestation
 	// wave counts catch-up waves. It advances once per maybeCatchUp, and is
 	// the clock peerHeightTTL and peerDemoteWaves are measured in.
 	wave uint64
@@ -415,7 +426,7 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		drvTP: dtp,
 		cfgC:  ccfg,
 		drv:   drv,
-		peerH: make(map[transport.PeerID]*peerAttestation),
+		peerH: make(map[string]*peerAttestation),
 		syncQ: make(chan transport.Message, syncQueueDepth),
 		stop:  make(chan struct{}),
 	}
@@ -613,7 +624,9 @@ func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	if !crypto.Verify(h.Validator, hh[:], h.Sig) {
 		return
 	}
-	v.recordHeight(from, h.Height)
+	// Keyed on the signed member identity, with the transport name kept only
+	// as the address a pull for this member is sent to (round 7, F1/F2).
+	v.recordHeight(string(h.Validator), from, h.Height)
 }
 
 // beginWave advances the catch-up wave counter. Every wave boundary moves the
@@ -624,18 +637,29 @@ func (v *Validator) beginWave() {
 	v.peerHMu.Unlock()
 }
 
-// recordHeight keeps a peer's LATEST attestation - not its maximum ever (audit
-// C-6): a peer that re-announces a smaller, honest height can drop, and a
-// vanished peer's entry expires on the wave clock rather than standing forever.
-func (v *Validator) recordHeight(from transport.PeerID, height uint64) {
+// recordHeight keeps a member's LATEST attestation (audit C-6) under its
+// signed member key (who), and remembers the transport name (via) the HELLO
+// arrived on as the address a pull for that member goes to. Because who is the
+// authenticated validator key, one member can only ever own one entry however
+// many transport names it replays a HELLO under, so the table is bounded by
+// the committee's size - a churning member cannot grow it (round 7, F2). It
+// also prunes entries whose announcement has expired, so the live table tracks
+// the members actually heard from rather than every member ever heard.
+func (v *Validator) recordHeight(who string, via transport.PeerID, height uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
-	st := v.peerH[from]
+	for id, st := range v.peerH {
+		if st.seen+peerHeightTTL < v.wave {
+			delete(v.peerH, id)
+		}
+	}
+	st := v.peerH[who]
 	if st == nil {
 		st = &peerAttestation{}
-		v.peerH[from] = st
+		v.peerH[who] = st
 	}
 	st.height = height
+	st.via = via
 	st.seen = v.wave
 }
 
@@ -648,59 +672,70 @@ func (v *Validator) peerWindow() uint64 {
 	return consensus.DefaultMaxBlocksPerResponse
 }
 
-// tallestPeer returns the tallest peer whose attestation is still usable: not
-// expired, not demoted, and capped by what that peer has ever substantiated
-// (audit C-6). An unproven peer is worth exactly one window - enough to try,
-// never enough to dwarf a peer that has served real blocks.
-func (v *Validator) tallestPeer() (transport.PeerID, uint64) {
+// tallestPeer returns the tallest MEMBER whose attestation is still usable:
+// not expired, not demoted, and capped by what that member has ever
+// substantiated (audit C-6). It returns the member's signed key (who), the
+// transport name its HELLO arrived on (via, where the pull is sent), and the
+// height it is trusted up to. Selection is deterministic: ties break on the
+// lexicographically smaller key, never on map iteration order. An unproven
+// member is worth exactly one window - enough to try, never enough to dwarf a
+// member that has served real blocks. Because the key is the member identity,
+// demoting one member cannot skip the honest members sharing its relay name
+// (round 7, F1).
+func (v *Validator) tallestPeer() (who string, via transport.PeerID, h uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
 	win := v.peerWindow()
-	var best transport.PeerID
-	var bestH uint64
 	for id, st := range v.peerH {
 		if st.seen+peerHeightTTL < v.wave {
 			continue // not refreshed within a few waves: expired
 		}
 		if st.demoted > v.wave {
-			continue // a pull from this peer proved nothing: rotate away
+			continue // a pull from this member proved nothing: rotate away
 		}
-		h := st.height
+		ch := st.height
 		if !st.proven {
-			if h > win {
-				h = win
+			if ch > win {
+				ch = win
 			}
-		} else if h > st.substantiated+win {
-			h = st.substantiated + win
+		} else if ch > st.substantiated+win {
+			ch = st.substantiated + win
 		}
-		if h > bestH {
-			best, bestH = id, h
+		if ch > h || (ch == h && (who == "" || id < who)) {
+			who, via, h = id, st.via, ch
 		}
 	}
-	return best, bestH
+	return who, via, h
 }
 
-// demotePeer skips a peer for a few waves after a pull from it failed to
-// substantiate its announcement, and records how far that pull actually
-// reached so the cap lowers with it.
-func (v *Validator) demotePeer(peer transport.PeerID, reached uint64) {
+// demotePeer skips a member for a few waves after a pull from it failed to
+// substantiate its announcement. It records how far that pull actually
+// reached, but ONLY as a high-water update: substantiated is documented as the
+// highest height a pull from this member ever reached, and a transient failure
+// must not drop the selection cap it earned (round 7, F3). A member that once
+// served 100 and then blips keeps a cap of at least 100; the demotion, not a
+// lowered cap, is what rotates it away meanwhile.
+func (v *Validator) demotePeer(who string, reached uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
-	st := v.peerH[peer]
+	st := v.peerH[who]
 	if st == nil {
 		return
 	}
 	st.demoted = v.wave + peerDemoteWaves
 	st.proven = true
-	st.substantiated = reached
+	if reached > st.substantiated {
+		st.substantiated = reached
+	}
 }
 
-// substantiatePeer records a pull that reached the peer's attested height and
-// clears any demotion: a peer that served what it claimed is trusted again.
-func (v *Validator) substantiatePeer(peer transport.PeerID, reached uint64) {
+// substantiatePeer records a pull that reached the member's attested height and
+// clears any demotion: a member that served what it claimed is trusted again.
+// substantiated is the high-water mark, never lowered.
+func (v *Validator) substantiatePeer(who string, reached uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
-	st := v.peerH[peer]
+	st := v.peerH[who]
 	if st == nil {
 		return
 	}
@@ -716,21 +751,27 @@ func (v *Validator) substantiatePeer(peer transport.PeerID, reached uint64) {
 // head, because the engine still judges the pre-pull height and would park
 // there forever once the committee moved on (see this file's rules).
 //
-// A pull that substantiates nothing while the peer stands above us - silence,
+// A pull that substantiates nothing while the member stands above us - silence,
 // a refused window, a transport error, or no block adopted at all - DEMOTES
-// that peer for a few waves (audit C-6), so a member announcing an
-// unserveable height cannot make every wave wait on it while truthful peers
-// are passed over. A pull that reaches the attested height substantiates and
-// clears the demotion, so a merely slow peer is not distrusted forever.
+// that MEMBER for a few waves (audit C-6, round 7 F1): keyed on the signed
+// identity, so a member announcing an unserveable height cannot make every
+// wave wait on it while truthful peers - including others behind the same
+// relay name - are passed over. A pull that reaches the attested height
+// substantiates and clears the demotion, so a merely slow member is not
+// distrusted forever.
 func (v *Validator) maybeCatchUp() {
 	v.beginWave()
-	peer, peerH := v.tallestPeer()
+	who, via, peerH := v.tallestPeer()
 	mine := v.ch.Height()
-	if peer == "" || peerH <= mine {
+	if who == "" || peerH <= mine {
 		return
 	}
 	before := mine
-	v.sy.Peer = peer
+	// The pull goes to the transport name the member's HELLO arrived on, and
+	// it will accept an answer ONLY from that member's signed key: on a relay
+	// the name is shared, so the expectation is the identity (round 7, F1).
+	v.sy.Peer = via
+	v.sy.Expect = ed25519.PublicKey(who)
 	pull := v.pull
 	if pull == nil {
 		pull = v.sy.PullAndAdopt
@@ -742,16 +783,21 @@ func (v *Validator) maybeCatchUp() {
 		v.adopted.Add(after - before)
 	}
 	if err != nil || (after < peerH && after == before) {
-		v.demotePeer(peer, after)
+		// Demote the MEMBER, not the transport name: an honest member behind
+		// the same relay must not be penalised for this one's failure (F1).
+		v.demotePeer(who, after)
 		return
 	}
-	v.substantiatePeer(peer, after)
+	v.substantiatePeer(who, after)
 }
 
 // enqueueSync hands a BLOCK_SYNC request to the async server (installed as
 // MessageRouter.AsyncServe). It NEVER blocks: the queue is bounded, and a full
 // queue drops the request (the asker reads silence and retries on a later
-// wave) rather than stalling the transport's dispatch goroutine.
+// wave) rather than stalling the transport's dispatch goroutine. A drop is
+// LOGGED as well as counted (round 7, F4): SyncRequestsDropped is the
+// operator's checkable bound, and a bound a reader cannot see is not a
+// documented bound.
 func (v *Validator) enqueueSync(m transport.Message) {
 	if v.closing.Load() {
 		return
@@ -759,14 +805,16 @@ func (v *Validator) enqueueSync(m transport.Message) {
 	select {
 	case v.syncQ <- m:
 	default:
-		v.syncDropped.Add(1)
+		n := v.syncDropped.Add(1)
+		log.Printf("b10coin: BLOCK_SYNC request from %q dropped: the serving queue is full (%d dropped so far)", m.From, n)
 	}
 }
 
 // syncWorker serves BLOCK_SYNC requests off the transport's dispatch
 // goroutine. It touches only the syncer and the chain, both of which are
 // guarded independently of the driver mutex, so serving cannot re-enter the
-// engine.
+// engine. The served-request counter is incremented HERE, after Handle
+// answered, never at handoff (round 7, F4).
 func (v *Validator) syncWorker() {
 	defer v.syncWG.Done()
 	for {
@@ -774,8 +822,11 @@ func (v *Validator) syncWorker() {
 		case <-v.stop:
 			return
 		case m := <-v.syncQ:
-			if frame, ok := v.sy.Handle(m.Data); ok && v.rt.SendReply != nil {
-				_ = v.rt.SendReply(m.From, frame)
+			if frame, ok := v.sy.Handle(m.Data); ok {
+				v.rt.NoteServed()
+				if v.rt.SendReply != nil {
+					_ = v.rt.SendReply(m.From, frame)
+				}
 			}
 		}
 	}
