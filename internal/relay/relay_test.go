@@ -778,6 +778,49 @@ func TestRelayAByteBudgetDropsInsteadOfBlocking(t *testing.T) {
 	}
 }
 
+// TestForwardDoesNotCountATornDownConnection is audit N-14's constructed pin.
+// The pre-fix finish closed dead (and the socket) BEFORE taking the registry
+// lock, so there was a window in which a connection was already dead but the
+// registry still named it; forward picked it as a target and counted a frame
+// the dead writer could never write, over-reporting Stats.Forwarded. That
+// window only exists between two lock acquisitions, so a live run cannot enter
+// it deterministically - the state is built directly instead: a corpse whose
+// dead channel is closed while it is still in the registry. The live target is
+// the control, so the test cannot pass by counting nothing at all.
+func TestForwardDoesNotCountATornDownConnection(t *testing.T) {
+	const (
+		frameBytes = 64
+		queueBytes = 8 * frameBytes
+	)
+	r := New(Options{MaxFrameBytes: 4096, MaxConns: 8, MaxConnsPerIP: 8, WriteQueueBytes: queueBytes})
+	newConn := func() *conn {
+		return &conn{q: newSendQ(queueBytes, 4096, 64), dead: make(chan struct{})}
+	}
+	sender, live, corpse := newConn(), newConn(), newConn()
+	close(corpse.dead) // torn down, yet still in the registry: the state finish used to expose
+
+	r.mu.Lock()
+	r.conns[sender] = struct{}{}
+	r.conns[live] = struct{}{}
+	r.conns[corpse] = struct{}{}
+	r.mu.Unlock()
+
+	r.forward(sender, make([]byte, frameBytes))
+
+	if st := r.Stats(); st.Forwarded != 1 {
+		t.Fatalf("Forwarded = %d after one fan-out to {live, corpse}, want exactly 1 - a torn-down connection was counted as delivered (audit N-14)", st.Forwarded)
+	}
+	if st := r.Stats(); st.Dropped != 0 {
+		t.Fatalf("Dropped = %d, want 0: a connection that is simply gone is not a queue-bound drop", st.Dropped)
+	}
+	if live.q.queued() != 1 {
+		t.Fatalf("the live target holds %d frame(s), want 1 - the control peer must still be served", live.q.queued())
+	}
+	if corpse.q.queued() != 0 {
+		t.Fatalf("the torn-down connection's queue holds %d frame(s), want 0 - a corpse must not be handed a frame", corpse.q.queued())
+	}
+}
+
 // The other half of the split - the liveness half - and, as of this round,
 // held in exactly the shape the bound now uses: with NO socket and NO hammer
 // anywhere. The failed history is why. The previous shape exercised "A is

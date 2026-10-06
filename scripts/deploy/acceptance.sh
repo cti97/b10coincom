@@ -66,7 +66,7 @@
 # Exit codes: 0 PASS, 1 UNREACHABLE, 2 STALLED, 3 DISAGREE, 4 RELAY,
 # 5 INCONCLUSIVE, 64 bad usage, 70 could not create its temp dir.
 
-set -u
+set -uo pipefail
 
 PROG=$(basename "$0")
 HTTP_PORT=8645          # the node's default --http port (deploy README §5)
@@ -141,7 +141,9 @@ done
 
 case $MODE in ssh|http) ;; *) die_usage "--mode must be ssh or http (got '$MODE')" ;; esac
 case $HTTP_PORT in *[!0-9]*|"") die_usage "--http-port must be a number (got '$HTTP_PORT')" ;; esac
-[ "$HTTP_PORT" -ge 1 ] && [ "$HTTP_PORT" -le 65535 ] || die_usage "--http-port must be 1..65535"
+if [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+    die_usage "--http-port must be 1..65535 (got '$HTTP_PORT')"
+fi
 case $ADVANCE_WAIT in *[!0-9]*|"") die_usage "--advance-wait must be seconds (got '$ADVANCE_WAIT')" ;; esac
 [ "$ADVANCE_WAIT" -ge 2 ] || die_usage "--advance-wait must be at least 2 s"
 case $PROBE_TIMEOUT in *[!0-9]*|"") die_usage "--relay-timeout must be seconds (got '$PROBE_TIMEOUT')" ;; esac
@@ -251,7 +253,7 @@ else
     echo 'neither curl nor wget is installed on the validator' >&2; exit 127
 fi"
     body=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
-        "$tgt" "$remote" 2>"$WORK/ssh.err")
+        -- "$tgt" "$remote" 2>"$WORK/ssh.err")
     rc=$?
     if [ "$rc" -ne 0 ]; then
         LAST_ERR=$(clean_err "$WORK/ssh.err")
@@ -309,7 +311,7 @@ verdict_label() {
 N=${#PIS[@]}
 CH=(); H1=(); H2=(); B1=(); B2=(); OK1=(); OK2=(); ERR=(); SCHEMA=()
 i=0
-while [ $i -lt $N ]; do
+while [ "$i" -lt "$N" ]; do
     CH+=("?"); H1+=(""); H2+=(""); B1+=(""); B2+=(""); OK1+=("no"); OK2+=("no"); ERR+=(""); SCHEMA+=("no")
     i=$((i + 1))
 done
@@ -317,8 +319,8 @@ done
 # read_status INDEX first|second — GET /status into the arrays.
 read_status() {
     local idx=$1 which=$2 cid h hh
-    if ! try_rpc "${PIS[$idx]}" /status; then
-        ERR[$idx]="no parseable /status after 3 attempts (last: ${LAST_ERR:-unknown})"
+    if ! try_rpc "${PIS[idx]}" /status; then
+        ERR[idx]="no parseable /status after 3 attempts (last: ${LAST_ERR:-unknown})"
         return 1
     fi
     cid=$(jstr "$OUT_BODY" chain_id)
@@ -330,15 +332,15 @@ read_status() {
         # unrelated listener on the RPC port. Failure is fail-safe, but the
         # wording must not send the operator to §8's connectivity steps — say
         # schema mismatch, and mark it so the verdict line lists it as one.
-        ERR[$idx]="node replied, but the reply is not a b10coin /status (missing chain_id/height/head_hash) — schema/version mismatch, not a network fault"
-        SCHEMA[$idx]=yes
+        ERR[idx]="node replied, but the reply is not a b10coin /status (missing chain_id/height/head_hash) — schema/version mismatch, not a network fault"
+        SCHEMA[idx]=yes
         return 1
     fi
-    CH[$idx]=$cid
+    CH[idx]=$cid
     if [ "$which" = first ]; then
-        H1[$idx]=$h; B1[$idx]=$hh; OK1[$idx]=yes
+        H1[idx]=$h; B1[idx]=$hh; OK1[idx]=yes
     else
-        H2[$idx]=$h; B2[$idx]=$hh; OK2[$idx]=yes
+        H2[idx]=$h; B2[idx]=$hh; OK2[idx]=yes
     fi
     return 0
 }
@@ -365,6 +367,13 @@ if [ -n "$RELAY_GIVEN" ]; then
         *:*) RELAY_HOST=${RELAY_GIVEN%:*}; RELAY_PORT=${RELAY_GIVEN##*:} ;;
         *)   RELAY_HOST=$RELAY_GIVEN;      RELAY_PORT=7001 ;;
     esac
+    # The port goes verbatim into the /dev/tcp probe path AND into the verdict
+    # text; a non-numeric or out-of-range value is a bad invocation. Naming it
+    # here keeps it from surfacing later as a misleading "relay unreachable".
+    case $RELAY_PORT in *[!0-9]*|"") die_usage "--relay port must be numeric (got '$RELAY_GIVEN')" ;; esac
+    if [ "$RELAY_PORT" -lt 1 ] || [ "$RELAY_PORT" -gt 65535 ]; then
+        die_usage "--relay port must be 1..65535 (got '$RELAY_GIVEN')"
+    fi
     if tcp_probe "$RELAY_HOST" "$RELAY_PORT" "$PROBE_TIMEOUT"; then
         RELAY_STATE=reachable
         RELAY_TXT="TCP connect ok (from THIS machine)"
@@ -380,7 +389,7 @@ echo "relay       ${RELAY_HOST:+$RELAY_HOST:$RELAY_PORT }$RELAY_STATE${RELAY_TXT
 echo
 echo "-- reading 1 --"
 i=0
-while [ $i -lt $N ]; do
+while [ "$i" -lt "$N" ]; do
     if read_status "$i" first; then
         echo "${PIS[$i]}  chain ${CH[$i]}  height ${H1[$i]}  head $(trunc "${B1[$i]}")..."
     else
@@ -392,7 +401,7 @@ done
 ANY_UNREACH=no
 ANY_SCHEMA=no
 i=0
-while [ $i -lt $N ]; do
+while [ "$i" -lt "$N" ]; do
     if [ "${OK1[$i]}" != yes ]; then
         ANY_UNREACH=yes
         [ "${SCHEMA[$i]}" = yes ] && ANY_SCHEMA=yes
@@ -409,7 +418,7 @@ else
     sleep "$ADVANCE_WAIT"
     echo "-- reading 2 --"
     i=0
-    while [ $i -lt $N ]; do
+    while [ "$i" -lt "$N" ]; do
         if read_status "$i" second; then
             echo "${PIS[$i]}  chain ${CH[$i]}  height ${H1[$i]} -> ${H2[$i]} (+$(( ${H2[$i]} - ${H1[$i]} )))  head $(trunc "${B2[$i]}")..."
         else
@@ -436,7 +445,7 @@ failed_validator() {
 REACHED_BOTH=yes
 NOT_ADVANCING=""
 i=0
-while [ $i -lt $N ]; do
+while [ "$i" -lt "$N" ]; do
     if [ "${OK1[$i]}" != yes ] || [ "${OK2[$i]}" != yes ]; then
         REACHED_BOTH=no
     elif [ "${H2[$i]}" -le "${H1[$i]}" ]; then
@@ -463,7 +472,7 @@ if [ "$REACHED_BOTH" = yes ]; then
     if [ "$(printf '%s\n' "$UNIQUE_CHAINS" | grep -c .)" -ne 1 ]; then
         AGREE_STATE="CHAIN-ID MISMATCH"
         i=0
-        while [ $i -lt $N ]; do
+        while [ "$i" -lt "$N" ]; do
             [ "$i" -gt 0 ] && AGREE_DETAIL="$AGREE_DETAIL; "
             AGREE_DETAIL="$AGREE_DETAIL${PIS[$i]}=${CH[$i]}"
             i=$((i + 1))
@@ -471,13 +480,13 @@ if [ "$REACHED_BOTH" = yes ]; then
     else
         COMMON_H=""
         i=0
-        while [ $i -lt $N ]; do
+        while [ "$i" -lt "$N" ]; do
             if [ -z "$COMMON_H" ] || [ "${H2[$i]}" -lt "$COMMON_H" ]; then COMMON_H=${H2[$i]}; fi
             i=$((i + 1))
         done
         BH_MISSING=0
         i=0
-        while [ $i -lt $N ]; do
+        while [ "$i" -lt "$N" ]; do
             bh=""
             if [ "${H2[$i]}" -eq "$COMMON_H" ]; then
                 bh=${B2[$i]}        # reading-2 head IS the block at height H
@@ -503,7 +512,7 @@ if [ "$REACHED_BOTH" = yes ]; then
             else
                 AGREE_STATE="BLOCK MISMATCH"
                 i=0
-                while [ $i -lt $N ]; do
+                while [ "$i" -lt "$N" ]; do
                     [ "$i" -gt 0 ] && AGREE_DETAIL="$AGREE_DETAIL; "
                     AGREE_DETAIL="$AGREE_DETAIL${PIS[$i]}=$(printf '%s' "${BH[$i]}" | head -c 16)..."
                     i=$((i + 1))
@@ -522,15 +531,15 @@ if [ "$REACHED_BOTH" != yes ]; then
     CODE=1
     ANY_NET=no
     i=0
-    while [ $i -lt $N ]; do
+    while [ "$i" -lt "$N" ]; do
         if failed_validator "$i" && [ "${SCHEMA[$i]}" = no ]; then ANY_NET=yes; fi
         i=$((i + 1))
     done
     echo "agreement   not judged: at least one validator gave no usable /status"
     echo
-    echo "VERDICT: FAIL — UNREACHABLE (exit 1): these validators gave no usable /status:$(i=0; while [ $i -lt $N ]; do if failed_validator "$i"; then printf ' %s' "${PIS[$i]}"; fi; i=$((i + 1)); done)"
+    echo "VERDICT: FAIL — UNREACHABLE (exit 1): these validators gave no usable /status:$(i=0; while [ "$i" -lt "$N" ]; do if failed_validator "$i"; then printf ' %s' "${PIS[$i]}"; fi; i=$((i + 1)); done)"
     i=0
-    while [ $i -lt $N ]; do
+    while [ "$i" -lt "$N" ]; do
         if failed_validator "$i"; then
             ctx=""
             [ "${OK1[$i]}" = yes ] && ctx=" (was reachable at reading 1, height ${H1[$i]}, then vanished)"

@@ -17,7 +17,35 @@ import (
 var (
 	ErrFrameTooLarge = errors.New("wire: frame exceeds the maximum size")
 	ErrShortFrame    = errors.New("wire: frame ended before its declared length")
+	// ErrEmptyFrame reports a payload of zero bytes. ReadFrame refuses a
+	// zero-length frame as fatal (every message begins with a tag byte), so a
+	// writer that emits one takes down every reader that sees it (audit N-11).
+	ErrEmptyFrame = errors.New("wire: frame payload is empty")
 )
+
+// MaxFramePayload is the largest payload a 4-byte big-endian length prefix can
+// carry: 2^32-1 bytes. It is an int64, not an int, so the bound is exact on a
+// 32-bit target too, where an int cannot even hold the value being compared.
+const MaxFramePayload int64 = 1<<32 - 1
+
+// WritableLen reports why a payload of n bytes cannot be framed on this wire,
+// or nil when it can. It exists so every write path refuses an unframable
+// payload EXPLICITLY - an error, with no bytes written - instead of silently
+// truncating it: a length at or above 4 GiB wraps the uint32 prefix to zero (or
+// to a truncated length), and a zero-length frame is the one frame every reader
+// treats as fatal, so the pre-fix WriteFrame turned a caller's bad payload into
+// a torn-down link at EVERY peer (audit N-11). The empty case is refused for the
+// same reason: no honest message is zero bytes, because every message begins
+// with its tag byte.
+func WritableLen(n int64) error {
+	if n == 0 {
+		return fmt.Errorf("%w: every frame begins with its tag byte, and readers refuse a zero-length frame", ErrEmptyFrame)
+	}
+	if n > MaxFramePayload {
+		return fmt.Errorf("%w: %d bytes cannot fit a 4-byte length prefix (maximum %d)", ErrFrameTooLarge, n, MaxFramePayload)
+	}
+	return nil
+}
 
 // FrameTooLarge is the structured face of ErrFrameTooLarge: it carries the
 // length the frame header DECLARED, so a stream reader that refuses an
@@ -43,8 +71,15 @@ func (e *FrameTooLarge) Error() string {
 
 func (e *FrameTooLarge) Unwrap() error { return ErrFrameTooLarge }
 
-// WriteFrame writes one length-prefixed payload.
+// WriteFrame writes one length-prefixed payload. A payload that cannot be
+// framed - empty, or above MaxFramePayload - is refused BEFORE any byte is
+// written, so the stream is never left holding a corrupt or fatal frame
+// (audit N-11). The refusal is an explicit error the caller can see and handle;
+// before this guard the length was truncated and the connection died instead.
 func WriteFrame(w io.Writer, payload []byte) error {
+	if err := WritableLen(int64(len(payload))); err != nil {
+		return err
+	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
 	if _, err := w.Write(hdr[:]); err != nil {

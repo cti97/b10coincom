@@ -72,7 +72,7 @@ for f in "bin/b10coin-$os-$arch$ext" "bin/b10coin-relay-$os-$arch$ext"; do
     fi
 done
 
-file bin/b10coin-"$os"-"$arch$ext" bin/b10coin-relay-"$os"-"$arch$ext"
+file "bin/b10coin-$os-$arch$ext" "bin/b10coin-relay-$os-$arch$ext"
 
 # bin/SHA256SUMS over the STABLE names, so the recipe can copy a checksum file
 # to each machine and verify what it copied ON THE TARGET (audit B-2; the

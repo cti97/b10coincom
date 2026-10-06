@@ -1194,17 +1194,32 @@ func (t *TcpTransport) reader(c *conn) {
 // needed to skip it - the same fact that makes the pre-allocation bound in
 // wire.ReadFrame safe to enforce before allocating.
 //
-// The trade, written down: an attacker can claim a 4 GiB length and then drip
-// bytes forever, keeping THIS reader busy - but per-connection goroutines
-// contain it, no memory is allocated for the skipped bytes, and every other
-// peer is unaffected. Killing the connection instead would punish the
-// honest-but-misconfigured case (a peer whose MaxFrameBytes is bigger than
-// ours sending a large frame) with a severed link: consensus tolerates a lost
-// frame vastly better than a lost peer.
+// The skip is BOUNDED: it re-arms the connection's idle read deadline before
+// draining, so a peer that declares a huge frame and then stops sending cannot
+// hold this reader (and this connection's goroutine and slot) past one
+// IdleReadTimeout. The reader above already armed the same deadline before the
+// header read, so the bound was inherited; arming it HERE makes the bound local
+// to the skip and explicit (audit N-13), rather than a property a future edit
+// that clears the deadline would silently remove. Draining is still
+// io.CopyN(io.Discard, ...): no memory is allocated for the skipped bytes, and
+// every other peer is unaffected.
+//
+// The trade, restated: an attacker can claim a near-4-GiB length and drip bytes
+// for up to the idle window, keeping THIS reader busy and nothing else. Killing
+// the connection instead would punish the honest-but-misconfigured case (a peer
+// whose MaxFrameBytes is bigger than ours sending a large frame) with a severed
+// link: consensus tolerates a lost frame vastly better than a lost peer.
 func (t *TcpTransport) skipOversized(c *conn, otl *wire.FrameTooLarge) bool {
+	// Re-arm the idle deadline so the drain cannot outlive it, whatever the
+	// header read left of the previous window; a peer that stalls mid-skip is
+	// ended, not parked.
+	if err := c.nc.SetReadDeadline(time.Now().Add(t.opts.IdleReadTimeout)); err != nil {
+		return false
+	}
 	if _, err := io.CopyN(io.Discard, c.nc, otl.Declared); err != nil {
-		// The declared payload never fully arrived, so framing is broken
-		// after all: end the connection.
+		// The declared payload never fully arrived (including: the deadline
+		// above expired while the peer stalled), so framing is broken after
+		// all: end the connection.
 		return false
 	}
 	t.droppedOversized.Add(1)
@@ -1241,6 +1256,17 @@ func (t *TcpTransport) writer(c *conn) {
 		case <-c.dead:
 			return
 		case b := <-c.tq:
+			// Unreachable while Broadcast and Send validate their input, but
+			// retained as the gate the "an unframable frame never ends a link"
+			// invariant is READ through (audit N-11, exactly as Send keeps its
+			// dead check): a payload this layer cannot encode is a caller bug,
+			// not a socket fault, so drop the frame and keep the connection.
+			// WriteFrame writes nothing before refusing, so the stream stays
+			// aligned for the next frame.
+			if err := wire.WritableLen(int64(len(b))); err != nil {
+				c.dropped.Add(1)
+				continue
+			}
 			if err := c.nc.SetWriteDeadline(time.Now().Add(t.opts.WriteTimeout)); err != nil {
 				t.finish(c)
 				return
@@ -1274,6 +1300,15 @@ func (t *TcpTransport) writer(c *conn) {
 // iterates can never contain the sender. The test TestBroadcastSkipsTheSender
 // pins that end of the invariant.
 func (t *TcpTransport) Broadcast(data []byte) error {
+	// An unframable payload is refused here, before any link is touched (audit
+	// N-11): a zero-length frame is exactly what every reader treats as fatal,
+	// so enqueueing one would tear down every connection this call fans out to.
+	// The caller gets an explicit error and every link survives. This is not a
+	// queue-full drop (BestEffort already documents those as silent): it is a
+	// malformed request, and the only honest answer is to name it.
+	if err := wire.WritableLen(int64(len(data))); err != nil {
+		return fmt.Errorf("tcp: refusing to broadcast an unframable payload: %w", err)
+	}
 	t.mu.Lock()
 	targets := make([]*conn, 0, len(t.conns))
 	for _, c := range t.conns {
@@ -1304,6 +1339,12 @@ func (t *TcpTransport) Broadcast(data []byte) error {
 // redial that recover from it (see maintain). Broadcast keeps its weaker
 // best-effort contract by design: gossip is redundant, a drop costs nothing.
 func (t *TcpTransport) Send(peer transport.PeerID, data []byte) error {
+	// Same refusal as Broadcast (audit N-11): a frame this layer cannot encode
+	// must be named as an error, never written as a zero-length frame that ends
+	// the connection.
+	if err := wire.WritableLen(int64(len(data))); err != nil {
+		return fmt.Errorf("tcp: refusing to send an unframable payload: %w", err)
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	c := t.conns[peer]

@@ -90,6 +90,22 @@ jobs:
         run: |
           unformatted=$(gofmt -l cmd internal)
           test -z "$unformatted" || { echo "not gofmt-clean:"; echo "$unformatted"; exit 1; }
+      # shellcheck over every shell script in the tree (audit N-16): the deploy
+      # harness, the release/build scripts and the plan guard are operator-facing
+      # code that no Go test runs. The gate is `--severity=warning` so it fails
+      # on real defects (warnings and errors) without turning pre-existing
+      # info/style notes into a red CI; acceptance.sh and check-plan.sh are
+      # clean at the default severity too. shellcheck ships on GitHub's
+      # ubuntu-latest runner, but a MISSING shellcheck must never look like a
+      # clean lint: this step fails loudly rather than passing silently.
+      - name: shellcheck the scripts
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::error::shellcheck is not installed; install it (apt-get install shellcheck). This gate must not pass silently."
+            exit 1
+          fi
+          shellcheck --version
+          git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
       # `go mod tidy` must be a no-op on a committed tree: a graph tidy wants
       # to change means go.mod/go.sum lie about the build. The diff pins both.
       - name: go mod tidy leaves no diff

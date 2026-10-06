@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	"runtime"
@@ -9,6 +10,101 @@ import (
 
 	"github.com/cti97/b10coincom/internal/types"
 )
+
+// TestWriteFrameRefusesAnEmptyPayloadWithoutWriting pins audit N-11's first
+// half: a zero-length frame is the one frame ReadFrame treats as fatal, so
+// WriteFrame must refuse an empty payload EXPLICITLY and write NOTHING. A
+// writer that emitted the 4-byte zero header instead took down every reader
+// that saw it - which is how a single Broadcast([]byte{}) ended every link.
+// The buffer assertion is what separates this fix from a refusal that already
+// wrote the header.
+func TestWriteFrameRefusesAnEmptyPayloadWithoutWriting(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, nil); !errors.Is(err, ErrEmptyFrame) {
+		t.Fatalf("WriteFrame(nil) = %v, want ErrEmptyFrame", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("WriteFrame(nil) wrote %d byte(s); a refused frame must leave the stream untouched", buf.Len())
+	}
+	if err := WriteFrame(&buf, []byte{}); !errors.Is(err, ErrEmptyFrame) {
+		t.Fatalf("WriteFrame(empty) = %v, want ErrEmptyFrame", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("WriteFrame(empty) wrote %d byte(s)", buf.Len())
+	}
+}
+
+// TestWritableLenBoundsTheLengthPrefix pins the boundary that used to truncate:
+// a payload of exactly MaxFramePayload (2^32-1) still fits the 4-byte prefix;
+// one byte more cannot be framed at all, and the pre-fix encoder wrapped it to
+// zero - the fatal zero-length frame. The check is on the LENGTH, so it needs
+// no 4-GiB allocation to exercise, which is why the bound is this separate
+// function rather than an inline condition WriteFrame can only reach with a
+// real oversized slice in hand.
+func TestWritableLenBoundsTheLengthPrefix(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want error
+	}{
+		{0, ErrEmptyFrame},
+		{1, nil},
+		{MaxFramePayload, nil},
+		{MaxFramePayload + 1, ErrFrameTooLarge},
+	}
+	for _, tc := range cases {
+		if err := WritableLen(tc.n); !errors.Is(err, tc.want) {
+			t.Fatalf("WritableLen(%d) = %v, want %v", tc.n, err, tc.want)
+		}
+	}
+}
+
+// TestDecodeRefusesAnOverLongWireKey pins audit N-12: a HELLO's validator key
+// and a BLOCK_SYNC request's requester key are Ed25519 keys of exactly one
+// legal width, so an over-long one is refused BEFORE the decoder copies it.
+// The membership checks are the second line of defence, not the first: a 1 MiB
+// "key" must not be copied only so SeatOfPubKey can fail to match it. The
+// boundary is exact - PublicKeySize decodes, one byte more does not - and the
+// signature field stays frame-bounded, so the test also shows a long Sig is
+// still accepted (it is verified, never interpreted as an identity).
+func TestDecodeRefusesAnOverLongWireKey(t *testing.T) {
+	hello := func(key []byte) []byte {
+		e := types.NewEncoder()
+		e.U8(uint8(MsgHello))
+		e.VarBytes([]byte("b10coin-devnet"))
+		e.VarBytes(key)
+		e.U64(1)
+		e.VarBytes(nil)
+		return e.Bytes()
+	}
+	for _, n := range []int{0, ed25519.PublicKeySize - 1, ed25519.PublicKeySize} {
+		if _, err := DecodeHello(hello(make([]byte, n))); err != nil {
+			t.Fatalf("a %d-byte HELLO validator key was refused (%v); a short or exactly-sized key must decode", n, err)
+		}
+	}
+	if _, err := DecodeHello(hello(make([]byte, ed25519.PublicKeySize+1))); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a %d-byte HELLO validator key decoded (%v); want ErrFieldTooLong", ed25519.PublicKeySize+1, err)
+	}
+	if _, err := DecodeHello(hello(make([]byte, 1<<20))); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a 1 MiB HELLO validator key decoded (%v); want ErrFieldTooLong", err)
+	}
+
+	req := func(key, sig []byte) []byte {
+		e := types.NewEncoder()
+		e.U8(uint8(MsgBlockSyncReq))
+		e.U64(1)
+		e.U64(2)
+		e.U64(3)
+		e.VarBytes(key)
+		e.VarBytes(sig)
+		return e.Bytes()
+	}
+	if _, err := DecodeBlockSyncReq(req(make([]byte, ed25519.PublicKeySize), make([]byte, 4096))); err != nil {
+		t.Fatalf("a 32-byte requester key with a 4 KiB signature was refused (%v); the signature stays frame-bounded", err)
+	}
+	if _, err := DecodeBlockSyncReq(req(make([]byte, 1<<20), nil)); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a 1 MiB BLOCK_SYNC requester key decoded (%v); want ErrFieldTooLong", err)
+	}
+}
 
 // TestFrameRoundTrips pins the frame layer's contract: it DELIMITS a payload
 // and nothing else. Write then read returns exactly the bytes written - and a

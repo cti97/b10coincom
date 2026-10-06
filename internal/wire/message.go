@@ -16,6 +16,7 @@ package wire
 // adjacent network state: never renumber a tag nor reorder a field.
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 
@@ -99,12 +100,23 @@ func DecodeHello(b []byte) (*Hello, error) {
 		return nil, err
 	}
 	h.ChainID = string(chainID)
-	if h.Validator, err = d.VarBytes(); err != nil {
+	// The validator key has exactly one legal width, so bound it before the
+	// copy (audit N-12), the same discipline the consensus decoders apply
+	// (audit C-17). Callers check membership - SeatOfPubKey compares the key
+	// against the genesis committee - but without this bound the decoder copies
+	// a frame-sized "key" (up to 1 MiB) before that check can reject it, and a
+	// legitimate committee key is always 32 bytes. A short or empty key still
+	// decodes, so the admission policy still sees and refuses it itself.
+	if h.Validator, err = d.VarBytesMax(ed25519.PublicKeySize); err != nil {
 		return nil, err
 	}
 	if h.Height, err = d.U64(); err != nil {
 		return nil, err
 	}
+	// The signature stays bounded only by the frame: its width is a property of
+	// the signing scheme the transport's handshake policy chose, not of this
+	// decoder, and it is verified or discarded rather than interpreted as an
+	// identity. ChainID is the same: it is compared against the local chain id.
 	if h.Sig, err = d.VarBytes(); err != nil {
 		return nil, err
 	}
@@ -162,7 +174,12 @@ func DecodeBlockSyncReq(b []byte) (*BlockSyncReq, error) {
 	if r.Nonce, err = d.U64(); err != nil {
 		return nil, err
 	}
-	if r.Requester, err = d.VarBytes(); err != nil {
+	// The requester key is an Ed25519 key and nothing else, so it is bounded
+	// before the copy (audit N-12) exactly as the HELLO's validator key is.
+	// verifySyncReq checks it against the committee, but that check must not be
+	// the only thing standing between a hostile length and a 1 MiB copy. The
+	// signature stays frame-bounded for the reason given at DecodeHello.
+	if r.Requester, err = d.VarBytesMax(ed25519.PublicKeySize); err != nil {
 		return nil, err
 	}
 	if r.Sig, err = d.VarBytes(); err != nil {

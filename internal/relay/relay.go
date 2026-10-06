@@ -716,13 +716,19 @@ type conn struct {
 	once sync.Once
 }
 
-// finish tears one connection down exactly once: close the socket (unblocking
-// every goroutine parked on it), close dead (unblocking the writer), and drop
-// the connection from the registry and from its source group's count.
+// finish tears one connection down exactly once: drop the connection from the
+// registry and from its source group's count, close dead (unblocking the
+// writer), and close the socket (unblocking every goroutine parked on it).
+//
+// All of it is ONE critical section, exactly as the transport's finish already
+// is (audit N-14): the registry delete and the connection's death are atomic, so
+// a fan-out holding the registry lock either sees a live connection or does not
+// see it at all. The pre-fix order closed dead and the socket BEFORE taking the
+// lock, leaving a window in which the registry still named a corpse; forward
+// then picked it as a target and counted a frame the dead writer could never
+// write, so Stats.Forwarded over-reported.
 func (r *Relay) finish(c *conn) {
 	c.once.Do(func() {
-		close(c.dead)
-		_ = c.nc.Close()
 		r.mu.Lock()
 		delete(r.conns, c)
 		if r.perGroup[c.srcGroup] > 0 {
@@ -731,6 +737,8 @@ func (r *Relay) finish(c *conn) {
 				delete(r.perGroup, c.srcGroup)
 			}
 		}
+		close(c.dead)
+		_ = c.nc.Close()
 		r.mu.Unlock()
 	})
 }
@@ -1028,23 +1036,37 @@ func (r *Relay) reader(c *conn) {
 // receiver's own queue budget divided among the distinct sender ACCOUNTS
 // (source groups) that can contend for it, i.e. every registered connection
 // except the receiver's own account. The whole registry is read under one
-// lock alongside the target snapshot. A receiver that is the only member of
-// its own account is not one of its senders, so its account is not counted;
-// a receiver with a sibling in its account (another connection from the same
-// host) IS contended by that sibling and counts it. The count is connection
-// identities, never payload: the relay still parses nothing.
+// lock alongside the target snapshot, and the enqueue happens UNDER that same
+// lock, so the selection and the admission are atomic with finish's registry
+// delete (audit N-14) - a connection is enqueued for only while it is in the
+// registry, and finish removes it before closing dead. push never blocks, so
+// holding the lock across the fan-out costs no wait on a peer. A receiver that
+// is the only member of its own account is not one of its senders, so its
+// account is not counted; a receiver with a sibling in its account (another
+// connection from the same host) IS contended by that sibling and counts it.
+// The count is connection identities, never payload: the relay still parses
+// nothing.
 func (r *Relay) forward(sender *conn, payload []byte) {
 	r.mu.Lock()
-	targets := make([]*conn, 0, len(r.conns))
+	defer r.mu.Unlock()
 	accounts := make(map[shareAccount]int, len(r.conns))
 	for c := range r.conns {
 		accounts[shareAccountOf(c)]++
-		if c != sender {
-			targets = append(targets, c)
-		}
 	}
-	r.mu.Unlock()
-	for _, c := range targets {
+	for c := range r.conns {
+		if c == sender {
+			continue
+		}
+		// Unreachable while finish deletes the registry entry under this same
+		// lock, but retained as the gate the "no frame is counted for a
+		// torn-down connection" invariant is READ through (audit N-14), the
+		// way the transport's Send keeps its dead check: a corpse must never
+		// inflate Forwarded, whatever a future edit does to finish's order.
+		select {
+		case <-c.dead:
+			continue
+		default:
+		}
 		if c.q.push(sender, payload, sendersFor(c, accounts)) {
 			r.forwarded.Add(1)
 		} else {

@@ -173,6 +173,124 @@ func TestTwoTransportsExchangeAMessage(t *testing.T) {
 	}
 }
 
+// TestBroadcastRefusesAnEmptyFrameAndKeepsEveryLink pins audit N-11 end to end.
+// Broadcast([]byte{}) used to enqueue a zero-length frame to every peer, and
+// every reader treats that as fatal, so one bad caller tore down every link it
+// fanned out to - the failure surfaced on the PEERS' side, as a broken reader,
+// while the caller saw nil. Now the call names the malformed request and
+// returns, touching no queue; both connections are still usable afterwards,
+// proven by exchanging a real frame in each direction. The direct-enqueue case
+// then shows the writer's own gate: a frame that reached the queue WITHOUT
+// passing Broadcast/Send is dropped, not written, and the link survives too.
+func TestBroadcastRefusesAnEmptyFrameAndKeepsEveryLink(t *testing.T) {
+	a := listen(t, Options{LocalID: "a"})
+	b := listen(t, Options{LocalID: "b"})
+	if err := b.Dial(a.Addr().String()); err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	waitPeersIs(t, a, "[b]")
+	waitPeersIs(t, b, "[a]")
+
+	if err := a.Broadcast([]byte{}); !errors.Is(err, wire.ErrEmptyFrame) {
+		t.Fatalf("Broadcast(empty) = %v, want ErrEmptyFrame", err)
+	}
+	if err := a.Broadcast(nil); !errors.Is(err, wire.ErrEmptyFrame) {
+		t.Fatalf("Broadcast(nil) = %v, want ErrEmptyFrame", err)
+	}
+	if err := a.Send("b", nil); !errors.Is(err, wire.ErrEmptyFrame) {
+		t.Fatalf("Send(empty) = %v, want ErrEmptyFrame", err)
+	}
+
+	// The writer's gate, reached by enqueueing directly (what a future caller
+	// that skipped the checks above would do): an unframable frame is dropped,
+	// the socket stream stays aligned, and the connection is not ended.
+	a.mu.Lock()
+	c := a.conns["b"]
+	a.mu.Unlock()
+	if c == nil {
+		t.Fatal("fixture: a has no connection to b to enqueue on")
+	}
+	if !c.enqueue([]byte{}) {
+		t.Fatal("fixture: the queue refused an empty frame before the writer could; the writer gate is not what this asserts")
+	}
+
+	// The links must be untouched: a real frame still crosses both ways.
+	gotA, gotB := new(recorder), new(recorder)
+	a.OnMessage(gotA.collect)
+	b.OnMessage(gotB.collect)
+	if err := a.Broadcast([]byte("still-alive")); err != nil {
+		t.Fatalf("Broadcast after the refusal: %v", err)
+	}
+	waitFor(t, "b receiving the frame after the refused empty one", 5*time.Second, func() bool {
+		return len(gotB.payloads()) == 1 && gotB.payloads()[0] == "still-alive"
+	})
+	if err := b.Broadcast([]byte("still-alive-back")); err != nil {
+		t.Fatalf("Broadcast back after the refusal: %v", err)
+	}
+	waitFor(t, "a receiving the return frame", 5*time.Second, func() bool {
+		return len(gotA.payloads()) == 1 && gotA.payloads()[0] == "still-alive-back"
+	})
+	waitPeersIs(t, a, "[b]")
+	waitPeersIs(t, b, "[a]")
+}
+
+// TestSkipOversizedIsBoundedByAReadDeadline is audit N-13's construct: a peer
+// declares an oversized frame and then sends none of its payload. skipOversized
+// must return - ending the connection - within a bounded multiple of the idle
+// read deadline, not park the reader (and the connection's goroutine and slot)
+// forever. The stall is CONSTRUCTED (header only, then silence), never raced,
+// and the 5 s wait is 50x the 100 ms deadline so a slow machine cannot flake it:
+// the only outcome the wait separates is "returned" from "never returns".
+func TestSkipOversizedIsBoundedByAReadDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var server net.Conn
+	select {
+	case server = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture: the loopback accept never happened")
+	}
+	defer server.Close()
+
+	// The 4-byte header claims a 1 MiB payload; the peer then stops writing.
+	if _, err := client.Write([]byte{0x00, 0x10, 0x00, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+
+	tp, err := New(Options{LocalID: "t", IdleReadTimeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tp.Close() })
+
+	done := make(chan bool, 1)
+	go func() { done <- tp.skipOversized(&conn{nc: server}, &wire.FrameTooLarge{Declared: 1 << 20, Max: 1024}) }()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("skipOversized reported a stalled 1 MiB payload fully drained")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("skipOversized did not return within 5s on a stalled payload: the drain is unbounded (audit N-13)")
+	}
+}
+
 // TestBroadcastSkipsTheSender pins the invariant a validator's tally leans
 // on: nobody is ever fed a message through a connection that claims to BE
 // the local node. Over TCP the enforcement point is the handshake, not a

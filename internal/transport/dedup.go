@@ -120,7 +120,25 @@ func (d *Dedup) evictLowest() {
 // still needs that height's votes.
 //
 // It deletes whole height BUCKETS, so its cost is the number of live heights
-// (at most the ceiling), not the number of keys ever seen (audit N-7).
+// (at most the ceiling), not the number of keys ever seen (audit N-7). It is
+// therefore NOT the O(n) scan audit N-18 described against an earlier revision.
+//
+// The one residual N-18 names that survives is worth recording: eviction and
+// Forget both order by height, so a key recorded at an extreme height (the
+// audit's Height=MaxUint64) is never removed - evictLowest always drops the
+// LOWEST bucket, and Forget only drops heights below the committed head, which
+// no real chain reaches. Such a key permanently holds one of maxHeights buckets.
+//
+// It is reachable only through a MEMBER-SIGNED PROPOSAL. The router consults
+// Seen strictly after Verify, and its vote path additionally applies the height
+// window (head or head+1) BEFORE Seen, so a vote at an extreme height never
+// reaches this set at all; the proposal path currently has no window gate, so a
+// committee member's signed proposal at Height=MaxUint64 is recorded. The cost
+// is bounded - at most maxHeights buckets regardless - and dedup is not
+// load-bearing in M4's star topology, where a frame arrives once or not at all
+// (the set exists for M5's mesh, see the type comment). When M5 turns the
+// topology into a mesh, the router must apply the same height window to
+// proposals, which removes the extreme-height insertion at its root.
 //
 // The zero-value or empty Dedup is a no-op here, not a panic: the chain can
 // advance before the first vote arrives.

@@ -22,24 +22,50 @@ if ! python3 scripts/plan_parity.py "$plan"; then
 fi
 
 # 2. Every task's brief must extract, be non-trivial, and not bleed into the next.
-dir=$("$HOME/.dsh/skills/subagent-driven-development/scripts/sdd-workspace" "$plan")
-tasks=$(grep -oE '^#+[[:space:]]+Task[[:space:]]+[0-9]+' "$plan" | grep -oE '[0-9]+$' | sort -n | uniq)
-echo "  tasks found: $(echo "$tasks" | tr '\n' ' ')"
-for n in $tasks; do
-  if ! "$HOME/.dsh/skills/subagent-driven-development/scripts/task-brief" "$plan" "$n" >/dev/null 2>&1; then
-    echo "  Task $n: EXTRACTION FAILED"; fail=1; continue
-  fi
-  b="$dir/task-$n-brief.md"
-  lines_n=$(wc -l < "$b" | tr -d ' ')
-  bleeds=$(grep -c "^## Task $((n+1))" "$b" || true)
-  if [ "$lines_n" -lt 20 ]; then echo "  Task $n: SUSPICIOUSLY SHORT ($lines_n lines)"; fail=1; fi
-  if [ "$bleeds" -ne 0 ]; then echo "  Task $n: BLEEDS into Task $((n+1))"; fail=1; fi
-done
-[ $fail -eq 0 ] && echo "  briefs: OK" || echo "  briefs: FAIL"
+#    This half drives the SDD skill's OWN scripts (sdd-workspace / task-brief).
+#    They live in the operator's skill directory, NOT in this repository, so on a
+#    machine without them the old hard-coded $HOME/.dsh path made every task read
+#    "EXTRACTION FAILED" and then "PLAN IS BROKEN" - a false failure caused by a
+#    missing tool, not by the plan (audit N-17). The directory is located through
+#    SDD_SKILL_DIR (default: the standard install path), and when the scripts are
+#    genuinely absent this half is SKIPPED with a loud note instead of inventing a
+#    verdict. The fence-parity half above is self-contained and always runs.
+skill_dir=${SDD_SKILL_DIR:-$HOME/.dsh/skills/subagent-driven-development}
+scripts_dir=$skill_dir/scripts
+workspace=$scripts_dir/sdd-workspace
+brief_tool=$scripts_dir/task-brief
+
+briefs_ran=no
+if [ -x "$workspace" ] && [ -x "$brief_tool" ]; then
+  briefs_ran=yes
+  dir=$("$workspace" "$plan")
+  tasks=$(grep -oE '^#+[[:space:]]+Task[[:space:]]+[0-9]+' "$plan" | grep -oE '[0-9]+$' | sort -n | uniq)
+  echo "  tasks found: $(echo "$tasks" | tr '\n' ' ')"
+  for n in $tasks; do
+    if ! "$brief_tool" "$plan" "$n" >/dev/null 2>&1; then
+      echo "  Task $n: EXTRACTION FAILED"; fail=1; continue
+    fi
+    b="$dir/task-$n-brief.md"
+    lines_n=$(wc -l < "$b" | tr -d ' ')
+    bleeds=$(grep -c "^## Task $((n+1))" "$b" || true)
+    if [ "$lines_n" -lt 20 ]; then echo "  Task $n: SUSPICIOUSLY SHORT ($lines_n lines)"; fail=1; fi
+    if [ "$bleeds" -ne 0 ]; then echo "  Task $n: BLEEDS into Task $((n+1))"; fail=1; fi
+  done
+  [ $fail -eq 0 ] && echo "  briefs: OK" || echo "  briefs: FAIL"
+else
+  echo "  briefs: SKIPPED - SDD skill scripts not found at:"
+  echo "           $workspace"
+  echo "           $brief_tool"
+  echo "           set SDD_SKILL_DIR to the skill directory to run the brief checks"
+fi
 
 if [ $fail -ne 0 ]; then
   echo
   echo "PLAN IS BROKEN - fix the fences before dispatching anything." >&2
   exit 1
 fi
-echo "PLAN OK"
+if [ "$briefs_ran" = yes ]; then
+  echo "PLAN OK"
+else
+  echo "PLAN PARITY OK - brief extraction SKIPPED (SDD skill scripts absent)"
+fi
