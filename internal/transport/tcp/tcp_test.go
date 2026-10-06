@@ -902,8 +902,43 @@ func TestCloseWaitsForInFlightHandshakes(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("Close took %v against a 300ms handshake bound", elapsed)
 	}
-	if leaked := runningTransportGoroutines(); leaked != 0 {
-		t.Fatalf("%d transport goroutine(s) still running after Close waited", leaked)
+	// The scan cannot be a SINGLE shot, because it is not an edge in the
+	// goroutine's life, only a snapshot of it. It is taken through
+	// runtime.Stack(all=true), which stops the world and then prints every
+	// goroutine that is not yet _Gdead. A goroutine that has ALREADY run the
+	// deferred wg.Done() - the very call that lets the wg.Wait() above return -
+	// is still alive and still printable: the runtime only marks it _Gdead
+	// inside goexit0's gdestroy (runtime/proc.go), and the path in between
+	// (sync.(*WaitGroup).Done -> semrelease1 -> goready -> runqput -> wakep) is
+	// a futex WAKE SYSCALL. Nor does stopping the world save the assertion:
+	// stopTheWorldWithSema counts a P whose goroutine is in _Gsyscall as
+	// stopped without waiting for it (setBlockOnExitSyscall -> gcstopP), so a
+	// dying goroutine parked in that kernel call is printed rather than waited
+	// out. The window is a kernel-timing window, so it closes in microseconds
+	// on an idle host and can stay open for a scheduler timeslice on a loaded
+	// CI runner - which is exactly where this failed, on the adopt closure that
+	// had just Done'd after its 300ms deadline.
+	//
+	// Retry, do not sleep a fixed interval: a genuine untracked goroutine is
+	// PARKED - nothing is on its way to closing it - so polling until the count
+	// reaches zero still fails loudly on a real leak, and only a goroutine that
+	// was already on its way out can pass. The retry cannot hide a leak because
+	// a leak never clears; persistence is precisely what separates the two.
+	// This is the same shape the sibling test in this file already uses, and the
+	// two elapsed assertions above are untouched: Close's own wait is still
+	// pinned by the 100ms floor and the 2s ceiling.
+	leakDeadline := time.Now().Add(2 * time.Second)
+	for {
+		leaked := runningTransportGoroutines()
+		if leaked == 0 {
+			break
+		}
+		if time.Now().After(leakDeadline) {
+			buf := make([]byte, 1<<16)
+			n := runtime.Stack(buf, true)
+			t.Fatalf("%d transport goroutine(s) still running 2s after Close returned - a leak, not an exit window:\n%s", leaked, buf[:n])
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
