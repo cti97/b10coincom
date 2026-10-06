@@ -172,6 +172,37 @@ func (d *Decoder) VarBytes() ([]byte, error) {
 	return out, nil
 }
 
+// ErrFieldTooLong reports a variable field whose declared length exceeds the
+// fixed bound its protocol role gives it. It is distinct from ErrShortBuffer: a
+// short buffer is malformed framing, an over-long field is a well-framed value
+// that cannot mean what its position claims.
+var ErrFieldTooLong = errors.New("types: field exceeds its protocol bound")
+
+// VarBytesMax is VarBytes with a hard ceiling on the declared length.
+//
+// A field whose legitimate width is a constant of the protocol - an Ed25519
+// public key is exactly 32 bytes - must not be able to make the decoder
+// allocate a frame-sized copy before its caller rejects it (audit C-17). The
+// length is read and checked BEFORE the make/copy, and the accepted encodings
+// are byte-for-byte VarBytes' own, so a bounded field re-encodes canonically
+// exactly as an unbounded one does.
+func (d *Decoder) VarBytesMax(max int) ([]byte, error) {
+	n, err := d.Len()
+	if err != nil {
+		return nil, err
+	}
+	if n > max {
+		return nil, fmt.Errorf("%w: %d bytes, above the %d-byte bound for this field", ErrFieldTooLong, n, max)
+	}
+	if n > d.remaining() {
+		return nil, ErrShortBuffer
+	}
+	out := make([]byte, n)
+	copy(out, d.buf[d.off:d.off+n])
+	d.off += n
+	return out, nil
+}
+
 func (d *Decoder) Fixed32() ([32]byte, error) {
 	var v [32]byte
 	if d.remaining() < HashSize {

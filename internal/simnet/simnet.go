@@ -231,7 +231,14 @@ func New(n int, opts Options) (*Net, error) {
 		tp.router = rt
 		out.syncs = append(out.syncs, sy)
 		out.rts = append(out.rts, rt)
-		out.drv = append(out.drv, out.newDriver(i, nil))
+		d, err := out.newDriver(i, nil)
+		if err != nil {
+			for _, opened := range out.ch {
+				_ = opened.Close()
+			}
+			return nil, err
+		}
+		out.drv = append(out.drv, d)
 	}
 	return out, nil
 }
@@ -242,14 +249,17 @@ func New(n int, opts Options) (*Net, error) {
 // driver-build path - New, reseat, CatchUp and the equivocator all build
 // through it - so a rebuilt driver can never lose the witness or the sync
 // routing the first build wired.
-func (n *Net) newDriver(i int, tpOverride transport.Transport) *consensus.Driver {
+func (n *Net) newDriver(i int, tpOverride transport.Transport) (*consensus.Driver, error) {
 	tp := n.transportFor(i)
 	if tpOverride != nil {
 		tp = tpOverride
 	}
-	d := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
+	d, err := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
+	if err != nil {
+		return nil, err
+	}
 	d.CommitWitness = n.syncs[i].RecordCommit
-	return d
+	return d, nil
 }
 
 // newSyncer builds validator i's BLOCK_SYNC syncer over tp and installs the
@@ -656,7 +666,11 @@ func (n *Net) installEquivocator(i int, typ consensus.MsgType) error {
 		forgeID: crypto.HashParts([]byte("b10coin-forged-block")),
 	}
 	n.equivs[i] = eq
-	n.drv[i] = n.newDriver(i, eq)
+	d, err := n.newDriver(i, eq)
+	if err != nil {
+		return err
+	}
+	n.drv[i] = d
 	return nil
 }
 
@@ -922,7 +936,9 @@ func (n *Net) CatchUp(i int) error {
 		return err
 	}
 	if n.ch[i].Height() > start {
-		n.rebuildDriver(i)
+		if err := n.rebuildDriver(i); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -933,20 +949,25 @@ func (n *Net) CatchUp(i int) error {
 // driver's engine judges a head that no longer exists - so the syncer and
 // the driver are rebuilt over the reopened one, exactly the wiring New did
 // for the first build.
-func (n *Net) reseat(i int, c *chain.Chain) {
+func (n *Net) reseat(i int, c *chain.Chain) error {
 	n.ch[i] = c
 	n.syncs[i] = n.newSyncer(i, c, n.transportFor(i))
 	n.rts[i].Sync = n.syncs[i]
-	n.rebuildDriver(i)
+	return n.rebuildDriver(i)
 }
 
 // rebuildDriver replaces validator i's driver with one judging the CURRENT
 // head - the rejoin a successful CatchUp takes, and the same shape the
 // restart scenario has always taken. The commit witness is re-wired so the
 // rebuilt driver keeps archiving certificates for the heights it commits.
-func (n *Net) rebuildDriver(i int) {
-	n.drv[i] = consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
-	n.drv[i].CommitWitness = n.syncs[i].RecordCommit
+func (n *Net) rebuildDriver(i int) error {
+	d, err := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
+	if err != nil {
+		return err
+	}
+	d.CommitWitness = n.syncs[i].RecordCommit
+	n.drv[i] = d
+	return nil
 }
 
 func ms(n int64) time.Duration { return time.Duration(n) * time.Millisecond }

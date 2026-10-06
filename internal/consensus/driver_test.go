@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -31,6 +32,18 @@ const (
 	roundStep = int64(10) // TimeoutStep for every driver fixture
 	netStep   = 10 * time.Millisecond
 )
+
+// mustDriver is NewDriver with the membership gate (audit C-11) turned into a
+// test fixture failure. Every driver fixture signs with a committee seat, so a
+// refusal here is a broken fixture, not the behaviour under test.
+func mustDriver(t *testing.T, cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) *Driver {
+	t.Helper()
+	d, err := NewDriver(cfg, ch, priv, tp, pool)
+	if err != nil {
+		t.Fatalf("NewDriver refused a committee seat: %v", err)
+	}
+	return d
+}
 
 // recordingTransport wraps the sim endpoint the driver is wired to and keeps
 // every payload the driver hands to Broadcast. It is the seam that lets the
@@ -155,7 +168,7 @@ func oneValidatorFixtureOnGenesis(t *testing.T, g *genesis.Genesis) (d *Driver, 
 	// empty pool proposes empty blocks, the behaviour every pre-existing
 	// driver test ran under before transactions had a source.
 	mp = mempool.New(1000, g.Hash(), ch.AdmissionHead)
-	d = NewDriver(cfg, ch, priv, rec, mp)
+	d = mustDriver(t, cfg, ch, priv, rec, mp)
 	return d, ch, rec, net, pub, priv, g, dir, mp
 }
 
@@ -193,7 +206,7 @@ func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *record
 	net.AddPeer("ghost") // listens, never sends: the absent second validator
 	rec = &recordingTransport{Transport: net.TransportFor("v0")}
 	mp = mempool.New(1000, g.Hash(), ch.AdmissionHead)
-	d = NewDriver(cfg, ch, priv, rec, mp)
+	d = mustDriver(t, cfg, ch, priv, rec, mp)
 	return d, ch, rec, net, pub, mp
 }
 
@@ -284,37 +297,44 @@ func TestDriverAppendsOnCommit(t *testing.T) {
 // constructor silently makes every engine after the first commit persist
 // NOTHING and restore NO lock - memory-only locks from height 2 on, i.e. the
 // exact defect persisting the lock exists to fix, arrived through one
-// unreviewed line. The test drives far enough that the post-commit swap has
-// created the engines judging heights 2 and 3, then requires those engines'
-// own lock moves to be in the store: if the swap lost its restore/persist
-// wiring, nothing reaches the lock log after height 1 and this fails.
+// unreviewed line. Height 2's promise is asserted while 2 is still the HEAD,
+// because audit C-13's pruning (which keeps the head's own record and drops
+// records below it) would otherwise hide a missing persist wiring; the test
+// then commits height 3 and checks that the height-3 engine - the NEXT swap -
+// left its promise too, and that the height-2 record is pruned exactly as
+// C-13 requires.
 func TestDriverPostCommitSwapStillCarriesTheLock(t *testing.T) {
 	d, ch, rec, net, _, _, _, _, _ := oneValidatorFixture(t)
 
-	// Three commits: heights 1, 2 and 3. The first engine is NewDriver's
-	// creation; every engine after it comes from flush's post-commit swap,
-	// which is the line the mutant reverts.
-	drive(t, d, net, 200, func() bool { return ch.Height() >= 3 })
-	if ch.Height() < 3 {
+	// The first engine is NewDriver's creation; every engine after it comes
+	// from flush's post-commit swap, which is the line the mutant reverts.
+	drive(t, d, net, 200, func() bool { return ch.Height() >= 2 })
+	if ch.Height() < 2 {
 		t.Fatalf("only %d block(s) committed in 200 drive iterations (%d messages): the post-commit swap never ran, the assertion below would be vacuous", ch.Height(), len(rec.broadcasts))
 	}
+	blk2, err := ch.BlockAt(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ch.LockAt(2); !ok || got != (store.LockRecord{Height: 2, Round: 0, BlockID: blk2.ID()}) {
+		t.Fatalf("the lock taken at the committed head 2 is %+v, %v; want the height-2 engine's own-proposal lock - the post-commit swap is holding locks in memory only and a restart would re-enter unlocked", got, ok)
+	}
 
-	for _, h := range []uint64{2, 3} {
-		blk, err := ch.BlockAt(h)
-		if err != nil {
-			t.Fatal(err)
-		}
-		wantID := blk.ID()
-		// Height h's engine precommitted its own proposal before committing it,
-		// so its lock (round 0, the committed block) must be durable - no
-		// pruning exists yet, a committed lock record stays readable.
-		got, ok := ch.LockAt(h)
-		if !ok {
-			t.Fatalf("the lock taken at committed height %d never reached the store: the engine the post-commit swap created is holding locks in memory only - a restart would re-enter unlocked", h)
-		}
-		if got != (store.LockRecord{Height: h, Round: 0, BlockID: wantID}) {
-			t.Fatalf("LockAt(%d) = %+v, want the own-proposal lock (round 0, block %x) the commit itself proves was taken", h, got, wantID[:8])
-		}
+	// One more swap: the height-3 engine must leave its promise too, and C-13
+	// then drops the height-2 record the chain has left.
+	drive(t, d, net, 200, func() bool { return ch.Height() >= 3 })
+	if ch.Height() < 3 {
+		t.Fatalf("only %d block(s) committed in 200 drive iterations: the height-3 swap never ran", ch.Height())
+	}
+	blk3, err := ch.BlockAt(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ch.LockAt(3); !ok || got != (store.LockRecord{Height: 3, Round: 0, BlockID: blk3.ID()}) {
+		t.Fatalf("LockAt(3) = %+v, %v; want the height-3 engine's own-proposal lock", got, ok)
+	}
+	if _, ok := ch.LockAt(2); ok {
+		t.Fatal("the committed height 2's lock survived Append(3): C-13 prunes records below the new head")
 	}
 }
 
@@ -604,7 +624,7 @@ func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Ch
 		// validator's pool is what M4's relay tasks will do, and a scenario
 		// that wants transactions on the wire puts them here.
 		pool := mempool.New(1000, g.Hash(), ch.AdmissionHead)
-		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)), pool))
+		ds = append(ds, mustDriver(t, cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)), pool))
 		chs = append(chs, ch)
 		pools = append(pools, pool)
 	}
@@ -779,8 +799,8 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	}
 	parent := ch1.Head().ID()
 	tp1 := &stalledTransport{}
-	d1 := NewDriver(cfg, ch1, priv0, tp1, nil) // no pool: this test wires no transaction source
-	d1Engine := d1.eng                         // kept only to prove the restart built a different engine
+	d1 := mustDriver(t, cfg, ch1, priv0, tp1, nil) // no pool: this test wires no transaction source
+	d1Engine := d1.eng                             // kept only to prove the restart built a different engine
 
 	// Walk the rounds until this validator is drawn as proposer at (1, r),
 	// then play the rest of the committee with one signed prevote for the
@@ -808,7 +828,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 			}
 		}
 		if lockRoundInt < 0 {
-			d1.eng.OnTimeout(TimeoutEvent{Height: d1.eng.Height(), Round: d1.eng.Round(), Step: d1.eng.Step()})
+			d1.eng.OnTimeout(TimeoutEvent{Height: d1.eng.Height(), Round: d1.eng.Round()})
 		}
 	}
 	if lockRoundInt < 0 {
@@ -850,7 +870,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 		t.Fatalf("the replayed chain sits at height %d; the restart must re-judge the undecided height 1", ch2.Height())
 	}
 	tp2 := &stalledTransport{}
-	d2 := NewDriver(cfg, ch2, priv0, tp2, nil) // no pool: this test wires no transaction source
+	d2 := mustDriver(t, cfg, ch2, priv0, tp2, nil) // no pool: this test wires no transaction source
 
 	// The restored lock, checked the instant the engine exists - before the
 	// engine has seen one message or one tick, i.e. before anything in run 2
@@ -932,7 +952,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	// ---- The restored lock is a REAL lock: it survives the round change, ----
 	// and it still releases the validator on verified evidence from a round
 	// strictly beyond its promise - persistence must not revoke liveness.
-	d2.eng.OnTimeout(TimeoutEvent{Height: d2.eng.Height(), Round: d2.eng.Round(), Step: d2.eng.Step()})
+	d2.eng.OnTimeout(TimeoutEvent{Height: d2.eng.Height(), Round: d2.eng.Round()})
 	if !d2.eng.lk.locked() || d2.eng.lk.blockID() != lockID || d2.eng.lk.round() != int64(lockRound) {
 		survivedID := d2.eng.lk.blockID()
 		t.Fatalf("the restored lock did not survive enterRound: now locked=%v (round %d, block %x)",
@@ -946,7 +966,15 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	// Only dev account 0 is funded on this genesis, so the second block keeps
 	// the same nonce but a different amount - a different tx, hence a
 	// different block ID from the bad block's.
-	p1 := cfg.Proposer(1, 1, parent)
+	//
+	// Audit C-9's standard shape: the polka forms at propRound (strictly newer
+	// than the stored lock, so it can unlock), and the re-proposal is offered
+	// ONE round later still, so ValidRound < Round. The engine is moved to that
+	// offering round before the envelope arrives.
+	propRound := lockRound + 1
+	offerRound := lockRound + 2
+	d2.eng.enterRound(offerRound)
+	p1 := cfg.Proposer(1, offerRound, parent)
 	newBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(p1)), []types.Tx{transferTx(ch2.Genesis(), 0, 1, 0, 5)}, ch2.Head().Header.Timestamp+1)
 	if err != nil {
 		t.Fatal(err)
@@ -960,9 +988,8 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	// stored lock. The quorum of 2 needs both committee members' signatures,
 	// and this test holds both keys - which is exactly why it can fabricate
 	// evidence the verification gate will accept.
-	propRound := lockRound + 1
 	goodProp := &Proposal{
-		Height: 1, Round: 1, Block: *newBlock, ValidRound: int64(propRound), Validator: cfg.Proposer(1, 1, parent),
+		Height: 1, Round: offerRound, Block: *newBlock, ValidRound: int64(propRound), Validator: p1,
 		Justification: encodeJustification([]*Vote{
 			voteFrom(t, cfg, 0, MsgPrevote, 1, propRound, newID),
 			voteFrom(t, cfg, 1, MsgPrevote, 1, propRound, newID),
@@ -973,7 +1000,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 		t.Fatal("the justified proposal must genuinely carry its polka")
 	}
 	d2.OnMessage(transport.Message{From: "v1", Data: EncodeProposal(goodProp)})
-	if nonNilPrevoteFor(t, tp2, 1, 1, newID) == nil {
+	if nonNilPrevoteFor(t, tp2, 1, offerRound, newID) == nil {
 		t.Fatal("a restored lock that refuses verified evidence from a strictly newer round would turn persistence into a permanent stop")
 	}
 
@@ -1343,7 +1370,7 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 	}
 	rec := &stalledTransport{}
 	mp := mempool.New(1000, g.Hash(), ch.AdmissionHead)
-	d := NewDriver(cfg, ch, priv0, rec, mp)
+	d := mustDriver(t, cfg, ch, priv0, rec, mp)
 
 	parent := ch.Head().ID()
 
@@ -1359,7 +1386,7 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 	// now=5, below the round timeout, so no timeout fires with it.
 	now := int64(5)
 	for r := 0; r < 64 && string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub0); r++ {
-		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 	}
 	if string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub0) {
 		t.Fatal("in 64 rounds the fixture never drew v0 as the proposer at height 1: no batch was ever built")
@@ -1391,7 +1418,7 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 
 	// The peer proposes an EMPTY block at the same height, in a later round.
 	for r := 0; r < 64 && string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub1); r++ {
-		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 	}
 	if string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub1) {
 		t.Fatal("in 64 rounds the fixture never drew v1 as the proposer: no foreign commit could happen")
@@ -1436,7 +1463,7 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 	// Tick(16) commit re-armed: the Tick proposes and nothing else.
 	parent2 := p2.ID()
 	for r := 0; r < 64 && string(cfg.Proposer(2, d.eng.Round(), parent2)) != string(pub0); r++ {
-		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 	}
 	if string(cfg.Proposer(2, d.eng.Round(), parent2)) != string(pub0) {
 		t.Fatal("in 64 rounds the fixture never drew v0 as the proposer at height 2: the reclaim had no proposal to ride")
@@ -1591,7 +1618,7 @@ func TestARebuiltDriverDoesNotBurnRoundZeroOnARunningClock(t *testing.T) {
 		t.Skip("fixture: seat 0 drew the height-1 round-0 proposition; the fixture needs a follower seat")
 	}
 	rec := &recordingTransport{Transport: silentTransport{}}
-	d := NewDriver(cfg, ch, testCommitteeKey(0), rec, nil)
+	d := mustDriver(t, cfg, ch, testCommitteeKey(0), rec, nil)
 
 	// The rebuilder's clock is ALREADY running (the net's step counter is at
 	// six figures by the time a catch-up rebuild happens).
@@ -1707,7 +1734,7 @@ func fourValidatorFixture(t *testing.T) (ds []*Driver, chs []*chain.Chain, recs 
 		}
 		mp := mempool.New(1000, g.Hash(), ch.AdmissionHead)
 		rec := &recordingTransport{Transport: net.TransportFor(fmt.Sprintf("v%d", i))}
-		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), rec, mp))
+		ds = append(ds, mustDriver(t, cfg, ch, testCommitteeKey(i), rec, mp))
 		chs = append(chs, ch)
 		recs = append(recs, rec)
 	}
@@ -2142,7 +2169,7 @@ func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
 	if err := e.OnMessage(EncodeVote(v0)); err != nil {
 		t.Fatal(err)
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 1 {
 		t.Fatalf("one future-round vote must not move the ladder bar: engine at round %d, want 1", e.Round())
 	}
@@ -2155,7 +2182,7 @@ func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
 	if err := e.OnMessage(EncodeVote(v2)); err != nil {
 		t.Fatal(err)
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 3 {
 		t.Fatalf("the power bar's future rounds must jump the ladder: engine at round %d, want 3 (the bar-completing round of attestations 5, 3)", e.Round())
 	}
@@ -2177,7 +2204,7 @@ func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
 	if err := e.OnMessage(EncodeVote(v1)); err != nil {
 		t.Fatal(err)
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 5 {
 		t.Fatalf("the jump target is the bar-completing round, not the furthest attested: engine at round %d, want 5", e.Round())
 	}
@@ -2207,7 +2234,7 @@ func TestTimeoutJumpNeedsDistinctMembersNotOneByzantine(t *testing.T) {
 	if len(e.future) != 1 || e.future[0].Round != 1<<30 {
 		t.Fatalf("fixture: one member must hold exactly one (its highest) entry, got %d entries", len(e.future))
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 1 {
 		t.Fatalf("a single member's future rounds must not jump the ladder (want +1 step, engine at round %d)", e.Round())
 	}
@@ -2253,7 +2280,7 @@ func TestJumpGateCountsPowerNotSeats(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 1 {
 		t.Fatalf("a coalition with 3/11 = 0.273 of the power in 3 seats moved the round to %d: 3 of 11 is strictly under one third and must not reach the power gate (want round 1)", e.Round())
 	}
@@ -2265,7 +2292,7 @@ func TestJumpGateCountsPowerNotSeats(t *testing.T) {
 	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 0, MsgPrevote, h, 9, someID))); err != nil {
 		t.Fatal(err)
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 1 {
 		t.Fatalf("one member holding 2/11 of the power moved the round to %d: a single validator must not reach the gate at all", e.Round())
 	}
@@ -2279,7 +2306,7 @@ func TestJumpGateCountsPowerNotSeats(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 9 {
 		t.Fatalf("a coalition holding 4/11 of the power in 2 seats did not move the round (at %d, want 9): the power gate must stay live", e.Round())
 	}
@@ -2298,7 +2325,7 @@ func TestJumpGateCountsPowerNotSeats(t *testing.T) {
 	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 3, MsgPrevote, h, 5, someID))); err != nil {
 		t.Fatal(err)
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 5 {
 		t.Fatalf("the jump went to round %d, want 5: with power 3 at claimed round 9 and power 2 attested at round 5, the bar of 4 is first reached at the honest member's round 5 - the target must not follow the sub-third coalition's furthest claim", e.Round())
 	}
@@ -2330,7 +2357,7 @@ func TestJumpNeverTravelsFurtherThanABoundedStride(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != maxRoundEscalation {
 		t.Fatalf("a MaxUint32-evidenced jump landed at round %d, want the bounded stride %d (an unbounded jump would strand the engine at OnTimeout's wrap guard and eject it from the height)", e.Round(), maxRoundEscalation)
 	}
@@ -2342,8 +2369,43 @@ func TestJumpNeverTravelsFurtherThanABoundedStride(t *testing.T) {
 	// moves the engine another bounded stride on the next timeout - a gap
 	// wider than the stride is closed by repetition, and no jump ever reaches
 	// the wrap guard's round.
-	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
 	if e.Round() != 2*maxRoundEscalation {
 		t.Fatalf("the second timeout did not carry another bounded stride (at round %d, want %d): the bound must not dead-end resync", e.Round(), 2*maxRoundEscalation)
+	}
+}
+
+// NewDriver refuses a signing key that is not a committee seat (audit C-11):
+// the engine's own vote could never be tallied, so the validator must fail to
+// start rather than panic on its first timeout. The state is CONSTRUCTED (a
+// known committee and a freshly generated stranger key), never provoked
+// through a buffer or a timing race.
+func TestNewDriverRefusesAKeyOutsideTheCommittee(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	g := genesis.Devnet()
+	g.Validators = cfg.Committee
+	g.Params.CommitteeSize = len(cfg.Committee)
+	ch, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	_, stranger, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewDriver(cfg, ch, stranger, &recordingTransport{Transport: silentInner{}}, nil)
+	if !errors.Is(err, ErrNotValidator) {
+		t.Fatalf("NewDriver with a stranger key = %v, want ErrNotValidator", err)
+	}
+	if d != nil {
+		t.Fatal("NewDriver handed back a driver for the key it refused")
+	}
+
+	// Non-vacuity control: the committee's own seat key is accepted, so the
+	// gate refuses the stranger, not every construction.
+	if d := mustDriver(t, cfg, ch, testCommitteeKey(0), &recordingTransport{Transport: silentInner{}}, nil); d == nil {
+		t.Fatal("NewDriver refused a committee seat")
 	}
 }

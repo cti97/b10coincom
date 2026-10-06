@@ -61,10 +61,15 @@ type Outbound struct {
 
 // TimeoutEvent tells the engine that its round has run out of time. The driver
 // owns the clock; the engine never reads one.
+//
+// It names ONLY (height, round). The step is deliberately not carried (audit
+// C-17): OnTimeout already judges the engine's own step - e.step - and a
+// caller-supplied step would be a second source of truth about it, exactly the
+// duplication the round check avoids. The engine never trusts a caller's echo of
+// its own state; it trusts its own.
 type TimeoutEvent struct {
 	Height uint64
 	Round  uint32
-	Step   Step
 }
 
 var (
@@ -348,8 +353,11 @@ func (e *Engine) emit(data []byte) { e.out = append(e.out, Outbound{Data: data})
 //
 //  1. The round that ran out is CLOSED: the validator casts any vote it still
 //     owes it. A validator that never received a usable proposal prevotes NIL
-//     exactly once for that round - its weight must leave the round or the
-//     round can never be left behind. A validator that already voted this
+//     exactly once for that round. The nil prevote is the honest RECORD of the
+//     round's outcome, not the mechanism that ends the round: with no
+//     nil-polka rule in this milestone (audit C-12) the round is left because
+//     the timer fired, not because nil weight reached anything - and no
+//     decision anywhere reads NilPower. A validator that already voted this
 //     round (prevote via maybePrevote, or precommit after it) casts nothing.
 //  2. The NEXT round is ENTERED: enterRound resets the per-round tallies and
 //     the proposal slots and parks the validator at StepPropose, waiting for
@@ -360,27 +368,35 @@ func (e *Engine) emit(data []byte) { e.out = append(e.out, Outbound{Data: data})
 // The lock deliberately survives this transition (it survives enterRound,
 // which is where the transition lands): the timeout rescues a stalled round,
 // it does not launder a promise.
-func (e *Engine) OnTimeout(ev TimeoutEvent) {
+//
+// The returned error (audit C-11) is the vote this timeout owed being refused -
+// a signing key outside the committee, or a self-tally that refused the vote.
+// The driver refuses such a key at construction, so the error is unreachable
+// for a correctly built driver; returning it keeps the engine from panicking on
+// the one shape its exported constructor cannot reject.
+func (e *Engine) OnTimeout(ev TimeoutEvent) error {
 	if ev.Height != e.height {
-		return // another height: behind us or not reached, not ours to judge
+		return nil // another height: behind us or not reached, not ours to judge
 	}
 	if ev.Round != e.round {
-		return // a stale re-fire for a round already left, or one not yet entered
+		return nil // a stale re-fire for a round already left, or one not yet entered
 	}
 	if e.step == StepCommit {
-		return // the height is decided; the driver moves to the next height
+		return nil // the height is decided; the driver moves to the next height
 	}
 	if e.round == math.MaxUint32 {
 		// e.round+1 would wrap to 0 and resurrect a long-settled round's
 		// tallies. There is no next round to enter; unreachable under any real
 		// timeout schedule, but the wrap must not be silent.
-		return
+		return nil
 	}
 	if e.step == StepPropose && e.proposal == nil {
 		// No usable proposal arrived before the round ran out: the one vote
 		// this round is owed is NIL. Emitted while e.round is still the round
 		// that is ending, so the vote is signed and tallied as that round's.
-		e.emitVote(MsgPrevote, [32]byte{})
+		if err := e.emitVote(MsgPrevote, [32]byte{}); err != nil {
+			return err
+		}
 	}
 	// The vote, if any, is cast: StepPrevote and StepPrecommit validators voted
 	// earlier through maybePrevote / maybePrecommit, and a validator holding a
@@ -399,10 +415,9 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) {
 	// the evidence can never name a round the engine chases to its own
 	// ejection. Without evidence the ladder escalates by one, as before.
 	if target := e.jumpTarget(); target > e.round {
-		e.enterRound(target)
-		return
+		return e.enterRound(target)
 	}
-	e.enterRound(e.round + 1)
+	return e.enterRound(e.round + 1)
 }
 
 // jumpTarget reports the round the engine should enter on a timeout when its
@@ -572,7 +587,7 @@ func (e *Engine) pruneRounds() {
 // is made durable BEFORE either emission (persist-before-emit, the same
 // ordering as the lock): a vote cast in round r must not outlive a crash that
 // forgets the validator ever reached r.
-func (e *Engine) enterRound(round uint32) {
+func (e *Engine) enterRound(round uint32) error {
 	e.bindRound(round)
 	e.step = StepPropose
 	e.proposal = nil
@@ -581,8 +596,10 @@ func (e *Engine) enterRound(round uint32) {
 	if e.persistRound != nil {
 		e.persistRound(e.height, round)
 	}
-	e.maybePrecommit()
-	e.maybeCommit()
+	if err := e.maybePrecommit(); err != nil {
+		return err
+	}
+	return e.maybeCommit()
 }
 
 // restoreRound reinstates the round a previous life of this engine had
@@ -675,22 +692,56 @@ func (e *Engine) committedPrecommits() []*Vote {
 // can survive the enterRound that immediately follows.
 //
 // The delivery cannot fail for a correctly constructed engine: the vote is
-// signed here, names the engine's own height and round, and its key was admitted
-// at construction. A panic on refusal is deliberate - a silent drop would
-// quietly reinstate the n-1 bug for a misconfigured committee.
-func (e *Engine) emitVote(typ MsgType, id [32]byte) {
+// signed here, names the engine's own height and round, and its key is used to
+// build the committee membership the engine was constructed with. A key that is
+// NOT in the committee is checked FIRST and returned as an error (audit C-11):
+// the engine refuses to sign a vote its own tally could never admit, instead of
+// emitting one and panicking when the tally refuses it. CheckMembership is the
+// same check at construction time, so a driver refuses such a key before it
+// ever drives the engine (see NewDriver); this guard is what keeps a
+// driver-less engine from panicking.
+func (e *Engine) emitVote(typ MsgType, id [32]byte) error {
+	if err := e.CheckMembership(); err != nil {
+		return err
+	}
 	v := &Vote{Type: typ, Height: e.height, Round: e.round, BlockID: id, Validator: e.pub}
 	h := v.SigningHash()
 	v.Sig = crypto.Sign(e.priv, h[:])
 	data := EncodeVote(v)
 	e.emit(data)
 	if err := e.OnMessage(data); err != nil {
-		panic(fmt.Sprintf("consensus: the engine's own vote was refused by its own tally: %v", err))
+		return fmt.Errorf("consensus: the engine's own vote was refused by its own tally: %w", err)
 	}
+	return nil
+}
+
+// CheckMembership reports whether the engine's signing key is one of the
+// committee's seats. It is the error the engine's construction cannot return
+// (NewEngine keeps its signature): NewDriver calls it and refuses to build a
+// driver whose validator holds no seat, and emitVote re-checks it before
+// signing anything. The committee index is computed once at construction; this
+// is the one place the engine reads it, so a future change to committee
+// membership cannot leave it silently unused.
+func (e *Engine) CheckMembership() error {
+	if e.idx < 0 {
+		return fmt.Errorf("%w: the engine's signing key (%x) is not in the committee of %d seats; it cannot sign a vote any member would tally",
+			ErrNotValidator, e.pub, len(e.cfg.Committee))
+	}
+	return nil
 }
 
 // OnMessage processes one wire message. An error means the message was malformed
 // or unusable; the caller may drop it and carry on.
+//
+// A nil return deliberately covers two outcomes: a message this engine ACCEPTED
+// and a well-formed message that was not for this engine - another height,
+// another round, a proposal from someone other than the round's proposer, or a
+// duplicate. The distinction is not observable at any caller (audit C-17): the
+// router drops an error and keeps a nil-returning message, and in both cases a
+// foreign message leaves the engine's state unchanged. Inventing an error for
+// "not mine" would report a healthy network's ordinary traffic as malformed,
+// the same misreporting ErrWrongHeightRound's comment warns against one level
+// down.
 func (e *Engine) OnMessage(data []byte) error {
 	if v, err := DecodeVote(data); err == nil {
 		return e.onVote(v)
@@ -740,8 +791,7 @@ func (e *Engine) onProposal(p *Proposal) error {
 	// cleared e.proposal on the way to a later round, and the commit then
 	// needs these bytes to append. See roundSets.proposal.
 	e.setsFor(e.round).proposal = e.proposal
-	e.maybePrevote()
-	return nil
+	return e.maybePrevote()
 }
 
 // noteFuture records, per member, the highest round at which that member has
@@ -805,7 +855,9 @@ func (e *Engine) onVote(v *Vote) error {
 			// A polka at the round we are in is what we precommit. Votes
 			// buffered for a round we have ALREADY left cannot drive a
 			// precommit now; enterRound re-runs this when it adopts them.
-			e.maybePrecommit()
+			if err := e.maybePrecommit(); err != nil {
+				return err
+			}
 		}
 	case MsgPrecommit:
 		added, err := s.precommits.Add(v)
@@ -822,10 +874,10 @@ func (e *Engine) onVote(v *Vote) error {
 			// like any other (audit C-3) - maybeCommit adopts the decided
 			// round so a late proposal for it can still be appended.
 			e.noteFuture(e.cfg.IndexOf(v.Validator), v)
-			e.maybeCommit()
+			return e.maybeCommit()
 		default:
 			// Current OR past: a quorum here is a commit (audit C-3).
-			e.maybeCommit()
+			return e.maybeCommit()
 		}
 	}
 	return nil
@@ -847,17 +899,17 @@ func (e *Engine) onVote(v *Vote) error {
 //     prevoted, the polka, the lock, the commit and the append refusal that
 //     previously parked every honest node forever can no longer form.
 //  3. canPrevote: the lock.
-func (e *Engine) maybePrevote() {
+func (e *Engine) maybePrevote() error {
 	if e.step != StepPropose && e.step != StepPrevote {
-		return
+		return nil
 	}
 	if e.proposal == nil || e.proposalEn == nil {
-		return
+		return nil
 	}
 	id := e.proposal.ID()
 	validRound, err := e.verifyJustification(e.proposalEn)
 	if err != nil {
-		return // an unjustified proposal is not prevoted at all - not even nil: no
+		return nil // an unjustified proposal is not prevoted at all - not even nil: no
 		// vote of this validator may rest on evidence that does not exist.
 	}
 	if e.validate != nil {
@@ -869,15 +921,16 @@ func (e *Engine) maybePrevote() {
 			// frame is on the stack. Writing the step after the emission
 			// would clobber the deeper transition.
 			e.step = StepPrevote
-			e.emitVote(MsgPrevote, [32]byte{})
-			return
+			return e.emitVote(MsgPrevote, [32]byte{})
 		}
 	}
 	if !e.lk.canPrevote(e.round, id, validRound) {
-		// The lock refuses this block. Prevote NIL rather than staying silent: a
-		// validator that emits nothing leaves its weight out of the nil tally, so
-		// the round can never end and the chain stalls on exactly the safety path
-		// this gate protects.
+		// The lock refuses this block. Prevote NIL rather than staying silent:
+		// the nil prevote is this validator's honest record that the round
+		// produced nothing it could accept, and - once a nil-polka rule exists
+		// - it is the weight such a rule would need. In THIS milestone it does
+		// not itself end the round (the timeout does; see OnTimeout) and no
+		// decision reads NilPower (audit C-12).
 		//
 		// The step is recorded BEFORE the emission: emitVote tallies the engine's
 		// own vote, and a late-arriving peer prevote may already sit one vote
@@ -885,24 +938,23 @@ func (e *Engine) maybePrevote() {
 		// maybePrecommit while this frame is on the stack. Writing the step after
 		// the emission would clobber the deeper transition.
 		e.step = StepPrevote
-		e.emitVote(MsgPrevote, [32]byte{})
-		return
+		return e.emitVote(MsgPrevote, [32]byte{})
 	}
 	// Same ordering as the nil branch above: the step goes down first, so the
 	// re-entrant precommit-or-commit the own prevote may trigger inside
 	// emitVote lands on top of a consistent mid-state instead of being
 	// overwritten here.
 	e.step = StepPrevote
-	e.emitVote(MsgPrevote, id)
+	return e.emitVote(MsgPrevote, id)
 }
 
-func (e *Engine) maybePrecommit() {
+func (e *Engine) maybePrecommit() error {
 	if e.step == StepPrecommit || e.step == StepCommit {
-		return
+		return nil
 	}
 	id, ok := e.prevotes.AnyQuorum()
 	if !ok {
-		return
+		return nil
 	}
 	// The step and the lock are recorded BEFORE the emission. emitVote tallies
 	// the engine's own precommit, which may complete the commit and synchronously
@@ -965,7 +1017,7 @@ func (e *Engine) maybePrecommit() {
 			e.lockedVoteRound = -1
 		}
 	}
-	e.emitVote(MsgPrecommit, id)
+	return e.emitVote(MsgPrecommit, id)
 }
 
 // maybeCommit commits the first block with a precommit quorum, in the current
@@ -997,13 +1049,12 @@ func (e *Engine) maybePrecommit() {
 // The current round is checked first, then the others ascending: the order is
 // only for determinism, since two honest quorums for two different blocks at
 // one height cannot exist.
-func (e *Engine) maybeCommit() {
+func (e *Engine) maybeCommit() error {
 	if e.hasCommitted {
-		return
+		return nil
 	}
 	if id, ok := e.precommits.AnyQuorum(); ok {
-		e.commitAt(id, e.round)
-		return
+		return e.commitAt(id, e.round)
 	}
 	for _, r := range e.retainedRoundsOther() {
 		s := e.sets[r]
@@ -1011,10 +1062,10 @@ func (e *Engine) maybeCommit() {
 			continue
 		}
 		if id, ok := s.precommits.AnyQuorum(); ok {
-			e.commitAt(id, r)
-			return
+			return e.commitAt(id, r)
 		}
 	}
+	return nil
 }
 
 // commitAt records the commit of id and the round whose precommit quorum
@@ -1029,7 +1080,7 @@ func (e *Engine) maybeCommit() {
 // entry, before the commit is recorded. The step is set last, so nothing the
 // adoption touches can be overwritten by a post-commit transition; once
 // committed the engine emits no further vote for this height.
-func (e *Engine) commitAt(id [32]byte, round uint32) {
+func (e *Engine) commitAt(id [32]byte, round uint32) error {
 	if round > e.round {
 		e.bindRound(round)
 		e.pruneRounds()
@@ -1049,6 +1100,7 @@ func (e *Engine) commitAt(id [32]byte, round uint32) {
 	e.committed, e.hasCommitted = id, true
 	e.commitRound = round
 	e.step = StepCommit
+	return nil
 }
 
 // committedBlock returns the block bytes for a committed ID this engine still
@@ -1187,8 +1239,7 @@ func (e *Engine) StartProposing() error {
 	// The proposer prevotes its own block once it has "received" it, which
 	// maybePrevote does for us. A transport never loops a sender's message back,
 	// so this is the only chance the proposer gets.
-	e.maybePrevote()
-	return nil
+	return e.maybePrevote()
 }
 
 // verifyJustification checks that the proposal's carried prevotes really do prove a
@@ -1210,6 +1261,20 @@ func (e *Engine) verifyJustification(p *Proposal) (int64, error) {
 		// VoteSet's round is a uint32; casting a larger claim would silently
 		// truncate it, so evidence could be tallied for a DIFFERENT round than
 		// the one the proposal asserts and the lock compares against.
+		return 0, ErrBadJustification
+	}
+	// A proposal is re-proposed FROM a later round than the polka it carries:
+	// its ValidRound must be STRICTLY earlier than the round it is offered in
+	// (audit C-9). Tendermint's validValue rule is validRound < round, and the
+	// bound is free to enforce: no honest proposer can offer a block whose
+	// polka is dated to the round the block is being proposed in. A proposer
+	// that did would be claiming a quorum that could not have formed before
+	// its own proposal went out - a round's polka is formed by the prevotes
+	// that proposal provokes - so accepting it would let a Byzantine proposer
+	// dress a bare round number as evidence. Rejecting it changes no honest
+	// behaviour: every fresh proposal claims -1 and every re-proposal names
+	// the earlier round its polka formed in.
+	if p.ValidRound >= int64(p.Round) {
 		return 0, ErrBadJustification
 	}
 	vs := NewVoteSet(e.cfg, e.height, uint32(p.ValidRound), MsgPrevote)

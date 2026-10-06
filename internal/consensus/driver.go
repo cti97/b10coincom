@@ -117,9 +117,24 @@ const maxRoundEscalation = uint32(16)
 // precommitted at head+1 and crashed before the height was decided, the lock
 // it persisted is restored here (newEngine) - a restart may not re-enter a
 // height the validator has already promised about.
-func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) *Driver {
+//
+// A signing key that is not one of the committee's seats is REFUSED with an
+// error (audit C-11): the engine cannot tally its own vote, so driving it would
+// only reach emitVote's refusal on the first timeout. Returning the error at
+// construction is the loud, non-panicking form of that refusal; the production
+// node already checks the same key against the genesis committee before it gets
+// here, and this makes the consensus layer enforce it for every caller.
+func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) (*Driver, error) {
 	d := &Driver{cfg: cfg, ch: ch, pool: pool, priv: priv, tp: tp}
 	d.eng = d.newEngine(ch.Height()+1, ch.Head().ID())
+	// The membership gate (audit C-11): the engine computed its committee
+	// index at construction but never used it, so a key outside the committee
+	// reached emitVote and panicked there. Refuse it before the transport is
+	// wired, so a misconfigured validator fails to start instead of failing to
+	// vote.
+	if err := d.eng.CheckMembership(); err != nil {
+		return nil, err
+	}
 	// timeoutAt is ARMED ON THE FIRST TICK, not at construction (the sentinel
 	// below). Anchoring it at construction means assuming the caller's clock
 	// starts at zero - true for a fresh simnet run, FALSE for every rebuild
@@ -136,7 +151,7 @@ func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transpor
 	// scenario's assertions are property assertions, not schedule assertions.
 	d.timeoutAt = -1
 	tp.OnMessage(d.OnMessage)
-	return d
+	return d, nil
 }
 
 // newEngine builds the engine for (height, parent) and connects it to the
@@ -206,6 +221,31 @@ func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
 // the engine is about to cast a vote in a round a restart could not
 // remember, and a node that cannot keep its position durable must stop rather
 // than vote from a state it cannot reproduce.
+//
+// PREVOTES ARE DELIBERATELY NOT PERSISTED (audit C-10). Only the lock and the
+// round are durable; the signed prevote a validator cast at (height, round) is
+// not written anywhere. A validator that prevotes and crashes before its round
+// advances therefore comes back with its round (restoreRound) and its lock
+// (restoreLock) restored but with NO memory of the prevote, and may honestly
+// cast a second prevote at that same round: a proposal re-delivered for the
+// round makes it prevote the same block again, and - the realistic case, since
+// this protocol does not retransmit proposals - its timeout makes it prevote
+// NIL, so the two signed prevotes at one (height, round) need not agree.
+//
+// This does not weaken commit safety, and the argument is why the omission is
+// acceptable rather than deferred: two conflicting commits at one height need
+// two quorums of more than two thirds of the power, whose intersection is more
+// than one third, so two conflicting quorums require more than one third of the
+// power to have double-voted. One validator's weight is capped below a quarter
+// of the total, so a single restarted validator can never supply that
+// intersection; and every honest validator in a quorum also precommitted, and
+// the lock IS persisted before that precommit is signed. What the omission
+// produces is therefore EVIDENCE, not an unsafe commit: the two signed prevotes
+// are exactly the equivocation M5 slashing must punish. M5 therefore either
+// persists the prevote before it is emitted (the same persist-before-emit
+// ordering the lock uses) or defines its evidence to include a re-cast prevote;
+// until slashing exists, this behaviour is documented here rather than assumed
+// away, and TestARestartDoesNotRememberAPrevote pins it.
 func (d *Driver) persistRound(height uint64, round uint32) {
 	rec := store.RoundRecord{Height: height, Round: round}
 	if err := d.ch.PutRound(rec); err != nil {
@@ -369,7 +409,14 @@ func (d *Driver) Tick(nowMillis int64) {
 		// one does (see NewDriver).
 		d.timeoutAt = nowMillis + d.cfg.TimeoutBase
 	} else if d.now >= d.timeoutAt {
-		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+		// The returned error (audit C-11) is discarded for the same reason
+		// StartProposing's is: NewDriver refused a signing key outside the
+		// committee, so the only emission this can refuse is a vote the
+		// engine's own tally would not admit - unreachable for a driver that
+		// was constructed at all. The driver has no error channel here (Tick
+		// is the clock's callback), and a key that cannot vote must fail at
+		// construction, which is where CheckMembership now puts it.
+		_ = d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 		// The round the engine is in NOW, after OnTimeout advanced it, gets
 		// the base timeout plus its own step - CAPPED at maxRoundEscalation
 		// steps (audit C-2): each round therefore runs longer than the one

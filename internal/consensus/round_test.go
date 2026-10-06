@@ -281,7 +281,7 @@ func TestRestartResumesAtThePersistedRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := NewDriver(cfg, ch, testCommitteeKey(1), &recordingTransport{Transport: silentInner{}}, nil)
+	d := mustDriver(t, cfg, ch, testCommitteeKey(1), &recordingTransport{Transport: silentInner{}}, nil)
 	if d.eng.Round() != 0 {
 		t.Fatal("fixture: a fresh engine starts at round 0")
 	}
@@ -308,7 +308,7 @@ func TestRestartResumesAtThePersistedRound(t *testing.T) {
 	if got, ok := ch2.RoundAt(ch2.Height() + 1); !ok || got != 5 {
 		t.Fatalf("the reopened chain reports round %d,%v for the judged height, want the persisted 5", got, ok)
 	}
-	d2 := NewDriver(cfg, ch2, testCommitteeKey(1), &recordingTransport{Transport: silentInner{}}, nil)
+	d2 := mustDriver(t, cfg, ch2, testCommitteeKey(1), &recordingTransport{Transport: silentInner{}}, nil)
 	if got := d2.eng.Round(); got != 5 {
 		t.Fatalf("a restarted driver resumed at round %d, want the persisted round 5", got)
 	}

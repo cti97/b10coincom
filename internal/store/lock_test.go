@@ -442,3 +442,132 @@ func TestLockAtReportsTheLiveStore(t *testing.T) {
 		t.Fatalf("LockAt(1) immediately after PutLock = %+v,%v; want %+v", got, ok, rec)
 	}
 }
+
+// countLockFrames reads locks.log back through the store's own framing and
+// counts its records, so a prune test can assert the FILE really shrank rather
+// than only the map.
+func countLockFrames(t *testing.T, dir string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, lockLogName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, off := 0, int64(0)
+	for off < int64(len(raw)) {
+		_, recEnd, err := frame(raw, off, lockPayloadLen)
+		if err != nil {
+			t.Fatalf("framing locks.log at offset %d: %v", off, err)
+		}
+		n++
+		off = recEnd
+	}
+	return n
+}
+
+// PruneLocks drops every promise strictly below the committed head and keeps
+// the two that can still be read - the head's own record (conservative
+// headroom) and the head+1 promise a restart restores - across both the live
+// store and a reopen (audit C-13).
+func TestPruneLocksDropsBelowTheCommittedHead(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The chain has committed through height 5, so the store knows its head on
+	// reopen.
+	for h := uint64(1); h <= 5; h++ {
+		if err := s.Append(h, []byte("block")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for h := uint64(1); h <= 6; h++ {
+		if err := s.PutLock(LockRecord{Height: h, Round: 1, BlockID: idOf(byte(h))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.PruneLocks(5); err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(1); h < 5; h++ {
+		if _, ok := s.LockAt(h); ok {
+			t.Fatalf("LockAt(%d) survived a prune below the committed head 5", h)
+		}
+	}
+	if _, ok := s.LockAt(5); !ok {
+		t.Fatal("the head's own lock was pruned; the fix deliberately keeps it")
+	}
+	if _, ok := s.LockAt(6); !ok {
+		t.Fatal("the head+1 promise was pruned: that record is the lock a restart reads, and dropping it reopens the M3 lock-persistence finding")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reopen prunes below its committed head too, so the same promises
+	// stand and the same heights are absent.
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	for h := uint64(1); h < 5; h++ {
+		if _, ok := s2.LockAt(h); ok {
+			t.Fatalf("after reopen LockAt(%d) is present for a height below the committed head", h)
+		}
+	}
+	if _, ok := s2.LockAt(5); !ok {
+		t.Fatal("the head's own lock did not survive the reopen")
+	}
+	if _, ok := s2.LockAt(6); !ok {
+		t.Fatal("the head+1 promise did not survive the reopen")
+	}
+}
+
+// A log of repeated relocks at one height grows one frame per move; once
+// enough stale frames have accumulated, PruneLocks rewrites the file to the
+// promises that stand, and the rewrite replays identically (audit C-13).
+func TestPruneLocksCompactsTheLog(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const moves = lockCompactThreshold + 2
+	newest := LockRecord{}
+	for i := 0; i < moves; i++ {
+		newest = LockRecord{Height: 9, Round: uint32(i), BlockID: idOf(byte(i))}
+		if err := s.PutLock(newest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if before := countLockFrames(t, dir); before != moves {
+		t.Fatalf("fixture: locks.log holds %d frames before the prune, want %d", before, moves)
+	}
+
+	if err := s.PruneLocks(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := countLockFrames(t, dir); got != 1 {
+		t.Fatalf("the compacted log holds %d frames, want the single newest promise", got)
+	}
+	if got, ok := s.LockAt(9); !ok || got != newest {
+		t.Fatalf("after compaction LockAt(9) = %+v,%v; want the newest %+v", got, ok, newest)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if got, ok := s2.LockAt(9); !ok || got != newest {
+		t.Fatalf("across the reopen the compacted log reads %+v,%v; want the newest %+v", got, ok, newest)
+	}
+	if _, ok := s2.LockAt(8); ok {
+		t.Fatal("a height that was never locked appeared after compaction")
+	}
+}

@@ -162,8 +162,14 @@ type Store struct {
 	// the NEWEST lock record for it. A height may legitimately carry a lock
 	// and no block: the lock points at head+1, the height being judged, so
 	// lock heights are deliberately NOT required to be appended heights.
-	lockFile *os.File
-	locks    map[uint64]LockRecord
+	//
+	// lockRecords is how many framed records the log PHYSICALLY holds, one per
+	// PutLock ever, while locks holds one entry per height. The difference is
+	// the stale growth audit C-13 names; PruneLocks deletes the below-head
+	// entries and rewrites the log when enough of them have accumulated.
+	lockFile    *os.File
+	locks       map[uint64]LockRecord
+	lockRecords int
 
 	// roundFile is the append handle on the round log; rounds maps a height
 	// to the NEWEST round recorded for it (audit C-3). Like a lock, a round
@@ -257,6 +263,14 @@ func Open(dir string) (*Store, error) {
 	s.lockFile = lf
 	s.roundFile = rf
 	s.certFile = cf
+	// Compact a lock log an earlier build (or a long run between restarts) grew
+	// one frame per height (audit C-13). scanLocks already pruned the map; this
+	// bounds the FILE too. The error is deliberately ignored: the old log is
+	// intact and complete, so a failed maintenance rewrite must not stop a node
+	// from opening its own data directory.
+	if s.have {
+		_ = s.PruneLocks(s.last)
+	}
 	return s, nil
 }
 
@@ -679,9 +693,33 @@ func (s *Store) scanLocks() error {
 		// Newest wins: a height whose lock moved appears once per move, and
 		// only the last frame carries the promise that stands.
 		s.locks[rec.Height] = rec
+		s.lockRecords++
 		off = recEnd
 	}
+	// Prune what a previous life of the chain has already left behind (audit
+	// C-13), IN MEMORY here: the file cannot be compacted until Open's append
+	// handle exists, so this bounds the map's load on a log that grew before
+	// this fix. Heights strictly below the committed head are never judged
+	// again (the driver only ever restores a lock for head+1), and the head's
+	// own record is deliberately kept - the conservative superset, and what
+	// chain_lock_test asserts survives a reopen.
+	if s.have {
+		s.pruneLockMap(s.last)
+	}
 	return nil
+}
+
+// pruneLockMap deletes every in-memory promise for a height strictly below the
+// committed head. The chain has left those heights for good: Append only
+// extends head+1, there is no reorg, and Driver.newEngine restores the lock for
+// head+1 alone. Keeping the head's own record (h == below) is deliberate
+// headroom, not a need - it is one record against the unbounded growth.
+func (s *Store) pruneLockMap(below uint64) {
+	for h := range s.locks {
+		if h < below {
+			delete(s.locks, h)
+		}
+	}
 }
 
 // scanRounds rebuilds the round index from the round log (audit C-3).
@@ -908,6 +946,126 @@ func (s *Store) PutLock(rec LockRecord) error {
 		return err
 	}
 	s.locks[rec.Height] = rec
+	s.lockRecords++
+	return nil
+}
+
+// lockCompactThreshold is how many records the lock log may hold beyond the
+// promises that still stand before PruneLocks rewrites it (audit C-13). A
+// rewrite costs a file create, a full re-encode, two fsyncs and a rename, so it
+// is batched rather than paid per commit; the steady state is the live promises
+// (head and head+1) plus at most this many stale frames, instead of one frame
+// per height forever.
+const lockCompactThreshold = 256
+
+// PruneLocks drops the lock-log records for every height strictly below the
+// committed head (audit C-13): the in-memory promises always, and the on-disk
+// log once enough stale frames have accumulated to be worth a rewrite.
+//
+// SAFETY, stated because the lock is a promise and this DELETES promises. A
+// lock record for height h is read in exactly one place - Driver.newEngine's
+// restoreLock - and only for the height the engine is about to judge, which is
+// always head+1. Once Append has made head >= h durable, no engine will ever
+// be built for h again: the chain has no reorg, Append only extends head+1, and
+// the validator's promise at h could only matter on a path that re-judged h.
+// So a record below the head is unreachable by construction, and dropping it
+// cannot turn a locked validator into an unlocked one. The records that CAN be
+// read - head (needlessly kept) and head+1 (the promise that matters, never
+// below the head) - are kept. Compaction is atomic in the only way that
+// matters: the kept set is written to a temporary file, fsynced and renamed
+// over the log, so a crash leaves either the old log (a superset) or the new
+// one, and both contain every promise head+1 could need. A failure is returned
+// but is not a safety event: the old file still holds every record, and the
+// caller (Chain.Append) deliberately ignores it so a storage-maintenance
+// failure cannot park consensus.
+func (s *Store) PruneLocks(below uint64) error {
+	s.pruneLockMap(below)
+	// Compact when stale frames - records that are not the newest for their
+	// height, or whose height was just dropped - have piled up. In the common
+	// case the map holds the head and head+1 records and the log holds a
+	// handful more, so this is a no-op.
+	if s.lockRecords <= len(s.locks)+lockCompactThreshold {
+		return nil
+	}
+	return s.compactLocks()
+}
+
+// compactLocks rewrites the lock log to exactly the promises currently in
+// s.locks (one newest record per live height), atomically. The temporary file
+// becomes the store's append handle after the rename, so there is no window in
+// which the renamed log has no valid handle; see PruneLocks for the safety
+// argument.
+func (s *Store) compactLocks() error {
+	kept := make([]LockRecord, 0, len(s.locks))
+	for _, rec := range s.locks {
+		kept = append(kept, rec)
+	}
+	// Ascending height, for a deterministic file: the newest-per-height map
+	// has one record per height, so order cannot change which promise wins,
+	// but a stable order keeps a rewritten log byte-reproducible.
+	slices.SortFunc(kept, func(a, b LockRecord) int {
+		switch {
+		case a.Height < b.Height:
+			return -1
+		case a.Height > b.Height:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	// A crash between CreateTemp and Rename can leave a temporary file behind.
+	// Open ignores it (it is neither locks.log nor a .seg), but it would
+	// accumulate one per interrupted compaction, so reclaim any leftovers
+	// before writing a new one. Compaction is serialised by the chain's write
+	// lock, so no other live writer owns one of these names.
+	if stale, _ := filepath.Glob(filepath.Join(s.dir, lockLogName+".compact-*")); len(stale) > 0 {
+		for _, p := range stale {
+			_ = os.Remove(p)
+		}
+	}
+
+	tmp, err := os.CreateTemp(s.dir, lockLogName+".compact-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// CreateTemp makes the file 0600; the log has always been 0644, so keep
+	// that mode across the rewrite.
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	for _, rec := range kept {
+		if err := writeRecord(tmp, encodeLockRecord(rec)); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+			return err
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	old := s.lockFile
+	oldRecords := s.lockRecords
+	s.lockFile = tmp
+	s.lockRecords = len(kept)
+	if err := os.Rename(tmpName, filepath.Join(s.dir, lockLogName)); err != nil {
+		// Nothing was renamed: restore the handle and record count, and drop
+		// the temporary file. The old log is untouched and complete.
+		s.lockFile = old
+		s.lockRecords = oldRecords
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// The rename committed. The old handle still names the unlinked inode; a
+	// Close failure there cannot affect the new log, so it is not reported.
+	_ = old.Close()
 	return nil
 }
 

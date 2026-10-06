@@ -538,6 +538,15 @@ func (c *Chain) Append(b *types.Block) error {
 	}
 	c.state = next
 	c.head = b
+	// The height just committed is behind every engine this node will build
+	// from now on (Driver.newEngine judges head+1, and there is no reorg), so
+	// its persisted lock - and every older one - can never be read again.
+	// Prune them (audit C-13): the in-memory map immediately, and the log file
+	// when enough stale frames have accumulated. The error is deliberately
+	// dropped: compacting the lock log is storage maintenance, never a safety
+	// step, and the old file (a superset) survives a failed rewrite. A commit
+	// must not be reported as failed because a rewrite could not happen.
+	_ = c.store.PruneLocks(b.Header.Height)
 	return nil
 }
 

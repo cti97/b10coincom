@@ -78,7 +78,7 @@ func TestAPastRoundQuorumStillAppendsTheCommittedBlock(t *testing.T) {
 	net := sim.New(sim.Options{Seed: 1, Latency: 1})
 	net.AddPeer(fmt.Sprintf("v%d", propIdx))
 	rec := &recordingTransport{Transport: net.TransportFor(fmt.Sprintf("v%d", propIdx))}
-	d := NewDriver(cfg, ch, priv, rec, nil)
+	d := mustDriver(t, cfg, ch, priv, rec, nil)
 
 	// Round 0's proposal arrives and is accepted, which retains its bytes with
 	// round 0's tallies.

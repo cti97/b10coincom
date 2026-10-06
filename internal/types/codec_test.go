@@ -91,3 +91,42 @@ func TestLenPrefixLargerThanBufferIsShortBuffer(t *testing.T) {
 		t.Fatalf("expected ErrShortBuffer, got %v", err)
 	}
 }
+
+// VarBytesMax is the bounded sibling of VarBytes (audit C-17): a declared
+// length above the protocol's fixed width for the field is refused with
+// ErrFieldTooLong BEFORE the copy, while exactly the bound is accepted and the
+// accepted bytes are byte-for-byte what VarBytes would have returned.
+func TestVarBytesMaxRefusesAboveTheBound(t *testing.T) {
+	e := NewEncoder()
+	e.VarBytes(make([]byte, 33))
+	d := NewDecoder(e.Bytes())
+	if _, err := d.VarBytesMax(32); !errors.Is(err, ErrFieldTooLong) {
+		t.Fatalf("a 33-byte field under a 32-byte bound gave %v, want ErrFieldTooLong", err)
+	}
+
+	e2 := NewEncoder()
+	payload := bytes.Repeat([]byte{0x5A}, 32)
+	e2.VarBytes(payload)
+	d2 := NewDecoder(e2.Bytes())
+	got, err := d2.VarBytesMax(32)
+	if err != nil {
+		t.Fatalf("a field exactly at the bound was refused: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the bounded decode returned different bytes than the encoding carried")
+	}
+	if err := d2.Done(); err != nil {
+		t.Fatalf("the bounded decode did not consume exactly its field: %v", err)
+	}
+
+	// Non-canonical and short-buffer handling is unchanged: the bound is an
+	// extra ceiling, not a second framing.
+	if _, err := NewDecoder([]byte{0x80, 0x00}).VarBytesMax(32); !errors.Is(err, ErrNonCanonical) {
+		t.Fatalf("a non-canonical length under a bound gave %v, want ErrNonCanonical", err)
+	}
+	short := NewEncoder()
+	short.Len(10)
+	if _, err := NewDecoder(short.Bytes()).VarBytesMax(32); !errors.Is(err, ErrShortBuffer) {
+		t.Fatalf("a length past the buffer under a bound gave %v, want ErrShortBuffer", err)
+	}
+}

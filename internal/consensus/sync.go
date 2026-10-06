@@ -167,6 +167,12 @@ var (
 	// asked about is refused before its certificate is even considered: the
 	// range, not the certificate, is the first thing the response must honour.
 	ErrSyncUnitOutOfRange = errors.New("consensus: peer served a block outside the requested range")
+	// ErrSyncUnitCount reports a response carrying more units than the window
+	// it answers could possibly hold (audit C-15). A window names at most
+	// MaxBlocksPerResponse heights, so more units than that cannot all be
+	// distinct in-window blocks; the answer is refused before any unit is
+	// examined, and the pull stops rather than appending a prefix of it.
+	ErrSyncUnitCount = errors.New("consensus: peer served more units than the requested window holds")
 	// ErrBadSyncCommit reports an adoptable-in-form block whose commit
 	// CERTIFICATE is missing, malformed, wrong-placed, non-member-signed, or
 	// short of the quorum the live commit rule requires. It is the puller's
@@ -620,6 +626,15 @@ func certVoteSet(vals []genesis.Validator, height uint64, round uint32) *VoteSet
 // of a commit that may never have happened.
 func (s *Syncer) verifyCertificate(blk *types.Block, round uint32, votes []*Vote) error {
 	vals := s.chain.Genesis().Validators
+	// certVoteSet builds a bare Config (no timeouts), so Config.Validate is not
+	// run over it and Config.Quorum would silently use a WRAPPED total if this
+	// genesis's powers summed past 2^64 (audit C-17). The production node
+	// validates the same committee at startup, but the certificate gate must
+	// not lean on a caller's earlier check: refuse the overflow here, as a
+	// refused certificate, so a wrapped quorum can never admit one.
+	if _, ok := totalPower(vals); !ok {
+		return fmt.Errorf("%w: the certificate's committee power overflows uint64", ErrBadSyncCommit)
+	}
 	vs := certVoteSet(vals, blk.Header.Height, round)
 	for i, v := range votes {
 		if v == nil {
@@ -947,7 +962,8 @@ func (s *Syncer) pullPeer() (transport.PeerID, error) {
 //
 //   - a request the transport refuses (peer down, partitioned, unknown)
 //     returns the error: the caller owns retry policy;
-//   - a unit outside the requested window, one that fails to decode, carries
+//   - a response with more units than the window can hold, a unit outside the
+//     requested window, one that fails to decode, carries
 //     no usable COMMIT CERTIFICATE (missing, malformed, wrong-placed,
 //     non-member, or sub-quorum), or a block that fails Append STOPS the pull
 //     and is returned as the error - never skipped ahead. Without the
@@ -1035,6 +1051,15 @@ func (s *Syncer) PullAndAdopt(from uint64) error {
 		clear()
 		if got == nil || len(got.Units) == 0 {
 			return nil // silence: nothing to adopt, nothing to retry here
+		}
+		// The window held at most `win` heights, so a response with more units
+		// than that cannot be an honest answer to THIS request: the extras
+		// could only be duplicates or units the per-unit check would refuse
+		// anyway. Refuse the whole window before examining a unit, so a peer
+		// cannot make the pull append an arbitrary prefix (audit C-15).
+		if uint64(len(got.Units)) > win {
+			return fmt.Errorf("%w: peer served %d units for a window of at most %d blocks",
+				ErrSyncUnitCount, len(got.Units), win)
 		}
 		for i, unit := range got.Units {
 			blk, err := types.DecodeBlock(unit.Block)

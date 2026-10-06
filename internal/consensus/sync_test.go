@@ -363,7 +363,7 @@ func newCommitteeRig(t *testing.T, majority int, driveTo uint64) *committeeRig {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("fixture: the committee config does not validate: %v", err)
 		}
-		drv := NewDriver(cfg, ch, testCommitteeKey(i), ep, nil) // nil pool: empty blocks, the M3 behaviour
+		drv := mustDriver(t, cfg, ch, testCommitteeKey(i), ep, nil) // nil pool: empty blocks, the M3 behaviour
 		drv.CommitWitness = srv.RecordCommit
 		c.drivers = append(c.drivers, drv)
 		ep.OnMessage(routeHonest(c.g.Validators, ep, drv, srv, func(req *wire.BlockSyncReq) {
@@ -1844,6 +1844,83 @@ func TestPullRefusesAUnitOutsideTheRequestedWindow(t *testing.T) {
 	}
 	w.halt()
 	w.assertUnchanged("after the out-of-window unit was refused", height, headID)
+}
+
+// TestPullRefusesAResponseWithTooManyUnits is C-15's count half, the sibling of
+// the out-of-window test above. A window names at most MaxBlocksPerResponse
+// heights, so a response with more units than that cannot be an honest answer
+// to it; the pull refuses the whole window BEFORE decoding any unit, so a peer
+// cannot make it append an arbitrary prefix. Every unit here is a decodable
+// block, so the COUNT, not a decode failure, is what stops the pull.
+func TestPullRefusesAResponseWithTooManyUnits(t *testing.T) {
+	w := newCertWorld(t)
+	defer w.rig.halt()
+
+	blk, err := w.pullCh.Build(testCommitteeKey(0), nil, w.pullCh.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	over := int(w.pull.MaxBlocksPerResponse) + 1
+	units := make([]wire.BlockSyncUnit, 0, over)
+	for i := 0; i < over; i++ {
+		units = append(units, wire.BlockSyncUnit{Block: blk.Encode(), Round: 1})
+	}
+	w.answer = func(req *wire.BlockSyncReq) []byte {
+		return signedResp(testCommitteeKey(3), req, units...)
+	}
+	// The over-count response is delivered by afterSend/settle BEFORE the wait,
+	// so the count gate - not ReplyWait - is what the pull reports (F5).
+	w.pull.ReplyWait = 100 * time.Millisecond
+	w.rig.start()
+	height, headID := w.pullCh.Height(), w.pullCh.Head().ID()
+
+	err = w.pull.PullAndAdopt(1)
+	if !errors.Is(err, ErrSyncUnitCount) {
+		t.Fatalf("a response with %d units for a %d-block window gave (%v), want ErrSyncUnitCount",
+			over, w.pull.MaxBlocksPerResponse, err)
+	}
+	w.halt()
+	w.assertUnchanged("after the over-count response was refused", height, headID)
+}
+
+// C-17: the certificate gate builds its VoteSet from a bare Config, so it does
+// not inherit the node's startup Config.Validate. A genesis whose validator
+// powers sum past 2^64 (Genesis.Validate does not check the sum) must be
+// refused by the GATE itself, as a sub-quorum certificate, instead of letting
+// Config.Quorum run on a wrapped total. The wrapped total is 0, whose Quorum is
+// 1, so ONE validator's precommit would otherwise pass the gate - the vote is
+// therefore carried, making the refusal the overflow check and nothing else.
+func TestCertificateGateRefusesAnOverflowingCommittee(t *testing.T) {
+	pub0, priv0, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub1, _, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := genesis.Devnet()
+	g.Validators = []genesis.Validator{
+		{PubKey: pub0, Power: 1 << 63},
+		{PubKey: pub1, Power: 1 << 63}, // 1<<63 + 1<<63 wraps uint64
+	}
+	g.Params.CommitteeSize = 2
+	ch, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatalf("fixture: the overflowing genesis no longer opens: %v", err)
+	}
+	defer ch.Close()
+
+	s := NewSyncer(ch, &recordingTransport{Transport: silentInner{}}, priv0)
+	blk := &types.Block{Header: types.Header{Height: 1}}
+	// A genuine, correctly placed precommit: without the overflow guard the
+	// wrapped quorum of 1 admits it.
+	v := &Vote{Type: MsgPrecommit, Height: 1, Round: 0, BlockID: blk.ID(), Validator: pub0}
+	vh := v.SigningHash()
+	v.Sig = crypto.Sign(priv0, vh[:])
+	if err := s.verifyCertificate(blk, 0, []*Vote{v}); !errors.Is(err, ErrBadSyncCommit) {
+		t.Fatalf("a certificate gate over a wrapping committee admitted one precommit (%v), want ErrBadSyncCommit from the overflow guard", err)
+	}
 }
 
 // TestSyncerRateLimitsARequester is the C-4 rate-limit pin: a requester gets a

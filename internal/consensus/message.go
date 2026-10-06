@@ -8,6 +8,7 @@
 package consensus
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 
@@ -50,9 +51,12 @@ var (
 
 // Vote is one validator's signed judgement about one (height, round).
 //
-// An all-zero BlockID is a NIL vote: "this round produced nothing I will accept".
-// Nil votes are first-class, not abstentions - without them a round whose proposer
-// is offline could never be left behind, and the chain would stall forever.
+// An all-zero BlockID is a NIL vote: "this round produced nothing I will
+// accept". Nil votes are first-class, not abstentions: they are the honest
+// record that a validator had nothing to prevote, and they are what a future
+// nil-polka rule would tally. They are NOT what ends a round in this milestone
+// (audit C-12): a round with no usable proposer ends when its timer fires, and
+// no decision anywhere reads the nil weight - see VoteSet.NilPower.
 type Vote struct {
 	Type      MsgType
 	Height    uint64
@@ -77,6 +81,20 @@ func (v *Vote) encodeBody() []byte {
 
 // SigningHash covers every field that carries meaning, so a validator cannot be
 // quoted as having said something it did not.
+//
+// CHAIN IDENTIFIER: deliberately ABSENT, as audit C-16 records, and deliberately
+// not added on this branch. A transaction's signature binds the genesis hash
+// (types.Tx.SigningHash, audit S-1), but a vote's does not. Adding it here is a
+// second consensus signing-coverage change on a branch that has already taken
+// its one coordinated signed-body fork (S-1/S-3): the change would invalidate
+// every stored commit certificate and every live peer's vote at once, so it
+// belongs in ONE versioned revision alongside the header version field audit
+// section 6.3 asks for - not in a networking milestone. The residual risk is
+// also low: a block ID is the header hash, and two chains differ in their
+// genesis hash, so their state roots - and therefore their block IDs - differ;
+// a vote for one chain's block is not a meaningful vote on another genesis.
+// When the versioned revision lands, the fix is to add the genesis hash as a
+// domain-separated HashParts part exactly as Tx.SigningHash does.
 func (v *Vote) SigningHash() [32]byte {
 	return crypto.HashParts([]byte("b10coin-vote"), v.encodeBody())
 }
@@ -109,7 +127,12 @@ func DecodeVote(b []byte) (*Vote, error) {
 	if v.BlockID, err = d.Fixed32(); err != nil {
 		return nil, err
 	}
-	if v.Validator, err = d.VarBytes(); err != nil {
+	// The validator key has EXACTLY one legal width (audit C-17): bounding it
+	// here refuses an over-long "key" before the decoder copies it, instead of
+	// copying a frame-sized slice for Verify to reject. A SHORT or empty key
+	// still decodes, so the tally's own ErrMissingValidatorKey/ErrNotValidator
+	// taxonomy is unchanged.
+	if v.Validator, err = d.VarBytesMax(ed25519.PublicKeySize); err != nil {
 		return nil, err
 	}
 	if v.Sig, err = d.VarBytes(); err != nil {
@@ -167,6 +190,10 @@ type Proposal struct {
 // ValidRound and Justification are signed with the rest: a proposer must not be
 // quotable as having claimed - or having furnished evidence of - a polka at a
 // round it never did.
+//
+// The chain identifier is absent for the same recorded reason as Vote's (audit
+// C-16): this is a second consensus signing-coverage change, deferred to the
+// single versioned revision rather than folded into M4. See Vote.SigningHash.
 func (p *Proposal) SigningHash() [32]byte {
 	e := types.NewEncoder()
 	e.U64(p.Height)
@@ -245,7 +272,10 @@ func DecodeProposal(b []byte) (*Proposal, error) {
 	if p.Justification, err = d.VarBytes(); err != nil {
 		return nil, err
 	}
-	if p.Validator, err = d.VarBytes(); err != nil {
+	// The proposer key is an Ed25519 key and nothing else; bound it before the
+	// copy, exactly as the vote's key (audit C-17). A short or empty key still
+	// decodes so Verify names the real problem.
+	if p.Validator, err = d.VarBytesMax(ed25519.PublicKeySize); err != nil {
 		return nil, err
 	}
 	if p.Sig, err = d.VarBytes(); err != nil {

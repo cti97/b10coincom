@@ -216,3 +216,43 @@ func TestProposalSignatureCoversHeightAndRound(t *testing.T) {
 		}
 	}
 }
+
+// C-17: a vote or proposal "key" that cannot be an Ed25519 public key is
+// refused at DECODE, before the decoder copies it, instead of being copied and
+// then rejected by Verify. The bound is exact - 32 bytes still round-trips -
+// and a 1 MiB key is not copied at all, because the length is checked before
+// the allocation.
+func TestDecodeRefusesAnOverLongValidatorKey(t *testing.T) {
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A valid 32-byte vote still decodes, so the bound refuses the width, not
+	// the vote.
+	v := &Vote{Type: MsgPrevote, Height: 7, Round: 3, Validator: pub}
+	vh := v.SigningHash()
+	v.Sig = crypto.Sign(priv, vh[:])
+	if _, err := DecodeVote(EncodeVote(v)); err != nil {
+		t.Fatalf("a 32-byte vote key no longer decodes: %v", err)
+	}
+	v.Validator = make([]byte, 1<<20)
+	if _, err := DecodeVote(EncodeVote(v)); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a 1 MiB vote key decoded (%v); want ErrFieldTooLong before any copy", err)
+	}
+
+	// The proposal envelope's proposer key gets the same gate.
+	blk := types.Block{Header: types.Header{
+		Height: 1, TxRoot: types.ComputeTxRoot(nil), Timestamp: 1_700_000_100, Proposer: pub,
+	}}
+	p := &Proposal{Height: 1, Round: 0, Block: blk, ValidRound: -1, Validator: pub}
+	ph := p.SigningHash()
+	p.Sig = crypto.Sign(priv, ph[:])
+	if _, err := DecodeProposal(EncodeProposal(p)); err != nil {
+		t.Fatalf("a 32-byte proposer key no longer decodes: %v", err)
+	}
+	p.Validator = make([]byte, 1<<20)
+	if _, err := DecodeProposal(EncodeProposal(p)); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a 1 MiB proposer key decoded (%v); want ErrFieldTooLong before any copy", err)
+	}
+}

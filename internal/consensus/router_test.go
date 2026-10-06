@@ -150,7 +150,7 @@ func newRouterRig(t *testing.T) *routerRig {
 	}
 	rec := &recordingTransport{Transport: silentInner{}}
 	sy := NewSyncer(ch, rec, testCommitteeKey(0))
-	d := NewDriver(cfg, ch, testCommitteeKey(0), rec, nil)
+	d := mustDriver(t, cfg, ch, testCommitteeKey(0), rec, nil)
 	d.CommitWitness = sy.RecordCommit
 	d.Tick(0)
 	if ch.Height() != 1 {

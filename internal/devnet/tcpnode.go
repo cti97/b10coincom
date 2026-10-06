@@ -451,7 +451,12 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// invokes), never the raw transport, or NewDriver's registration would
 	// overwrite the router's.
 	dtp := &driverTP{inner: tp}
-	drv := consensus.NewDriver(ccfg, ch, priv, dtp, pool)
+	drv, err := consensus.NewDriver(ccfg, ch, priv, dtp, pool)
+	if err != nil {
+		_ = tp.Close()
+		_ = ch.Close()
+		return nil, err
+	}
 	// CommitWitness: every commit this node makes is archived with its
 	// precommit votes, so the chain it holds is pullable by a catching-up
 	// peer (Design Decision 8). Without it, Answer refuses every range.
@@ -829,7 +834,14 @@ func (v *Validator) maybeCatchUp() {
 	err := pull(before + 1)
 	after := v.ch.Height()
 	if after > before {
-		v.rebuildDriver()
+		if rerr := v.rebuildDriver(); rerr != nil {
+			// Unreachable for a validator the constructor already admitted
+			// (same config, same key): treat it as a failed catch-up - demote
+			// the member and let a later wave retry - rather than panic or
+			// keep an engine that judges a head the chain has left.
+			v.demotePeer(who, after)
+			return
+		}
 		v.adopted.Add(after - before)
 	}
 	if err != nil || (after < peerH && after == before) {
@@ -890,11 +902,16 @@ func (v *Validator) SyncRequestsDropped() uint64 { return v.syncDropped.Load() }
 // The old engine's volatile round state is discarded the way a restart's is;
 // its persisted locks (if any) are per-height and restored by the fresh
 // engine automatically when they still matter.
-func (v *Validator) rebuildDriver() {
+func (v *Validator) rebuildDriver() error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.drv = consensus.NewDriver(v.cfgC, v.ch, v.priv, v.drvTP, v.pool)
-	v.drv.CommitWitness = v.sy.RecordCommit
+	d, err := consensus.NewDriver(v.cfgC, v.ch, v.priv, v.drvTP, v.pool)
+	if err != nil {
+		return err
+	}
+	d.CommitWitness = v.sy.RecordCommit
+	v.drv = d
+	return nil
 }
 
 // Close stops the loops, closes the transport and the chain, and is

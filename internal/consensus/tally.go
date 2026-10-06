@@ -121,6 +121,12 @@ func (vs *VoteSet) Votes() []*Vote { return vs.votes }
 func (vs *VoteSet) PowerFor(blockID [32]byte) uint64 { return vs.power[blockID] }
 
 // NilPower is the weight behind nil votes for this round.
+//
+// Nothing in this milestone READS it (audit C-12): rounds end on their timeout,
+// not on a nil polka, and AnyQuorum skips the nil block ID. It is retained so a
+// nil-polka fast round change has the tally it would need, and so the
+// observation is testable; the engine's comments must not claim it leaves the
+// round.
 func (vs *VoteSet) NilPower() uint64 { return vs.power[[32]byte{}] }
 
 // HasQuorum reports whether a block has reached the two-thirds threshold.

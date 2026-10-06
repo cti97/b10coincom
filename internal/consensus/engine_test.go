@@ -321,7 +321,7 @@ func TestNonProposerEmitsANilPrevoteWhenNoProposalArrives(t *testing.T) {
 	h := round0ProposerHeight(t, cfg, 1, false, parent)
 	e := newTestEngine(t, cfg, 1, h, parent)
 
-	e.OnTimeout(TimeoutEvent{Height: h, Round: 0, Step: StepPrevote})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: 0})
 	outs := e.Drain()
 
 	found := false
@@ -355,7 +355,7 @@ func TestThreeTimeoutsAdvanceTheRoundOneNilPrevoteEach(t *testing.T) {
 			t.Fatalf("fixture: the engine is at round %d, want %d", e.Round(), ended)
 		}
 		// The driver's shape: fire the timer for the round the engine is in.
-		e.OnTimeout(TimeoutEvent{Height: e.Height(), Round: e.Round(), Step: e.Step()})
+		e.OnTimeout(TimeoutEvent{Height: e.Height(), Round: e.Round()})
 		outs := e.Drain()
 		if len(outs) != 1 {
 			t.Fatalf("round %d: the timeout must emit exactly the owed nil prevote, got %d message(s)",
@@ -381,9 +381,9 @@ func TestThreeTimeoutsAdvanceTheRoundOneNilPrevoteEach(t *testing.T) {
 	// and an event for another height are all ignored: only the current round
 	// can run out of time, and only the driver knows which one that is.
 	for _, stale := range []TimeoutEvent{
-		{Height: h, Round: 0, Step: StepPrevote},     // a round already left
-		{Height: h, Round: 99, Step: StepPropose},    // a round never entered
-		{Height: h + 1, Round: 3, Step: StepPropose}, // another height
+		{Height: h, Round: 0},     // a round already left
+		{Height: h, Round: 99},    // a round never entered
+		{Height: h + 1, Round: 3}, // another height
 	} {
 		e.OnTimeout(stale)
 		if e.Round() != 3 {
@@ -413,7 +413,7 @@ func TestTimeoutIntoTheNextRoundKeepsTheLock(t *testing.T) {
 	}
 	e.Drain() // clear the precommit the lock emitted
 
-	e.OnTimeout(TimeoutEvent{Height: e.Height(), Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: e.Height(), Round: e.Round()})
 
 	if e.Round() != 1 {
 		t.Fatalf("the timeout did not advance the round, still at %d", e.Round())
@@ -604,6 +604,10 @@ func TestUnjustifiedProposalIsNotPrevoted(t *testing.T) {
 // proposal above prevotes a conflicting block the moment its justification
 // checks out - three quorum prevotes for that block at the claimed round. Unlock
 // on evidence is liveness; without this half the gate would be a permanent stop.
+//
+// The proposal is offered at round 2 with a polka formed at round 1 (audit C-9
+// requires ValidRound < Round): the lock is at round 0, the polka is strictly
+// newer, and the proposing round is newer still.
 func TestJustifiedProposalUnlocksALockedValidator(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	parent := crypto.HashParts([]byte("parent"))
@@ -611,12 +615,13 @@ func TestJustifiedProposalUnlocksALockedValidator(t *testing.T) {
 	blkA := testProposer(t, cfg, h, 0, parent)
 	lockedID := blkA.ID()
 	e := lockedEngineAtRound1(t, cfg, 1, h, parent, lockedID)
+	e.enterRound(2) // the polka below formed in round 1; the proposal is offered in round 2
 
 	blkB := conflictingBlock(t, cfg, h, 1, parent, 0xB7)
 	idB := blkB.ID()
-	p1 := cfg.Proposer(h, 1, parent)
+	p1 := cfg.Proposer(h, 2, parent)
 	propB := &Proposal{
-		Height: h, Round: 1, Block: blkB, ValidRound: 1, Validator: p1,
+		Height: h, Round: 2, Block: blkB, ValidRound: 1, Validator: p1,
 		Justification: encodeJustification([]*Vote{
 			voteFrom(t, cfg, 0, MsgPrevote, h, 1, idB),
 			voteFrom(t, cfg, 1, MsgPrevote, h, 1, idB),
@@ -754,10 +759,8 @@ func TestJustificationMustProveQuorumForTheProposalsOwnBlock(t *testing.T) {
 // A ValidRound that does not fit the VoteSet's uint32 round must be REJECTED
 // outright, never truncated: uint32(MaxUint32+1) is 0, so a silent truncation
 // would tally the carried evidence for round 0 and grant an unlock at a round
-// the proposal never claimed. The boundary is pinned from BOTH sides: the
-// evidence below is genuine quorum prevotes, so anything other than the range
-// guard would let the too-large claim through, while exactly MaxUint32 - where
-// no truncation occurs - must still verify.
+// the proposal never claimed. The evidence below is a genuine quorum, so only
+// the range guard can be what refuses the too-large claim.
 func TestValidRoundAboveUint32IsRejected(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	parent := crypto.HashParts([]byte("parent"))
@@ -792,21 +795,90 @@ func TestValidRoundAboveUint32IsRejected(t *testing.T) {
 		t.Fatalf("a proposal whose ValidRound cannot fit a uint32 round must not be prevoted, got %d message(s)", len(left))
 	}
 
-	// The other side of the boundary: exactly MaxUint32 FITS, so with evidence
-	// genuinely from that round the justification verifies.
+	// The other side of the boundary is now the C-9 rule: no uint32 proposing
+	// round is strictly GREATER than MaxUint32, so the largest ValidRound that
+	// can ever verify is MaxUint32-1, offered at Round MaxUint32.
 	justAtMax := encodeJustification([]*Vote{
-		voteFrom(t, cfg, 0, MsgPrevote, h, math.MaxUint32, blk.ID()),
-		voteFrom(t, cfg, 1, MsgPrevote, h, math.MaxUint32, blk.ID()),
-		voteFrom(t, cfg, 2, MsgPrevote, h, math.MaxUint32, blk.ID()),
+		voteFrom(t, cfg, 0, MsgPrevote, h, math.MaxUint32-1, blk.ID()),
+		voteFrom(t, cfg, 1, MsgPrevote, h, math.MaxUint32-1, blk.ID()),
+		voteFrom(t, cfg, 2, MsgPrevote, h, math.MaxUint32-1, blk.ID()),
 	})
 	pMax := &Proposal{
-		Height: h, Round: 0, Block: blk, ValidRound: math.MaxUint32,
+		Height: h, Round: math.MaxUint32, Block: blk, ValidRound: math.MaxUint32 - 1,
 		Justification: justAtMax, Validator: p0,
 	}
 	pMax.Sig = signProposal(t, cfg, pMax)
 	got, err := e.verifyJustification(pMax)
-	if err != nil || got != math.MaxUint32 {
-		t.Fatalf("a ValidRound of exactly MaxUint32 fits a uint32 and must verify, got round %d, err %v", got, err)
+	if err != nil || got != math.MaxUint32-1 {
+		t.Fatalf("a ValidRound of MaxUint32-1 at Round MaxUint32 must verify, got round %d, err %v", got, err)
+	}
+}
+
+// C-9's boundary, from BOTH sides, each with a GENUINE quorum as the carried
+// evidence - so the proposal-round comparison, and nothing else, is what
+// refuses or admits the claim. At the boundary a proposal offered at round 1
+// may not claim a polka at round 1: the block would be quoting a quorum that
+// could not have formed before its own proposal went out. One round lower is a
+// real earlier polka and verifies.
+func TestValidRoundAtTheProposalRoundIsRejected(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	idx := 1
+	// A height where THIS engine is the round-1 proposer, so the proposal
+	// passes the proposer check and the boundary rule is what refuses it.
+	h := roundProposerHeight(t, cfg, idx, 1, parent)
+	e := newTestEngine(t, cfg, idx, h, parent)
+	blk := testProposer(t, cfg, h, 1, parent)
+
+	just := encodeJustification([]*Vote{
+		voteFrom(t, cfg, 0, MsgPrevote, h, 1, blk.ID()),
+		voteFrom(t, cfg, 1, MsgPrevote, h, 1, blk.ID()),
+		voteFrom(t, cfg, 2, MsgPrevote, h, 1, blk.ID()),
+	})
+	p := &Proposal{
+		Height: h, Round: 1, Block: blk, ValidRound: 1,
+		Justification: just, Validator: cfg.Proposer(h, 1, parent),
+	}
+	p.Sig = signProposal(t, cfg, p)
+
+	if _, err := e.verifyJustification(p); !errors.Is(err, ErrBadJustification) {
+		t.Fatalf("ValidRound == Round must be refused with ErrBadJustification, got %v", err)
+	}
+	// Behaviourally: no vote may rest on it, and the step must not move.
+	if err := e.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatalf("OnMessage returned %v; want silent refusal", err)
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("a proposal claiming a polka at its own round was prevoted (%d message(s))", len(left))
+	}
+	if e.Step() != StepPropose {
+		t.Fatalf("the boundary proposal moved the step to %s", e.Step())
+	}
+}
+
+// The other side of C-9's boundary: ValidRound == Round-1 is a genuinely
+// earlier polka and verifies when its evidence is a real quorum.
+func TestValidRoundOneBelowTheProposalRoundVerifies(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, true, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+	blk := testProposer(t, cfg, h, 0, parent)
+
+	just := encodeJustification([]*Vote{
+		voteFrom(t, cfg, 0, MsgPrevote, h, 0, blk.ID()),
+		voteFrom(t, cfg, 1, MsgPrevote, h, 0, blk.ID()),
+		voteFrom(t, cfg, 2, MsgPrevote, h, 0, blk.ID()),
+	})
+	p := &Proposal{
+		Height: h, Round: 1, Block: blk, ValidRound: 0,
+		Justification: just, Validator: cfg.Proposer(h, 1, parent),
+	}
+	p.Sig = signProposal(t, cfg, p)
+
+	got, err := e.verifyJustification(p)
+	if err != nil || got != 0 {
+		t.Fatalf("ValidRound == Round-1 with a real quorum must verify at round 0, got %d, err %v", got, err)
 	}
 }
 
@@ -1396,5 +1468,141 @@ func TestLockedProposerWithoutBytesFallsThroughToARefusedFreshBuild(t *testing.T
 			}
 			return -999
 		}())
+	}
+}
+
+// A signing key outside the committee is refused with an ERROR, never a panic
+// (audit C-11). The engine used to sign the vote, deliver it to its own tally,
+// and panic when the tally refused it as ErrNotValidator; emitVote now checks
+// membership FIRST and returns the error, and CheckMembership is the same check
+// a driver calls before it drives the engine (see
+// TestNewDriverRefusesAKeyOutsideTheCommittee). The state is CONSTRUCTED here -
+// a stranger key at a known height - not provoked through a buffer or a race.
+func TestANonMemberEngineReturnsAnErrorInsteadOfPanicking(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+
+	_, stranger, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewEngine(cfg, h, parent, stranger, nil)
+
+	if err := e.CheckMembership(); !errors.Is(err, ErrNotValidator) {
+		t.Fatalf("CheckMembership for a stranger key = %v, want ErrNotValidator", err)
+	}
+	// A timeout owes a nil prevote; for a non-member that emission must come
+	// back as an error naming the real reason, not crash the process.
+	if err := e.OnTimeout(TimeoutEvent{Height: h, Round: 0}); !errors.Is(err, ErrNotValidator) {
+		t.Fatalf("a non-member engine's timeout = %v, want ErrNotValidator (the panic is gone)", err)
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("a non-member engine emitted %d message(s); it must sign nothing at all", len(left))
+	}
+}
+
+// C-12's decision, pinned: nil prevotes are tallied but have NO protocol
+// effect. A whole committee's nil prevotes at the current round do not
+// precommit, lock, commit, or advance the round; only OnTimeout leaves it. The
+// engine's comments now say exactly this. A future nil-polka fast round change
+// would replace this test, and that change is what would need a new safety
+// argument.
+func TestNilPrevotesDoNotLeaveTheRound(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+	e.Drain()
+
+	for i := 0; i < len(cfg.Committee); i++ {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, i, MsgPrevote, h, 0, [32]byte{}))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if e.Round() != 0 {
+		t.Fatalf("nil prevotes moved the engine to round %d; only a timeout may leave a round (audit C-12)", e.Round())
+	}
+	if e.Step() == StepPrecommit || e.Step() == StepCommit {
+		t.Fatalf("nil prevote weight moved the engine to step %s; it must have no protocol effect", e.Step())
+	}
+	if e.Locked() {
+		t.Fatal("nil prevotes locked the engine, though there is no block to promise about")
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("nil prevotes produced %d emission(s)", len(left))
+	}
+	// The tally DID observe the weight, so a future nil-polka rule has it even
+	// though nothing decides on it today.
+	if got := e.prevotes.NilPower(); got != 4 {
+		t.Fatalf("nil weight tallied as %d, want the committee's 4", got)
+	}
+}
+
+// solePrevote requires exactly one outbound message and returns it decoded as
+// a prevote.
+func solePrevote(t *testing.T, outs []Outbound) *Vote {
+	t.Helper()
+	if len(outs) != 1 {
+		t.Fatalf("the engine emitted %d message(s), want exactly one prevote", len(outs))
+	}
+	v, err := DecodeVote(outs[0].Data)
+	if err != nil || v.Type != MsgPrevote {
+		t.Fatalf("the single emission is not a decodable prevote (err %v, type %d)", err, v.Type)
+	}
+	return v
+}
+
+// C-10's documented gap, pinned: the lock and the round are durable, the
+// prevote is not. A validator that prevotes FOR a block, crashes and restarts
+// at the same (height, round) casts a SECOND, independently signed prevote at
+// that round - here a NIL one, because the protocol does not retransmit the
+// proposal it prevoted. This is the evidence M5 slashing must punish, not a
+// safety hole: the lock is persisted before the precommit, and one validator's
+// capped weight cannot supply the one-third intersection two conflicting
+// quorums would need (see Driver.persistRound's C-10 note).
+func TestARestartDoesNotRememberAPrevote(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	idx := 1
+	h := round0ProposerHeight(t, cfg, idx, false, parent)
+	blkA := testProposer(t, cfg, h, 0, parent)
+	accept := func(*types.Block) error { return nil }
+
+	// First life: the round-0 proposal arrives and this validator prevotes FOR.
+	first := NewEngine(cfg, h, parent, testCommitteeKey(idx), nil)
+	first.SetValidate(accept)
+	p := &Proposal{Height: h, Round: 0, Block: blkA, ValidRound: -1, Validator: cfg.Proposer(h, 0, parent)}
+	p.Sig = signProposal(t, cfg, p)
+	if err := first.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatal(err)
+	}
+	firstVote := solePrevote(t, first.Drain())
+	if firstVote.IsNil() || firstVote.BlockID != blkA.ID() {
+		t.Fatal("fixture: the first life must prevote FOR the round-0 block")
+	}
+
+	// Restart: a fresh engine at the same height and round, same key. The
+	// round is restored; the prevote is not, by design (audit C-10).
+	second := NewEngine(cfg, h, parent, testCommitteeKey(idx), nil)
+	second.SetValidate(accept)
+	second.restoreRound(0)
+	if err := second.OnTimeout(TimeoutEvent{Height: h, Round: 0}); err != nil {
+		t.Fatalf("the restarted engine's timeout: %v", err)
+	}
+	secondVote := solePrevote(t, second.Drain())
+	if !secondVote.IsNil() {
+		t.Fatalf("the restarted engine prevoted %x; the no-proposal timeout must prevote NIL", secondVote.BlockID[:8])
+	}
+	if secondVote.Height != h || secondVote.Round != 0 {
+		t.Fatalf("the second prevote is for (%d,%d), want (%d,0)", secondVote.Height, secondVote.Round, h)
+	}
+	// Two prevotes, one (height, round), one key, different block IDs: the
+	// equivocation the persisted lock cannot prevent and M5 slashing must.
+	if string(firstVote.Validator) != string(secondVote.Validator) {
+		t.Fatal("fixture: both lives must sign with the same validator key")
+	}
+	if firstVote.BlockID == secondVote.BlockID {
+		t.Fatal("fixture: the two prevotes must disagree for this test to say anything")
 	}
 }
