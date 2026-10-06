@@ -380,6 +380,29 @@ func RunMulti(o Options) (Summary, error) {
 	}
 	defer net.Close()
 
+	// The multi-validator half of Run's fresh-chain guard (audit O-10, and the
+	// false PASS this guard closes). Run already refuses a --dir that holds a
+	// chain; RunMulti had no such guard, and here the hole was worse than a
+	// confusing height error. runUntil's success test is "every waited
+	// validator's height is at or above the target", so a second
+	// `devnet --validators 4 --blocks 3 --dir D` against a directory D left at
+	// height 5 returned at step 0 - before a single tick - and printed
+	// `heights v0=5 v1=5 v2=5 v3=5`, `agreed yes`, `OK`, exit 0, having
+	// produced ZERO blocks and blessed the stale chain. Judge it exactly as
+	// Run judges it: any chain already built under o.Dir means this is not a
+	// fresh devnet, so refuse plainly instead of reporting a run that did not
+	// happen. Checked per validator because the requested committee size need
+	// not match the one the directory was built for.
+	// Indexed in order, not by ranging the map, so the refusal names the same
+	// validator on every invocation: a user-facing error that depends on Go's
+	// map order is not reproducible output.
+	heights := net.Heights()
+	for i := uint64(0); i < o.Validators; i++ {
+		if h := heights[i]; h != 0 {
+			return Summary{}, fmt.Errorf("devnet: the data directory %q already holds a chain for validator %d at height %d; devnet builds a fresh committee - use an empty --dir, or `b10coin devnet --validators %d` with no --dir for a temporary one", o.Dir, i, h, o.Validators)
+		}
+	}
+
 	for _, i := range o.OfflineValidators {
 		if i < 0 || i >= int(o.Validators) {
 			return Summary{}, fmt.Errorf("devnet: OfflineValidators names validator %d in a committee of %d", i, o.Validators)

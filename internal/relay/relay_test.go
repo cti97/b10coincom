@@ -1984,3 +1984,363 @@ func TestTheRelayRefusesATokenDialThatSaysNothing(t *testing.T) {
 		t.Fatalf("a silent dial was registered (Conns=%d)", got)
 	}
 }
+
+// TestTheAccessTokenCapBindsAtAcceptBeforeTheHandshake pins audit F1, the
+// regression the N-8 fix introduced. N-8 moved the token read off the accept
+// loop (correct - it blocks on the remote) but left the two caps in admit,
+// which runs only AFTER that read returns. With a token configured, every
+// silent dial therefore got its own goroutine, socket, frame buffer and
+// handshaking entry for up to AccessTimeout, checked against NOTHING: the
+// reviewer measured 20 silent dials with MaxConns=2, MaxConnsPerIP=1 and read
+// handshaking=20, registered=0, refused=0, bounded only by LimitNOFILE.
+//
+// The decision this pins, deliberately: a socket that is still presenting its
+// access token COUNTS against MaxConns and MaxConnsPerIP. The slot, the
+// goroutine and the frame buffer all exist from the instant of accept, so the
+// cap must be a cap on sockets, not on sockets that have already spoken. The
+// two sub-cases make each cap the binding one in turn, so neither can be the
+// only one that was fixed. The observable is constructed, not timed: the
+// accept loop classifies every accepted dial synchronously (reserved or
+// refused), so "every dial classified" is an exact count, and refusals are
+// counted as they happen.
+func TestTheAccessTokenCapBindsAtAcceptBeforeTheHandshake(t *testing.T) {
+	token := []byte("pre-shared-access-token")
+	const dials = 20
+	for _, tc := range []struct {
+		name       string
+		maxConns   int
+		maxConnsIP int
+		wantHeld   int
+		wantRefuse uint64
+	}{
+		// The reviewer's own reproduction, kept verbatim: MaxConns=2,
+		// MaxConnsPerIP=1, 20 silent dials. Pre-fix it read handshaking=20,
+		// registered=0, refused=0; the per-group cap now holds the population
+		// at one.
+		{"the reviewer's reproduction (MaxConns 2, MaxConnsPerIP 1)", 2, 1, 1, dials - 1},
+		// All 20 dials come from one loopback group, so the per-group cap must
+		// be raised out of the way for the GLOBAL cap to be the one under test.
+		{"global cap counts a handshaking socket", 2, 16, 2, dials - 2},
+		{"per-group cap counts a handshaking socket", 16, 1, 1, dials - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := New(Options{
+				MaxFrameBytes: 4096, MaxConns: tc.maxConns, MaxConnsPerIP: tc.maxConnsIP,
+				WriteQueueBytes: 1 << 16, AccessToken: token,
+				AccessTimeout: 5 * time.Second, // long ON PURPOSE: every dial stays silent
+			})
+			if err := r.Listen("127.0.0.1:0"); err != nil {
+				t.Fatalf("relay listen: %v", err)
+			}
+			t.Cleanup(r.Close)
+
+			conns := make([]net.Conn, 0, dials)
+			for i := 0; i < dials; i++ {
+				c, err := net.DialTimeout("tcp", r.Addr().String(), 5*time.Second)
+				if err != nil {
+					t.Fatalf("silent dial %d: %v", i, err)
+				}
+				conns = append(conns, c)
+			}
+			defer func() {
+				for _, c := range conns {
+					_ = c.Close()
+				}
+			}()
+
+			// Every dial is either reserved or refused by the accept loop, in
+			// order: once the refusals are counted, the classification is done.
+			// The poll is bounded and its failure prints the three numbers the
+			// finding is stated in, so a regression reads like the
+			// reproduction instead of like a generic timeout.
+			deadline := time.Now().Add(3 * time.Second)
+			for r.Stats().RefusedConns != tc.wantRefuse && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if got := r.Stats().RefusedConns; got != tc.wantRefuse {
+				r.mu.Lock()
+				held, registered := len(r.handshaking), len(r.conns)
+				r.mu.Unlock()
+				t.Fatalf("after %d silent dials with MaxConns=%d and MaxConnsPerIP=%d: handshaking=%d registered=%d refused=%d, want handshaking %d, registered 0, refused %d - the caps are not applied at accept, so silent dials hold goroutines, frame buffers and sockets for AccessTimeout unchecked (audit F1)",
+					dials, tc.maxConns, tc.maxConnsIP, held, registered, got, tc.wantHeld, tc.wantRefuse)
+			}
+
+			r.mu.Lock()
+			held := len(r.handshaking)
+			registered := len(r.conns)
+			r.mu.Unlock()
+			if held != tc.wantHeld {
+				t.Fatalf("%d silent dials are in handshake with the caps at MaxConns=%d/MaxConnsPerIP=%d, want %d - a socket still presenting the token is not counted (audit F1): the caps bound nothing until the handshake finishes",
+					held, tc.maxConns, tc.maxConnsIP, tc.wantHeld)
+			}
+			if registered != 0 || r.Stats().Conns != 0 {
+				t.Fatalf("a silent dial was REGISTERED (registry %d, handshaking %d) - the token gate never ran", registered, held)
+			}
+			if got := r.Stats().Unauthorized; got != 0 {
+				t.Fatalf("Unauthorized = %d while every dial is still inside its access window, want 0 - the test's premise (silence) was broken", got)
+			}
+			// The slots really are reserved, not merely refused: releasing one
+			// handshaking socket must hand its slot back and let exactly one
+			// refused dial's worth of room re-appear. Closing every silent dial
+			// proves the accounting is refunded rather than leaked.
+			for _, c := range conns {
+				_ = c.Close()
+			}
+			waitFor(t, func() bool {
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				return len(r.handshaking) == 0
+			}, "every silent dial's handshake reservation to be released")
+		})
+	}
+}
+
+// TestRelayASustainedFloodFirstCannotCensorASecondSender is audit F2, the
+// fourth failure in this area and the first whose shape is FLOOD FIRST.
+//
+// Both pre-existing share tests seed the honest sender FIRST, so the honest
+// sender's bytes are already in the queue when the flooder arrives and the
+// share is measured against real contention. The reviewer built the other
+// ordering: the attacker fills the receiver's budget while it is the ONLY
+// account holding a byte - so its allowance is the whole queue and it takes
+// all 300 - and the honest sender's first frame is then refused for as long
+// as the flooder refills faster than the writer drains. 100 sustained rounds,
+// 100 refusals: two connections from one host crowd an honest sender out
+// indefinitely, not just for the window the old comment admitted to.
+//
+// The mechanism, not the threshold: the refusal itself is now evidence of
+// contention. The instant a push is refused room that ANOTHER account is
+// holding, the equal share becomes unconditional for this queue, so the
+// squatter cannot refill past its share while the writer's drain ages its
+// occupancy back down to it. The lone-sender invariant is untouched, because a
+// queue that has never denied anyone room has never been contended:
+// TestRelayASingleSenderAmongIdlePeersUsesTheWholeQueue stays green.
+//
+// Nothing here is provoked: no socket, no kernel buffer, no flood, no
+// scheduler. Every frame is a direct call, every round is a fixed sequence
+// (writer pops, the flooder refills, the honest sender takes its turn), and
+// the assertion is a count. Under the pre-fix push the honest sender is
+// admitted 0 times and its occupancy ends at 0.
+func TestRelayASustainedFloodFirstCannotCensorASecondSender(t *testing.T) {
+	const (
+		frameBytes    = 50
+		queueBytes    = 300
+		rounds        = 100
+		maxFrameBound = 32
+	)
+	newConn := func(group string) *conn {
+		return &conn{q: newSendQ(queueBytes, maxFrameBound, 64), dead: make(chan struct{}), srcGroup: group}
+	}
+	r := New(Options{MaxFrameBytes: maxFrameBound, MaxConns: 8, MaxConnsPerIP: 8, WriteQueueBytes: queueBytes})
+	flooder := newConn("198.51.100.0/24")
+	honest := newConn("203.0.113.0/24")
+	wedged := newConn("192.0.2.0/24") // the receiver whose queue they contend for
+	r.mu.Lock()
+	accounts := make(map[shareAccount]int, 3)
+	for _, c := range []*conn{flooder, honest, wedged} {
+		r.conns[c] = struct{}{}
+		accounts[shareAccountOf(c)]++
+	}
+	r.mu.Unlock()
+	senders := sendersFor(wedged, accounts) // 2: the flooder's group and the honest sender's
+	if senders != 2 {
+		t.Fatalf("sendersFor(wedged) = %d for this registry, want 2 - the constructed contention never formed", senders)
+	}
+	shareBytes := wedged.q.shareFor(senders) // 300/2 = 150
+	if shareBytes*2 != queueBytes {
+		t.Fatalf("shareFor(2) = %d for a %d-byte queue, want half of it - the share the test measures against has drifted", shareBytes, queueBytes)
+	}
+
+	frame := make([]byte, frameBytes)
+	// THE order the suite never exercised: the flooder goes first and fills
+	// the receiver's whole budget while no other account holds anything.
+	floodFirst := queueBytes / frameBytes
+	for i := 0; i < floodFirst; i++ {
+		if !wedged.q.push(flooder, frame, senders) {
+			t.Fatalf("the flooder's frame %d was refused with the queue at %d/%d bytes - the flood-first state (the only account holding anything) never formed", i, wedged.q.bytes, queueBytes)
+		}
+	}
+	if wedged.q.bytes != queueBytes || wedged.q.occupancy(honest) != 0 {
+		t.Fatalf("the flood-first state reads queue=%d/%d, honest ocupancy=%d, want %d/0 - the premise never formed", wedged.q.bytes, queueBytes, wedged.q.occupancy(honest), queueBytes)
+	}
+
+	// Sustained rounds in the flooder's own order: the writer pops the head,
+	// the flooder refills the room that just freed, and only THEN does the
+	// honest sender push. This is the interleaving the finding is stated in.
+	admittedHonest := 0
+	for i := 0; i < rounds; i++ {
+		if _, ok := wedged.q.pop(); !ok {
+			t.Fatalf("round %d: the writer's pop found an empty queue - the sustained state collapsed", i)
+		}
+		r.forward(flooder, frame) // the refill, before the honest sender's turn
+		before := wedged.q.occupancy(honest)
+		r.forward(honest, frame)
+		if wedged.q.occupancy(honest) > before {
+			admittedHonest++
+		}
+	}
+	if admittedHonest == 0 {
+		t.Fatalf("the honest sender was admitted 0 times in %d sustained flood-first rounds (final: queue=%d/%d, flooder=%d, honest=%d) - the flooder kept the whole-budget allowance it squatted on and the honest sender's frames are refused indefinitely (audit F2)",
+			rounds, wedged.q.bytes, queueBytes, wedged.q.occupancy(flooder), wedged.q.occupancy(honest))
+	}
+	// Sustained, not a one-off: the honest sender keeps getting in, and the
+	// squatter is held at its share rather than at the whole queue.
+	if admittedHonest < rounds/4 {
+		t.Fatalf("the honest sender was admitted only %d times in %d sustained flood-first rounds (final: queue=%d/%d, flooder=%d, honest=%d) - the share turned contention on but the flooder still crowds the queue", admittedHonest, rounds, wedged.q.bytes, queueBytes, wedged.q.occupancy(flooder), wedged.q.occupancy(honest))
+	}
+	if got := wedged.q.occupancy(flooder); got > shareBytes {
+		t.Fatalf("after %d sustained rounds the flooder holds %d bytes, over its %d-byte share - the reservation is not unconditional once contention is observed", rounds, got, shareBytes)
+	}
+	t.Logf("%d/%d sustained flood-first rounds admitted an honest frame; final queue %d/%d bytes (flooder %d, honest %d)",
+		admittedHonest, rounds, wedged.q.bytes, queueBytes, wedged.q.occupancy(flooder), wedged.q.occupancy(honest))
+}
+
+// gateConn is a net.Conn for the attribution test below: its FIRST write blocks
+// on gate until the test releases it, every later write completes at once, and
+// the write deadline is recorded but never enforced - a receiver that is
+// READING FINE, which is the whole point. The test releasing the gate is what
+// chooses the instant the writer re-evaluates its queue, so no host, buffer or
+// scheduler gets a vote.
+type gateConn struct {
+	mu       sync.Mutex
+	deadline time.Time
+	closed   chan struct{}
+	once     sync.Once
+	gate     chan struct{}
+	entered  chan struct{}
+	writes   atomic.Int64
+	// payloadSize, when non-zero, makes payloads count writes of exactly that
+	// size. wire.WriteFrame issues the header and the payload as two separate
+	// calls, so counting writes alone would count headers too; counting
+	// payload-sized writes is the frame count the assertion is about.
+	payloadSize int
+	payloads    atomic.Int64
+}
+
+func (g *gateConn) Read([]byte) (int, error) {
+	<-g.closed
+	return 0, io.EOF
+}
+
+func (g *gateConn) Write(b []byte) (int, error) {
+	if g.writes.Add(1) == 1 {
+		close(g.entered) // the writer has begun its first write
+		<-g.gate
+	}
+	if g.payloadSize > 0 && len(b) == g.payloadSize {
+		g.payloads.Add(1)
+	}
+	return len(b), nil
+}
+
+func (g *gateConn) Close() error {
+	g.once.Do(func() { close(g.closed) })
+	return nil
+}
+
+func (g *gateConn) LocalAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+func (g *gateConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2}
+}
+func (g *gateConn) SetDeadline(time.Time) error     { return nil }
+func (g *gateConn) SetReadDeadline(time.Time) error { return nil }
+func (g *gateConn) SetWriteDeadline(t time.Time) error {
+	g.mu.Lock()
+	g.deadline = t
+	g.mu.Unlock()
+	return nil
+}
+
+// TestTheReaperDoesNotBlameAReceiverForASendersBacklog is audit F3. The
+// writer ended any connection whose queue did not reach empty within
+// WriteTimeout, and a queue can be kept non-empty forever by somebody ELSE's
+// frames: a flooder sustaining an honest receiver's backlog past the timeout
+// made the relay tear that validator's link down (third-party-triggerable -
+// the flooder's goal exactly, reached through the relay's own hand).
+//
+// The decision, stated: a SENDER-caused backlog is not grounds to end the
+// RECEIVER's connection. The reaper now asks whose backlog it is - non-empty
+// past WriteTimeout AND no frame admitted within that same window means the
+// receiver is not keeping up and is ended; frames still arriving means the
+// sender owns it, the byte budget and the per-sender share answer it, and the
+// individual write is bounded fresh instead. The relay still parses nothing:
+// both halves are timestamps on an already-queued frame.
+//
+// The state is CONSTRUCTED, not provoked: the queue is aged past its deadline
+// by assigning oldest directly, and lastPush is set to now - a backlog held by
+// continuing arrivals - instead of waiting out a timeout or filling a buffer.
+// The first write is gated so the test observes the writer's decision at the
+// exact moment the old code reaped. Pre-fix the connection is finished before
+// the first write ever starts.
+func TestTheReaperDoesNotBlameAReceiverForASendersBacklog(t *testing.T) {
+	const (
+		writeTimeout = 200 * time.Millisecond
+		queued       = 4
+		frameBytes   = 64
+	)
+	r := New(Options{
+		MaxFrameBytes: 4096, MaxConns: 8, MaxConnsPerIP: 8,
+		WriteQueueBytes: 1 << 20, WriteQueueFrames: 64, WriteTimeout: writeTimeout,
+	})
+	nc := &gateConn{closed: make(chan struct{}), gate: make(chan struct{}), entered: make(chan struct{}), payloadSize: frameBytes}
+	c := &conn{
+		nc:       nc,
+		q:        newSendQ(1<<20, 4096, 64),
+		dead:     make(chan struct{}),
+		srcGroup: "192.0.2.0/24",
+	}
+	flooder := &conn{q: newSendQ(1<<20, 4096, 64), dead: make(chan struct{}), srcGroup: "198.51.100.0/24"}
+	r.mu.Lock()
+	r.conns[c] = struct{}{}
+	r.conns[flooder] = struct{}{}
+	r.perGroup[c.srcGroup]++
+	r.perGroup[flooder.srcGroup]++
+	r.mu.Unlock()
+
+	for i := 0; i < queued; i++ {
+		// One sender account only, so the share is the whole budget and cannot
+		// be what binds: the state under test is the queue's AGE, and who put
+		// it there.
+		if !c.q.push(flooder, make([]byte, frameBytes), 1) {
+			t.Fatalf("frame %d was refused while the queue was far below both bounds - the sender-caused backlog never formed", i)
+		}
+	}
+	// The constructed attribution state: the queue has been non-empty for
+	// longer than WriteTimeout (oldest, backdated), and a frame arrived within
+	// the window (lastPush, now). A sender is still feeding it.
+	c.q.mu.Lock()
+	c.q.oldest = time.Now().Add(-10 * writeTimeout)
+	c.q.lastPush = time.Now()
+	aged := time.Since(c.q.oldest) >= writeTimeout
+	fresh := time.Since(c.q.lastPush) < writeTimeout
+	c.q.mu.Unlock()
+	if !aged || !fresh {
+		t.Fatalf("the constructed state reads aged=%v fresh=%v, want true/true - the attribution premise never formed", aged, fresh)
+	}
+
+	r.wg.Add(1)
+	go r.writer(c)
+
+	// The writer's very first decision. Pre-fix: the aged deadline fires and
+	// the connection is finished here, before a single byte is written. The
+	// fixed code begins writing instead, which is what the gate reports.
+	select {
+	case <-nc.entered:
+	case <-c.dead:
+		t.Fatalf("the writer tore down a connection whose backlog is SENDER-caused: the queue was kept non-empty by frames still arriving after its deadline, and the receiver was reading (audit F3)")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the writer neither wrote nor reaped the connection - the attribution path did not run")
+	}
+	time.Sleep(writeTimeout / 4) // keep the release comfortably inside the fresh arrival window
+	close(nc.gate)
+
+	waitFor(t, func() bool { return c.q.queued() == 0 }, "the sender's backlog to be written out rather than reaped")
+	if got := nc.payloads.Load(); got != queued {
+		t.Fatalf("the receiver socket saw %d of the %d frames written out - the writer did not serve the whole queue", got, queued)
+	}
+	select {
+	case <-c.dead:
+		t.Fatalf("the connection was finished after serving its backlog - the receiver's link was torn down for a sender's frames (audit F3)")
+	default:
+	}
+}

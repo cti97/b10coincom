@@ -43,7 +43,10 @@
 //   - MaxConns and MaxConnsPerIP at accept, the latter grouped by source
 //     PREFIX (IPv6 /64, IPv4 /24): a stranger is bounded in how many slots it
 //     can hold, total and per group, so one routed prefix cannot bypass the
-//     cap by rotating addresses.
+//     cap by rotating addresses. Both caps bind the instant the socket is
+//     accepted and count a socket that is still presenting its access token
+//     (audit F1): the slot, the goroutine and the frame buffer exist before
+//     the token is read, so a silent dialer is capped like any other.
 //
 // Shape, mirroring the transport's answer to the same problem (one goroutine
 // per direction, a bounded write queue, never block the forwarding path):
@@ -77,8 +80,8 @@
 package relay
 
 import (
-	"bytes"
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net"
@@ -390,6 +393,17 @@ func (o Options) withDefaults() Options {
 // sender-accounting map is bounded by the connections that can feed one
 // queue (at most MaxConns entries) and is covered by the MemoryMax headroom,
 // not itemised here.
+//
+// A socket still presenting its access token is counted against MaxConns from
+// the instant of accept (audit F1), and it holds strictly LESS than the term
+// above: no sendQ and no entry ring yet, and at most the one frame buffer
+// wire.ReadFrame allocated for the token - which is unreferenced the instant
+// the comparison completes, before the reader goroutine exists, so it never
+// stands beside a second live buffer. It IS the reader term's one frame per
+// connection. So handshake memory needs no term of its own: the aggregate is
+// still MaxConns x the per-conn bound, with the handshaking population inside
+// the same MaxConns. The handshake goroutine's stack is outside every frame
+// bound, exactly as a reader's or writer's is.
 func (o Options) MaxPinnedBytes() int {
 	return o.MaxConns * (o.WriteQueueBytes + o.WriteQueueFrames*queuedFrameEntryBytes + 2*o.MaxFrameBytes)
 }
@@ -490,17 +504,28 @@ func shareAccountOf(c *conn) shareAccount {
 // maxFrames, and in which no single SENDER (shareAccount - a source group,
 // not a connection) ever occupies more than its allowance of the bytes (audit
 // N-2: byte-bounded queues, per-frame entry bound, per-sender fair share).
-// The allowance is contention-relative, not a flat division: while no OTHER
-// account holds a byte the sender may use the whole budget, and once another
-// account is holding bytes the sender is held to its equal share of the
-// queue's OWN limit (shareFor). A queue with one sender therefore admits up to
-// its whole budget and loses nothing while the receiver has room; the equal
-// share reserves room for the other registered senders only once the queue is
-// really shared, which is the crowding-out the share exists to stop. What this
-// does NOT bound is a flooder that fills the queue before another sender has
-// queued anything: that sender's first frames drop until the backlog drains,
-// and a receiver too slow to drain it is ended by the WriteTimeout reaper (see
-// writer).
+// The allowance is contention-relative AND contention-sticky: while no OTHER
+// account has ever held a byte and no push has ever been REFUSED room, the
+// sender may use the whole budget; once a push has been refused while another
+// account held bytes - the one observable that says the queue is really
+// shared - every sender is held to its equal share of the queue's OWN limit
+// (shareFor) for the queue's lifetime. A queue with one sender therefore
+// admits up to its whole budget and loses nothing while the receiver has room;
+// the equal share reserves room for the other registered senders only once the
+// queue is really shared, which is the crowding-out the share exists to stop.
+//
+// What this closes (audit F2, the fourth failure here): a flooder that fills
+// the queue BEFORE another sender has queued anything used to keep the whole
+// budget for itself, because it was still the only account holding bytes, and
+// its refill would beat the honest sender to the room every time - the honest
+// sender's frames refused indefinitely, 100 rounds out of 100. The refusal
+// itself is now the evidence: the instant an honest frame is denied room by
+// another account's occupancy, the reservation becomes unconditional, the
+// squatter can no longer refill past its share, and the writer's drain ages its
+// occupancy back down to that share. What this does NOT bound is a flooder
+// whose share IS the whole queue (the only contending account) keeping a
+// receiver too slow to drain backlogged: that receiver is the one not keeping
+// up, and it is the reaper's (see writer).
 //
 // The queue is a fixed ring of maxFrames entries allocated once at accept, so
 // its entry memory is exactly maxFrames x queuedFrameEntryBytes - the term a
@@ -528,7 +553,21 @@ type sendQ struct {
 	bytes  int
 	from   map[shareAccount]int // queued bytes per sender account, refunded on pop
 	oldest time.Time            // when the queue became non-empty; zero when empty
-	ready  chan struct{}        // cap 1: signalled on empty -> non-empty
+	// lastPush is when the most recent frame was ADMITTED (zero while empty).
+	// The writer reads it beside oldest to attribute a stalled drain (audit
+	// F3): a queue that has taken no new frame for a whole WriteTimeout and
+	// still has not emptied is the RECEIVER's backlog; one that is merely
+	// kept full by continuing arrivals is the SENDER's, and must not cost the
+	// receiver its link.
+	lastPush time.Time
+	// contended records that at least one push has been refused room while
+	// another account held bytes in this queue. Once true it stays true for
+	// the queue's lifetime: the equal share then applies unconditionally, so a
+	// sender that squatted on the whole budget before contention appeared
+	// cannot keep refilling past its share (audit F2). A queue that has never
+	// been refused room keeps the whole-budget allowance for its sole sender.
+	contended bool
+	ready     chan struct{} // cap 1: signalled on empty -> non-empty
 }
 
 // newSendQ derives the bounds from the options: limit is the byte budget as
@@ -559,9 +598,17 @@ func newSendQ(limit, maxFrameBytes, maxFrames int) *sendQ {
 // (1/senders) of the queue's OWN byte capacity, floored at one maximum frame
 // so a legitimate largest frame always has room even when the division would
 // round it below a frame, and never above the queue's own budget. push applies
-// this only once another account is actually holding bytes; while none is, the
-// lone sender's allowance is the whole budget, so a sender is not throttled by
-// peers that are registered but not queueing.
+// this unconditionally once the queue has been observed CONTENDED - at least
+// one push has been refused while another account held bytes - and falls back
+// to the whole budget only while no refusal has ever happened and no other
+// account holds a byte. So the sole sender of a queue that has never been
+// crowded faces the whole capacity and loses nothing, which is the property
+// TestRelayASingleSenderAmongIdlePeersUsesTheWholeQueue pins; but a sender
+// that filled the queue first (while it was the only one holding anything)
+// loses the whole-budget allowance the moment a second account is refused
+// room, instead of keeping the reservation it squatted on indefinitely (audit
+// F2: the fourth failure in this area, and the first one whose shape is
+// "flood first, then the honest sender arrives").
 //
 // Dividing the receiver's capacity - rather than capping a sender at a fixed
 // in-flight number - is what keeps the share from throttling a healthy flow:
@@ -603,11 +650,15 @@ func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 	share := s.shareFor(senders)
 	s.mu.Lock()
 	// Actual contention is the bytes another account is holding in this
-	// queue. While there are none, the one sender using the queue may take
-	// the whole budget; the equal share is what it is held to only once the
-	// queue is really shared.
+	// queue - OR the fact that this queue has already denied someone room
+	// because of them (s.contended). While neither has ever happened, the one
+	// sender using the queue may take the whole budget; the equal share is
+	// what it is held to once the queue is really shared. The sticky half is
+	// what stops a flood-first squatter: it loses the whole-budget allowance
+	// the moment the sender it crowded out is refused, and the writer's drain
+	// then ages its occupancy back to its share (audit F2).
 	allow := share
-	if s.bytes-s.from[acct] == 0 {
+	if !s.contended && s.bytes-s.from[acct] == 0 {
 		allow = s.limit
 	}
 	ok := len(b) <= s.limit &&
@@ -615,9 +666,11 @@ func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 		s.n < s.maxFrames &&
 		s.from[acct]+len(b) <= allow
 	if ok {
+		now := time.Now()
 		if s.n == 0 {
-			s.oldest = time.Now()
+			s.oldest = now
 		}
+		s.lastPush = now
 		s.ents[(s.head+s.n)%s.maxFrames] = sentFrame{sender: sender, b: b}
 		s.n++
 		s.bytes += len(b)
@@ -628,6 +681,14 @@ func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 			default: // a token is already pending: the wake is not lost
 			}
 		}
+	} else if s.bytes-s.from[acct] > 0 {
+		// This sender was refused room that ANOTHER account is holding:
+		// that is the queue being shared, and it is the observable that
+		// turns the equal share on for good (audit F2). A refusal with no
+		// other account in the queue (the sender is at its own share, or the
+		// frame is oversized, or the ring is full of its own frames) says
+		// nothing about sharing and does not set it.
+		s.contended = true
 	}
 	s.mu.Unlock()
 	return ok
@@ -666,6 +727,10 @@ func (s *sendQ) pop() (sentFrame, bool) {
 // the backlog never clears. The writer arms the socket with this deadline and
 // refuses to write past it, so the whole backlog is bounded by one
 // WriteTimeout from its arrival however steadily the peer trickles.
+//
+// It is a READING, not the whole reaping rule: receiverStalled below says
+// whether the expiry is grounds to end the connection or evidence that a
+// sender owns this backlog (audit F3).
 func (s *sendQ) writeDeadline(timeout time.Duration) (time.Time, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -673,6 +738,32 @@ func (s *sendQ) writeDeadline(timeout time.Duration) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return s.oldest.Add(timeout), true
+}
+
+// receiverStalled reports whether this queue's backlog belongs to the
+// RECEIVER (audit F3): it has been continuously non-empty for at least
+// timeout AND no frame has been admitted within that same window. Only then
+// is the drain failing for a reason the receiver owns - nothing is still
+// arriving, and the queue still will not clear.
+//
+// The second half is the attribution fix. A queue kept full by frames that
+// keep ARRIVING has a SENDER's backlog: the byte budget and the per-sender
+// share (audit F2) are what answer it, and the writer drops what does not fit
+// while still writing what does. Ending the receiver's connection there is
+// exactly the third-party lever audit F3 names - a flooder sustaining an
+// honest validator's backlog past WriteTimeout would make the relay tear that
+// validator's link down, and the validator redials into the same flood
+// (flapping rather than dormancy, but the flooder's goal either way). The
+// relay parses nothing here either: "a frame was admitted within the last
+// WriteTimeout" is a timestamp on the queue, never a byte of payload.
+func (s *sendQ) receiverStalled(timeout time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.n == 0 {
+		return false
+	}
+	now := time.Now()
+	return now.Sub(s.oldest) >= timeout && now.Sub(s.lastPush) >= timeout
 }
 
 // queued reports the live entry count - the ring's length bound made readable
@@ -731,12 +822,7 @@ func (r *Relay) finish(c *conn) {
 	c.once.Do(func() {
 		r.mu.Lock()
 		delete(r.conns, c)
-		if r.perGroup[c.srcGroup] > 0 {
-			r.perGroup[c.srcGroup]-- // the accept-time cap sees the freed slot again
-			if r.perGroup[c.srcGroup] == 0 {
-				delete(r.perGroup, c.srcGroup)
-			}
-		}
+		r.decGroupLocked(c.srcGroup) // the accept-time cap sees the freed slot again
 		close(c.dead)
 		_ = c.nc.Close()
 		r.mu.Unlock()
@@ -756,10 +842,15 @@ type Relay struct {
 	// accept-time cap's bookkeeping, decremented by finish.
 	perGroup map[string]int
 	// handshaking holds accepted sockets that have not yet presented the
-	// access token (audit N-8), so Close can close them instead of waiting
-	// out accessTokenTimeout. A connection is in this set only between
-	// Accept and admit; it is never registered and never forwarded.
-	handshaking map[net.Conn]struct{}
+	// access token (audit N-8), keyed to the source group whose accept-time
+	// slot they hold, so Close can close them instead of waiting out
+	// accessTokenTimeout. A connection is in this set only between accept and
+	// admit; it is never registered and never forwarded. It IS counted
+	// against BOTH caps from the moment of accept: the resource being bounded
+	// is the socket, its goroutine, its frame buffer and its slot - all of
+	// which exist before the token is read - so a silent dialer cannot
+	// escape the cap by staying silent (audit F1).
+	handshaking map[net.Conn]string
 
 	quit      chan struct{}
 	closed    atomic.Bool
@@ -784,7 +875,7 @@ func New(opts Options) *Relay {
 		opts:        opts.withDefaults(),
 		conns:       make(map[*conn]struct{}),
 		perGroup:    make(map[string]int),
-		handshaking: make(map[net.Conn]struct{}),
+		handshaking: make(map[net.Conn]string),
 		quit:        make(chan struct{}),
 	}
 }
@@ -857,94 +948,165 @@ func (r *Relay) acceptLoop(l net.Listener) {
 				continue
 			}
 		}
+		// The cap binds HERE, under the registry lock and BEFORE any
+		// per-connection goroutine, socket deadline or handshake state
+		// exists (audit F1). The N-8 gate moved the token read off the accept
+		// loop - correctly, it blocks on the remote - but it left the cap in
+		// admit, which runs only after that read returns: with a token
+		// configured, silent dials held a goroutine, a frame buffer and a
+		// socket for AccessTimeout each, unbounded by MaxConns and
+		// unaccounted in MaxPinnedBytes. N-8's regression, undone: the slot
+		// is RESERVED at accept (r.handshaking + r.perGroup, the same two
+		// numbers admit used to check) and the handshake goroutine is only
+		// spawned once the reservation is held. A socket in handshake is the
+		// resource, so it counts: the cap is the cap on sockets, not on
+		// sockets that have already said something.
+		group := connGroup(nc.RemoteAddr())
+		r.mu.Lock()
+		if err := r.acceptCapLocked(group); err != nil {
+			r.mu.Unlock()
+			if !errors.Is(err, ErrClosed) {
+				r.refused.Add(1)
+			}
+			_ = nc.Close()
+			continue
+		}
+		r.handshaking[nc] = group
+		r.perGroup[group]++
 		// handshake performs the access-token read when a token is
 		// configured, which BLOCKS on the remote speaking - it must never run
 		// on the accept loop, or one silent dialer would stall every other
 		// connection. The handshake goroutine is counted on the same
 		// WaitGroup Close waits on, and the socket is tracked in
-		// r.handshaking so Close can close it rather than wait out the token
-		// deadline.
+		// r.handshaking (with its reserved slot) so Close can close it rather
+		// than wait out the token deadline.
 		r.wg.Add(1)
-		go r.handshake(nc)
+		r.mu.Unlock()
+		go r.handshake(nc, group)
+	}
+}
+
+// acceptCapLocked applies the accept-time refusal rules in order - relay
+// closed, then MaxConns, then MaxConnsPerIP (audit N-2: no single source may
+// hold every slot; the per-GROUP count is kept under the same mutex the
+// registry is, and releaseHandshake and finish both give the slot back).
+// BOTH caps count a HANDSHAKING socket exactly as they count a registered
+// one, because both bound the same thing: a live socket with a goroutine and
+// a slot. r.mu must be held.
+func (r *Relay) acceptCapLocked(group string) error {
+	if r.closed.Load() {
+		return ErrClosed
+	}
+	if len(r.conns)+len(r.handshaking) >= r.opts.MaxConns {
+		return fmt.Errorf("relay: registry full (%d)", r.opts.MaxConns)
+	}
+	if r.perGroup[group] >= r.opts.MaxConnsPerIP {
+		return fmt.Errorf("relay: source group %s holds %d slots already (cap %d)", group, r.perGroup[group], r.opts.MaxConnsPerIP)
+	}
+	return nil
+}
+
+// decGroupLocked returns one accept-time slot to a source group - the single
+// place the per-group count is decremented, used by both finish (a registered
+// connection ends) and releaseHandshake (a handshaking socket ends), so the
+// two paths can never drift. r.mu must be held.
+func (r *Relay) decGroupLocked(group string) {
+	if r.perGroup[group] > 0 {
+		r.perGroup[group]--
+		if r.perGroup[group] == 0 {
+			delete(r.perGroup, group)
+		}
+	}
+}
+
+// releaseHandshake drops a handshaking socket's accept-time reservation: its
+// handshaking entry and its per-group slot are freed together, so the cap
+// sees the slot again the instant the token is refused, the read fails, or
+// the relay shuts down. It is a no-op for a socket that has already been
+// admitted (the entry is gone) or was never reserved.
+func (r *Relay) releaseHandshake(nc net.Conn) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if group, ok := r.handshaking[nc]; ok {
+		delete(r.handshaking, nc)
+		r.decGroupLocked(group)
 	}
 }
 
 // handshake presents the access-token gate (audit N-8) and then admits the
-// connection. With no token configured it is the admit call alone. With a
-// token, the FIRST frame must equal it EXACTLY - length and bytes - and is
-// then consumed, never forwarded. The check reads only the frame length
-// (wire.ReadFrame) and compares raw bytes: the relay decodes nothing, so its
-// "parses nothing" posture is intact. A connection that fails, or says
-// nothing within accessTokenTimeout, is closed and counted as unauthorized;
-// it is NEVER registered, so it can neither receive nor forward a frame.
-func (r *Relay) handshake(nc net.Conn) {
+// connection whose accept-time slot the caller has already reserved against
+// both caps (audit F1). With no token configured it is the admit call alone.
+// With a token, the FIRST frame must equal it EXACTLY - length and bytes - and
+// is then consumed, never forwarded. The check reads only the frame length
+// (wire.ReadFrame) and compares raw bytes in constant time (subtle.
+// ConstantTimeCompare): the relay decodes nothing, so its "parses nothing"
+// posture is intact. A connection that fails, or says nothing within
+// accessTokenTimeout, is closed, counted as unauthorized, and its reserved
+// slot is RELEASED; it is NEVER registered, so it can neither receive nor
+// forward a frame.
+func (r *Relay) handshake(nc net.Conn, group string) {
 	defer r.wg.Done()
 	if len(r.opts.AccessToken) > 0 {
-		r.mu.Lock()
-		if r.closed.Load() {
-			r.mu.Unlock()
-			nc.Close()
-			return
-		}
-		r.handshaking[nc] = struct{}{}
-		r.mu.Unlock()
-		defer func() {
-			r.mu.Lock()
-			delete(r.handshaking, nc)
-			r.mu.Unlock()
-		}()
-
 		if err := nc.SetReadDeadline(time.Now().Add(r.opts.AccessTimeout)); err != nil {
 			r.unauthorized.Add(1)
-			nc.Close()
+			r.releaseHandshake(nc)
+			_ = nc.Close()
 			return
 		}
 		frame, err := wire.ReadFrame(nc, r.opts.MaxFrameBytes)
-		// Length-and-equality only: no decode, no interpretation. A token of
-		// a different length is refused without a byte comparison.
-		if err != nil || len(frame) != len(r.opts.AccessToken) || !bytes.Equal(frame, r.opts.AccessToken) {
+		// Length-and-equality only: no decode, no interpretation. The
+		// comparison is constant-time (audit F5), so the bytes of the token
+		// leak nothing through timing; the LENGTH check is not a leak either,
+		// because the length is the frame's own declared prefix, which this
+		// layer must read anyway to bound the allocation. A wrong length is
+		// refused without touching the token's bytes.
+		if err != nil || len(frame) != len(r.opts.AccessToken) ||
+			subtle.ConstantTimeCompare(frame, r.opts.AccessToken) != 1 {
 			r.unauthorized.Add(1)
-			nc.Close()
+			r.releaseHandshake(nc)
+			_ = nc.Close()
 			return
 		}
 		// The token frame is consumed; clear the deadline so the reader arms
 		// its own per-frame one.
 		if err := nc.SetReadDeadline(time.Time{}); err != nil {
-			nc.Close()
+			r.releaseHandshake(nc)
+			_ = nc.Close()
 			return
 		}
 	}
-	if err := r.admit(nc); err != nil {
-		// A refusal by BOUND (registry full, or one source IP at its cap) is
-		// counted; a close because the relay is shutting down is not a
-		// refusal, only a shutdown.
+	if err := r.admit(nc, group); err != nil {
+		// The only refusal admit can still return is a shutdown: the two
+		// bounds were applied at accept, before the handshake could block.
+		// admit has already released the reservation on that path.
 		if !errors.Is(err, ErrClosed) {
 			r.refused.Add(1)
 		}
-		nc.Close()
+		_ = nc.Close()
 	}
 }
 
-// admit applies the accept-time refusal rules in order - relay closed, then
-// MaxConns, then MaxConnsPerIP (audit N-2: no single source may hold every
-// slot; the per-GROUP count is kept under the same mutex the registry is) -
-// and registers the accepted connection with its two goroutines. The
-// registration stays under the same lock Close's snapshot takes, so a Close
-// racing an accept either sees the connection (and finishes it) or finds
-// the closed flag up and closes the raw socket itself.
-func (r *Relay) admit(nc net.Conn) error {
+// admit converts an accepted socket whose accept-time slot is ALREADY
+// RESERVED (r.handshaking + r.perGroup, taken by acceptLoop under
+// acceptCapLocked) into a registered connection with its two goroutines. The
+// reservation becomes the registration in one critical section: the
+// handshaking entry is deleted and the conn takes its place in r.conns, so the
+// sum the caps count never dips and never doubles. On a shutdown the
+// reservation is released instead, so a Close racing this admit leaves no
+// slot behind. The registration stays under the same lock Close's snapshot
+// takes, so a Close racing an accept either sees the connection (and finishes
+// it) or finds the closed flag up and closes the raw socket itself.
+func (r *Relay) admit(nc net.Conn, group string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed.Load() {
+		if g, ok := r.handshaking[nc]; ok {
+			delete(r.handshaking, nc)
+			r.decGroupLocked(g)
+		}
 		return ErrClosed
 	}
-	if len(r.conns) >= r.opts.MaxConns {
-		return fmt.Errorf("relay: registry full (%d)", r.opts.MaxConns)
-	}
-	group := connGroup(nc.RemoteAddr())
-	if r.perGroup[group] >= r.opts.MaxConnsPerIP {
-		return fmt.Errorf("relay: source group %s holds %d slots already (cap %d)", group, r.perGroup[group], r.opts.MaxConnsPerIP)
-	}
+	delete(r.handshaking, nc) // the reservation is now the registration
 	c := &conn{
 		nc:       nc,
 		q:        newSendQ(r.opts.WriteQueueBytes, r.opts.MaxFrameBytes, r.opts.WriteQueueFrames),
@@ -952,7 +1114,6 @@ func (r *Relay) admit(nc net.Conn) error {
 		srcGroup: group,
 	}
 	r.conns[c] = struct{}{}
-	r.perGroup[group]++
 	r.wg.Add(2)
 	go r.reader(c)
 	go r.writer(c)
@@ -1106,6 +1267,16 @@ func sendersFor(c *conn, accounts map[shareAccount]int) int {
 // the entry ring and the group's count, and the reader unblocks into the same
 // teardown. A peer that drains as it goes empties the queue and starts a fresh
 // deadline on the next burst, so an honest flow is never cut off.
+//
+// The expiry alone is not grounds to end the connection (audit F3): it is read
+// through receiverStalled, which asks whether the backlog is the RECEIVER's
+// (nothing has arrived for a whole WriteTimeout and the queue still will not
+// clear) or a SENDER's (frames keep arriving, and only the byte budget and the
+// per-sender share can answer that). A sender-caused backlog must not cost the
+// receiver its link; the write that follows is then bounded by a fresh
+// deadline of its own, so a receiver that genuinely stops reading mid-frame is
+// still ended by the timeout on that write. The relay still parses nothing:
+// both questions are timestamps on an already-queued frame.
 func (r *Relay) writer(c *conn) {
 	defer r.wg.Done()
 	for {
@@ -1118,9 +1289,11 @@ func (r *Relay) writer(c *conn) {
 				if !ok {
 					break // drained; sleep until the next push signals
 				}
-				if !time.Now().Before(deadline) {
+				if c.q.receiverStalled(r.opts.WriteTimeout) {
 					// The backlog has failed to clear within WriteTimeout of
-					// its arrival, however steadily the peer trickled.
+					// its arrival AND nothing new has arrived within that
+					// window: the receiver is the one not keeping up, however
+					// steadily it trickled. End it.
 					r.finish(c)
 					return
 				}
@@ -1128,14 +1301,22 @@ func (r *Relay) writer(c *conn) {
 				if !ok {
 					break
 				}
-				if err := c.nc.SetWriteDeadline(deadline); err != nil {
+				writeDeadline := deadline
+				if !time.Now().Before(deadline) {
+					// The queue has been non-empty past WriteTimeout, but
+					// frames are still arriving: the backlog belongs to a
+					// SENDER (audit F3), so the receiver must not pay for it
+					// with its link. Bound THIS write instead of the queue.
+					writeDeadline = time.Now().Add(r.opts.WriteTimeout)
+				}
+				if err := c.nc.SetWriteDeadline(writeDeadline); err != nil {
 					r.finish(c)
 					return
 				}
 				if err := wire.WriteFrame(c.nc, f.b); err != nil {
-					// Socket failure, or the progress deadline expiring on a
-					// peer that has stopped reading - the same ending either
-					// way: nothing is parsed, nothing is retried, the slot is
+					// Socket failure, or the write deadline expiring on a peer
+					// that has stopped reading - the same ending either way:
+					// nothing is parsed, nothing is retried, the slot is
 					// released.
 					r.finish(c)
 					return

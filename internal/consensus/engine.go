@@ -425,13 +425,12 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) error {
 // and 0 when there is none (0 is never a valid target: the engine is at round
 // >= 0 and only jumps strictly forward).
 //
-// The criterion is a POWER fraction, not a seat count: members carrying
-// strictly more than one third of the committee's TOTAL power - the same
-// Byzantine budget every other power comparison in this package is measured
-// against - must have attested a round ahead of the current one. It uses the
-// committee's own TotalPower arithmetic, so a weighted committee is measured
-// in its real currency. A seat count would be wrong twice: on a weighted
-// genesis a coalition holding strictly UNDER a third of the power can occupy
+// The criterion is a POWER threshold, not a seat count: the members whose
+// combined power can leave the rest of the committee short of quorum must have
+// attested a round ahead of the current one. It uses the committee's own
+// TotalPower/Quorum arithmetic, so a weighted committee is measured in its real
+// currency. A seat count would be wrong twice: on a weighted genesis a
+// coalition holding strictly UNDER a third of the power can occupy
 // floor(n/3)+1 SEATS (demonstrated on n=7, powers {1,1,1,2,2,2,2}: three
 // power-1 seats hold 3/11 ≈ 0.27 of power yet fill the member gate exactly),
 // and a coalition holding MORE than a third can do it with fewer seats.
@@ -441,12 +440,12 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) error {
 // (one entry per member, highest round only - a member's repeat claims cannot
 // multiply its weight), and the target is the FIRST round at which the
 // accumulated power reaches the bar. Before that round the accumulated power
-// was under one third, so the target is bounded above by some honest member's
-// own attested round: a sub-third coalition cannot pull the target past the
-// furthest honest attestation, and a single Byzantine validator - whose power
-// the genesis power cap holds under one quarter of total - cannot reach the
-// bar at all. One jump moves to the evidence's bulk; further evidence, on
-// later timeouts, moves further.
+// could not block a quorum, so the target is bounded above by some honest
+// member's own attested round: a sub-bar coalition cannot pull the target past
+// the furthest honest attestation, and - bar the whole-committee case below - a
+// single Byzantine validator, whose power the genesis power cap holds under one
+// quarter of total, cannot reach the bar at all. One jump moves to the
+// evidence's bulk; further evidence, on later timeouts, moves further.
 //
 // The target is additionally CAPPED at maxRoundEscalation rounds ahead of the
 // engine's own round. The gate is correct against the committee's fault
@@ -465,10 +464,43 @@ func (e *Engine) jumpTarget() uint32 {
 	if len(e.future) == 0 {
 		return 0
 	}
-	// The bar: the smallest power that is strictly more than one third of the
-	// total. total/3+1 in integer arithmetic is exactly that smallest value,
-	// for every remainder of total mod 3, and total/3 cannot overflow uint64.
-	bar := e.cfg.TotalPower()/3 + 1
+	// The bar: the smallest attested power whose absence leaves the REST of
+	// the committee short of quorum, i.e. total - quorum + 1. That is the exact
+	// complement of the quorum, and it is what makes a jump a RESYNC rather
+	// than a gamble: if that much power sits in a higher round, no round this
+	// validator can reach holds a completable quorum, so waiting cannot help.
+	// The subtraction cannot underflow - quorumFor(total) <= total for every
+	// total - so the bar is always >= 1.
+	//
+	// It evaluates to ceil(total/3): strictly more than one third when
+	// total % 3 != 0, and EXACTLY one third when total % 3 == 0. The previous
+	// bar, total/3 + 1, was strictly more than one third in every case, and
+	// that single unit was the whole defect at total = 3k. There a
+	// quorum-blocking set is exactly total/3, so the smallest set that can
+	// stop the rest from reaching quorum could never reach the bar - the bar
+	// and the quorum were not complementary. On three equal seats
+	// (--validators 3: cap 1/1, quorum 3 = ALL of them) one seat ahead could
+	// therefore never trigger the resync while that same one seat's absence
+	// blocked every quorum, so a round divergence past the timeout cap left
+	// the chains at height 0 with no recovery while an undiverged control on
+	// the same fixture committed. Six equal seats had the identical gap
+	// (bar 3 against a blocking set of 2); totals 4, 5 and 7 were already
+	// complementary.
+	//
+	// The one-Byzantine property the higher bar existed for is kept wherever
+	// it can hold. The genesis power cap is 1/4 of total above the four-seat
+	// floor and ceil(total/3) > total/4, so on every committee of four or more
+	// no single member reaches the bar. The sole exception is a committee whose
+	// quorum is the WHOLE committee (quorum == total, which arithmetic fixes at
+	// total <= 3): there one member's absence already blocks every quorum, so
+	// that member holds full stall power whatever the bar is, and keeping the
+	// bar above it buys no safety - only the unrecoverable stall. The bar drops
+	// to a single member there, and that limitation is stated for the three-Pi
+	// acceptance shape in scripts/deploy/README.md.
+	bar := e.cfg.TotalPower() - e.cfg.Quorum() + 1
+	if quorum := e.cfg.Quorum(); quorum == e.cfg.TotalPower() {
+		bar = 1
+	}
 
 	// Walk the attested members from the furthest round down, accumulating
 	// power; stop at the first round whose prefix reaches the bar. The walk

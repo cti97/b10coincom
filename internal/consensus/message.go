@@ -135,7 +135,12 @@ func DecodeVote(b []byte) (*Vote, error) {
 	if v.Validator, err = d.VarBytesMax(ed25519.PublicKeySize); err != nil {
 		return nil, err
 	}
-	if v.Sig, err = d.VarBytes(); err != nil {
+	// The signature has exactly one legal width too - an Ed25519 signature is
+	// 64 bytes and nothing else (audit C-17d, extended here by review F4): an
+	// unbounded VarBytes copied a frame-sized slice for Verify to reject. A
+	// short or empty signature still decodes, so Verify keeps naming the real
+	// problem.
+	if v.Sig, err = d.VarBytesMax(ed25519.SignatureSize); err != nil {
 		return nil, err
 	}
 	if err := d.Done(); err != nil {
@@ -278,7 +283,8 @@ func DecodeProposal(b []byte) (*Proposal, error) {
 	if p.Validator, err = d.VarBytesMax(ed25519.PublicKeySize); err != nil {
 		return nil, err
 	}
-	if p.Sig, err = d.VarBytes(); err != nil {
+	// The signature is bounded as the vote's is (audit C-17d, review F4).
+	if p.Sig, err = d.VarBytesMax(ed25519.SignatureSize); err != nil {
 		return nil, err
 	}
 	if err := d.Done(); err != nil {
@@ -304,13 +310,42 @@ func encodeJustification(votes []*Vote) []byte {
 	return e.Bytes()
 }
 
+// minJustifiedVoteWireBytes is the smallest number of justification bytes a
+// single element can occupy and still decode as a Vote, expressed in the framing
+// encodeJustification writes: one length prefix for the element (1), then
+// EncodeVote's own minimum - a one-byte type, 8-byte height, 4-byte round,
+// 32-byte block ID, the key's length prefix with an empty key (1), and the
+// signature's length prefix with an empty signature (1). A shorter element
+// cannot decode as a Vote, and verifyJustification rejects the frame outright on
+// its first undecodable element (audit N-4's shape, applied here by review F4).
+const minJustifiedVoteWireBytes = 1 + (1 + 8 + 4 + 32 + 1) + 1
+
 // decodeVotes reads encodeJustification's wire shape. A short, oversized, or
 // non-canonical frame decodes to nil, which verifyJustification then rejects by
 // finding no quorum.
+//
+// The declared count is attacker bytes, bounded by Len only by the bytes
+// remaining in the frame, and the OLD code trusted it twice (review F4, the
+// consensus twin of audit N-4): `make([][]byte, 0, n)` pre-allocated 24 bytes of
+// slice header per remaining frame byte - measured 25,166,408 bytes, 24.0x, on a
+// 1 MiB justification whose count had no elements behind it - and the loop ran
+// the claimed count of times, so an element-dense frame bought a ~1M-iteration
+// walk. Both are reachable from any committee member drawn as the proposer.
+//
+// The cap is the MINIMUM ELEMENT SIZE, not the frame size: a justification holds
+// encoded votes, so it cannot carry more than remaining/minJustifiedVoteWireBytes
+// of them, and a larger count names a sequence that verifyJustification would
+// reject element by element anyway. Refusing it here therefore rejects no frame
+// that could ever form a quorum - it only makes the frame's own bytes, rather
+// than the attacker's count, bound the allocation AND the loop. The capacity hint
+// is set to the same bound, so the two can never disagree.
 func decodeVotes(b []byte) [][]byte {
 	d := types.NewDecoder(b)
 	n, err := d.Len()
 	if err != nil {
+		return nil
+	}
+	if max := d.Remaining() / minJustifiedVoteWireBytes; n > max {
 		return nil
 	}
 	out := make([][]byte, 0, n)

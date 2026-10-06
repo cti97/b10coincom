@@ -2093,3 +2093,114 @@ func TestTheReaderShedsFramesOverThePerConnectionRateLimit(t *testing.T) {
 		t.Fatal("no frame was shed: the reader did not consult the rate limiter")
 	}
 }
+
+// TestAnUnadmittedSquatterCannotHoldAPeersName is the residual half of audit
+// F4. The maintain half is genuinely fixed (TestADuplicateRefusalHeals...):
+// every failure backs off and retries. But install wrote t.conns[id] for an
+// INBOUND connection INDEPENDENTLY of admission, and the duplicate check reads
+// t.conns - so a connection the transport refuses to call a peer (absent from
+// Peers(), off every Broadcast, every frame gated) still held the peer's NAME.
+// With Options.Admit refusing everything, the reviewer reproduced 3/3: the
+// squatter kept the name for as long as it held one socket alive (a 1-byte
+// frame every < 2 min), and the honest peer's maintained dial was refused on
+// every retry.
+//
+// The fix is an admission asymmetry in the duplicate check: an unadmitted
+// incumbent loses the name to an admitted newcomer whatever the cross-dial rank
+// says, and an unadmitted newcomer never evicts an admitted incumbent. The rank
+// is untouched for two ADMITTED candidates, which is where its agreement
+// property lives.
+//
+// The state is CONSTRUCTED: the squatter installs and is verified (Peers() is
+// empty while the registry names it) BEFORE the maintained dial starts, and the
+// rank is chosen so the pre-fix code refuses that dial deterministically
+// ("zzz" > "aaa", so the squatter's inbound wins the differ-by-direction case).
+// Nothing here races.
+func TestAnUnadmittedSquatterCannotHoldAPeersName(t *testing.T) {
+	tp := listen(t, Options{
+		LocalID: "zzz",
+		// The gate refuses EVERYTHING, so the squatter can never become a peer
+		// however long it lives - which is exactly the state the finding is
+		// about.
+		Admit:       func([]byte) bool { return false },
+		BackoffBase: 20 * time.Millisecond,
+		BackoffMax:  200 * time.Millisecond,
+	})
+
+	// The squatter completes the ID handshake as the real peer's name. It is
+	// installed, it is NOT a peer, and it holds the name.
+	hc, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hc.Close() })
+	if err := wire.WriteFrame(hc, []byte("aaa")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.ReadFrame(hc, maxHandshakeIDBytes); err != nil {
+		t.Fatalf("the squatter's handshake greeting: %v", err)
+	}
+	waitFor(t, "the unadmitted squatter to install", 5*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		c := tp.conns["aaa"]
+		return c != nil && !c.admitted.Load()
+	})
+	if got := tp.Peers(); len(got) != 0 {
+		t.Fatalf("the unadmitted squatter is in Peers(): %v - the premise (a squatter that is not a peer) never formed", got)
+	}
+
+	// The real peer: a raw server that answers every handshake as "aaa" and
+	// then holds its socket open. A stand-in for the validator whose maintained
+	// dial this name is denying.
+	rl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rl.Close() })
+	go func() {
+		for {
+			nc, aerr := rl.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(nc net.Conn) {
+				defer nc.Close()
+				br := bufio.NewReader(nc)
+				_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+				if _, rerr := wire.ReadFrame(br, maxHandshakeIDBytes); rerr != nil {
+					return // the dialer's greeting ("zzz")
+				}
+				_ = nc.SetReadDeadline(time.Time{})
+				if werr := wire.WriteFrame(nc, []byte("aaa")); werr != nil {
+					return
+				}
+				buf := make([]byte, 64)
+				for {
+					if _, err := nc.Read(buf); err != nil {
+						return
+					}
+				}
+			}(nc)
+		}
+	}()
+
+	if err := tp.AddPeer(rl.Addr().String()); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	// THE clause: the maintained dial takes the name from the squatter.
+	waitFor(t, "the real peer's maintained dial to take the name from the unadmitted squatter", 5*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		c := tp.conns["aaa"]
+		return c != nil && c.admitted.Load() && c.nc.RemoteAddr().String() == rl.Addr().String() && !c.superseded
+	})
+	// The squatter lost its slot with the name: its socket is closed, not left
+	// holding a registry entry behind the winner.
+	waitClosedConn(t, hc, "the superseded unadmitted squatter")
+	// And the link is a working peer: it is in Peers(), and Send crosses it.
+	waitPeersIs(t, tp, "[aaa]")
+	if err := tp.Send("aaa", []byte("healed")); err != nil {
+		t.Fatalf("Send over the healed link: %v", err)
+	}
+}

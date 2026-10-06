@@ -1068,16 +1068,45 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled bool, id transp
 		return nil, fmt.Errorf("%w (%q on %s)", ErrReservedPeerName, id, addr)
 	}
 	existing := t.conns[id]
-	if existing != nil && !newcomerWins(t.opts.LocalID, existing, c) {
-		// The incumbent outranks the newcomer: the newcomer loses, the
-		// incumbent stays EXACTLY as it was (still installed, still healthy,
-		// still maintained by whichever side holds it). This is the branch
-		// a maintainer's re-dial lands in when the peer's own dial won the
-		// link: its registration was released on exit, so the registry no
-		// longer claims what it did not keep.
-		t.mu.Unlock()
-		nc.Close()
-		return nil, fmt.Errorf("%w (%q on %s)", ErrDuplicatePeer, id, addr)
+	if existing != nil {
+		// Admission asymmetry (audit F4). An unadmitted connection is a
+		// socket, not a peer (audit N-3): it is absent from Peers() and off
+		// every Broadcast, but install still wrote it into t.conns, so it
+		// held the peer's NAME. The rank alone then decided the name, and a
+		// squatter that had claimed an honest peer's name first kept it for
+		// as long as it held one socket alive - the honest peer's maintained
+		// dial refused every retry, forever, by a connection the transport
+		// itself refuses to call a peer. Both directions of that asymmetry
+		// are closed here, so admission - not arrival order and not the
+		// cross-dial rank - decides which of the two is a peer:
+		//
+		//   - an UNADMITTED incumbent never refuses an admitted newcomer: the
+		//     real link takes the name and the squatter is superseded and
+		//     closed, whatever the rank would have said;
+		//   - an UNADMITTED newcomer never evicts an admitted incumbent: the
+		//     squatter cannot make the transport drop a real peer's link.
+		//
+		// The rank itself is untouched for two ADMITTED candidates, which is
+		// where the cross-dial agreement it exists for actually lives.
+		newcomerAdmitted := c.admitted.Load()
+		switch {
+		case !existing.admitted.Load() && newcomerAdmitted:
+			// fall through to the replacement below
+		case existing.admitted.Load() && !newcomerAdmitted:
+			t.mu.Unlock()
+			nc.Close()
+			return nil, fmt.Errorf("%w (%q on %s)", ErrDuplicatePeer, id, addr)
+		case !newcomerWins(t.opts.LocalID, existing, c):
+			// The incumbent outranks the newcomer: the newcomer loses, the
+			// incumbent stays EXACTLY as it was (still installed, still
+			// healthy, still maintained by whichever side holds it). This is
+			// the branch a maintainer's re-dial lands in when the peer's own
+			// dial won the link: its registration was released on exit, so
+			// the registry no longer claims what it did not keep.
+			t.mu.Unlock()
+			nc.Close()
+			return nil, fmt.Errorf("%w (%q on %s)", ErrDuplicatePeer, id, addr)
+		}
 	}
 	if existing != nil {
 		// The newcomer outranks the incumbent, so the newcomer WINS the

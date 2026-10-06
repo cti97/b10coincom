@@ -231,6 +231,24 @@ can rewrite its economy hand-edited. **Treat the file as final once the
 chain starts** — editing it changes the genesis hash, i.e. it starts a
 different chain.
 
+> **⚠️ A three-seat committee is the one shape with a liveness limitation
+> (review F2), and it is the shape this recipe deploys.** Consensus needs more
+> than two thirds of total power, so with three equal seats the quorum is **all
+> three**: any one Pi down, disconnected, or merely slow blocks *every* block.
+> The protocol's recovery rule — a node whose peers are demonstrably in a later
+> round resyncs forward — has a power bar that is the exact complement of the
+> quorum, and with quorum == total that complement is **one** seat. So on a
+> three-seat committee a single seat's higher-round evidence is enough to move a
+> node's round (bounded to 16 rounds per timeout), and a single faulty or
+> malicious seat can force such a jump as well as stall the chain. Neither
+> costs **safety** — every consensus message is signed, and a jump can only skip
+> rounds, never forge a block — but this run has **no fault tolerance**: it
+> finalizes only while all three Pis are healthy and reachable. The bar cannot
+> be raised here without re-creating a height that can never resync, so the
+> limitation is inherent to three seats, not to this build; a **fourth** seat
+> (quorum 3 of 4, the `--validators 4` acceptance shape) is what buys a
+> one-fault-tolerant committee.
+
 Then copy the SAME file to every Pi:
 
 ```sh

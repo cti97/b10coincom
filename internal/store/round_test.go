@@ -212,3 +212,163 @@ func TestRoundRecordPayloadFraming(t *testing.T) {
 		t.Fatal("an oversized payload decoded into a round: the strict width check is gone")
 	}
 }
+
+// countRoundFrames frames the round log and returns how many records it holds.
+// It is the round log's half of countLockFrames, and it fails the test on a
+// framing error rather than guessing, so a bound asserted with it cannot pass
+// over a corrupt file.
+func countRoundFrames(t *testing.T, dir string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, roundLogName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, off := 0, int64(0)
+	for off < int64(len(raw)) {
+		_, recEnd, err := frame(raw, off, roundPayloadLen)
+		if err != nil {
+			t.Fatalf("framing rounds.log at offset %d: %v", off, err)
+		}
+		n++
+		off = recEnd
+	}
+	return n
+}
+
+// PruneRounds drops every round strictly below the committed head and keeps the
+// two that can still be read - the head's own record (conservative headroom)
+// and the head+1 round a restart restores - across both the live store and a
+// reopen (review F3). This is the round log's half of the C-13 fix.
+func TestPruneRoundsDropsBelowTheCommittedHead(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The chain has committed through height 5, so the store knows its head on
+	// reopen.
+	for h := uint64(1); h <= 5; h++ {
+		if err := s.Append(h, []byte("block")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A round at every committed height, plus the head+1 round being judged.
+	for h := uint64(1); h <= 6; h++ {
+		if err := s.PutRound(RoundRecord{Height: h, Round: uint32(h)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.PruneRounds(5); err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(1); h < 5; h++ {
+		if _, ok := s.RoundAt(h); ok {
+			t.Fatalf("RoundAt(%d) survived a prune below the committed head 5", h)
+		}
+	}
+	if _, ok := s.RoundAt(5); !ok {
+		t.Fatal("the head's own round was pruned; the fix deliberately keeps it")
+	}
+	if got, ok := s.RoundAt(6); !ok || got != 6 {
+		t.Fatalf("the head+1 round was pruned: that record is the round a restart reads, so dropping it breaks the restart-resume property (got %d,%v)", got, ok)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reopen prunes below its committed head too, so the same rounds stand
+	// and the same heights are absent.
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	for h := uint64(1); h < 5; h++ {
+		if _, ok := s2.RoundAt(h); ok {
+			t.Fatalf("after reopen RoundAt(%d) is present for a height below the committed head", h)
+		}
+	}
+	if _, ok := s2.RoundAt(5); !ok {
+		t.Fatal("the head's own round did not survive the reopen")
+	}
+	if got, ok := s2.RoundAt(6); !ok || got != 6 {
+		t.Fatalf("after reopen RoundAt(6) = %d,%v; the head+1 round must survive - without it a restarted validator re-enters round 0 for a height the committee has already carried forward", got, ok)
+	}
+}
+
+// A long-running validator must not grow its round log without bound (review
+// F3). Each round ENTERED appends and fsyncs a frame, and each height keeps a
+// map entry forever, so a node that runs for thousands of heights used to carry
+// one frame per round per height with no prune path. This test drives 600
+// heights through the live rule - PutRound at the height being judged, then the
+// head advancing past it (PruneRounds, exactly as Chain.Append calls it) - and
+// asserts three things: the file stays bounded, the map stays bounded, and the
+// restart-resume property holds at EVERY step (the round persisted for head+1
+// is readable, so a crash here resumes at the right round rather than at 0).
+// The height count is 600 rather than thousands only because every PutRound
+// fsyncs; one frame per round entered would already be ~2400 frames against a
+// bound of ~264.
+func TestPruneRoundsBoundsALongRunningValidatorsLog(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const heights = 600
+	const roundsPerHeight = 2 // rounds 0..2 entered while judging one height
+
+	for h := uint64(1); h <= heights; h++ {
+		// The engine judges height h (head is h-1) and enters rounds 0..2.
+		for r := uint32(0); r <= roundsPerHeight; r++ {
+			if err := s.PutRound(RoundRecord{Height: h, Round: r}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Committing h prunes strictly below h, exactly as Chain.Append does.
+		if err := s.PruneRounds(h); err != nil {
+			t.Fatal(err)
+		}
+		// The engine for the NEXT height persists its round; a crash right here
+		// must resume at that round, not at 0.
+		if err := s.PutRound(RoundRecord{Height: h + 1, Round: 7}); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := s.RoundAt(h + 1); !ok || got != 7 {
+			t.Fatalf("at head %d the head+1 round is %d,%v; want the persisted 7 - the restart-resume property must hold at every step", h, got, ok)
+		}
+	}
+
+	frames := countRoundFrames(t, dir)
+	t.Logf("%d heights x %d rounds/height: rounds.log holds %d frames (one frame per round entered would be %d; the map holds %d entries)",
+		heights, roundsPerHeight+1, frames, heights*(roundsPerHeight+2), len(s.rounds))
+	// After the last prune the log holds the live rounds plus at most the
+	// compaction threshold. Allow the last iteration's few puts on top.
+	if max := roundCompactThreshold + 2*(roundsPerHeight+2); frames > max {
+		t.Fatalf("rounds.log holds %d frames after %d heights, want at most %d: the log grows without bound", frames, heights, max)
+	}
+	if live := len(s.rounds); live > 2 {
+		t.Fatalf("the round map holds %d entries after the head moved past %d heights, want at most 2 (head and head+1)", live, heights)
+	}
+	unbounded := heights * (roundsPerHeight + 2)
+	if frames*4 >= unbounded {
+		t.Fatalf("rounds.log holds %d frames; one frame per round entered would be %d, and the bound must be far below it", frames, unbounded)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen: the log replays to the same bounded set, and the head+1 round the
+	// restart needs is still there.
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if _, ok := s2.RoundAt(heights); !ok {
+		t.Fatal("after reopen the committed head's round is gone")
+	}
+	if got, ok := s2.RoundAt(heights + 1); !ok || got != 7 {
+		t.Fatalf("after reopen the head+1 round is %d,%v, want 7: a restart must resume at the persisted round", got, ok)
+	}
+}
