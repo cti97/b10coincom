@@ -234,6 +234,16 @@ type Engine struct {
 type roundSets struct {
 	prevotes   *VoteSet
 	precommits *VoteSet
+	// proposal is the block this engine accepted (or built) while it was IN
+	// this round, retained for as long as the round's tallies are. It exists
+	// because a precommit quorum can complete for a round the engine has
+	// already LEFT (audit C-3 keeps those tallies), and a commit needs the
+	// block BYTES to append: enterRound clears e.proposal on the round
+	// change, so without this copy a late quorum would commit an ID the
+	// driver could not append - and, because step becomes StepCommit, one the
+	// engine could never recover from. The round window prunes this with the
+	// tallies, so retention is bounded by the same pastVoteRounds+1 rounds.
+	proposal *types.Block
 }
 
 // errNoValidationSeam is what NewEngine's default seam returns. It is the
@@ -725,6 +735,11 @@ func (e *Engine) onProposal(p *Proposal) error {
 	}
 	e.proposal = &p.Block
 	e.proposalEn = p
+	// Retain the bytes with this round's tallies (audit C-3's window): a
+	// precommit quorum for this round can still complete after enterRound
+	// cleared e.proposal on the way to a later round, and the commit then
+	// needs these bytes to append. See roundSets.proposal.
+	e.setsFor(e.round).proposal = e.proposal
 	e.maybePrevote()
 	return nil
 }
@@ -1018,6 +1033,15 @@ func (e *Engine) commitAt(id [32]byte, round uint32) {
 	if round > e.round {
 		e.bindRound(round)
 		e.pruneRounds()
+		// The adopted round is not the round e.proposal came from: holding a
+		// stale proposal would make onProposal refuse the adopted round's own
+		// proposal ("first proposal wins") and strand the height with a
+		// committed ID and no bytes. Keep it only when it IS the committed
+		// block, where it is exactly the bytes the driver must append.
+		if e.proposal != nil && e.proposal.ID() != id {
+			e.proposal = nil
+			e.proposalEn = nil
+		}
 		if e.persistRound != nil {
 			e.persistRound(e.height, round)
 		}
@@ -1025,6 +1049,38 @@ func (e *Engine) commitAt(id [32]byte, round uint32) {
 	e.committed, e.hasCommitted = id, true
 	e.commitRound = round
 	e.step = StepCommit
+}
+
+// committedBlock returns the block bytes for a committed ID this engine still
+// holds, or nil when it holds none. Committing an ID is a safety decision the
+// engine takes on the precommit evidence alone (a quorum can complete for a
+// round whose proposal this engine never received, or has already left and
+// cleared), but appending the block is a separate step the DRIVER owns - and
+// it must not depend on e.proposal, which enterRound clears on every round
+// change. The bytes can survive in three places, all already bounded:
+//
+//   - e.proposal, when the commit is in the round the engine is in;
+//   - e.sets[e.commitRound].proposal, the round's retained copy (audit C-3's
+//     window), which is what makes a LATE quorum for a round the engine has
+//     left appendable;
+//   - e.lockedBlock, the proof-of-lock bytes C-2 retains for a locked block.
+//
+// The caller still runs Append, which re-validates the block against the
+// chain - so a wrong or stale copy cannot enter the chain; this only decides
+// whether there is something to offer. Nil means the bytes are genuinely
+// absent; the driver parks and the catch-up path (a peer that did append)
+// is what recovers it.
+func (e *Engine) committedBlock(id [32]byte) *types.Block {
+	if e.proposal != nil && e.proposal.ID() == id {
+		return e.proposal
+	}
+	if s := e.sets[e.commitRound]; s != nil && s.proposal != nil && s.proposal.ID() == id {
+		return s.proposal
+	}
+	if e.lockedBlock != nil && e.lockedBlock.ID() == id {
+		return e.lockedBlock
+	}
+	return nil
 }
 
 // StartProposing is called by the driver when this engine is the proposer for
@@ -1123,6 +1179,10 @@ func (e *Engine) StartProposing() error {
 	p.Sig = crypto.Sign(e.priv, h[:])
 	e.proposal = &b
 	e.proposalEn = p
+	// Retain the bytes with this round's tallies (audit C-3's window), so a
+	// quorum that completes after the engine has left the round can still be
+	// appended - see roundSets.proposal.
+	e.setsFor(e.round).proposal = e.proposal
 	e.emit(EncodeProposal(p))
 	// The proposer prevotes its own block once it has "received" it, which
 	// maybePrevote does for us. A transport never loops a sender's message back,

@@ -428,15 +428,19 @@ func (d *Driver) flush() {
 		return
 	}
 	// The committed block is the proposal this engine accepted: the driver can
-	// only append bytes it actually holds, and only the proposal it judged
-	// carries them. A quorum CAN precommit a block whose proposal this engine
-	// never received (the proposal is lost while the precommits it caused
-	// still arrive): the engine has legitimately judged that ID on its
-	// precommit evidence, but this node holds no block bytes to append and
-	// must not guess or reconstruct any. It appends nothing and stays at the
-	// undecided height - reporting a lower height than the peers that did
-	// receive the proposal, never a fabricated one.
-	if d.eng.proposal == nil || d.eng.proposal.ID() != id {
+	// only append bytes it actually holds. A quorum CAN precommit a block
+	// whose proposal this engine never received, or one it received and then
+	// cleared when the round changed (audit C-3 commits from ANY retained
+	// round, so the committing round need not be the current one): the engine
+	// has legitimately judged that ID on its precommit evidence, and the bytes
+	// may still be retained with the committing round's tallies or as the
+	// proof-of-lock copy. committedBlock is where those copies are collected;
+	// a node that holds none appends nothing and stays at the undecided
+	// height - reporting a lower height than the peers that did receive the
+	// proposal, never a fabricated one - and catch-up from a peer that DID
+	// append is its recovery.
+	blk := d.eng.committedBlock(id)
+	if blk == nil {
 		return
 	}
 	// Append re-validates the block against the chain - parent link, height,
@@ -444,7 +448,7 @@ func (d *Driver) flush() {
 	// inject an invalid block: it fails here and the chain stays untouched.
 	// The failure is recorded so no later flush re-offers the same refused
 	// block to the chain's write lock.
-	if err := d.ch.Append(d.eng.proposal); err != nil {
+	if err := d.ch.Append(blk); err != nil {
 		d.appendRefused = true
 		return
 	}
