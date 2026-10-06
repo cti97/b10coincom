@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -254,5 +255,122 @@ func TestDecodeRefusesAnOverLongValidatorKey(t *testing.T) {
 	p.Validator = make([]byte, 1<<20)
 	if _, err := DecodeProposal(EncodeProposal(p)); !errors.Is(err, types.ErrFieldTooLong) {
 		t.Fatalf("a 1 MiB proposer key decoded (%v); want ErrFieldTooLong before any copy", err)
+	}
+}
+
+// The SIGNATURE is a protocol constant too - an Ed25519 signature is 64 bytes
+// and nothing else - so it gets the same bound as the key (audit C-17d; review
+// F4, which found both consensus Sig fields still an unbounded VarBytes). A
+// decoder that trusts the declared width copies the whole claimed signature
+// into memory before Verify can reject it; the bound refuses the width before
+// the copy. A short or empty signature still decodes, so Verify keeps naming
+// the real problem, and the allocation assertion shows the copy never happened.
+func TestDecodeVoteAndProposalBoundTheSignatureField(t *testing.T) {
+	pub, priv := testKey(t)
+	const hostile = 1 << 20
+
+	v := &Vote{Type: MsgPrevote, Height: 7, Round: 3, Validator: pub}
+	vh := v.SigningHash()
+	v.Sig = crypto.Sign(priv, vh[:])
+	if _, err := DecodeVote(EncodeVote(v)); err != nil {
+		t.Fatalf("a 64-byte vote signature no longer decodes: %v", err)
+	}
+	v.Sig = make([]byte, hostile)
+	vframe := EncodeVote(v)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := DecodeVote(vframe)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a %d-byte vote signature decoded (%v); want ErrFieldTooLong before any copy", hostile, err)
+	}
+	if grown := after.TotalAlloc - before.TotalAlloc; grown > uint64(len(vframe))/4 {
+		t.Fatalf("the over-long vote signature was copied before the width bound was applied: allocated %d B for a %d-byte frame", grown, len(vframe))
+	}
+
+	blk := types.Block{Header: types.Header{
+		Height: 1, TxRoot: types.ComputeTxRoot(nil), Timestamp: 1_700_000_100, Proposer: pub,
+	}}
+	p := &Proposal{Height: 1, Round: 0, Block: blk, ValidRound: -1, Validator: pub}
+	ph := p.SigningHash()
+	p.Sig = crypto.Sign(priv, ph[:])
+	if _, err := DecodeProposal(EncodeProposal(p)); err != nil {
+		t.Fatalf("a 64-byte proposal signature no longer decodes: %v", err)
+	}
+	p.Sig = make([]byte, hostile)
+	pframe := EncodeProposal(p)
+	runtime.ReadMemStats(&before)
+	_, err = DecodeProposal(pframe)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a %d-byte proposal signature decoded (%v); want ErrFieldTooLong before any copy", hostile, err)
+	}
+	if grown := after.TotalAlloc - before.TotalAlloc; grown > uint64(len(pframe))/4 {
+		t.Fatalf("the over-long proposal signature was copied before the width bound was applied: allocated %d B for a %d-byte frame", grown, len(pframe))
+	}
+}
+
+// The justification's element count is attacker bytes, and decodeVotes used to
+// size-hint `make([][]byte, 0, n)` from it (review F4, the consensus twin of
+// audit N-4). Len refuses a count larger than the bytes remaining, so on a
+// 1 MiB justification the count can be ~1 MiB - and a slice header is 24 bytes
+// against a MINIMUM element width of ONE wire byte (an empty length-prefixed
+// blob), so no remaining-derived hint can ever bind below n. The pre-allocation
+// therefore multiplied a 1 MiB frame into ~24 MiB before failing on the short
+// buffer. A length-prefixed sequence needs no hint: append grows to the votes
+// actually present. TotalAlloc is a monotonic heap counter, so the fix shows up
+// here as the allocation collapsing to the frame's own size.
+func TestDecodeVotesDoesNotPreallocateAHostileCount(t *testing.T) {
+	const hostile = 1 << 20 // one MiB, the frame's whole payload budget
+	e := types.NewEncoder()
+	e.Len(hostile)
+	e.Raw([]byte{0xFE, 0xFF, 0xFF, 0xFF, 0x0F}) // a vote length ~2^32: fails on the first element
+	e.Raw(make([]byte, hostile-5))
+	frame := e.Bytes()
+	// The count must not already be refused by Len for exceeding the remaining
+	// bytes, or the test would pass without ever reaching the hint.
+	if len(frame) < hostile {
+		t.Fatalf("fixture: the frame is %d bytes, shorter than the %d-byte count, so Len refuses it before the hint", len(frame), hostile)
+	}
+	dense := types.NewEncoder()
+	dense.Len(hostile)
+	dense.Raw(make([]byte, hostile)) // `hostile` minimal elements really present: the 1M-iteration shape
+	denseFrame := dense.Bytes()
+
+	for _, tc := range []struct {
+		name  string
+		frame []byte
+	}{
+		{"count with no elements behind it", frame},
+		{"count with minimal elements behind it", denseFrame},
+	} {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		out := decodeVotes(tc.frame)
+		runtime.ReadMemStats(&after)
+		grown := after.TotalAlloc - before.TotalAlloc
+		t.Logf("%s: hostile count %d over a %d-byte justification allocated %d B (%.1fx)", tc.name, hostile, len(tc.frame), grown, float64(grown)/float64(len(tc.frame)))
+		if out != nil {
+			t.Errorf("%s: a justification whose count runs past the frame must decode to nil (got %d elements)", tc.name, len(out))
+		}
+		if grown > uint64(len(tc.frame))/2 {
+			t.Errorf("%s: a %d-byte justification with a hostile count allocated %d B before failing: the count must be capped by the MINIMUM ELEMENT SIZE, not trusted (want at most %d B; pre-fix it was ~24x)",
+				tc.name, len(tc.frame), grown, len(tc.frame)/2)
+		}
+	}
+
+	// Non-vacuity: a justification whose count the frame really can hold still
+	// decodes, so the cap refuses impossible counts, not large ones.
+	pub, priv := testKey(t)
+	var id [32]byte
+	id[0] = 0x5a
+	real := func(h uint64) *Vote {
+		v := &Vote{Type: MsgPrevote, Height: h, Round: 0, BlockID: id, Validator: pub}
+		s := v.SigningHash()
+		v.Sig = crypto.Sign(priv, s[:])
+		return v
+	}
+	if got := decodeVotes(encodeJustification([]*Vote{real(1), real(2)})); len(got) != 2 {
+		t.Fatalf("a two-vote justification decoded to %d votes; the count cap must not refuse frames the bytes can hold", len(got))
 	}
 }

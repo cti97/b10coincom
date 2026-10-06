@@ -627,6 +627,13 @@ func (c *Chain) Append(b *types.Block) error {
 	// step, and the old file (a superset) survives a failed rewrite. A commit
 	// must not be reported as failed because a rewrite could not happen.
 	_ = c.store.PruneLocks(b.Header.Height)
+	// The round log's round belongs to the SAME never-again heights: the round
+	// persisted for head+1 (see Chain.PutRound) becomes unreadable the moment
+	// head+1 is committed, because the next engine this node builds judges the
+	// new head+1. Prune it on exactly the lock log's rule and with the same
+	// dropped error (review F3): without this the log grows one frame per
+	// round entered, forever, with no prune path at all.
+	_ = c.store.PruneRounds(b.Header.Height)
 	return nil
 }
 

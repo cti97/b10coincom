@@ -186,8 +186,17 @@ type Store struct {
 	// roundFile is the append handle on the round log; rounds maps a height
 	// to the NEWEST round recorded for it (audit C-3). Like a lock, a round
 	// is recorded for a height that has not been appended yet.
-	roundFile *os.File
-	rounds    map[uint64]uint32
+	//
+	// roundRecords is how many framed records the log PHYSICALLY holds, one per
+	// PutRound ever, while rounds holds one entry per height. The difference is
+	// the stale growth the lock log's C-13 fix names, recreated here by the
+	// round log: one 28-byte frame PER ROUND ENTERED (audit review F3, measured
+	// 5600 bytes for 200 entries at one height), and one map entry per height
+	// forever. PruneRounds deletes the below-head entries and rewrites the log
+	// when enough stale frames have accumulated, exactly as PruneLocks does.
+	roundFile    *os.File
+	rounds       map[uint64]uint32
+	roundRecords int
 
 	// certFile is the append-and-read handle on the commit-certificate log
 	// (audit C-7); certIndex maps a height to the offset of its record in
@@ -288,6 +297,11 @@ func Open(dir string) (*Store, error) {
 	// from opening its own data directory.
 	if s.have {
 		_ = s.PruneLocks(s.last)
+		// The round log carries the identical stale growth (review F3): one
+		// frame per round ENTERED, and one map entry per height forever. Bound
+		// both the same way and with the same ignored error - a failed
+		// maintenance rewrite leaves the old log intact and complete.
+		_ = s.PruneRounds(s.last)
 	}
 	return s, nil
 }
@@ -882,6 +896,7 @@ func (s *Store) scanRounds() error {
 		// Newest wins: the round only ever advances at a height, so the last
 		// frame is the position that stands.
 		s.rounds[rec.Height] = rec.Round
+		s.roundRecords++
 		off = recEnd
 	}
 	return nil
@@ -1228,6 +1243,13 @@ func decodeRoundRecord(payload []byte) (RoundRecord, error) {
 // previous round intact and a restart resumes from the furthest round whose
 // record reached disk. Round heights are NOT required to be appended block
 // heights: the round belongs to the height being judged, head+1.
+//
+// The log is PRUNED, not unbounded (review F3): one frame per round entered is
+// the same stale growth C-13 fixed in the lock log, and PruneRounds keeps only
+// the rounds the chain can still read. What the prune MUST NOT break is the
+// restart-resume property above: Driver.newEngine reads RoundAt for head+1
+// alone, and PruneRounds deletes strictly BELOW the committed head, so head+1's
+// record - the only one a restart reads back - always survives.
 func (s *Store) PutRound(rec RoundRecord) error {
 	payload := encodeRoundRecord(rec)
 	off, err := s.roundFile.Seek(0, io.SeekEnd)
@@ -1241,6 +1263,7 @@ func (s *Store) PutRound(rec RoundRecord) error {
 		return err
 	}
 	s.rounds[rec.Height] = rec.Round
+	s.roundRecords++
 	return nil
 }
 
@@ -1251,6 +1274,143 @@ func (s *Store) PutRound(rec RoundRecord) error {
 func (s *Store) RoundAt(height uint64) (uint32, bool) {
 	r, ok := s.rounds[height]
 	return r, ok
+}
+
+// roundCompactThreshold is how many records the round log may hold beyond the
+// rounds that still stand before PruneRounds rewrites it (review F3). It is the
+// lock log's number, for the lock log's reason: a rewrite costs a file create, a
+// full re-encode, two fsyncs and a rename, so it is batched rather than paid per
+// round entered. The steady state is the live rounds (head and head+1) plus at
+// most this many stale frames, instead of one 28-byte frame per round PER HEIGHT
+// forever (measured: 5600 bytes for 200 entries at a single height).
+const roundCompactThreshold = 256
+
+// PruneRounds drops the round-log records for every height strictly below the
+// committed head (review F3), the round log's half of PruneLocks. The in-memory
+// entries go always; the on-disk log is rewritten once enough stale frames have
+// accumulated to be worth it.
+//
+// SAFETY, stated because this DELETES state a restart reads. A round record for
+// height h is read in exactly one place - Driver.newEngine's restoreRound - and
+// only for the height the engine is about to judge, which is always head+1
+// (Driver calls newEngine(ch.Height()+1, ...)). Once Append has made head >= h
+// durable, no engine will ever be built for h again: the chain has no reorg,
+// Append only extends head+1, and a round at h could only matter on a path that
+// re-judged h. So a record below the head is unreachable by construction, and
+// dropping it cannot make a restart resume at the wrong round. The records that
+// CAN be read - head (needlessly kept) and head+1 (the one that matters, never
+// below the head) - are kept. Compaction is atomic in the same way locks'
+// compaction is: the kept set is written to a temporary file, fsynced and
+// renamed over the log, so a crash leaves either the old log (a superset) or the
+// new one, and both contain the round head+1 could need. A failure is returned
+// but is not a safety event: the old file still holds every record, and the
+// caller (Chain.Append) deliberately ignores it so a storage-maintenance
+// failure cannot park consensus.
+func (s *Store) PruneRounds(below uint64) error {
+	s.pruneRoundMap(below)
+	// Compact when stale frames - records that are not the newest for their
+	// height, or whose height was just dropped - have piled up. In the common
+	// case the map holds the head and head+1 records and the log holds a
+	// handful more, so this is a no-op.
+	if s.roundRecords <= len(s.rounds)+roundCompactThreshold {
+		return nil
+	}
+	return s.compactRounds()
+}
+
+// pruneRoundMap deletes every in-memory round for a height strictly below the
+// committed head, for the reason pruneLockMap gives: the chain has left those
+// heights for good, and Driver.newEngine restores the round for head+1 alone.
+// Keeping the head's own record (h == below) is deliberate headroom, not a need.
+func (s *Store) pruneRoundMap(below uint64) {
+	for h := range s.rounds {
+		if h < below {
+			delete(s.rounds, h)
+		}
+	}
+}
+
+// compactRounds rewrites the round log to exactly the rounds currently in
+// s.rounds (one newest record per live height), atomically. The temporary file
+// becomes the store's append handle after the rename, so there is no window in
+// which the renamed log has no valid handle; see PruneRounds for the safety
+// argument.
+func (s *Store) compactRounds() error {
+	kept := make([]RoundRecord, 0, len(s.rounds))
+	for h, r := range s.rounds {
+		kept = append(kept, RoundRecord{Height: h, Round: r})
+	}
+	// Ascending height, for a deterministic file, exactly as compactLocks does:
+	// the newest-per-height map has one record per height, so order cannot
+	// change which round wins, but a stable order keeps a rewritten log
+	// byte-reproducible.
+	slices.SortFunc(kept, func(a, b RoundRecord) int {
+		switch {
+		case a.Height < b.Height:
+			return -1
+		case a.Height > b.Height:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	// Reclaim temporary files a crash between CreateTemp and Rename may have
+	// left; Open ignores them (neither roundLogName nor a .seg), but they would
+	// accumulate one per interrupted compaction. Compaction is serialised by the
+	// chain's write lock, so no other live writer owns one of these names.
+	if stale, _ := filepath.Glob(filepath.Join(s.dir, roundLogName+".compact-*")); len(stale) > 0 {
+		for _, p := range stale {
+			_ = os.Remove(p)
+		}
+	}
+
+	tmp, err := os.CreateTemp(s.dir, roundLogName+".compact-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// CreateTemp makes the file 0600; the log has always been 0644, so keep
+	// that mode across the rewrite.
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	for _, rec := range kept {
+		if err := writeRecord(tmp, encodeRoundRecord(rec)); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+			return err
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	old := s.roundFile
+	oldRecords := s.roundRecords
+	s.roundFile = tmp
+	s.roundRecords = len(kept)
+	if err := os.Rename(tmpName, filepath.Join(s.dir, roundLogName)); err != nil {
+		// Nothing was renamed: restore the handle and record count, and drop
+		// the temporary file. The old log is untouched and complete.
+		s.roundFile = old
+		s.roundRecords = oldRecords
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// The rename committed. Make it durable (audit S-15), for the lock log's
+	// reason: without the directory fsync a crash could leave the old log's
+	// entry in place even though the new one was renamed over it.
+	syncDir(s.dir)
+	// The old handle still names the unlinked inode; a Close failure there
+	// cannot affect the new log, so it is not reported.
+	_ = old.Close()
+	return nil
 }
 
 // Close releases every handle - the block segment, the lock log, the round log

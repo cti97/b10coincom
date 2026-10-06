@@ -202,3 +202,124 @@ func TestCommittedBlockFindsEveryRetainedCopy(t *testing.T) {
 		t.Fatal("committedBlock returned a block whose ID is not the committed one")
 	}
 }
+
+// Committing a round AHEAD of the engine's own adopts that round, and the
+// adopted round's own proposal must still be acceptable. The stale-proposal
+// clearing in commitAt is what makes that true, and it was UNPINNED: deleting
+// it survived the whole package. This test CONSTRUCTS the state it guards,
+// with no race and no buffer: a round-0 proposal is accepted while the engine
+// holds nothing (so e.proposal names round 0's block), a precommit quorum for a
+// DIFFERENT block completes in round 1 - ahead of the engine - and only then is
+// round 1's own proposal delivered. With the clearing, "first proposal wins"
+// sees an empty e.proposal and accepts it; with the mutant, the stale round-0
+// proposal refuses it, committedBlock finds no bytes for the committed ID, and
+// the driver appends nothing.
+func TestAQuorumAheadClearsAStaleProposalAndStillAppends(t *testing.T) {
+	vals := make([]genesis.Validator, 0, 4)
+	for i := 0; i < 4; i++ {
+		vals = append(vals, testValidator(i, 1))
+	}
+	g := genesis.Devnet()
+	g.Validators = vals
+	g.Params.CommitteeSize = 4
+
+	ch, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	parent := ch.Head().ID()
+	cfg := Config{Committee: g.Validators, TimeoutBase: roundBase, TimeoutStep: roundStep, PowerCapNum: 1, PowerCapDen: 4}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// The engine's own seat is the ROUND-1 proposer, so the driver can build the
+	// adopted round's block itself; round 0's proposer is a different seat.
+	idxY := cfg.IndexOf(cfg.Proposer(1, 1, parent))
+	idxX := cfg.IndexOf(cfg.Proposer(1, 0, parent))
+	if idxX < 0 || idxY < 0 || idxX == idxY {
+		t.Fatalf("fixture: need distinct round-0 and round-1 proposers, got %d and %d", idxX, idxY)
+	}
+
+	net := sim.New(sim.Options{Seed: 1, Latency: 1})
+	net.AddPeer(fmt.Sprintf("v%d", idxY))
+	rec := &recordingTransport{Transport: net.TransportFor(fmt.Sprintf("v%d", idxY))}
+	d := mustDriver(t, cfg, ch, testCommitteeKey(idxY), rec, nil)
+
+	// Round 0's block, built and signed by round 0's proposer, is accepted while
+	// the engine holds no lock: e.proposal names round 0's block from now on.
+	blkX, err := ch.Build(testCommitteeKey(idxX), nil, ch.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatalf("building round 0's block: %v", err)
+	}
+	idX := blkX.ID()
+	envX := &Proposal{Height: 1, Round: 0, Block: *blkX, ValidRound: -1, Validator: cfg.Proposer(1, 0, parent)}
+	envX.Sig = signProposal(t, cfg, envX)
+	if err := d.eng.onProposal(envX); err != nil {
+		t.Fatalf("the round-0 proposal was refused: %v", err)
+	}
+	if d.eng.proposal == nil || d.eng.proposal.ID() != idX {
+		t.Fatal("fixture: the round-0 proposal was not accepted into e.proposal")
+	}
+
+	// Round 1's block is a DIFFERENT block at the same height (it is signed by
+	// round 1's proposer, so its ID differs). Three seats precommit it in round
+	// 1 - a quorum for a round AHEAD of the engine's round 0.
+	blkY, err := d.eng.propose(1, 1, parent)
+	if err != nil {
+		t.Fatalf("the fixture could not build the round-1 block: %v", err)
+	}
+	idY := blkY.ID()
+	if idY == idX {
+		t.Fatal("fixture: the two rounds' blocks must be different blocks at height 1")
+	}
+	for i := 0; i < 4; i++ {
+		if i == idxY {
+			continue // three of four is a quorum
+		}
+		v := &Vote{Type: MsgPrecommit, Height: 1, Round: 1, BlockID: idY, Validator: testValidator(i, 1).PubKey}
+		h := v.SigningHash()
+		v.Sig = crypto.Sign(testCommitteeKey(i), h[:])
+		if err := d.eng.onVote(v); err != nil {
+			t.Fatalf("the round-1 precommit from seat %d was refused: %v", i, err)
+		}
+	}
+	if cid, ok := d.eng.Committed(); !ok || cid != idY {
+		t.Fatalf("the round-1 quorum did not commit the block: committed=%v", ok)
+	}
+	if d.eng.Round() != 1 {
+		t.Fatalf("the engine did not adopt the decided round (at %d, want 1)", d.eng.Round())
+	}
+
+	// Round 1's own proposal arrives. Only a cleared e.proposal lets it in.
+	envY := &Proposal{Height: 1, Round: 1, Block: blkY, ValidRound: -1, Validator: cfg.Proposer(1, 1, parent)}
+	envY.Sig = signProposal(t, cfg, envY)
+	if err := d.eng.onProposal(envY); err != nil {
+		t.Fatalf("the adopted round's proposal was refused: %v", err)
+	}
+	if d.eng.proposal == nil || d.eng.proposal.ID() != idY {
+		held := "none"
+		if d.eng.proposal != nil {
+			heldID := d.eng.proposal.ID()
+			held = fmt.Sprintf("%x", heldID[:8])
+		}
+		t.Fatalf("the adopted round's own proposal did not become e.proposal (held %s, want %x): the stale round-0 proposal was not cleared on adopting round 1, so \"first proposal wins\" strands the committed height", held, idY[:8])
+	}
+
+	// The driver must append it: the chain advances and holds the very block the
+	// quorum committed. With the mutant, committedBlock returns nil and the
+	// height parks in StepCommit forever.
+	d.flush()
+	if ch.Height() != 1 {
+		t.Fatalf("the committed height never appended: chain height %d, want 1 (a stale proposal parked a quorum ahead)", ch.Height())
+	}
+	got, err := ch.BlockAt(1)
+	if err != nil {
+		t.Fatalf("reading the appended block: %v", err)
+	}
+	if got.ID() != idY {
+		gotID := got.ID()
+		t.Fatalf("appended %x, want the committed %x", gotID[:8], idY[:8])
+	}
+}

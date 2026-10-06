@@ -458,6 +458,52 @@ func TestRunMultiRejectsImpossibleOptions(t *testing.T) {
 	}
 }
 
+// RunMulti must REFUSE a --dir that already holds a chain, exactly as Run does
+// (audit O-10, and the false PASS this test pins). README.md documents --dir
+// for the multi-validator form, so the second of two runs into one directory
+// is a documented usage, and before the guard it was a documented LIE:
+//
+//	devnet --validators 4 --blocks 5 --dir D   # D now at height 5
+//	devnet --validators 4 --blocks 3 --dir D   # prints OK, exit 0, heights v0=5..v3=5
+//
+// The second run produced ZERO blocks. runUntil's success condition is "every
+// waited validator is at or above the target" (simnet.runUntil ->
+// waitedAtLeast), so with all four chains already at height 5 the run returned
+// at step 0, before any tick, and reported the STALE heights as a completed
+// three-block run. The run block is the mutant killer: deleting the per-
+// validator height guard in RunMulti lets the second call return a nil error
+// and this test fails with "reported success", which is the exact false PASS
+// the guard exists to make impossible.
+func TestRunMultiRefusesADataDirectoryThatAlreadyHoldsAChain(t *testing.T) {
+	dir := t.TempDir()
+	first, err := RunMulti(Options{Dir: dir, Blocks: 5, Validators: 4})
+	if err != nil {
+		t.Fatalf("the first run into a fresh directory must succeed: %v", err)
+	}
+	if first.Height != 5 {
+		t.Fatalf("fixture: the first run left the committee at height %d, want 5", first.Height)
+	}
+
+	// The documented second run: a SHORTER target against the SAME directory.
+	// Its heights are already past the target, so the harness cannot tell the
+	// difference between "reached 3 of 3 blocks" and "was already at 5".
+	second, err := RunMulti(Options{Dir: dir, Blocks: 3, Validators: 4})
+	if err == nil {
+		t.Fatalf("a second multi-validator run into a directory that already holds a chain reported success (heights %v, agreed=%v): it produced ZERO blocks and blessed a stale chain, which is precisely the false PASS the guard must refuse",
+			second.ValidatorHeights, second.Agreed)
+	}
+	if !strings.Contains(err.Error(), "already holds a chain") {
+		t.Fatalf("the refusal does not name the reason (a non-empty data directory): %v", err)
+	}
+	// The refusal must be a REFUSAL, not a partially-run committee: no chain
+	// may have advanced past where the first run left it.
+	for i := 0; i < 4; i++ {
+		if got := second.ValidatorHeights[i]; got != 0 && got != 5 {
+			t.Fatalf("the refused run reported validator %d at height %d: it neither refused cleanly nor left the chain alone", i, got)
+		}
+	}
+}
+
 // forkNet is the stand-in that lets the disagreement path be tested at all.
 // Honest simnet validators never disagree — one history is the safety property
 // the protocol guarantees — so there is no committee the real harness could

@@ -2409,3 +2409,97 @@ func TestNewDriverRefusesAKeyOutsideTheCommittee(t *testing.T) {
 		t.Fatal("NewDriver refused a committee seat")
 	}
 }
+
+// The jump bar must be the exact complement of the quorum (review F2). A
+// quorum-blocking set holds total - quorum + 1 power: leave that much in a
+// higher round and the remainder cannot reach quorum, so only a resync can
+// move this validator. For total = 3k that set is EXACTLY total/3, and the old
+// bar total/3 + 1 sat strictly above it, so on every multiple of three the
+// smallest set that could stall the committee could never trigger the
+// recovery. Totals 4, 5 and 7 were already complementary; 3 and 6 were not.
+//
+// This test is the boundary, at both multiples of three in the shipped range:
+//
+//   - total = 6: the blocking set is 2 seats. Two seats must now jump, and one
+//     seat must still not (bar 2 > one seat's power 1): the one-Byzantine
+//     property survives.
+//   - total = 3 (--validators 3: cap 1/1, quorum 3 = ALL): the blocking set is
+//     1 seat, and the bar must be 1 for the previously-dead case to jump. That
+//     necessarily lets one member force a jump, which is why it is stated here
+//     and in scripts/deploy/README.md: with quorum == total a single member's
+//     absence already blocks every quorum, so it holds full stall power
+//     whatever the bar is, and a higher bar would buy no protection at all:
+//     only an unrecoverable height.
+func TestJumpGateIsComplementaryToQuorumAtMultiplesOfThree(t *testing.T) {
+	parent := crypto.HashParts([]byte("parent"))
+	someID := crypto.HashParts([]byte("some-later-block"))
+
+	// --- total = 6: the previously-dead case, with the one-Byzantine property
+	// still intact because 2 > 1.
+	cfg := evenCommittee(t, 6, 1)
+	if total, quorum := cfg.TotalPower(), cfg.Quorum(); quorum != 5 || total != 6 {
+		t.Fatalf("fixture: total %d quorum %d, want total 6 quorum 5", total, quorum)
+	}
+	if blocking := cfg.TotalPower() - cfg.Quorum() + 1; blocking != 2 {
+		t.Fatalf("fixture: the quorum-blocking set is %d of 6, want 2", blocking)
+	}
+	h := round0ProposerHeight(t, cfg, 5, false, parent)
+
+	// One of six seats is below the bar: the ladder takes a single step. This
+	// is the property the higher bar existed for, kept.
+	e := newTestEngine(t, cfg, 5, h, parent)
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 0, MsgPrevote, h, 9, someID))); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 1 {
+		t.Fatalf("one of six seats moved the round to %d, want 1 (+1 step): a single Byzantine validator must not force a jump even at total %% 3 == 0", e.Round())
+	}
+
+	// Two seats hold 2 of 6 and quorum is 5, so the other four cannot make
+	// quorum without them: this is the smallest set that can stall the height
+	// and it MUST be able to resync. Pre-fix (bar 3) the engine sat at round 1.
+	e = newTestEngine(t, cfg, 5, h, parent)
+	for _, seat := range []int{0, 1} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, 9, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 9 {
+		t.Fatalf("a two-seat quorum-blocking set (2 of 6 power, quorum 5) did not move the round (at %d, want 9): the bar and the quorum are not complementary at total %% 3 == 0", e.Round())
+	}
+
+	// --- total = 3: the shipped three-seat shape, and the exactly-dead case.
+	cfg3 := wholeCommittee(t, 3)
+	if total, quorum := cfg3.TotalPower(), cfg3.Quorum(); quorum != total {
+		t.Fatalf("fixture: three equal seats have total %d quorum %d, want quorum == total", total, quorum)
+	}
+	h3 := round0ProposerHeight(t, cfg3, 2, false, parent)
+	e = newTestEngine(t, cfg3, 2, h3, parent)
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg3, 0, MsgPrevote, h3, 9, someID))); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h3, Round: e.Round()})
+	if e.Round() != 9 {
+		t.Fatalf("one seat of three ahead in round 9 did not resync the engine (at round %d, want 9): with quorum == total that seat's absence blocks every quorum, so the jump is the ONLY recovery - the old bar of 2 deadlocked the height, which is exactly the constructed stall review F2 names", e.Round())
+	}
+}
+
+// wholeCommittee builds an n-seat equal-power committee under the 1/1 power
+// cap, the shape internal/simnet.New uses for every committee below four seats
+// (a 1/4 cap is unsatisfiable there: the largest of n < 4 equal holders is at
+// least a third of total). It exists so a small-fixture test measures the same
+// committee the shipped --validators 3 shape runs.
+func wholeCommittee(t *testing.T, n int) Config {
+	t.Helper()
+	vals := make([]genesis.Validator, 0, n)
+	for i := 0; i < n; i++ {
+		vals = append(vals, testValidator(i, 1))
+	}
+	c := Config{Committee: vals, TimeoutBase: 1, TimeoutStep: 1, PowerCapNum: 1, PowerCapDen: 1}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("whole committee of %d rejected: %v", n, err)
+	}
+	return c
+}
