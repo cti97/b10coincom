@@ -473,21 +473,52 @@ func (d *Driver) Tick(nowMillis int64) {
 		// briefly delayed - and there one live seat holds 1 of the bar's 2, so
 		// the laggards step +1 forever and the height never decides.
 		//
-		// Nor can the cap be SOFTENED rather than removed. The escalation is an
-		// integer, so a schedule that is strictly increasing in the round must
-		// grow by at least one step per round - i.e. it must be at least this
-		// ladder. Any cap-shaped schedule (a smaller step past K, a logarithm,
-		// any sub-linear growth) has rounds r, r+1 with the SAME deadline, and
-		// that one flat step is the same absorbing state at that one round
-		// pair: engines sitting at r and r+1 would step in lockstep forever.
-		// Demanding that no round pair can be trapped therefore forces the
-		// ladder to be linear, and the choice is forced rather than tuned.
+		// Nor can the cap be SOFTENED by any BOUNDED monotone schedule. A
+		// bounded schedule is flat past its bound, and there every engine
+		// leaves exactly one round per timeout, so the gap is invariant - the
+		// same absorbing state, reached at the bound instead of at
+		// min(round, K). That was MEASURED on the exact dynamics rather than
+		// argued: a bounded monotone schedule (the old min(round,16) cap, and
+		// a bounded soft cap) NEVER closed any gap tested, across 2M-20M
+		// steps (the review-fixes-4 report's fourth review round, section 10).
 		//
-		// The cost is stated honestly rather than hidden: an undecided height
-		// now grows its rounds' cost without bound. But a height that CANNOT
-		// decide is not helped by a fixed cadence - it still never decides, at
-		// any cadence - while a height that CAN decide is exactly the one this
-		// asymmetry carries to a commit. That is the trade C-2 got backwards.
+		// What is NOT true is that a flat step ALONE traps the engine, and an
+		// earlier version of this comment said exactly that. It is false. An
+		// UNBOUNDED schedule may be sub-linear and still have flat steps
+		// between consecutive rounds: base + TimeoutStep*floor(sqrt(round)) is
+		// one, and the fourth review round ran that overlay against the
+		// recovery test and it PASSED (every live seat back in one round 420
+		// rounds after the lead's round 21, the height committed at step
+		// 7306). A flat step is a momentary zero-gain transition, not an
+		// absorbing state: the gap resumes closing at the next round where
+		// the cadence differs again. The real distinction is
+		// BOUNDED-versus-UNBOUNDED monotone growth, not linear-versus-flat.
+		//
+		// The linear ladder is kept because it is the FASTEST closer - the
+		// choice is made for recovery latency, not forced by an
+		// impossibility. At production defaults (base 200ms, step 100ms) a
+		// gap-5 divergence recovers in 8.2 min linear versus 29.1 min with
+		// floor(sqrt(round)), and a gap-100 divergence closes in 26 days
+		// linear but does not close at all with floor(sqrt(round)). The
+		// unbounded growth of an undecided height's round cost is the
+		// accepted price of that choice.
+		//
+		// The cost is stated honestly rather than hidden. An undecided height
+		// now grows its rounds' cost without bound: at production defaults
+		// (base 200ms, step 100ms) round 16 costs 1.8s, round 100 costs
+		// 10.2s, round 1000 costs 100.2s and round 10000 costs about 16.7
+		// min; a round divergence of gap g recovers in finite time that grows
+		// with g - gap 1 in 2s, gap 3 in 150s, gap 5 in 490s (8.2 min), gap
+		// 10 in 42 min, gap 50 in 2.6 days, gap 100 in 26 days. OPERATIONAL
+		// CONSEQUENCE, and an operator must know it: on three Raspberry Pis,
+		// a long outage that leaves one live seat a single round ahead can
+		// hold the chain effectively down for many minutes, and a deep
+		// divergence for days. Removing the cap converts a PERMANENT park
+		// into a FINITE one; it does not restore a 60-second recovery margin.
+		// But a height that CANNOT decide is not helped by a fixed cadence -
+		// it still never decides, at any cadence - while a height that CAN
+		// decide is exactly the one this asymmetry carries to a commit. That
+		// is the trade C-2 got backwards.
 		d.timeoutAt = d.now + d.cfg.TimeoutBase + int64(d.eng.Round())*d.cfg.TimeoutStep
 	}
 	d.flush()

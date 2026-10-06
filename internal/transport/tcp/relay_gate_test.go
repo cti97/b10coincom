@@ -2,12 +2,14 @@ package tcp
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,7 +65,7 @@ func TestTheSharedRelayLinkIsNotShedByThePerConnectionBucket(t *testing.T) {
 	})
 
 	addr := "relay.example.net:7001"
-	c, err := tp.install(server, addr, true, RelayPeerName(addr))
+	c, err := tp.install(server, addr, true, true, RelayPeerName(addr))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,14 +137,14 @@ func TestADirectFlooderIsStillShedSoItCannotDelayHonestDispatch(t *testing.T) {
 	defer floodCli.Close()
 	honestSrv, honestCli := net.Pipe()
 	defer honestCli.Close()
-	fl, err := tp.install(floodSrv, "flooder", true, "flooder")
+	fl, err := tp.install(floodSrv, "flooder", true, false, "flooder")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fl.relayMode {
 		t.Fatal("a direct connection was marked relay-mode: the exemption is not restricted to the shared relay link")
 	}
-	if _, err := tp.install(honestSrv, "honest", true, "honest"); err != nil {
+	if _, err := tp.install(honestSrv, "honest", true, false, "honest"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -178,6 +180,109 @@ func TestADirectFlooderIsStillShedSoItCannotDelayHonestDispatch(t *testing.T) {
 	}
 	if dispatched > 8 {
 		t.Fatalf("a direct flooder got %d of 50 frames through the dispatch callback (burst 4); the bound is what keeps an honest peer's frame from queuing behind the flood", dispatched)
+	}
+}
+
+// TestADialedDirectPeerMayNotWearTheRelayName pins the hole the fourth review
+// round found in item 1's own fix. relayMode was derived from the
+// PEER-SUPPLIED identity (`dialled && strings.HasPrefix(id, "relay:")`), and
+// the reserved-name refusal applied only to !dialled - so a peer this node
+// DIALED (or a plaintext-TCP MITM at a dialed address) could announce
+// "relay:<anything>" and have its DIRECT connection exempted from the rate
+// bucket (reader). The bucket exists so one direct flooder cannot delay honest
+// dispatch; a name a peer chooses must not switch it off.
+//
+// The state is CONSTRUCTED, not raced: a real listener answers this
+// transport's hello with the reserved name, so the dial's adopt path reads it
+// exactly as production would. On the pre-fix code the connection installs
+// (relayMode true, bucket skipped) and the 50-frame flood below is fully
+// dispatched; with the fix the reserved name is refused on a DIALED direct
+// connection too (ErrReservedPeerName) and no connection exists. A genuine
+// relay connection is still exempt and a direct one still is not - those are
+// pinned by TestTheSharedRelayLinkIsNotShedByThePerConnectionBucket and
+// TestADirectFlooderIsStillShedSoItCannotDelayHonestDispatch.
+func TestADialedDirectPeerMayNotWearTheRelayName(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	relayName := RelayPeerName("evil.example:7001")
+	type accepted struct{ nc net.Conn }
+	acceptedCh := make(chan accepted, 16)
+	go func() {
+		for {
+			nc, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(nc net.Conn) {
+				// Both ends write before reading: consume this transport's
+				// hello, then answer with the reserved name.
+				if _, err := wire.ReadFrame(nc, maxHandshakeIDBytes); err != nil {
+					_ = nc.Close()
+					return
+				}
+				if err := wire.WriteFrame(nc, []byte(relayName)); err != nil {
+					_ = nc.Close()
+					return
+				}
+				select {
+				case acceptedCh <- accepted{nc: nc}:
+				default:
+				}
+			}(nc)
+		}
+	}()
+
+	tp, err := New(Options{
+		LocalID: "validator", RateLimitPerSec: 1, RateLimitBurst: 4,
+		IdleReadTimeout: time.Hour, WriteTimeout: time.Second,
+		DialTimeout: time.Second, HandshakeTimeout: time.Second,
+		BackoffBase: 20 * time.Millisecond, BackoffMax: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tp.Close()
+
+	var dispatched atomic.Uint64
+	tp.OnMessage(func(transport.Message) { dispatched.Add(1) })
+
+	err = tp.Dial(ln.Addr().String())
+	if err == nil {
+		// The pre-fix state: a dialed DIRECT connection installed under the
+		// name the peer chose. Show the consequence, not just the name.
+		tp.mu.Lock()
+		c := tp.conns[relayName]
+		tp.mu.Unlock()
+		if c != nil && c.relayMode {
+			select {
+			case acc := <-acceptedCh:
+				for i := 0; i < 50; i++ {
+					if werr := wire.WriteFrame(acc.nc, []byte{0xCC}); werr != nil {
+						break
+					}
+				}
+				waitFor(t, "the flood to settle", 5*time.Second, func() bool {
+					return dispatched.Load()+c.rateLimited.Load() >= 50
+				})
+			case <-time.After(5 * time.Second):
+			}
+			t.Fatalf("a dialed direct peer announcing %q was installed relayMode=true: %d frames dispatched and %d shed - the rate bucket was bypassed on a DIRECT link by a peer-chosen name",
+				relayName, dispatched.Load(), c.rateLimited.Load())
+		}
+		t.Fatalf("a dialed direct peer announcing the reserved name %q was installed instead of refused (conn %v, relayMode %v)", relayName, c, c != nil && c.relayMode)
+	}
+	if !errors.Is(err, ErrReservedPeerName) {
+		t.Fatalf("a dialed direct peer announcing the reserved name %q was refused with %v, want ErrReservedPeerName", relayName, err)
+	}
+	tp.mu.Lock()
+	_, installed := tp.conns[relayName]
+	tp.mu.Unlock()
+	if installed {
+		t.Fatalf("a refused dialed connection still holds the registry name %q", relayName)
 	}
 }
 

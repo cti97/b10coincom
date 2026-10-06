@@ -185,12 +185,18 @@ func TestALoneLiveSeatAheadPastTheRoundWindowRecoversByTheCadenceAsymmetry(t *te
 }
 
 // The ladder's asymmetry is the whole mechanism above, so it must not be
-// possible to trap a round pair inside a flat cadence: from every round the
-// next round's deadline is STRICTLY longer. This is the property audit C-2's
-// saturation removed, stated as the thing that must hold at every round rather
-// than only below a cap - and it is what makes the fix forced instead of tuned,
-// because an integer schedule that has no flat step anywhere cannot be capped
-// or sub-linear at all.
+// possible to SATURATE it: past the old cap the deadline must keep growing, or
+// the catch-up asymmetry is gone from that round on. This test also pins the
+// exact linear schedule (base + round*step), which is the FASTEST closer and
+// therefore the design choice.
+//
+// The strictly-increasing-at-every-round assertion is that choice stated
+// concretely. It is NOT a claim that a flat step traps the engine - an
+// UNBOUNDED sub-linear ladder (base + step*floor(sqrt(round))) also closes a
+// gap, just more slowly, and the fourth review round ran exactly that overlay
+// against the recovery test and it passed. What is genuinely absorbing is
+// BOUNDED growth, which is flat past its bound forever. See driver.go's Tick
+// comment and the review-fixes-4 report's section 10.
 //
 // The fixture is the blocked-quorum pair (quorum 2, one live validator): the
 // height can never commit, so the ladder rides out on its own, and the ghost
@@ -214,8 +220,8 @@ func TestRoundTimeoutsNeverSaturateSoTheLadderAlwaysClosesAGap(t *testing.T) {
 				r, r, delta, want)
 		}
 		if r > 0 && delta <= prev {
-			t.Fatalf("round %d's deadline %d is not STRICTLY longer than round %d's %d: the cadence has a flat step, so an engine at round %d can never gain on an engine at round %d, and a committee that diverged across that pair stays diverged for good",
-				r, delta, r-1, prev, r-1, r)
+			t.Fatalf("round %d's deadline %d is not STRICTLY longer than round %d's %d: the ladder has fallen off the design's strictly-increasing linear schedule, so its catch-up latency is not the one the recovery analysis measured (a BOUNDED schedule is what genuinely traps a gap; a sub-linear unbounded one merely closes it more slowly)",
+				r, delta, r-1, prev)
 		}
 		prev = delta
 		now = d.timeoutAt

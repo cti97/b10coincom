@@ -2036,7 +2036,7 @@ func TestAPeerThatStopsReadingIsCutOffByTheWriteDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	c, err := a.install(server, "pipe-peer", true, "pipe-peer")
+	c, err := a.install(server, "pipe-peer", true, false, "pipe-peer")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2104,7 +2104,7 @@ func TestTheReaderShedsFramesOverThePerConnectionRateLimit(t *testing.T) {
 	}
 	defer a.Close()
 	a.OnMessage(func(transport.Message) { got.Add(1) })
-	c, err := a.install(server, "pipe-peer", true, "pipe-peer")
+	c, err := a.install(server, "pipe-peer", true, false, "pipe-peer")
 	if err != nil {
 		t.Fatal(err)
 	}

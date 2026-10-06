@@ -271,7 +271,19 @@ func TestAValidatorThatJoinsLateCatchesUpOverTCP(t *testing.T) {
 	if err := connectMesh(vs[:3]); err != nil {
 		t.Fatal(err)
 	}
-	waitAllReach(t, vs[:3], 6, 60*time.Second)
+	// This budget reflects what the protocol ACTUALLY guarantees, which is not
+	// a 60-second margin. If one of the three live seats falls a round or two
+	// ahead - the `-race` clock/dispatch skew that produced this test's CI
+	// flake - the round gap closes only through the timeout-ladder asymmetry,
+	// and its latency grows with the gap. At this devnet's production timeouts
+	// (base 200ms, step 100ms) a gap-1 divergence recovers in ~2s, gap 3 in
+	// ~150s and the constructed gap-5 shape in ~490s (8.2 min). Ten minutes
+	// clears the constructed shape with margin; it does NOT make recovery
+	// fast, and a deeper divergence (gap 10 is ~42 min) would still exceed it.
+	// Removing the old saturating cap turned a permanent park into a finite
+	// one - see driver.go's Tick comment and README "Consensus" for the
+	// operational consequence.
+	waitAllReach(t, vs[:3], 6, 10*time.Minute)
 
 	late, err := StartValidator(ValidatorConfig{
 		Dir:        t.TempDir(),

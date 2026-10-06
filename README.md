@@ -562,6 +562,24 @@ by `(height, round, parent hash)`, so every validator computes the same
 proposer without communication; a round that produces no decision times out
 into the next round, with slightly longer timeouts.
 
+**The timeout ladder is unbounded, and an operator should understand the
+cost.** A round that cannot decide is given `base + round × step` — one step
+longer per round, with no cap. Removing the cap is what lets a *round
+divergence* close at all: a capped ladder is flat past the cap, so every
+validator leaves one round per timeout and the gap between two validators'
+rounds becomes invariant — a permanent park, not merely a slow recovery. The
+price is that recovery scales with how far apart the live rounds are. At the
+default 200 ms base and 100 ms step, a one-round gap closes in about 2 s,
+three rounds in about 150 s and five rounds in about 8 min (ten rounds is
+about 42 min; a hundred, about 26 days). On three Raspberry Pis, then, a long
+outage that leaves one live seat a round ahead can hold the chain effectively
+down for many minutes, and a deep divergence for days — this is a **liveness**
+limit worth knowing, not a safety one (two conflicting blocks still cannot
+commit at one height, and a validator that has fallen behind in *height*
+rather than in round still catches up through BLOCK_SYNC). The measured
+numbers and the choice of the linear ladder over the slower sub-linear
+alternatives are recorded in `internal/consensus/driver.go`.
+
 Three rules carry the safety, and all three are about the arithmetic of
 distrust:
 
@@ -793,6 +811,12 @@ The full recipe — three Pis on separate home networks plus one relay VPS,
 build → copy → shared genesis → first contact → systemd units → what output
 means success, then the three likeliest failures and how to tell them apart —
 lives in [`scripts/deploy/README.md`](scripts/deploy/README.md).
+
+One operational limit to know before the Pi run: the timeout ladder is
+unbounded, so an outage that leaves one live seat a round ahead can hold the
+chain effectively down for minutes (or, for a deep divergence, days) while the
+round gap closes. It is a liveness limit, not a safety one — see
+[Consensus](#consensus).
 
 After the Pis are running, the acceptance run itself becomes one command:
 
