@@ -153,7 +153,12 @@ func (n *Net) Heal() {
 // messages is due, in the same order, as a loop that held the lock throughout
 // would choose.
 func (n *Net) Advance(d time.Duration) {
+	// Read the clock under the lock (audit O-11): n.now is written under mu
+	// below, and reading it outside would be a data race with a concurrent
+	// Advance or a Send.
+	n.mu.Lock()
 	target := n.now + d
+	n.mu.Unlock()
 	for {
 		n.mu.Lock()
 		next := -1

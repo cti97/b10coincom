@@ -1020,3 +1020,143 @@ func TestValidateNextAcceptsExactlyWhatAppendAccepts(t *testing.T) {
 		})
 	}
 }
+
+// Audit O-6: Build must return an error, not panic, for a proposer key that
+// cannot be used. ed25519.PrivateKey.Public() indexes the key and panics on a
+// short one, so a nil wiring bug used to crash the node.
+func TestBuildRefusesANilProposerInsteadOfPanicking(t *testing.T) {
+	c, _ := devChain(t)
+	for _, key := range []ed25519.PrivateKey{nil, {}} {
+		if _, err := c.Build(key, nil, 1_700_000_100); !errors.Is(err, ErrUnknownProposer) {
+			t.Fatalf("Build with a %d-byte proposer gave %v, want ErrUnknownProposer", len(key), err)
+		}
+	}
+}
+
+// Audit O-5: a data directory belongs to one genesis. Opening it with another
+// must be reported as a genesis mismatch BEFORE any block is replayed, not as
+// an opaque "replay diverged" after the fact.
+func TestOpenRefusesADifferentGenesisUpFront(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	_, priv := devKey()
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Append(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if c2, err := Open(genesis.Testnet(), dir); err == nil {
+		_ = c2.Close()
+		t.Fatal("opening a devnet directory with the testnet genesis must fail")
+	} else if !errors.Is(err, ErrWrongGenesis) {
+		t.Fatalf("wrong genesis reported as %v, want ErrWrongGenesis", err)
+	} else if errors.Is(err, ErrGenesisReplay) {
+		t.Fatal("a wrong genesis must not be reported as a replay divergence")
+	}
+}
+
+// Audit S-14 evidence: a stray/duplicated segment does NOT silently renumber
+// the chain. The store numbers heights by record count, but replay refuses a
+// stored block whose own header does not claim its position, so the extra
+// copy fails Open instead of shifting every later height.
+func TestOpenRefusesADuplicatedSegment(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	_, priv := devKey()
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := 1; h <= 3; h++ {
+		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stray copy sorted AFTER the real segment: its three records are
+	// re-indexed as heights 4..6 while still claiming heights 1..3.
+	if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%08d.seg", 1)), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c2, err := Open(g, dir); err == nil {
+		_ = c2.Close()
+		t.Fatal("a duplicated segment silently renumbered the chain")
+	} else if !errors.Is(err, ErrGenesisReplay) {
+		t.Fatalf("a duplicated segment reported as %v, want ErrGenesisReplay", err)
+	}
+}
+
+// Audit O-8: /status reads the head height, ID and root from one critical
+// section. The invariant is checked while blocks are appended concurrently:
+// every snapshot's ID and root must belong to a real block at that height.
+// The outcome does not depend on interleaving, so it cannot flake.
+func TestHeadSnapshotIsConsistentUnderAppends(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, priv := devKey()
+
+	stop := make(chan struct{})
+	checked := make(chan struct{})
+	go func() {
+		defer close(checked)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			height, id, stateRoot := c.HeadSnapshot()
+			blk, err := c.BlockAt(height)
+			if err != nil {
+				t.Errorf("BlockAt(%d) after HeadSnapshot: %v", height, err)
+				return
+			}
+			if got := blk.ID(); got != id {
+				t.Errorf("head snapshot height %d: ID %x does not match the block at that height (%x)", height, id[:8], got[:8])
+				return
+			}
+			if blk.Header.StateRoot != stateRoot {
+				t.Errorf("head snapshot height %d: state root %x does not match the block at that height", height, stateRoot[:8])
+				return
+			}
+		}
+	}()
+	for h := 1; h <= 60; h++ {
+		b, err := c.Build(priv, nil, c.Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	<-checked
+}

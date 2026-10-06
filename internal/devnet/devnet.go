@@ -170,6 +170,15 @@ func Run(o Options) (Summary, error) {
 		return Summary{}, err
 	}
 	defer c.Close()
+	// Run builds a FRESH chain and counts the blocks it appends; pointed at a
+	// directory that already holds a chain it used to extend that chain and
+	// then fail the caller's height arithmetic with a confusing "expected
+	// height N, got M" (audit O-10). Refuse the reuse plainly instead.
+	// (devnet.Replay is the package API that reads an existing directory back;
+	// the CLI has no command that extends one.)
+	if h := c.Height(); h != 0 {
+		return Summary{}, fmt.Errorf("devnet: the data directory %q already holds a chain at height %d; devnet builds a fresh chain — use an empty --dir, or `b10coin devnet` with no --dir for a temporary one", o.Dir, h)
+	}
 
 	_, priv := genesis.DevValidatorKey()
 	mp := mempool.New(1000, g.Hash(), c.AdmissionHead)

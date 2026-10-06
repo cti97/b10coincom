@@ -84,6 +84,21 @@ type Argon2Params struct {
 // The claimant's public key and the epoch are both inside the hashed preimage,
 // so a solution is worthless for any other key or any other epoch: solutions
 // cannot be traded between claimants or replayed in a later epoch.
+//
+// PREIMAGE LAYOUT (audit S-18): the preimage is the unprefixed concatenation
+// pubkey || uint64be(epoch) || uint64be(nonce), and the key is variable
+// length. The audit called that ambiguous; it is not. If two triples produced
+// equal preimages their byte strings would be equal, hence equal length,
+// hence equal key length (epoch and nonce are fixed 8 bytes each), and then
+// the common prefix forces the keys equal and the two fixed fields force the
+// epoch and nonce equal. The map is injective, so no two distinct claims ever
+// share a digest however long a key is. Every real caller also passes exactly
+// 32 bytes: ApplyTx only reaches PowDigest after VerifySignature has accepted
+// the key (crypto.Verify length-checks 32 before ed25519.Verify), and the
+// CLI/devnet solvers pass generated or derived 32-byte keys. The layout is
+// pinned by TestPowDigestKnownAnswer, so this is a fixed format, not a
+// silently improvised one - do not "harden" it with a length prefix without a
+// deliberate fork, because that changes every solution.
 func PowDigest(pubkey []byte, epoch, nonce uint64, p Argon2Params) [32]byte {
 	pre := make([]byte, 0, len(pubkey)+16)
 	pre = append(pre, pubkey...)

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -97,7 +98,9 @@ protocol.
 
 The claim command signs with an ephemeral key that is printed and never
 stored: the key signs exactly this claim and is printed once so it can be
-reused for a follow-up transfer.
+reused for a follow-up transfer. Because stdout is captured by shells, CI
+logs and journalctl, --print-key=false withholds the key: safe when
+no follow-up transfer is planned, and the claimant address is still printed.
 `)
 }
 
@@ -291,6 +294,11 @@ func cmdClaim(args []string) error {
 	// accepted so scripts built on the other commands keep working; its value
 	// is deliberately never read here.
 	fs.String("dir", "./b10coin-data", "the node's data directory (unused by the claim itself; the devnet genesis is compiled in)")
+	// Printing the key is the documented default (kept for compatibility),
+	// but stdout is captured by shells, CI and journalctl, so the opt-out is
+	// the safe choice for any run that does not intend a follow-up transfer
+	// (audit O-10). The claimant ADDRESS is printed either way.
+	printKey := fs.Bool("print-key", true, "print the ephemeral signing key to stdout; set --print-key=false to keep the secret out of shell history, CI logs and journalctl (the key is then unrecoverable and no follow-up transfer is possible)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -350,8 +358,12 @@ func cmdClaim(args []string) error {
 	fmt.Printf("claim epoch %d\n", epoch)
 	fmt.Printf("pow nonce   %d\n", pow)
 	fmt.Printf("txid        %s\n", txid)
-	fmt.Println("no key file, no keystore: the ephemeral signing key below cannot be recovered later.")
-	fmt.Printf("ephemeral key %x  <- copy now only if you plan a follow-up transfer\n", priv)
+	fmt.Println("no key file, no keystore: the ephemeral signing key cannot be recovered later.")
+	if *printKey {
+		fmt.Printf("ephemeral key %x  <- copy now only if you plan a follow-up transfer\n", priv)
+	} else {
+		fmt.Println("ephemeral key withheld (--print-key=false); no follow-up transfer from this claimant is possible")
+	}
 	fmt.Println("the claim is queued on the node; it is paid when the node's next block applies it.")
 	return nil
 }
@@ -462,6 +474,20 @@ func cmdNode(args []string) error {
 // fixture key, no round protocol. It takes no key: there is exactly one
 // honest chain identity here (the devnet genesis) and its one key is part of
 // that fixture, so a --key flag here could only make a flag lie.
+// httpShutdownGrace bounds how long a shutdown waits for in-flight requests.
+// It is a bound, not a hang: Shutdown stops accepting immediately and returns
+// when active requests finish or this expires.
+const httpShutdownGrace = 5 * time.Second
+
+// shutdownHTTP drains in-flight requests instead of aborting them (audit
+// O-10). http.Server.Close aborted every active request; Shutdown stops
+// accepting, waits for the active ones up to the grace period, and returns.
+func shutdownHTTP(s *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), httpShutdownGrace)
+	defer cancel()
+	_ = s.Shutdown(ctx)
+}
+
 func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	// M1 nodes run the devnet genesis. The testnet genesis has no validator
 	// keys yet, so there is nothing to sign blocks with until M4.
@@ -479,10 +505,16 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Timeouts suit a local-node API serving small JSON bodies to trusted
-	// LAN clients: header reading is the untrusted window, reads and writes
-	// never take longer than a slow client, and idle keep-alives are
-	// reaped so a vanished peer cannot hold a connection forever.
+	// Bind before announcing, and drain rather than abort on the way out
+	// (audit O-10). The banner used to print before ListenAndServe, so a
+	// failed bind still claimed to be "listening"; a synchronous net.Listen
+	// makes the failure an error and the banner true. On shutdown, Shutdown
+	// (not Close) lets an in-flight request finish, and the caller waits for
+	// it before returning so the process does not exit under one.
+	ln, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
 	httpSrv := &http.Server{
 		Addr:              httpAddr,
 		Handler:           srv.Handler(),
@@ -491,22 +523,24 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
-		_ = httpSrv.Close()
+		shutdownHTTP(httpSrv)
+		close(shutdownDone)
 	}()
 
 	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
-		version.Version, httpAddr, c.Genesis().ChainID, c.Height())
+		version.Version, ln.Addr(), c.Genesis().ChainID, c.Height())
 
-	// A failed listen must reach the shell as a failure, not as exit 0: the
+	// A failed Serve must reach the shell as a failure, not as exit 0: the
 	// goroutine delivers its error into the buffered channel BEFORE calling
 	// stop(), so by the time n.Run returns from that cancellation the error
 	// is already available to be read below — no window in which a failure is
 	// visible only to the node loop.
 	serveErr := make(chan error, 1)
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintln(os.Stderr, "http:", err)
 			serveErr <- err
 			stop()
@@ -516,6 +550,10 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	if err := n.Run(ctx, blockTime); err != nil && ctx.Err() == nil {
 		return err
 	}
+	// Wait for the HTTP drain before returning. On the clean-signal path this
+	// is the drain; on a failed Serve path stop() has already fired, so it is
+	// already complete.
+	<-shutdownDone
 	// A cancelled context is either a clean SIGINT shutdown — success — or
 	// the consequence of a failed listen, which must fail the process. The
 	// buffered serve error is guaranteed present in the latter case and
@@ -688,7 +726,12 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 	defer stop()
 
 	// The same HTTP shape the single node runs (same timeouts, same failure
-	// plumbing) so a networked node's RPC behaves identically.
+	// plumbing, same bind-before-banner and drain-on-shutdown fixes: audit
+	// O-10) so a networked node's RPC behaves identically.
+	ln, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
 	httpSrv := &http.Server{
 		Addr:              httpAddr,
 		Handler:           srv.Handler(),
@@ -697,13 +740,15 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
-		_ = httpSrv.Close()
+		shutdownHTTP(httpSrv)
+		close(shutdownDone)
 	}()
 
 	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
-		version.Version, httpAddr, v.Chain().Genesis().ChainID, v.Height())
+		version.Version, ln.Addr(), v.Chain().Genesis().ChainID, v.Height())
 	dialDesc := "listening for inbound connections"
 	if len(dial) > 0 {
 		dialDesc = "dialled " + strings.Join(dial, " ")
@@ -715,7 +760,7 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 
 	serveErr := make(chan error, 1)
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintln(os.Stderr, "http:", err)
 			serveErr <- err
 			stop()
@@ -724,7 +769,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 
 	<-ctx.Done()
 	// Same semantics as the single node: a clean SIGINT is success; a failed
-	// listen must fail the process.
+	// listen must fail the process. The drain is waited out so the process
+	// does not exit under an in-flight request.
+	<-shutdownDone
 	select {
 	case err := <-serveErr:
 		return err

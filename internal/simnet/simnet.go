@@ -744,7 +744,13 @@ func (t *tap) keepSent(data []byte) {
 // the driver, never enters the recv log, and a request is answered by the
 // router through this validator's own Send.
 func (t *tap) OnMessage(fn func(transport.Message)) {
+	// cons is written here and read on every delivery, which can run while a
+	// rebuild re-registers the driver; guard the slot with the same mutex the
+	// logs use (audit O-11). The callback is invoked AFTER the lock is
+	// released, so a handler that sends cannot deadlock on it.
+	t.mu.Lock()
 	t.cons = fn
+	t.mu.Unlock()
 	t.inner.OnMessage(func(m transport.Message) {
 		if t.router != nil {
 			if !t.router.Route(m) {
@@ -752,8 +758,11 @@ func (t *tap) OnMessage(fn func(transport.Message)) {
 			}
 		}
 		t.keepRecv(m.Data)
-		if t.cons != nil {
-			t.cons(m)
+		t.mu.Lock()
+		cons := t.cons
+		t.mu.Unlock()
+		if cons != nil {
+			cons(m)
 		}
 	})
 }

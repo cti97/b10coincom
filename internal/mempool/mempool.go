@@ -103,10 +103,12 @@ const maxPendingClaimsPerSender = 1
 type HeadView func() (*state.State, uint64)
 
 // entry is one pending transaction plus the bookkeeping admission and ageing
-// need: its sender (the address its signature is bound to) and how many times
-// Take has passed it over.
+// need: its ID (computed once, at admission, so Remove/forget/Take never
+// re-encode and re-hash the transaction - audit O-9), its sender (the address
+// its signature is bound to) and how many times Take has passed it over.
 type entry struct {
 	tx      types.Tx
+	id      [32]byte
 	sender  types.Address
 	skipped uint32
 }
@@ -266,7 +268,7 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 				continue
 			}
 		}
-		m.insert(tx, sender)
+		m.insert(tx, id, sender)
 	}
 	return errs
 }
@@ -349,10 +351,12 @@ func (m *Mempool) admitClaim(tx *types.Tx, st *state.State, headHeight uint64) e
 	return nil
 }
 
-// insert records an admitted transaction and its bookkeeping.
-func (m *Mempool) insert(tx types.Tx, sender types.Address) {
-	m.txs = append(m.txs, entry{tx: tx, sender: sender})
-	m.seen[tx.ID()] = struct{}{}
+// insert records an admitted transaction and its bookkeeping. The ID is
+// passed in (already computed by Add) so it is encoded and hashed exactly
+// once per transaction, not again on every lookup.
+func (m *Mempool) insert(tx types.Tx, id [32]byte, sender types.Address) {
+	m.txs = append(m.txs, entry{tx: tx, id: id, sender: sender})
+	m.seen[id] = struct{}{}
 	m.pending[sender]++
 	if tx.Type == types.TxTransfer {
 		set := m.pendingNonces[sender]
@@ -370,7 +374,7 @@ func (m *Mempool) insert(tx types.Tx, sender types.Address) {
 
 // forget removes one entry's bookkeeping. The caller removes the entry itself.
 func (m *Mempool) forget(e entry) {
-	delete(m.seen, e.tx.ID())
+	delete(m.seen, e.id)
 	if n := m.pending[e.sender]; n <= 1 {
 		delete(m.pending, e.sender)
 	} else {
@@ -446,6 +450,15 @@ func (m *Mempool) Take(max int) []types.Tx {
 }
 
 // Remove drops a transaction by ID, used when a block includes it.
+//
+// The scan is O(n) in the pool size (audit O-9). That is accepted rather than
+// fixed: the pool is bounded (1,000 on a real node), Remove is not on the
+// block-production path (the driver's selection relies on Take/filters, not
+// this), and an index from ID to slot would have to be rebuilt on every
+// removal anyway - a linked list is the only structure that would make it
+// constant time, at the cost of worse cache behaviour everywhere else. The
+// previously quadratic-looking part - recomputing each entry's ID() while
+// scanning - is gone: the ID is now stored in the entry.
 func (m *Mempool) Remove(id [32]byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -453,7 +466,7 @@ func (m *Mempool) Remove(id [32]byte) {
 		return
 	}
 	for i := range m.txs {
-		if m.txs[i].tx.ID() == id {
+		if m.txs[i].id == id {
 			m.forget(m.txs[i])
 			m.txs = append(m.txs[:i], m.txs[i+1:]...)
 			return

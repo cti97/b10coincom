@@ -22,6 +22,12 @@ var (
 	ErrShortBuffer   = errors.New("types: short buffer")
 	ErrTrailingBytes = errors.New("types: trailing bytes after decode")
 	ErrNonCanonical  = errors.New("types: non-canonical encoding")
+	// ErrVarintOverflow reports a LEB128 varint whose value does not fit in
+	// 64 bits. It is deliberately distinct from ErrShortBuffer (audit S-17):
+	// an over-long value is a well-framed malformed number, while a short
+	// buffer is a truncated one, and the two want different diagnostics. The
+	// bytes are neither trusted nor turned into a length either way.
+	ErrVarintOverflow = errors.New("types: varint value overflows 64 bits")
 )
 
 // HashSize is the length in bytes of a full hash field, the fixed-width
@@ -143,7 +149,13 @@ func (d *Decoder) Len() (int, error) {
 		return 0, ErrShortBuffer
 	}
 	n, m := binary.Uvarint(d.buf[d.off:])
-	if m <= 0 {
+	if m < 0 {
+		// A value wider than 64 bits. It is not a short buffer: every
+		// continuation byte the encoder needs is present, the number itself
+		// is simply unrepresentable (audit S-17).
+		return 0, ErrVarintOverflow
+	}
+	if m == 0 {
 		return 0, ErrShortBuffer
 	}
 	// A multi-byte varint whose final byte is zero has redundant

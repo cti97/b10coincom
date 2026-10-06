@@ -44,6 +44,16 @@ type Block struct {
 }
 
 // ComputeTxRoot commits to the ordered list of transaction IDs.
+//
+// COUPLING (audit S-12): crypto.MerkleRoot duplicates an odd final node, so
+// [a,b,c] and [a,b,c,c] share a root. That ambiguity is closed here ONLY by
+// ValidateStructure refusing a block with a duplicate transaction, and by
+// nothing else. A caller that trusts a TxRoot WITHOUT running
+// ValidateStructure (or an inclusion proof added later) reopens it: the root
+// alone cannot distinguish the two lists. Keep the duplicate check in
+// ValidateStructure; if TxRoot is ever consumed on a path that skips it,
+// either run ValidateStructure there or add the missing leaf count to what
+// the header commits. See crypto.MerkleRoot's own known-limitation note.
 func ComputeTxRoot(txs []Tx) [32]byte {
 	leaves := make([][32]byte, len(txs))
 	for i := range txs {
@@ -114,6 +124,16 @@ func (b *Block) ValidateStructure() error {
 }
 
 func DecodeBlock(b []byte) (*Block, error) {
+	// Refuse anything already larger than a legal block BEFORE decoding any
+	// of it (audit S-17). Without this an attacker-sized input is parsed
+	// element by element and only rejected at the end by ValidateStructure,
+	// if at all - the decoder allocates the transaction slice and every
+	// transaction along the way. A valid block's Encode() is at most
+	// MaxBlockBytes by ValidateStructure, so every legal encoding still
+	// decodes to exactly the same bytes.
+	if len(b) > MaxBlockBytes {
+		return nil, fmt.Errorf("%w: %d bytes, above the %d-byte block bound", ErrBlockTooLarge, len(b), MaxBlockBytes)
+	}
 	d := NewDecoder(b)
 	out := &Block{}
 	var err error

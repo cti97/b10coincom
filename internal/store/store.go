@@ -76,6 +76,15 @@ const certLogName = "certs.log"
 // certificate logs its name avoids the ".seg" suffix for the same reason.
 const roundLogName = "rounds.log"
 
+// genesisFileName holds the data directory's genesis identity: the 32-byte
+// genesis hash this chain was first opened with (audit O-5). It has no ".seg"
+// suffix so scan never indexes it as a block, and it is written once, on the
+// first Open, then compared on every later one. Without it a wrong genesis is
+// only discovered after replay has already diverged, as an opaque
+// "replay diverged" error; with it the first Open that names a different
+// genesis is told exactly that, before a block is replayed.
+const genesisFileName = "genesis.hash"
+
 // RecordHeaderLen and RecordTrailerLen are the on-disk framing's fixed sizes:
 // an 8-byte big-endian payload length plus the 4-byte CRC32C of those 8 bytes,
 // and a 4-byte CRC32C of the header and the payload. They are exported because
@@ -91,6 +100,9 @@ var (
 	ErrNotFound      = errors.New("store: height not found")
 	ErrBadHeight     = errors.New("store: heights must be appended sequentially")
 	ErrCorruptRecord = errors.New("store: record checksum mismatch")
+	// ErrWrongGenesis reports a data directory whose recorded genesis hash
+	// differs from the genesis the caller is opening it with (audit O-5).
+	ErrWrongGenesis = errors.New("store: data directory belongs to a different genesis")
 	// errTornRecord reports a record the file ends inside. It is not
 	// corruption: it is the one shape a crash mid-write can leave, and it is
 	// the only shape Open may truncate. It is unexported because callers
@@ -263,6 +275,12 @@ func Open(dir string) (*Store, error) {
 	s.lockFile = lf
 	s.roundFile = rf
 	s.certFile = cf
+	// Make the directory entries for any file just created durable (audit
+	// S-15). Each file's own contents are fsynced as they are written; without
+	// this, a crash can lose the freshly created directory entry even though
+	// the data blocks were flushed, leaving a directory that replays shorter
+	// than the last acknowledged block. Best-effort: see syncDir.
+	syncDir(dir)
 	// Compact a lock log an earlier build (or a long run between restarts) grew
 	// one frame per height (audit C-13). scanLocks already pruned the map; this
 	// bounds the FILE too. The error is deliberately ignored: the old log is
@@ -279,6 +297,80 @@ func (s *Store) segmentPath() string {
 		return filepath.Join(s.dir, segmentName(s.last))
 	}
 	return filepath.Join(s.dir, segmentName(0))
+}
+
+// syncDir best-effort fsyncs a directory so a newly created or renamed entry
+// survives a power loss (audit S-15). Directory fsync is not portable - some
+// platforms and filesystems reject it - so the error is deliberately dropped:
+// on a platform that supports it the entry is made durable, and on one that
+// does not there is nothing further this layer can do. It is called after
+// creating a new segment, creating the logs, compacting the lock log, and
+// recording the genesis marker.
+func syncDir(dir string) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = f.Sync()
+	_ = f.Close()
+}
+
+// CheckGenesis records h as this data directory's genesis identity on the
+// first call, and refuses every later call with a different hash (audit O-5).
+// It is called by chain.Open while the store holds the directory's exclusive
+// lock, so the read-then-write is single-writer. The marker is written
+// atomically (temp, fsync, rename, dir fsync) and is NOT part of the block
+// framing: a missing marker (a directory written by a build older than this
+// one) is recorded on first sight, so no existing directory is invalidated.
+func (s *Store) CheckGenesis(h [32]byte) error {
+	path := filepath.Join(s.dir, genesisFileName)
+	raw, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if len(raw) != len(h) {
+			return fmt.Errorf("store: %s is %d bytes, want the %d-byte genesis hash; the data directory is damaged", path, len(raw), len(h))
+		}
+		var got [32]byte
+		copy(got[:], raw)
+		if got != h {
+			return fmt.Errorf("%w: %s records genesis %x, but the node was started with genesis %x; use a different --dir or the matching genesis",
+				ErrWrongGenesis, path, got[:8], h[:8])
+		}
+		return nil
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	}
+	tmp, err := os.CreateTemp(s.dir, genesisFileName+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(h[:]); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	syncDir(s.dir)
+	return nil
 }
 
 // scan rebuilds the index from disk and repairs the final segment's tail.
@@ -385,6 +477,24 @@ func readRecordAt(r io.ReaderAt, size, off, exact int64) (int64, int64, error) {
 	return frameHeader(header[:], off, rem, exact)
 }
 
+// repairHint is appended to a corruption error so the operator is told the
+// ONE recovery path this format has (audit O-5). Automatic repair cannot be
+// offered: a COMPLETE record whose checksum fails is bit rot, not the torn
+// tail a crash leaves, and its length prefix may itself be the damaged bytes,
+// so the scan cannot frame what follows it and truncating there deletes
+// committed data. The hint names the file and the offset at which an operator
+// (after backing up, or with a replica to compare) can truncate, which
+// discards the damaged record and everything after it and is the only way
+// back to an openable directory. For a non-final segment even that is unsafe:
+// later segments are numbered from this one's record count, so truncating it
+// would renumber them, and only restoring the segment itself is a repair.
+func repairHint(final bool, path string, off int64) string {
+	if !final {
+		return fmt.Sprintf(" (a non-final segment cannot be repaired by truncation: later segments are numbered from its records; restore %s from a replica)", path)
+	}
+	return fmt.Sprintf(" (a COMPLETE record whose checksum fails is bit rot, not a crash, so it is not truncated automatically: back up %s, then truncate it at offset %d to recover everything before the damage, or restore it from a replica)", path, off)
+}
+
 // scanSegment walks one segment record by record. Earlier segments are
 // closed, so a damaged record there is real corruption and fails Open; the
 // final segment is the only place a crash could have cut a record, so a torn
@@ -422,7 +532,7 @@ func (s *Store) scanSegment(name string, final bool) error {
 				_ = f.Close()
 				return s.truncateTail(path, off)
 			}
-			return fmt.Errorf("%w: %s in %s at offset %d", ErrCorruptRecord, err, name, off)
+			return fmt.Errorf("%w: %s in %s at offset %d%s", ErrCorruptRecord, err, name, off, repairHint(final, path, off))
 		}
 		need := RecordHeaderLen + int(n)
 		if cap(buf) < need {
@@ -441,7 +551,7 @@ func (s *Store) scanSegment(name string, final bool) error {
 		// that disagrees with the bytes it frames cannot pass, whether or not
 		// the header's own checksum already caught it.
 		if crc32.Checksum(buf, crcTable) != binary.BigEndian.Uint32(trailer[:]) {
-			return fmt.Errorf("%w: checksum mismatch in %s at offset %d", ErrCorruptRecord, name, off)
+			return fmt.Errorf("%w: checksum mismatch in %s at offset %d%s", ErrCorruptRecord, name, off, repairHint(final, path, off))
 		}
 		h := s.last + 1
 		s.index[h] = off
@@ -486,6 +596,10 @@ func (s *Store) Append(height uint64, payload []byte) error {
 		}
 		old := s.file
 		s.file = f
+		// Make the new segment's directory entry durable before the write
+		// below (audit S-15): the record is fsynced, so the entry must be too,
+		// or a crash could leave data on disk with nothing naming it.
+		syncDir(s.dir)
 		if err := old.Close(); err != nil {
 			return err
 		}
@@ -1063,8 +1177,12 @@ func (s *Store) compactLocks() error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	// The rename committed. The old handle still names the unlinked inode; a
-	// Close failure there cannot affect the new log, so it is not reported.
+	// The rename committed. Make it durable (audit S-15): without the
+	// directory fsync a crash could leave the old log's entry in place even
+	// though the new one was renamed over it.
+	syncDir(s.dir)
+	// The old handle still names the unlinked inode; a Close failure there
+	// cannot affect the new log, so it is not reported.
 	_ = old.Close()
 	return nil
 }

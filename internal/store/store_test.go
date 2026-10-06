@@ -615,3 +615,40 @@ func TestTornCertificateTailIsTruncatedAndEarlierRecordsSurvive(t *testing.T) {
 		t.Fatalf("the torn certificate tail was not cut: size = %d, want %d (%v)", st.Size(), intact.Size(), err)
 	}
 }
+
+// Audit O-5: the genesis identity is recorded once and compared on every
+// later check, so a mismatched genesis is named for what it is rather than
+// surfacing after replay as a divergence.
+func TestCheckGenesisRecordsOnceAndRefusesAMismatch(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a, b [32]byte
+	a[0], b[0] = 0xA1, 0xB2
+	if err := s.CheckGenesis(a); err != nil {
+		t.Fatalf("recording the genesis: %v", err)
+	}
+	if err := s.CheckGenesis(a); err != nil {
+		t.Fatalf("the same genesis must be accepted again: %v", err)
+	}
+	if err := s.CheckGenesis(b); !errors.Is(err, ErrWrongGenesis) {
+		t.Fatalf("a different genesis gave %v, want ErrWrongGenesis", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if err := s2.CheckGenesis(b); !errors.Is(err, ErrWrongGenesis) {
+		t.Fatalf("the recorded genesis did not survive reopen: %v, want ErrWrongGenesis", err)
+	}
+	if err := s2.CheckGenesis(a); err != nil {
+		t.Fatalf("the recorded genesis was not accepted after reopen: %v", err)
+	}
+}

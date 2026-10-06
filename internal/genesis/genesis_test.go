@@ -714,6 +714,74 @@ func TestValidateRejectsAnOutOfRangeCommitteeSize(t *testing.T) {
 	}
 }
 
+// Audit S-20: DecodeGenesis must not reinterpret an out-of-range encoded seat
+// count through int. A negative int encodes as a huge uint64 and a value above
+// the ceiling must be refused at decode time, before Validate ever sees it.
+func TestDecodeGenesisRejectsAnOutOfRangeCommitteeSize(t *testing.T) {
+	for _, size := range []int{-1, maxCommitteeSize + 1} {
+		g := Testnet()
+		g.Params.CommitteeSize = size
+		if _, err := DecodeGenesis(g.Encode()); !errors.Is(err, ErrBadGenesis) {
+			t.Fatalf("DecodeGenesis accepted CommitteeSize %d (encoded as %d), got %v",
+				size, uint64(size), err)
+		}
+	}
+}
+
+// A legal genesis must still decode to exactly the bytes it encoded, and to
+// the same genesis hash: the S-20 decode guard changed no valid input.
+func TestDecodeGenesisRoundTripsCanonicalBytes(t *testing.T) {
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		enc := g.Encode()
+		got, err := DecodeGenesis(enc)
+		if err != nil {
+			t.Fatalf("%s: DecodeGenesis: %v", g.ChainID, err)
+		}
+		if !bytes.Equal(got.Encode(), enc) {
+			t.Fatalf("%s: decode/encode changed the canonical bytes", g.ChainID)
+		}
+		if got.Hash() != g.Hash() {
+			t.Fatalf("%s: decode changed the genesis hash", g.ChainID)
+		}
+		if err := got.Validate(); err != nil {
+			t.Fatalf("%s: the decoded genesis no longer validates: %v", g.ChainID, err)
+		}
+	}
+}
+
+// Audit S-16: there is deliberately NO premine + emission <= cap rule in
+// Validate, and this test PINS that documented absence rather than a
+// validation. It records the arithmetic the audit asked to be stated: the
+// devnet fixture's premine plus the realized series exceeds the README's cap,
+// while the real testnet chain - which has no premine - cannot.
+func TestTheSupplyCapIsEmissionOnlyAndTheDevnetFixtureExceedsIt(t *testing.T) {
+	dev := Devnet()
+	var premine uint64
+	for _, d := range dev.DevAccounts {
+		premine += d.BalanceSparks
+	}
+	series := faucet.SeriesTotal(dev.Params.InitialRewardSparks, dev.Params.HalvingIntervalBlocks)
+	if premine == 0 {
+		t.Fatal("the devnet fixture is documented as premined; it has no dev accounts")
+	}
+	if premine+series <= dev.Params.TotalSupplySparks {
+		t.Fatalf("the devnet fixture no longer exceeds the cap (premine %d + series %d <= cap %d); update Devnet's and Validate's documentation with the new arithmetic",
+			premine, series, dev.Params.TotalSupplySparks)
+	}
+	if err := dev.Validate(); err != nil {
+		t.Fatalf("the devnet fixture must stay valid: %v", err)
+	}
+	// The real chain: no premine, and the relation keeps the series at or
+	// under the cap.
+	tn := Testnet()
+	if len(tn.DevAccounts) != 0 {
+		t.Fatal("the testnet must have no premine")
+	}
+	if s := faucet.SeriesTotal(tn.Params.InitialRewardSparks, tn.Params.HalvingIntervalBlocks); s > tn.Params.TotalSupplySparks {
+		t.Fatalf("the testnet emission series %d exceeds the cap %d", s, tn.Params.TotalSupplySparks)
+	}
+}
+
 // The genesis timestamp is the height-0 block's timestamp; the same > 0 rule
 // every later block obeys applies to it.
 func TestValidateRejectsANonPositiveGenesisTime(t *testing.T) {

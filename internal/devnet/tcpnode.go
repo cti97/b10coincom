@@ -588,19 +588,32 @@ func (v *Validator) route(m transport.Message) {
 	}
 }
 
+// consensusClock is the driver's virtual-millisecond clock. It ACCUMULATES
+// each real tick's full duration and converts the running total to
+// milliseconds, rather than adding TickEvery/time.Millisecond per tick.
+// The old form truncated a sub-millisecond TickEvery to zero, so the driver's
+// clock never advanced and consensus time froze (audit O-11); accumulating
+// means 5 ticks of 200µs advance the clock exactly as far as one 1ms tick.
+type consensusClock struct{ elapsed time.Duration }
+
+func (c *consensusClock) tick(every time.Duration) int64 {
+	c.elapsed += every
+	return int64(c.elapsed / time.Millisecond)
+}
+
 // tickLoop is the driver's clock: TickEvery of REAL time per tick, the
 // monotonic counter the driver's virtual milliseconds read.
 func (v *Validator) tickLoop() {
 	defer v.wg.Done()
 	ticker := time.NewTicker(v.cfg.TickEvery)
 	defer ticker.Stop()
-	var now int64
+	var clock consensusClock
 	for {
 		select {
 		case <-v.stop:
 			return
 		case <-ticker.C:
-			now += int64(v.cfg.TickEvery / time.Millisecond)
+			now := clock.tick(v.cfg.TickEvery)
 			v.mu.Lock()
 			v.drv.Tick(now)
 			v.mu.Unlock()

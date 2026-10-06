@@ -475,6 +475,11 @@ re-measured together on real hardware before any public testnet opens.
   rule yet, so "runs on fees only" describes the schedule, not a distribution
   rule the code already implements.
 - The **supply cap is 21,000,000 b10** (2.1 × 10¹⁵ sparks).
+  The cap governs the real chain's EMISSION; it is not enforced against a
+  premine, and the devnet fixture deliberately exceeds it: `genesis.Devnet`
+  funds 1,000,000 b10 of test accounts on top of the realized series, and
+  `Validate` has no premine-plus-emission rule (audit S-16). Testnet has no
+  premine, and a committee file cannot mint one.
 - The **realized series lands at 20,999,997.48 b10** (2,099,999,748,000,000
   sparks): each halving's shift truncates, losing 252,000,000 sparks (2.52 b10)
   in total. The series therefore falls **2.52 b10 short of the cap** — and it

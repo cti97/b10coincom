@@ -83,6 +83,23 @@ func TestDecoderRejectsNonCanonicalVarint(t *testing.T) {
 	}
 }
 
+// A varint whose value does not fit in 64 bits is a distinct failure from a
+// short buffer (audit S-17): the bytes are all present, the number is just
+// unrepresentable. It must not be reported as ErrShortBuffer.
+func TestDecoderRejectsVarintOverflowDistinctly(t *testing.T) {
+	// Ten bytes: nine continuation bytes and a final byte that carries a
+	// value bit above bit 63.
+	overflow := []byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02}
+	d := NewDecoder(overflow)
+	_, err := d.Len()
+	if !errors.Is(err, ErrVarintOverflow) {
+		t.Fatalf("a 65-bit varint gave %v, want ErrVarintOverflow", err)
+	}
+	if errors.Is(err, ErrShortBuffer) {
+		t.Fatal("a 65-bit varint must not be reported as a short buffer")
+	}
+}
+
 func TestLenPrefixLargerThanBufferIsShortBuffer(t *testing.T) {
 	e := NewEncoder()
 	e.Len(1000)

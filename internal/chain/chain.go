@@ -26,6 +26,12 @@ var (
 	ErrNotValidator    = errors.New("chain: proposer is not in the validator set")
 	ErrGenesisReplay   = errors.New("chain: replay diverged from stored state root")
 	ErrUnknownProposer = errors.New("chain: cannot determine proposer key")
+	// ErrWrongGenesis reports a data directory whose recorded genesis hash
+	// differs from the genesis the node was started with (audit O-5). It is
+	// deliberately distinct from ErrGenesisReplay: a wrong genesis is a
+	// configuration mistake knowable BEFORE any block is replayed, not a
+	// damaged chain discovered mid-replay.
+	ErrWrongGenesis = errors.New("chain: data directory belongs to a different genesis")
 	// ErrBadTimestamp reports a block whose timestamp is not strictly greater
 	// than its parent's, or - on the consensus path - one that is not exactly
 	// the parent's plus one (audit S-8). Timestamps feed no economic rule
@@ -135,6 +141,19 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 	}()
 	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st), faucet: g.FaucetAddress()}
 
+	// Compare the genesis BEFORE replaying a single block (audit O-5). A data
+	// directory belongs to one chain; opening it with a different genesis
+	// used to replay until the divergence surfaced as ErrGenesisReplay, which
+	// names neither cause nor fix. The store records the genesis hash once
+	// (atomically) and refuses a later mismatch with store.ErrWrongGenesis,
+	// which is surfaced as this chain's ErrWrongGenesis.
+	if err := s.CheckGenesis(g.Hash()); err != nil {
+		if errors.Is(err, store.ErrWrongGenesis) {
+			return nil, fmt.Errorf("%w: %w", ErrWrongGenesis, err)
+		}
+		return nil, err
+	}
+
 	height, ok := s.Height()
 	if !ok {
 		owned = true
@@ -202,6 +221,19 @@ func (c *Chain) Head() *types.Block {
 	return c.head
 }
 
+// State returns the current committed state.
+//
+// IN-PROCESS TRUST ONLY (audit O-3). The returned *state.State is the chain's
+// LIVE state value, not a copy: it is replaced (never mutated) by every
+// Append, so a reader that holds one snapshot sees a consistent, immutable
+// world, but a caller that type-asserts or reaches for state.Set/SetHeight
+// can write into the chain's own state and silently desynchronise it from the
+// store. Those methods are exported because chain.genesisState and
+// state.ApplyBlock build state with them; they are not a public mutator.
+// Likewise Head() returns the retained *types.Block and Genesis() returns the
+// *genesis.Genesis handed to Open - callers must treat both as read-only.
+// This is acceptable for one process whose components trust each other; it is
+// not safe across a trust boundary and must not be exposed to one.
 func (c *Chain) State() *state.State {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -218,6 +250,18 @@ func (c *Chain) AdmissionHead() (*state.State, uint64) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.state, c.head.Header.Height
+}
+
+// HeadSnapshot returns the head height, the head block's ID and its state
+// root in ONE read-locked critical section (audit O-8). RPC's /status used to
+// call Head() and Height() separately, so a block committed between the two
+// calls produced a response whose height named the new head while the hash
+// and root named the old one - internally inconsistent, and a liar to any
+// monitor that compared them. All three values now come from the same head.
+func (c *Chain) HeadSnapshot() (height uint64, id [32]byte, stateRoot [32]byte) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.head.Header.Height, c.head.ID(), c.head.Header.StateRoot
 }
 
 // isValidator reports whether pub is in the genesis validator set.
@@ -334,9 +378,18 @@ func (c *Chain) SelectApplicable(candidates []types.Tx) ([]types.Tx, error) {
 
 // Build constructs and signs a candidate block. It does not mutate the
 // chain: the caller decides whether to Append.
+//
+// A proposer key that is nil or the wrong length is refused up front (audit
+// O-6). ed25519.PrivateKey.Public() indexes the key's seed and public halves,
+// so calling it on a short key panics; a wiring bug that passed nil used to
+// crash the node instead of returning. The length check makes the existing
+// ErrUnknownProposer return reachable for that case.
 func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int64) (*types.Block, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if len(proposer) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("%w: proposer key is %d bytes, want %d", ErrUnknownProposer, len(proposer), ed25519.PrivateKeySize)
+	}
 	pub, ok := proposer.Public().(ed25519.PublicKey)
 	if !ok {
 		return nil, ErrUnknownProposer
@@ -367,6 +420,21 @@ func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int
 // applyValidated applies a block whose structure is already trusted.
 // Write-locked; the unlocked body lives in applyValidatedLocked so Append can
 // reuse it while holding the lock.
+//
+// TRUST BOUNDARY (audit O-2), stated here because this is the one place that
+// skips checks: replay trusts the bytes already in the local data directory.
+// It verifies the block's (height, parent link) against its position and the
+// recomputed state root against the header - the properties that detect a
+// renumbered, reordered or truncated log - but it deliberately does NOT
+// re-run ValidateStructure, proposer membership or the proposer signature.
+// The bytes were accepted by Append (which runs every check) and then fsynced
+// by this process or a predecessor on this disk; the cost of re-verifying
+// every stored block on every start buys no safety the disk does not already
+// carry. The boundary is the local filesystem: a host that can rewrite the
+// data directory can already rewrite the binary or the genesis, so replay's
+// job is corruption detection, not authentication. A node that must distrust
+// its own disk needs the whole directory authenticated by something outside
+// it - out of scope, and not to be half-done here.
 func (c *Chain) applyValidated(b *types.Block) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -517,6 +585,18 @@ func (c *Chain) ValidateConsensusNext(b *types.Block) error {
 // Append validates a block against the current head and state, then stores
 // it. Validation happens before any mutation, so a rejected block leaves the
 // chain untouched.
+//
+// LOCKING AND fsync (audit O-4), stated because it is a real latency choice:
+// the whole operation - validation, the store write and its fsync, and the
+// in-memory swap - runs under the exclusive c.mu. That means a concurrent
+// RPC read (State/Height/Head/AdmissionHead) waits for the block's fsync,
+// which on a Raspberry Pi's SD card can be milliseconds. The alternative -
+// releasing the lock across the fsync - would let a reader observe a head
+// whose block is not yet durable, or let two Appends interleave their store
+// writes and state swaps; the store is not built for concurrent writers.
+// Correctness over read latency is the deliberate choice for this milestone;
+// a future split would need a store-level append lock and a commit protocol
+// (write, fsync, then publish) before the read lock could be dropped.
 //
 // Aliasing contract: on success Append retains the caller's *types.Block as
 // the chain's head (no defensive copy), and Head() later hands that same

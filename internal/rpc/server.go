@@ -4,6 +4,7 @@ package rpc
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -55,6 +56,14 @@ const (
 	txRateBurst      = 256
 	txRatePerSecond  = 64
 	txRateMaxSources = 4096
+
+	// maxTxBodyBytes bounds one POST /tx body (audit O-8). A canonical valid
+	// transaction is at most ~163 bytes (a transfer: type, 20-byte address,
+	// 33-byte framed 32-byte key, two u64s, 20-byte recipient, u64 amount,
+	// 65-byte framed 64-byte signature); 4096 bytes is 25x that, so no legal
+	// transaction is refused, while the previous 1 MiB let one request make
+	// every handler read 5,000 transactions' worth of bytes to reject one.
+	maxTxBodyBytes = 4096
 )
 
 type txBucket struct {
@@ -162,14 +171,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{"method not allowed"})
 		return
 	}
-	head := s.chain.Head()
-	h := head.ID()
-	sr := head.Header.StateRoot
+	// One snapshot, one lock (audit O-8): reading Head() then Height()
+	// separately let a commit in between pair the new height with the old
+	// head's hash and root. Genesis is immutable, so it needs no such care.
+	height, headID, stateRoot := s.chain.HeadSnapshot()
 	writeJSON(w, http.StatusOK, statusResponse{
 		ChainID:   s.chain.Genesis().ChainID,
-		Height:    s.chain.Height(),
-		HeadHash:  hex.EncodeToString(h[:]),
-		StateRoot: hex.EncodeToString(sr[:]),
+		Height:    height,
+		HeadHash:  hex.EncodeToString(headID[:]),
+		StateRoot: hex.EncodeToString(stateRoot[:]),
 		Mempool:   s.mempool.Len(),
 	})
 }
@@ -194,7 +204,12 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 	if height != b.Header.Height {
 		blk, err := s.chain.BlockAt(height)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorResponse{err.Error()})
+			// Never echo err.Error() here (audit O-8): a store failure names
+			// the data directory, the segment file and an offset - filesystem
+			// paths a remote client has no business learning. The 404 above
+			// already covers "no such height"; anything left is an internal
+			// failure and is reported generically.
+			writeJSON(w, http.StatusInternalServerError, errorResponse{"internal error: block unavailable"})
 			return
 		}
 		b = blk
@@ -210,6 +225,12 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleTx admits ONE transaction to the mempool. A 200 means the transaction
+// was ADMITTED, not that it will be included (audit O-7): a transaction whose
+// nonce is ahead of the chain's is held until its predecessors land, and if
+// they never do the pool drops it when a block's filter finds it inapplicable.
+// There is deliberately no /tx/{id} on this milestone, so a client cannot poll
+// that outcome; it learns it by observing the chain's nonce.
 func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{"method not allowed"})
@@ -223,10 +244,16 @@ func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	// Accept either a bare hex body or a JSON-quoted hex string: read once,
-	// trim whitespace and surrounding quotes, then hex-decode.
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	// trim whitespace and surrounding quotes, then hex-decode. Read one byte
+	// past the bound so an oversized body is detected rather than silently
+	// truncated (audit O-8).
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxTxBodyBytes+1))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{"cannot read body"})
+		return
+	}
+	if len(body) > maxTxBodyBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, errorResponse{"transaction body too large"})
 		return
 	}
 	enc := strings.Trim(string(body), " \t\r\n\"")
@@ -245,7 +272,14 @@ func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.mempool.Add([]types.Tx{*tx})[0]; err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse{err.Error()})
+		// A full pool is a transient CAPACITY condition, not a malformed
+		// request: 503 tells a client to retry, 400 would tell it to fix its
+		// bytes (audit O-8). Malformed/refused transactions stay 400.
+		code := http.StatusBadRequest
+		if errors.Is(err, mempool.ErrFull) || errors.Is(err, mempool.ErrClaimPoolFull) {
+			code = http.StatusServiceUnavailable
+		}
+		writeJSON(w, code, errorResponse{err.Error()})
 		return
 	}
 	id := tx.ID()

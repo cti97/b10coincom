@@ -217,6 +217,20 @@ func (g *Genesis) Validate() error {
 	if lo != p.TotalSupplySparks {
 		return ErrEmissionMath
 	}
+	// Audit S-16, stated where a reader would look for the rule: there is
+	// deliberately NO "premine + emission <= cap" check. The relation above
+	// constrains the EMISSION SERIES alone; a genesis with funded dev
+	// accounts can mint the series on top of that premine and exceed
+	// TotalSupplySparks. That is not an accident of this function but a
+	// consequence of the fixtures: Devnet (and simnet.Committee, which reuses
+	// it under a b10coin-simnet-N id) fund accounts so the transfer path is
+	// exercisable, and they exceed the README's cap by design. Enforcing the
+	// rule globally would reject every such fixture, and there is no
+	// principled way to tell a fixture premine from an operator's. The real
+	// chains are protected by the no-premine policy instead: Testnet has no
+	// dev accounts, and ParseCommitteeJSON refuses to mint any. See
+	// TestTheSupplyCapIsEmissionOnlyAndTheDevnetFixtureExceedsIt, which pins
+	// the arithmetic this comment describes rather than a validation.
 	// A zero puzzle target is unsatisfiable: a claim verifies only if its
 	// Argon2id digest is strictly below the target, and no digest is strictly
 	// below zero, so every claim on such a chain would fail forever. Every
@@ -391,6 +405,19 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Refuse a seat count the int conversion cannot hold, and any value above
+	// the committee ceiling (audit S-20): CommitteeSize is encoded as a
+	// uint64 and was decoded straight to int, so a value above MaxInt64
+	// arrived negative (and on a 32-bit platform a value above MaxInt32
+	// truncated). Validate rejects the negatives, but the decode itself must
+	// not silently reinterpret the number. This changes nothing for a legal
+	// genesis: Encode is untouched, so every valid genesis still encodes to
+	// exactly the same bytes, and this only refuses a value Encode could
+	// never legitimately have been handed.
+	if cs > uint64(maxCommitteeSize) {
+		return nil, fmt.Errorf("%w: encoded CommitteeSize is %d, above the %d-seat ceiling (the int conversion would wrap)",
+			ErrBadGenesis, cs, maxCommitteeSize)
+	}
 	g.Params.CommitteeSize = int(cs)
 	if g.Params.FaucetPowArgon2.MemoryKiB, err = d.U32(); err != nil {
 		return nil, err
@@ -456,6 +483,17 @@ func sharedParams(chainID string, epochBlocks, claimAmountSparks uint64, committ
 }
 
 // Devnet is a single-validator chain with funded test accounts.
+//
+// FIXTURE, NOT MONETARY POLICY, stated plainly for audit S-16: its two dev
+// accounts hold 1,000,000 b10 between them, and the emission series mints
+// ~20,999,997 b10 more. The sum EXCEEDS the 21,000,000 b10 supply cap the
+// README states for the real chain. Validate does not reject it, because
+// there is deliberately no premine + emission rule (see Validate): the
+// fixtures need the premine to exercise transfers, and Testnet - the real
+// chain - has no premine at all and is bounded by the emission relation
+// alone. simnet.Committee is this same genesis under a b10coin-simnet-N ID,
+// so it carries the same fixture premine. Never treat devnet balances as
+// value.
 func Devnet() *Genesis {
 	pub, _, _ := deterministicKey("b10coin-devnet-validator-1")
 	devPub, _, _ := deterministicKey("b10coin-devnet-faucet-tester")

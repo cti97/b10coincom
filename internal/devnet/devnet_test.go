@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -590,5 +591,41 @@ func TestDriveReportsAgreedFalseAndFailsWhenValidatorsDisagree(t *testing.T) {
 	}
 	if !s.Agreed {
 		t.Fatal("the disagreement detector fired on chains that are identical")
+	}
+}
+
+// Audit O-11: the driver's clock accumulates real tick durations. The old
+// per-tick `TickEvery / time.Millisecond` truncated a sub-millisecond cadence
+// to zero, so the clock never advanced and consensus time froze.
+func TestConsensusClockDoesNotFreezeBelowOneMillisecond(t *testing.T) {
+	var c consensusClock
+	if got := c.tick(200 * time.Microsecond); got != 0 {
+		t.Fatalf("the first 200µs tick advanced the clock to %dms, want 0", got)
+	}
+	for i := 0; i < 3; i++ {
+		c.tick(200 * time.Microsecond)
+	}
+	if got := c.tick(200 * time.Microsecond); got != 1 {
+		t.Fatalf("five 200µs ticks reached %dms, want 1ms (the old code froze at 0)", got)
+	}
+	if got := c.tick(50 * time.Millisecond); got != 51 {
+		t.Fatalf("a following 50ms tick reached %dms, want 51ms", got)
+	}
+}
+
+// Audit O-10: Run builds a fresh chain, so pointing it at a directory that
+// already holds one must fail with a clear message, not extend the chain and
+// then fail the caller's height arithmetic.
+func TestRunRefusesANonEmptyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Run(Options{Dir: dir, Blocks: 5}); err != nil {
+		t.Fatalf("the first run on an empty dir: %v", err)
+	}
+	_, err := Run(Options{Dir: dir, Blocks: 5})
+	if err == nil {
+		t.Fatal("a second Run on the same directory must be refused")
+	}
+	if !strings.Contains(err.Error(), "already holds a chain") {
+		t.Fatalf("the refusal did not explain the existing chain: %v", err)
 	}
 }

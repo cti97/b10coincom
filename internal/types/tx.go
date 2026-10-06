@@ -36,6 +36,17 @@ const (
 // The sender's public key travels with the transaction because an address is
 // only a hash of that key: the key cannot be recovered from the address, so
 // signature verification needs it supplied explicitly.
+//
+// VALIDITY WINDOW (audit S-19): a signed transaction carries NO expiry or
+// height window. Its only bound is the account nonce - once the nonce is
+// consumed the transaction can never apply again, and a transfer sits
+// spendable indefinitely until then. This is a deliberate, acknowledged
+// property, not a latent bug: a window needs a height/timestamp field inside
+// the signed body, which is a hard-fork-shaped encoding change. S-1 and S-3
+// already spent one such change on the chain identifier and the fee; adding
+// the expiry field belongs in the same place (Header has no version field, so
+// there is no in-band signal for a second one). Do not add an unsigned
+// expiry: an unauthenticated bound is worse than none.
 type Tx struct {
 	Type   TxType
 	From   Address
@@ -97,7 +108,20 @@ func (tx *Tx) SigningHash(genesisHash [32]byte) [32]byte {
 	return crypto.HashParts([]byte("b10coin-tx"), genesisHash[:], tx.encodeBody())
 }
 
-// ID is the transaction identifier used for deduplication and indexing.
+// ID is the transaction identifier used for deduplication and indexing. It
+// covers the signature, not only the body (audit S-13).
+//
+// That is deliberate and was re-checked rather than changed. The audit's
+// concern - "the signer can produce unlimited valid IDs for one body and fill
+// the pool with copies" - does not hold: Ed25519 signing (crypto.Sign, hence
+// ed25519.Sign) is DETERMINISTIC, so a given key has exactly one signature
+// over a given SigningHash. Two byte-different valid encodings of "one body"
+// therefore require two different signed bodies, i.e. two different
+// transactions, and those are bounded downstream by the mempool's per-sender
+// transfer cap and its rule that one sender may hold only one pending
+// transfer per nonce (audit S-9). Hashing the signature also means a
+// malformed or substituted signature cannot collide with the real
+// transaction's ID.
 func (tx *Tx) ID() [32]byte {
 	return crypto.HashParts([]byte("b10coin-txid"), tx.Encode())
 }
