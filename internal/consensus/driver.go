@@ -383,6 +383,26 @@ func (d *Driver) reAdd(txs []types.Tx, cause error) error {
 // the rest of the network: merely behind.
 func (d *Driver) Height() uint64 { return d.ch.Height() }
 
+// Round reports the round the driver's current engine is in. Together with
+// AppendRefused it is the pair a stalled node needs to be diagnosable from
+// outside: "the height is not moving" has two entirely different causes, and
+// the committed height cannot tell them apart.
+//
+// A node whose engine has committed but whose Append was REFUSED reports
+// AppendRefused true and a round that has stopped advancing (the engine is at
+// StepCommit; see flush). A node churning its round ladder - the shape a
+// scheduler-skewed run produces, where one engine's rounds run ahead of the
+// committee's and neither side's votes are any longer tallied at the other's
+// round - reports AppendRefused false and a round that keeps climbing. It is
+// the round number, not the height, that says which one this is.
+func (d *Driver) Round() uint32 { return d.eng.Round() }
+
+// AppendRefused reports whether flush has STOPPED offering this height's
+// committed block because the chain refused it: the park described on the
+// field itself and by Design Decision 8. It is true only after a refused
+// Append, and it clears when a fresh engine replaces the refused one.
+func (d *Driver) AppendRefused() bool { return d.appendRefused }
+
 // Tick advances the driver's clock to nowMillis and drives three things in a
 // fixed order: proposing (a proposer must not sit silently in its own round),
 // the round timeout of the round the engine is IN, and the flush that delivers

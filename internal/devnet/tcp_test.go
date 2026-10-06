@@ -27,6 +27,8 @@ package devnet
 //     an empty peer set and heights frozen at 0.
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +101,43 @@ func minMax(hs []uint64) (min, max uint64) {
 	return min, max
 }
 
+// stallReport names, per validator, WHY a networked run is not advancing. The
+// committed height alone cannot: a node with a refused Append (parked) and a
+// node whose round ladder has run past the committee's (undecidable) report the
+// same frozen height, and the CI failure this exists for - a 3-of-4 committee
+// sitting at height 1 for a full minute under `go test -race` - could not be
+// told apart from a merely slow run in the log it left behind. It reads only
+// exported, lock-guarded observables; nil slots are the validators a deferred
+// closeAll tolerates.
+func stallReport(vs []*Validator) string {
+	var b strings.Builder
+	b.WriteString("\n\tper validator [height round parked syncdropped adopted peers]:")
+	for i, v := range vs {
+		if v == nil {
+			fmt.Fprintf(&b, "\n\t%d: not started", i)
+			continue
+		}
+		fmt.Fprintf(&b, "\n\t%d: [%d %d %v %d %d %d]",
+			i, v.Height(), v.Round(), v.AppendRefused(),
+			v.SyncRequestsDropped(), v.BlocksAdopted(), v.PeerCount())
+	}
+	return b.String()
+}
+
+// reachError is what waitAllReach reports when the height was never reached.
+// It is a function, not an inline Fatalf, so the test below can assert the
+// message names the mechanism WITHOUT waiting out a real stall.
+func reachError(vs []*Validator, target uint64, timeout time.Duration) error {
+	return fmt.Errorf("validators did not reach height %d in %s; heights %v%s",
+		target, timeout, heightsOf(vs), stallReport(vs))
+}
+
+// convergedError is waitConvergedEqual's half of the same report.
+func convergedError(vs []*Validator, target uint64, timeout time.Duration) error {
+	return fmt.Errorf("the committee did not converge to a common height >= %d in %s; heights %v%s",
+		target, timeout, heightsOf(vs), stallReport(vs))
+}
+
 // waitAllReach polls until every validator named by the slice stands at or
 // above target.
 func waitAllReach(t *testing.T, vs []*Validator, target uint64, timeout time.Duration) {
@@ -110,7 +149,7 @@ func waitAllReach(t *testing.T, vs []*Validator, target uint64, timeout time.Dur
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("validators did not reach height %d in %s; heights %v", target, timeout, hs)
+			t.Fatal(reachError(vs, target, timeout))
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -130,7 +169,7 @@ func waitConvergedEqual(t *testing.T, vs []*Validator, target uint64, timeout ti
 			return min
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the committee did not converge to a common height >= %d in %s; heights %v", target, timeout, hs)
+			t.Fatal(convergedError(vs, target, timeout))
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -323,6 +362,55 @@ func TestFourValidatorsFinaliseThroughTheRelayStar(t *testing.T) {
 	waitAllReach(t, vs, h+6, 150*time.Second)
 	assertIdenticalHistory(t, vs, h+6)
 	assertVotesAtOrAbove(t, late, uint64(h), 150*time.Second)
+}
+
+// TestAStalledRunNamesItsMechanism pins the diagnostic the CI failure needed
+// and did not have. The failing run printed one line and a height triple -
+// "heights [1 1 1]" - after sixty seconds in the `-race` step, which is exactly
+// what a parked node, a node whose round ladder has run past the committee's,
+// and a merely starved run all print. The report must name the round and the
+// park for every validator, so the next occurrence is diagnosable from the log
+// alone rather than by a local rerun that cannot reproduce it.
+//
+// The mutant this pins: dropping stallReport from reachError/convergedError
+// makes this test fail on the missing "round"/"parked"/"syncdropped" fields.
+func TestAStalledRunNamesItsMechanism(t *testing.T) {
+	v := startListening(t, 0, 4)
+	w := startListening(t, 1, 4)
+	defer closeAll([]*Validator{v, w})
+
+	for _, tc := range []struct {
+		name string
+		msg  string
+	}{
+		{"reach", reachError([]*Validator{v, w}, 6, time.Minute).Error()},
+		{"converged", convergedError([]*Validator{v, w}, 6, time.Minute).Error()},
+	} {
+		// The failure still says what it always said, so no reader loses the
+		// headline while gaining the diagnosis.
+		if !strings.Contains(tc.msg, "heights [0 0]") {
+			t.Fatalf("%s: the message no longer reports the heights it always did: %s", tc.name, tc.msg)
+		}
+		for _, want := range []string{"round", "parked", "syncdropped", "adopted", "peers"} {
+			if !strings.Contains(tc.msg, want) {
+				t.Fatalf("%s: the stall message does not name %q, so a stalled run is still mute about its mechanism: %s", tc.name, want, tc.msg)
+			}
+		}
+		// A live, unparked validator reports its real observables: parked false
+		// and a round, which is the pair that tells a park apart from a round
+		// divergence.
+		if !strings.Contains(tc.msg, "\n\t0: [0 ") {
+			t.Fatalf("%s: a fresh validator's line is not [height round ...]: %s", tc.name, tc.msg)
+		}
+		if v.AppendRefused() || w.AppendRefused() {
+			t.Fatal("a freshly started validator reports a refused Append")
+		}
+	}
+	// A slot the deferred closeAll tolerates is reported as such, never
+	// dereferenced.
+	if got := stallReport([]*Validator{v, nil}); !strings.Contains(got, "\n\t1: not started") {
+		t.Fatalf("a nil validator slot was not reported as not started: %s", got)
+	}
 }
 
 // The Close regression pin that used to live here —
