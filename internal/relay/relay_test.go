@@ -79,6 +79,7 @@ import (
 	"unsafe"
 
 	"github.com/cti97/b10coincom/internal/wire"
+	"strings"
 )
 
 // startRelay is spelled out in full in every test rather than in a default
@@ -126,6 +127,30 @@ func readFrame(t *testing.T, c net.Conn, max int) []byte {
 		t.Fatalf("clear read deadline: %v", err)
 	}
 	return payload
+}
+
+// expectGateGreeting / expectGateAccepted pin the two fixed frames of the
+// access-token handshake (review, audit fix round 4). The relay writes the
+// greeting as its FIRST frame on every accepted connection when a token is
+// configured, and the accepted frame only after the presented token matched.
+// Both are byte-for-byte constants from internal/wire: the relay still decodes
+// nothing, and a node that does not see the greeting never sends its token, so
+// a relay started without --access-token-file cannot be handed the secret to
+// forward. waitClosed's "delivered data instead of closing" check is what keeps
+// these honest: it is handed the frames it expects, so any other byte is still
+// a protocol violation.
+func expectGateGreeting(t *testing.T, c net.Conn) {
+	t.Helper()
+	if got := readFrame(t, c, 1<<16); !bytes.Equal(got, wire.RelayGateGreeting) {
+		t.Fatalf("relay's first frame is %q; want the fixed gate greeting %q", got, wire.RelayGateGreeting)
+	}
+}
+
+func expectGateAccepted(t *testing.T, c net.Conn) {
+	t.Helper()
+	if got := readFrame(t, c, 1<<16); !bytes.Equal(got, wire.RelayGateAccepted) {
+		t.Fatalf("relay's frame after a valid token is %q; want the fixed accepted frame %q", got, wire.RelayGateAccepted)
+	}
 }
 
 // waitClosed asserts the relay closed OUR end of the connection: the next
@@ -1945,6 +1970,7 @@ func TestTheAccessTokenGateAdmitsOnlyTheTokenHolder(t *testing.T) {
 	differentLength := append([]byte("short"), token...)
 	for name, bad := range map[string][]byte{"same-length": sameLength, "different-length": differentLength} {
 		c := dial(t, r.Addr().String())
+		expectGateGreeting(t, c)
 		writeFrame(t, c, bad)
 		waitClosed(t, c, "a "+name+" wrong-token dial")
 	}
@@ -1954,12 +1980,19 @@ func TestTheAccessTokenGateAdmitsOnlyTheTokenHolder(t *testing.T) {
 	}
 
 	// Two holders register, and the token frame never reaches the forwarding
-	// path.
+	// path. Each must read the relay's greeting BEFORE writing the token
+	// (review, audit fix round 4) and the accepted frame after it: those two
+	// fixed frames are how the node knows the relay gates at all, so a node
+	// never hands its secret to a relay that would forward it as payload.
 	a := dial(t, r.Addr().String())
+	expectGateGreeting(t, a)
 	writeFrame(t, a, token)
+	expectGateAccepted(t, a)
 	waitRegistered(t, r, 1, "the first token holder was not registered")
 	b := dial(t, r.Addr().String())
+	expectGateGreeting(t, b)
 	writeFrame(t, b, token)
+	expectGateAccepted(t, b)
 	waitRegistered(t, r, 2, "the second token holder was not registered")
 
 	writeFrame(t, a, []byte("payload"))
@@ -1975,9 +2008,12 @@ func TestTheAccessTokenGateAdmitsOnlyTheTokenHolder(t *testing.T) {
 func TestTheRelayRefusesATokenDialThatSaysNothing(t *testing.T) {
 	r := startRelay(t, Options{
 		MaxFrameBytes: 4096, MaxConns: 8, MaxConnsPerIP: 8,
-		WriteQueueBytes: 1 << 16, AccessToken: []byte("token"), AccessTimeout: 150 * time.Millisecond,
+		WriteQueueBytes: 1 << 16, AccessToken: []byte("silent-dial-token"), AccessTimeout: 150 * time.Millisecond,
 	})
 	c := dial(t, r.Addr().String())
+	// The relay announces the gate first, then waits out AccessTimeout for a
+	// token that never comes.
+	expectGateGreeting(t, c)
 	waitClosed(t, c, "a dial that never presented the token")
 	waitFor(t, func() bool { return r.Stats().Unauthorized >= 1 }, "the silent dial to be counted unauthorized")
 	if got := r.Stats().Conns; got != 0 {
@@ -2343,4 +2379,29 @@ func TestTheReaperDoesNotBlameAReceiverForASendersBacklog(t *testing.T) {
 		t.Fatalf("the connection was finished after serving its backlog - the receiver's link was torn down for a sender's frames (audit F3)")
 	default:
 	}
+}
+
+// TestAShortAccessTokenIsRefusedAtStartup pins the minimum token length on the
+// relay side (review, audit fix round 4). The token is the relay's only
+// credential and its check is one comparison per dial, so a 1-byte token falls
+// in 256 dials and a 4-byte one in 2^32. New cannot report the problem - it
+// returns no error - so Listen, the call that makes the relay reachable, is
+// where the configuration is refused, before a listener exists.
+func TestAShortAccessTokenIsRefusedAtStartup(t *testing.T) {
+	for _, n := range []int{1, 4, wire.MinRelayAccessTokenBytes - 1} {
+		r := New(Options{AccessToken: bytes.Repeat([]byte{'t'}, n)})
+		err := r.Listen("127.0.0.1:0")
+		if err == nil {
+			r.Close()
+			t.Fatalf("the relay listened with a %d-byte access token; the floor is %d", n, wire.MinRelayAccessTokenBytes)
+		}
+		if !strings.Contains(err.Error(), "at least") {
+			t.Fatalf("the refusal for a %d-byte token reads %q; it must name the minimum", n, err)
+		}
+	}
+	r := New(Options{AccessToken: bytes.Repeat([]byte{'t'}, wire.MinRelayAccessTokenBytes)})
+	if err := r.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("a token of exactly the minimum length was refused: %v", err)
+	}
+	r.Close()
 }

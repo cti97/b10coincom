@@ -880,8 +880,9 @@ func New(opts Options) *Relay {
 	}
 }
 
-// Listen accepts connections on addr until Close. It returns error only for a
-// failed net.Listen, a double Listen, or a Listen after Close.
+// Listen accepts connections on addr until Close. It returns error for a
+// failed net.Listen, a double Listen, a Listen after Close, or an access token
+// shorter than wire.MinRelayAccessTokenBytes.
 func (r *Relay) Listen(addr string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -890,6 +891,17 @@ func (r *Relay) Listen(addr string) error {
 	}
 	if r.lsn != nil {
 		return fmt.Errorf("relay: already listening on %s", r.lsn.Addr())
+	}
+	if n := len(r.opts.AccessToken); n > 0 && n < wire.MinRelayAccessTokenBytes {
+		// Refused at STARTUP, before a listener exists, not at each dial: a
+		// token shorter than the floor is brute-forced by dialling it (a
+		// 1-byte token falls in 256 attempts), and a relay that came up anyway
+		// would advertise a gate it cannot defend. New cannot report this (it
+		// returns no error), so Listen - the call that makes the relay
+		// reachable - is where the configuration is refused. cmd/b10coin-relay
+		// checks the flag too, so an operator gets the message before this.
+		return fmt.Errorf("relay: access token is %d bytes; at least %d are required (a short token is brute-forced by dialling)",
+			n, wire.MinRelayAccessTokenBytes)
 	}
 	// TCP keepalive is set here, at listener construction, on every
 	// connection this listener ever accepts: the half-open reaping is
@@ -1036,17 +1048,41 @@ func (r *Relay) releaseHandshake(nc net.Conn) {
 // handshake presents the access-token gate (audit N-8) and then admits the
 // connection whose accept-time slot the caller has already reserved against
 // both caps (audit F1). With no token configured it is the admit call alone.
-// With a token, the FIRST frame must equal it EXACTLY - length and bytes - and
-// is then consumed, never forwarded. The check reads only the frame length
-// (wire.ReadFrame) and compares raw bytes in constant time (subtle.
-// ConstantTimeCompare): the relay decodes nothing, so its "parses nothing"
-// posture is intact. A connection that fails, or says nothing within
-// accessTokenTimeout, is closed, counted as unauthorized, and its reserved
-// slot is RELEASED; it is NEVER registered, so it can neither receive nor
-// forward a frame.
+//
+// With a token, the exchange is three frames and no decoding at any point:
+// the relay writes the FIXED greeting frame FIRST (review, audit fix round 4),
+// so a token-configured node will not part with its secret until the relay has
+// announced that it wants one; the connection's FIRST inbound frame must then
+// equal the token EXACTLY - length and bytes - and is consumed, never
+// forwarded; and only on a match does the relay write the FIXED accepted frame
+// so the node can tell a refusal from a dead socket instead of redialling in
+// silence. The greeting costs one write on a socket that is already open,
+// before the relay knows anything about the peer.
+//
+// The relay still calls no decoder anywhere in this path: it reads a frame
+// (wire.ReadFrame), compares raw bytes in constant time (subtle.
+// ConstantTimeCompare), and writes two constant byte strings. Its "parses
+// nothing" posture is intact by construction. A connection that fails, or says
+// nothing within accessTokenTimeout, is closed, counted as unauthorized, and
+// its reserved slot is RELEASED; it is NEVER registered, so it can neither
+// receive nor forward a frame.
+//
+// The greeting is a wire-format fact shared with the node side, so it comes
+// from internal/wire (RelayGateGreeting/RelayGateAccepted), which both ends
+// already import - one source of truth, no import of the transport layer here.
 func (r *Relay) handshake(nc net.Conn, group string) {
 	defer r.wg.Done()
 	if len(r.opts.AccessToken) > 0 {
+		// Announce gating before asking for anything. A node that reads this
+		// knows the relay will consume a token frame; a node that does not
+		// get it refuses to send one (tcp.adoptRelay). The write is bounded
+		// like every other handshake write on this socket.
+		if err := writeGateFrame(nc, wire.RelayGateGreeting, r.opts.WriteTimeout); err != nil {
+			r.unauthorized.Add(1)
+			r.releaseHandshake(nc)
+			_ = nc.Close()
+			return
+		}
 		if err := nc.SetReadDeadline(time.Now().Add(r.opts.AccessTimeout)); err != nil {
 			r.unauthorized.Add(1)
 			r.releaseHandshake(nc)
@@ -1067,9 +1103,25 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 			_ = nc.Close()
 			return
 		}
-		// The token frame is consumed; clear the deadline so the reader arms
-		// its own per-frame one.
+		// The token matched. Confirm it with the fixed accepted frame BEFORE
+		// clearing the deadline, so a node with a wrong token (which the relay
+		// closes above, without an ack) is distinguishable from one that was
+		// admitted: the node's read of this frame is its only signal. A write
+		// failure here is a dying socket, not a refused token, so it is not
+		// counted as unauthorized.
+		if err := writeGateFrame(nc, wire.RelayGateAccepted, r.opts.WriteTimeout); err != nil {
+			r.releaseHandshake(nc)
+			_ = nc.Close()
+			return
+		}
+		// Both gate frames are done; clear the deadlines so the reader and
+		// writer arm their own per-frame ones.
 		if err := nc.SetReadDeadline(time.Time{}); err != nil {
+			r.releaseHandshake(nc)
+			_ = nc.Close()
+			return
+		}
+		if err := nc.SetWriteDeadline(time.Time{}); err != nil {
 			r.releaseHandshake(nc)
 			_ = nc.Close()
 			return
@@ -1084,6 +1136,20 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 		}
 		_ = nc.Close()
 	}
+}
+
+// writeGateFrame writes one of the access-token gate's two fixed frames under
+// a write deadline, so a peer that has stopped reading cannot park the
+// handshake goroutine on a 20-byte write. The greeting and the accepted frame
+// are the only things the relay ever writes before a connection is registered,
+// and both are constants: no token bytes, no peer-derived bytes, nothing to
+// decode on the other side. The deadline is cleared by the caller once the
+// gate is done, because the connection's reader and writer arm their own.
+func writeGateFrame(nc net.Conn, frame []byte, timeout time.Duration) error {
+	if err := nc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
+	return wire.WriteFrame(nc, frame)
 }
 
 // admit converts an accepted socket whose accept-time slot is ALREADY

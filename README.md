@@ -257,8 +257,8 @@ whose keys sign, and that is the security boundary:**
 | `--genesis PATH` | *unset* | shared committee file listing the validators' public keys; giving it runs the consensus committee that file names |
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
-| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back, is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
-| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8): sent as the first frame of every `--relay` dial so a relay started with `--access-token-file` admits this node. The relay compares it by length and equality and decodes nothing |
+| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
+| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The node waits for the relay's **gate greeting** before sending it, then waits for the relay's **accepted** frame, so a relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — is refused WITHOUT ever being handed the secret, and the refusal is logged. Plaintext over TCP and replayable: see the relay section |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |
@@ -313,15 +313,26 @@ anyone with this repository can reproduce: with a fixture committee, anyone
 can be every validator, and no property of the relay matters because forging
 needs no relay at all. That is why the deployment recipe's firewall step
 allowlists the validators' IPs — and why the relay also supports a
-**pre-shared first-frame access token** (`--access-token-file` on the relay,
+**pre-shared access token** (`--access-token-file` on the relay,
 `--relay-access-token-file` on each node), which is the layer that works
 behind CGNAT where a source-IP allowlist cannot, and why the fixture
 committee must never reach a publicly reachable relay. The token is compared
 by length and byte equality and is opaque to the relay: the relay still
-decodes nothing. If relay-only trust ever stops being acceptable
-the answer is multiple relays and direct connections — never a smarter relay,
-because a relay that understood consensus would be a relay that could be
-wrong about it.
+decodes nothing. The exchange is three FIXED frames and no decoding anywhere:
+the relay announces gating (`b10coin-relay-gate-v1`), the node answers with the
+token, and the relay confirms with a second fixed frame — so a node refuses to
+send the secret to a relay that has not announced it gates, and a node whose
+token is REFUSED logs the handshake death instead of redialling in silence.
+The token must be at least 16 bytes on both ends (a shorter one is
+brute-forced by dialling: one byte falls in 256 attempts). **Two limits to
+know:** the token travels in **plaintext** over TCP, so a passive observer of
+the link reads it, and it is **replayable** — it is a constant compared per
+connection, neither challenged nor expired — so use it over a trusted path (a
+VPN) or accept that its compromise is a connection you must be able to absorb.
+It authenticates a connection, never a peer. If relay-only trust ever stops
+being acceptable the answer is multiple relays and direct connections — never
+a smarter relay, because a relay that understood consensus would be a relay
+that could be wrong about it.
 
 Because it authenticates nothing, it binds everything a stranger controls,
 with **structural bounds only** (byte budgets, socket deadlines, endpoint
@@ -637,7 +648,7 @@ by `cmd` alone.
 | `internal/state` | Address → account state map; the transfer transition (chain-binding signature, nonce, minimum fee, balance rules, amount+fee overflow) applied atomically per block on a clone; the fee is burned; sorted-leaf Merkle state root; zero-value accounts pruned |
 | `internal/genesis` | Protocol parameters, genesis hash and validation, the devnet and testnet configurations, deterministic public dev fixtures, and the keyless faucet address |
 | `internal/faucet` | The M2 faucet machinery: the Argon2id claim puzzle (`Solve`, digest construction, target comparison), the cheap BLAKE3 **outer puzzle** (`PreDigest`, `SolveClaim`) a node's mempool checks before paying for Argon2id, and the emission schedule (`Reward`, `SeriesTotal`) |
-| `internal/store` | Append-only block segment files (1,000 blocks per segment), each record framed by a **checksummed fixed-width header** (length plus its CRC32C) and a trailing CRC32C over the length and payload, with the lock log and the commit-certificate log framed the same way; a torn trailing record is truncated on open, and a complete record whose checksum fails stops the scan and fails open, never silently dropped |
+| `internal/store` | Append-only block segment files (1,000 blocks per segment). EVERY log file (segments, lock log, round log, certificate log) begins with a **segment header**: the `b10coin-seg` magic and a big-endian format version, checked before a single record is framed, so a directory written by an older layout is refused as an unrecognised format — never as corruption with truncation advice, which would delete an intact chain. After the header each record is framed by a **checksummed fixed-width header** (length plus its CRC32C) and a trailing CRC32C over the length and payload; a torn trailing record is truncated on open, and a complete record whose checksum fails stops the scan and fails open, never silently dropped |
 | `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency |
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction. Admission is **stateful** against the head state a block would execute now (audit R-1): a faucet claim is refused for a wrong epoch, an already-spent claim marker, a wrong nonce or a missing cheap outer puzzle before any Argon2id evaluation; claims are capped in a sub-pool separate from transfers and per sender, and a claim `Take` keeps skipping ages out. A full pool refuses a new transaction rather than evicting an older one |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
@@ -645,7 +656,7 @@ by `cmd` alone.
 | `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters. M4 adds BLOCK_SYNC catch-up and a certificate log: a commit certificate is persisted to the data directory, so a restarted validator still serves the evidence for blocks it adopted before it restarted |
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
-| `internal/transport/tcp` | The real TCP transport: a framed reader/writer with socket deadlines, direct dial/listen, a relay-aware dial mode registered under `relay:<addr>`, and reconnect backoff |
+| `internal/transport/tcp` | The real TCP transport: a framed reader/writer with socket deadlines, direct dial/listen, a relay-aware dial mode registered under `relay:<addr>`, and reconnect backoff. Its per-connection frame-rate bucket (audit N-6, the bound that stops one flooder monopolising the single dispatch callback) is applied to DIRECT connections only: on a relay connection the connection is the shared link, not the sender, so the bucket would drop honest members' votes for a stranger's flood — the relay's own per-sender share is the bound that replaces it there |
 | `internal/relay` | The dumb frame forwarder (`cmd/b10coin-relay`): a peer registry, per-receiver byte- and frame-bounded queues, per-source-prefix connection caps, socket deadlines and an optional pre-shared access-token first frame; it decodes nothing beyond the length prefix |
 | `internal/wire` | The wire envelopes shared with the transport and the consensus syncer: HELLO and BLOCK_SYNC request/response codecs with their own signed hashes |
 | `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, catch-up and prefix-agreement assertions — the harness the eight seeded scenarios drive, and the multi-validator devnet with it |
@@ -691,7 +702,15 @@ by `cmd` alone.
    what the shift-truncated rewards actually sum to — totals
    20,999,997.48 b10, 2.52 b10 below the cap, and
    `TestEmissionNeverExceedsTheCap` keeps the cap a maximum, never a target.
-6. **Crash-tolerant, append-only block storage.** Blocks are written to
+6. **Crash-tolerant, append-only block storage.** Every log file begins with a
+   **segment header** — the `b10coin-seg` magic and a format version — so the
+   directory states its layout before a record is framed. A directory written
+   before this marker existed (a build before the fourth review round) is
+   refused as an **unrecognised format**, with a hint that says so and warns
+   against truncation; it is never reported as bit rot, which would have
+   advised truncating at offset 0 and deleting the chain. **Upgrading from such
+   a build has no in-place migration: point `--dir` at a new, empty directory
+   and re-sync from a peer, or keep the older build.** Blocks are written to
    segment files as records with a fixed-width, checksummed header — the
    payload length and the CRC32C of that length — followed by the payload and
    a CRC32C over both. The length's own checksum is what lets the scanner

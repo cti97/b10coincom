@@ -731,3 +731,32 @@ func TestCliFixtureNodeStillRunsButWarnsItsKeysArePublic(t *testing.T) {
 		t.Fatalf("a publicly derivable committee started without the fixture warning:\n%s", p.tails())
 	}
 }
+
+// TestCmdNodeRefusesAShortRelayAccessToken pins the node half of the token
+// length floor (review, audit fix round 4). A token is the credential a relay
+// checks once per dial, so a short one is brute-forced at network speed; the
+// node must refuse it before it starts listening, not redial a relay that will
+// refuse every handshake. The refusal happens while parsing flags, so this
+// touches no socket.
+func TestCmdNodeRefusesAShortRelayAccessToken(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "relay.token")
+	if err := os.WriteFile(tokenPath, []byte("fifteen-bytes.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := cmdNode([]string{
+		"--dir", filepath.Join(dir, "data"),
+		"--relay", "127.0.0.1:7001",
+		"--relay-access-token-file", tokenPath,
+	})
+	if err == nil {
+		t.Fatal("a 14-byte relay access token was accepted; it is brute-forced by dialling")
+	}
+	if !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("the short-token refusal reads %q; it must name the minimum", err)
+	}
+	// And no data directory was created: the refusal precedes the store.
+	if _, statErr := os.Stat(filepath.Join(dir, "data")); !os.IsNotExist(statErr) {
+		t.Fatalf("the refused invocation created its data directory (stat err = %v)", statErr)
+	}
+}

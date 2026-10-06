@@ -30,6 +30,7 @@ import (
 	"github.com/cti97/b10coincom/internal/rpc"
 	"github.com/cti97/b10coincom/internal/types"
 	"github.com/cti97/b10coincom/internal/version"
+	"github.com/cti97/b10coincom/internal/wire"
 )
 
 func main() {
@@ -428,7 +429,7 @@ func cmdNode(args []string) error {
 	//     anyone with the repository can reproduce, for development only.
 	peers := fs.String("peers", "", "comma-separated peer addresses to dial")
 	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
-	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8); sent as the first frame of every --relay dial, because the relay compares bytes and decodes nothing")
+	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8; at least 16 bytes). Sent only after the relay announces its gate with a fixed first frame, so a relay without a token never receives it; a refused token is logged and retried. Plaintext over TCP and replayable: use it over a trusted path")
 	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
 	validators := fs.Int("validators", 0, "FIXTURE committee size (development mode; committee from --genesis otherwise)")
 	index := fs.Int("index", 0, "FIXTURE committee seat (development mode; the seat of --key is derived from --genesis otherwise)")
@@ -464,6 +465,13 @@ func cmdNode(args []string) error {
 		relayToken = bytes.TrimRight(data, "\r\n")
 		if len(relayToken) == 0 {
 			return fmt.Errorf("relay access-token file %q is empty; remove the flag or give it at least one byte", *relayTokenPath)
+		}
+		// The same floor the relay enforces, refused here so the operator
+		// learns about it before the node is listening rather than from a
+		// relay that closes every dial. See wire.MinRelayAccessTokenBytes.
+		if len(relayToken) < wire.MinRelayAccessTokenBytes {
+			return fmt.Errorf("relay access-token file %q holds %d bytes; at least %d are required (a shorter token is brute-forced by dialling)",
+				*relayTokenPath, len(relayToken), wire.MinRelayAccessTokenBytes)
 		}
 	}
 	return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken)

@@ -129,10 +129,10 @@ func TestOpenFailsOnCorruptLockRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != RecordHeaderLen+lockPayloadLen+RecordTrailerLen {
-		t.Fatalf("lock log is %d bytes; expected the %d-byte framed header, the fixed %d-byte payload (8-byte height, 4-byte round, 32-byte ID) and the %d-byte CRC", len(raw), RecordHeaderLen, lockPayloadLen, RecordTrailerLen)
+	if len(raw) != SegmentHeaderLen+RecordHeaderLen+lockPayloadLen+RecordTrailerLen {
+		t.Fatalf("lock log is %d bytes; expected the %d-byte segment header, the %d-byte framed header, the fixed %d-byte payload (8-byte height, 4-byte round, 32-byte ID) and the %d-byte CRC", len(raw), SegmentHeaderLen, RecordHeaderLen, lockPayloadLen, RecordTrailerLen)
 	}
-	raw[RecordHeaderLen+3] ^= 0xFF // a byte inside the record's fixed-width height field
+	raw[SegmentHeaderLen+RecordHeaderLen+3] ^= 0xFF // a byte inside the record's fixed-width height field
 	if err := os.WriteFile(logPath, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -174,16 +174,16 @@ func TestOpenFailsOnCorruptLengthPrefixLoudly(t *testing.T) {
 			// The most significant byte of the length: the record now
 			// appears to run past EOF - the exact shape that used to be
 			// truncated away as a torn tail.
-			raw[0] ^= 0x80
+			raw[SegmentHeaderLen] ^= 0x80
 		},
 		"valid-header-wrong-constant": func(raw []byte) {
 			// A length one byte too long, with the header checksum recomputed
 			// so the framing check agrees with it. Only the constant rule can
 			// tell this apart from a crash - and without it the record would
 			// be truncated away as torn.
-			binary.BigEndian.PutUint64(raw[:lengthFieldLen], lockPayloadLen+1)
-			binary.BigEndian.PutUint32(raw[lengthFieldLen:RecordHeaderLen],
-				crc32.Checksum(raw[:lengthFieldLen], crcTable))
+			binary.BigEndian.PutUint64(raw[SegmentHeaderLen:SegmentHeaderLen+lengthFieldLen], lockPayloadLen+1)
+			binary.BigEndian.PutUint32(raw[SegmentHeaderLen+lengthFieldLen:SegmentHeaderLen+RecordHeaderLen],
+				crc32.Checksum(raw[SegmentHeaderLen:SegmentHeaderLen+lengthFieldLen], crcTable))
 		},
 	}
 	for name, corrupt := range cases {
@@ -206,14 +206,14 @@ func TestOpenFailsOnCorruptLengthPrefixLoudly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(raw) != RecordHeaderLen+lockPayloadLen+RecordTrailerLen {
-				t.Fatalf("lock log is %d bytes, want one whole %d-byte record", len(raw), RecordHeaderLen+lockPayloadLen+RecordTrailerLen)
+			if len(raw) != SegmentHeaderLen+RecordHeaderLen+lockPayloadLen+RecordTrailerLen {
+				t.Fatalf("lock log is %d bytes, want the segment header plus one whole %d-byte record", len(raw), RecordHeaderLen+lockPayloadLen+RecordTrailerLen)
 			}
 			sizeBefore, err := fileSize(logPath)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := binary.BigEndian.Uint64(raw[:lengthFieldLen]); got != lockPayloadLen {
+			if got := binary.BigEndian.Uint64(raw[SegmentHeaderLen : SegmentHeaderLen+lengthFieldLen]); got != lockPayloadLen {
 				t.Fatalf("the length field is %d, want the constant %d the writer emits", got, lockPayloadLen)
 			}
 			corrupt(raw)
@@ -452,7 +452,7 @@ func countLockFrames(t *testing.T, dir string) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, off := 0, int64(0)
+	n, off := 0, int64(SegmentHeaderLen)
 	for off < int64(len(raw)) {
 		_, recEnd, err := frame(raw, off, lockPayloadLen)
 		if err != nil {
