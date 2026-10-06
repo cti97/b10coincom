@@ -26,6 +26,19 @@ var (
 	ErrNotValidator    = errors.New("chain: proposer is not in the validator set")
 	ErrGenesisReplay   = errors.New("chain: replay diverged from stored state root")
 	ErrUnknownProposer = errors.New("chain: cannot determine proposer key")
+	// ErrWrongGenesis reports a data directory whose recorded genesis hash
+	// differs from the genesis the node was started with (audit O-5). It is
+	// deliberately distinct from ErrGenesisReplay: a wrong genesis is a
+	// configuration mistake knowable BEFORE any block is replayed, not a
+	// damaged chain discovered mid-replay.
+	ErrWrongGenesis = errors.New("chain: data directory belongs to a different genesis")
+	// ErrBadTimestamp reports a block whose timestamp is not strictly greater
+	// than its parent's, or - on the consensus path - one that is not exactly
+	// the parent's plus one (audit S-8). Timestamps feed no economic rule
+	// today (epochs are height-based), but leaving them unvalidated let a
+	// proposer set any positive value, including one behind its parent, and
+	// made the timestamp a free grinding input for the next proposer draw.
+	ErrBadTimestamp = errors.New("chain: block timestamp is not valid for its parent")
 )
 
 // Chain is a validated, durably-stored block sequence. It is safe for
@@ -69,6 +82,12 @@ func genesisState(g *genesis.Genesis) *state.State {
 		// wiring it here the bound would exist only in states that tests
 		// construct by hand, and no real chain would enforce it.
 		MaxClaimsPerBlock: g.Params.MaxClaimsPerBlock,
+		// The chain identifier every transaction signature is bound to (audit
+		// S-1) and the fee floor a transfer must clear (audit S-3). Both are
+		// genesis parameters, so two chains that differ on either judge the
+		// same bytes differently - which is the point.
+		GenesisHash: g.Hash(),
+		MinFee:      g.Params.MinFeeSparks,
 	})
 	for _, d := range g.DevAccounts {
 		addr := types.AddressFromPub(d.PubKey)
@@ -121,6 +140,19 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 		}
 	}()
 	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st), faucet: g.FaucetAddress()}
+
+	// Compare the genesis BEFORE replaying a single block (audit O-5). A data
+	// directory belongs to one chain; opening it with a different genesis
+	// used to replay until the divergence surfaced as ErrGenesisReplay, which
+	// names neither cause nor fix. The store records the genesis hash once
+	// (atomically) and refuses a later mismatch with store.ErrWrongGenesis,
+	// which is surfaced as this chain's ErrWrongGenesis.
+	if err := s.CheckGenesis(g.Hash()); err != nil {
+		if errors.Is(err, store.ErrWrongGenesis) {
+			return nil, fmt.Errorf("%w: %w", ErrWrongGenesis, err)
+		}
+		return nil, err
+	}
 
 	height, ok := s.Height()
 	if !ok {
@@ -189,10 +221,47 @@ func (c *Chain) Head() *types.Block {
 	return c.head
 }
 
+// State returns the current committed state.
+//
+// IN-PROCESS TRUST ONLY (audit O-3). The returned *state.State is the chain's
+// LIVE state value, not a copy: it is replaced (never mutated) by every
+// Append, so a reader that holds one snapshot sees a consistent, immutable
+// world, but a caller that type-asserts or reaches for state.Set/SetHeight
+// can write into the chain's own state and silently desynchronise it from the
+// store. Those methods are exported because chain.genesisState and
+// state.ApplyBlock build state with them; they are not a public mutator.
+// Likewise Head() returns the retained *types.Block and Genesis() returns the
+// *genesis.Genesis handed to Open - callers must treat both as read-only.
+// This is acceptable for one process whose components trust each other; it is
+// not safe across a trust boundary and must not be exposed to one.
 func (c *Chain) State() *state.State {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.state
+}
+
+// AdmissionHead returns the head state together with the head height, under one
+// lock so the pair cannot disagree. The mempool uses it to admit a transaction
+// against the state a block would execute now, before paying for any expensive
+// verification (audit R-1). The returned *State is immutable once published -
+// every transition clones and replaces it - so a caller may read it without the
+// chain lock, exactly as Chain.State's contract already allows.
+func (c *Chain) AdmissionHead() (*state.State, uint64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.state, c.head.Header.Height
+}
+
+// HeadSnapshot returns the head height, the head block's ID and its state
+// root in ONE read-locked critical section (audit O-8). RPC's /status used to
+// call Head() and Height() separately, so a block committed between the two
+// calls produced a response whose height named the new head while the hash
+// and root named the old one - internally inconsistent, and a liar to any
+// monitor that compared them. All three values now come from the same head.
+func (c *Chain) HeadSnapshot() (height uint64, id [32]byte, stateRoot [32]byte) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.head.Header.Height, c.head.ID(), c.head.Header.StateRoot
 }
 
 // isValidator reports whether pub is in the genesis validator set.
@@ -263,11 +332,21 @@ func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
 // cumulative - each accepted transaction is inside the running state the next
 // probe starts from, so a candidate may chain onto its accepted siblings
 // (transfers with nonces 0 and 1 both survive; probing each against the bare
-// head state would evict the second). Equivalent-but-quadratic alternative:
-// probing every candidate through Probe(accepted... + candidate) re-derives and
-// re-verifies the accepted prefix's signatures per candidate, which on a
-// full MaxTxsPerBlock mempool is hours of ed25519 per block - a DoS the
-// one-base form avoids.
+// head state would evict the second).
+//
+// COST (audit S-6): the base is mutated IN PLACE by state.ApplyTx, so the
+// account map is cloned ONCE for the whole candidate list, not once per
+// candidate. ApplyTx's contract is that every validation runs before the first
+// write, so a rejected candidate leaves the running state untouched and the
+// next candidate still starts from valid state; that contract is load-bearing
+// here and is verified rather than trusted - see
+// state.TestApplyTxLeavesNoPartialWriteOnEveryFailurePath. Per candidate the
+// cost is one signature verification plus the transition's own writes, not a
+// full account-map copy (O(candidates × accounts) before this change, with up
+// to MaxTxsPerBlock = 10,000 candidates). A candidate that cannot apply is
+// dropped ALONE and leaves no trace on the running state; it does not discard
+// its valid siblings, and it is gone for good once the caller's Take does not
+// see it again - the caller owns what eviction means for its pool.
 //
 // The per-block claim bound is deliberately NOT applied here and its callers
 // must not duplicate it: state.ApplyBlock enforces it before any Argon2id
@@ -277,24 +356,21 @@ func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
 // a second claim rule that could drift from the state machine's; the two
 // layers this side of ApplyBlock stay exactly where they are.
 //
-// A candidate that cannot apply is dropped ALONE: it does not discard its
-// valid siblings, and it is gone for good once the caller's Take does not see
-// it again - the caller owns what eviction means for its pool. An error
-// return means the empty head+1 transition itself failed, so nothing applies
-// and every candidate was lost by the caller's bookkeeping; the caller is
-// expected to return its candidates to wherever they came from.
+// An error return means the empty head+1 transition itself failed, so nothing
+// applies and every candidate was lost by the caller's bookkeeping; the caller
+// is expected to return its candidates to wherever they came from.
 func (c *Chain) SelectApplicable(candidates []types.Tx) ([]types.Tx, error) {
+	// Probe returns a fresh state (advanceLocked clones before applying), so it
+	// is the caller's to mutate; no further clone is needed.
 	base, err := c.Probe(nil)
 	if err != nil {
 		return nil, err
 	}
 	valid := make([]types.Tx, 0, len(candidates))
 	for i := range candidates {
-		next, err := base.ApplyBlock([]types.Tx{candidates[i]})
-		if err != nil {
-			continue // evict: it cannot apply at this state
+		if err := base.ApplyTx(&candidates[i]); err != nil {
+			continue // evict: it cannot apply at this state, leaving base unchanged
 		}
-		base = next
 		valid = append(valid, candidates[i])
 	}
 	return valid, nil
@@ -302,9 +378,18 @@ func (c *Chain) SelectApplicable(candidates []types.Tx) ([]types.Tx, error) {
 
 // Build constructs and signs a candidate block. It does not mutate the
 // chain: the caller decides whether to Append.
+//
+// A proposer key that is nil or the wrong length is refused up front (audit
+// O-6). ed25519.PrivateKey.Public() indexes the key's seed and public halves,
+// so calling it on a short key panics; a wiring bug that passed nil used to
+// crash the node instead of returning. The length check makes the existing
+// ErrUnknownProposer return reachable for that case.
 func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int64) (*types.Block, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if len(proposer) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("%w: proposer key is %d bytes, want %d", ErrUnknownProposer, len(proposer), ed25519.PrivateKeySize)
+	}
 	pub, ok := proposer.Public().(ed25519.PublicKey)
 	if !ok {
 		return nil, ErrUnknownProposer
@@ -335,6 +420,21 @@ func (c *Chain) Build(proposer ed25519.PrivateKey, txs []types.Tx, timestamp int
 // applyValidated applies a block whose structure is already trusted.
 // Write-locked; the unlocked body lives in applyValidatedLocked so Append can
 // reuse it while holding the lock.
+//
+// TRUST BOUNDARY (audit O-2), stated here because this is the one place that
+// skips checks: replay trusts the bytes already in the local data directory.
+// It verifies the block's (height, parent link) against its position and the
+// recomputed state root against the header - the properties that detect a
+// renumbered, reordered or truncated log - but it deliberately does NOT
+// re-run ValidateStructure, proposer membership or the proposer signature.
+// The bytes were accepted by Append (which runs every check) and then fsynced
+// by this process or a predecessor on this disk; the cost of re-verifying
+// every stored block on every start buys no safety the disk does not already
+// carry. The boundary is the local filesystem: a host that can rewrite the
+// data directory can already rewrite the binary or the genesis, so replay's
+// job is corruption detection, not authentication. A node that must distrust
+// its own disk needs the whole directory authenticated by something outside
+// it - out of scope, and not to be half-done here.
 func (c *Chain) applyValidated(b *types.Block) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -351,9 +451,152 @@ func (c *Chain) applyValidatedLocked(b *types.Block) error {
 	return nil
 }
 
+// validateLocked runs every check Append runs for a block over the chain's
+// CURRENT head, and returns the state a valid block would produce.
+//
+// This is the ONE validation policy for what makes a block acceptable at
+// head+1: Append (the durable write) and ValidateNext (the consensus engine's
+// pre-vote seam) both call it, so a block the engine prevotes is, by
+// construction, a block Append would accept - and a proposer's Build (which
+// signs exactly the same transition) cannot disagree with either. Two
+// validators can only disagree about the chain, never about the rules.
+//
+// The checks, in Append's order: parent link, head+1 height, block structure
+// (types), proposer membership, proposer signature, then the whole state
+// transition through advanceLocked - height set, emission credited,
+// transactions applied - whose recomputed root must equal the header's claim.
+// That last check is the state-root probe: the same Probe-style transition a
+// peer who never saw the block would run to judge it.
+//
+// Read-lock sufficient: nothing here mutates the chain (advanceLocked works
+// on a clone). The caller must hold c.mu.
+func (c *Chain) validateLocked(b *types.Block) (*state.State, error) {
+	if b.Header.ParentHash != c.head.ID() {
+		return nil, ErrBadParent
+	}
+	if b.Header.Height != c.head.Header.Height+1 {
+		return nil, fmt.Errorf("%w: got %d, want %d", ErrBadHeight, b.Header.Height, c.head.Header.Height+1)
+	}
+	if err := b.ValidateStructure(); err != nil {
+		return nil, err
+	}
+	// Strict monotonicity (audit S-8): a block's timestamp must be greater than
+	// its parent's. This is the deterministic half of the fix - it depends only
+	// on the two headers, never on a wall clock - so replay and consensus stay
+	// exact. It runs before the state transition so a bad timestamp costs no
+	// Argon2id work.
+	if b.Header.Timestamp <= c.head.Header.Timestamp {
+		return nil, fmt.Errorf("%w: block timestamp %d is not after parent timestamp %d",
+			ErrBadTimestamp, b.Header.Timestamp, c.head.Header.Timestamp)
+	}
+	if !c.isValidator(b.Header.Proposer) {
+		return nil, ErrNotValidator
+	}
+	if b.Sig == nil {
+		return nil, ErrBadProposerSig
+	}
+	headerHash := b.Header.SigningHash()
+	if !crypto.Verify(b.Header.Proposer, headerHash[:], b.Sig) {
+		return nil, ErrBadProposerSig
+	}
+	next, err := c.advanceLocked(b.Header.Height, b.Txs)
+	if err != nil {
+		return nil, err
+	}
+	if computed := next.Root(); computed != b.Header.StateRoot {
+		return nil, fmt.Errorf("%w: computed %x, header claims %x",
+			ErrBadStateRoot, computed[:8], b.Header.StateRoot[:8])
+	}
+	return next, nil
+}
+
+// ValidateNext reports whether b is a valid block for head+1, WITHOUT
+// appending or mutating anything: it runs exactly the checks Append runs -
+// they live in one shared method so the two cannot drift - and returns the
+// first failure.
+//
+// COST, stated where the reviewer will look for it (audit round 3, F4): the
+// seam is the whole state transition, not a cheap pre-check. A proposal is
+// cloned and applied end to end - emission credited, every transaction
+// applied - and a faucet claim's puzzle can only be accepted or rejected by
+// evaluating it, so each claim in b costs one FULL Argon2id evaluation here,
+// bounded exactly as a genuine block is bounded by MaxClaimsPerBlock and
+// MaxTxsPerBlock (ApplyBlock refuses the block above any bound before any
+// puzzle runs). All of it runs under this chain's READ lock, so a Byzantine
+// proposer can force that work for a block it already knows will fail the
+// root comparison at the end - and the work is charged to every validator
+// the proposal reaches. The bound is structural: the engine judges at most
+// ONE proposal per round (the first stored proposal wins; later ones are
+// dropped as duplicates), so the attack is at most one full-transition
+// validation per round per validator - the price of the pre-vote probing the
+// audit asked for (judging the state root BEFORE a vote can rest on it), and
+// work the pre-fix prevote path never did. It is accepted cost, documented
+// here so no reviewer has to rediscover it.
+//
+// This is the audit C-1 seam's chain half: the consensus engine must judge a
+// proposal BEFORE prevoting it, and the check it makes must be the one a peer
+// (and the chain itself) would make at append time. A validator that lets a
+// proposal reach a polka, a lock and a commit before the chain sees it risks
+// every node parking on the chain's refusal, with no one able to move on -
+// the halt one Byzantine proposer can otherwise inflict with a garbage state
+// root.
+//
+// Like Append, validation is all-or-nothing against the current head: a
+// refusal leaves height, state and store untouched.
+func (c *Chain) ValidateNext(b *types.Block) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, err := c.validateLocked(b)
+	return err
+}
+
+// ValidateConsensusNext is ValidateNext plus the consensus path's timestamp
+// pin (audit S-8): a block this node will prevote must carry EXACTLY the
+// parent's timestamp plus one.
+//
+// This is the second half of the S-8 fix and the stricter one. The audit
+// offered a wall-clock future bound (Timestamp <= now + drift) or pinning the
+// consensus path to parent+1. The pin was chosen because a wall-clock bound
+// would put each validator's local clock into a consensus rule: the same block
+// could be valid at one node and invalid at a clock-skewed neighbour, and a
+// replayed check could disagree with the live one. The chain's own driver
+// already builds every proposal at parent+1 (deterministic and replayable), so
+// pinning it as a rule costs honest peers nothing and removes the proposer's
+// timestamp-grinding lever (C-14) entirely: on the consensus path there is one
+// legal timestamp, not a range.
+//
+// Append deliberately keeps only the monotonic rule. The single-node/RPC path
+// (node.RunOnce) is not consensus - it stamps the block with the local clock -
+// and requiring parent+1 there would be a needless hard fork. The weaker rule
+// still refuses a timestamp behind the parent on every path.
+func (c *Chain) ValidateConsensusNext(b *types.Block) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if _, err := c.validateLocked(b); err != nil {
+		return err
+	}
+	if want := c.head.Header.Timestamp + 1; b.Header.Timestamp != want {
+		return fmt.Errorf("%w: the consensus path pins the timestamp to parent+1; got %d, want %d",
+			ErrBadTimestamp, b.Header.Timestamp, want)
+	}
+	return nil
+}
+
 // Append validates a block against the current head and state, then stores
 // it. Validation happens before any mutation, so a rejected block leaves the
 // chain untouched.
+//
+// LOCKING AND fsync (audit O-4), stated because it is a real latency choice:
+// the whole operation - validation, the store write and its fsync, and the
+// in-memory swap - runs under the exclusive c.mu. That means a concurrent
+// RPC read (State/Height/Head/AdmissionHead) waits for the block's fsync,
+// which on a Raspberry Pi's SD card can be milliseconds. The alternative -
+// releasing the lock across the fsync - would let a reader observe a head
+// whose block is not yet durable, or let two Appends interleave their store
+// writes and state swaps; the store is not built for concurrent writers.
+// Correctness over read latency is the deliberate choice for this milestone;
+// a future split would need a store-level append lock and a commit protocol
+// (write, fsync, then publish) before the read lock could be dropped.
 //
 // Aliasing contract: on success Append retains the caller's *types.Block as
 // the chain's head (no defensive copy), and Head() later hands that same
@@ -363,40 +606,27 @@ func (c *Chain) applyValidatedLocked(b *types.Block) error {
 func (c *Chain) Append(b *types.Block) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if b.Header.ParentHash != c.head.ID() {
-		return ErrBadParent
-	}
-	if b.Header.Height != c.head.Header.Height+1 {
-		return fmt.Errorf("%w: got %d, want %d", ErrBadHeight, b.Header.Height, c.head.Header.Height+1)
-	}
-	if err := b.ValidateStructure(); err != nil {
-		return err
-	}
-	if !c.isValidator(b.Header.Proposer) {
-		return ErrNotValidator
-	}
-	if b.Sig == nil {
-		return ErrBadProposerSig
-	}
-	headerHash := b.Header.SigningHash()
-	if !crypto.Verify(b.Header.Proposer, headerHash[:], b.Sig) {
-		return ErrBadProposerSig
-	}
-
-	next, err := c.advanceLocked(b.Header.Height, b.Txs)
+	// The full validation runs first (validateLocked), so a rejected block
+	// never reaches the store: a refusal leaves the chain byte-identical to
+	// what ValidateNext would have observed.
+	next, err := c.validateLocked(b)
 	if err != nil {
 		return err
 	}
-	if computed := next.Root(); computed != b.Header.StateRoot {
-		return fmt.Errorf("%w: computed %x, header claims %x",
-			ErrBadStateRoot, computed[:8], b.Header.StateRoot[:8])
-	}
-
 	if err := c.store.Append(b.Header.Height, b.Encode()); err != nil {
 		return err
 	}
 	c.state = next
 	c.head = b
+	// The height just committed is behind every engine this node will build
+	// from now on (Driver.newEngine judges head+1, and there is no reorg), so
+	// its persisted lock - and every older one - can never be read again.
+	// Prune them (audit C-13): the in-memory map immediately, and the log file
+	// when enough stale frames have accumulated. The error is deliberately
+	// dropped: compacting the lock log is storage maintenance, never a safety
+	// step, and the old file (a superset) survives a failed rewrite. A commit
+	// must not be reported as failed because a rewrite could not happen.
+	_ = c.store.PruneLocks(b.Header.Height)
 	return nil
 }
 
@@ -446,6 +676,50 @@ func (c *Chain) LockAt(height uint64) (store.LockRecord, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.store.LockAt(height)
+}
+
+// PutRound durably records that a validator entered rec.Round at rec.Height
+// (audit C-3). The chain exposes the store's round log for the same reason it
+// exposes the lock log: the position a validator had reached must survive a
+// restart, and it belongs in the one crash-tolerant directory the blocks
+// replay from. Write-locked: it appends, fsyncs and re-indexes the store.
+func (c *Chain) PutRound(rec store.RoundRecord) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.PutRound(rec)
+}
+
+// RoundAt returns the newest round recorded for height, and whether one
+// exists. A restarted validator reads its position back through here, so the
+// driver's fresh engine resumes at the round the crashed one had reached
+// instead of re-entering round 0 for an already-contested height.
+func (c *Chain) RoundAt(height uint64) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.store.RoundAt(height)
+}
+
+// PutCert durably records the opaque commit certificate for height (audit
+// C-7). The chain exposes the store's certificate log for the same reason it
+// exposes the lock log: the evidence a node serves for a block it holds must
+// outlive the process that adopted the block, and it belongs in the one
+// crash-tolerant directory the blocks replay from. The encoding is the
+// consensus package's; the chain only files the bytes against a height.
+// Write-locked: it appends, fsyncs and re-indexes the store.
+func (c *Chain) PutCert(height uint64, payload []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.store.PutCert(height, payload)
+}
+
+// CertAt returns a copy of the recorded commit certificate for height, and
+// whether this chain holds one. A restarted node reads its history's
+// certificates back through here, so it can serve a peer the proof for blocks
+// it adopted in a previous life.
+func (c *Chain) CertAt(height uint64) ([]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.store.CertAt(height)
 }
 
 func (c *Chain) Close() error {

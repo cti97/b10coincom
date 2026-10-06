@@ -27,8 +27,14 @@ func Reward(height, initialReward, halvingInterval uint64) uint64 {
 }
 
 // SeriesTotal is the sum of Reward over every height from 0 to the point the
-// reward reaches zero. It is used by tests and by the genesis-parameter check to
-// prove the schedule cannot exceed the cap.
+// reward reaches zero, saturated at MaxUint64 rather than allowed to wrap.
+//
+// It is used by tests and by callers that need the realized series. It is NOT
+// used by the genesis-parameter check (audit S-16 corrected this doc): this
+// comment used to claim Validate called it, and Validate never did. Validate
+// proves the emission relation arithmetically (bits.Mul64) instead, and there
+// is deliberately no premine + emission rule for it to participate in - see
+// Genesis.Validate.
 func SeriesTotal(initialReward, halvingInterval uint64) uint64 {
 	if halvingInterval == 0 {
 		return 0

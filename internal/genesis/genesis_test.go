@@ -17,7 +17,11 @@ import (
 
 func TestGenesisHashIsDeterministic(t *testing.T) {
 	g := Devnet()
-	if g.Hash() != g.Hash() {
+	// Two separate calls, two variables: SA4000 flags `f(x) != f(x)` as an
+	// identical-expression comparison, and naming the two results also states
+	// the property under test (call-to-call determinism) more plainly.
+	first, second := g.Hash(), g.Hash()
+	if first != second {
 		t.Fatal("genesis hash is not deterministic")
 	}
 }
@@ -233,6 +237,30 @@ func TestGenesisRoundTripThroughEncoding(t *testing.T) {
 		t.Fatalf("genesis round trip lost MaxClaimsPerBlock: got %d, want %d",
 			got.Params.MaxClaimsPerBlock, g.Params.MaxClaimsPerBlock)
 	}
+	// MinFeeSparks is consensus too - it decides which transactions are valid -
+	// so a decode that drops it must fail here rather than quietly restoring
+	// free transfers (audit S-3).
+	if got.Params.MinFeeSparks != g.Params.MinFeeSparks {
+		t.Fatalf("genesis round trip lost MinFeeSparks: got %d, want %d",
+			got.Params.MinFeeSparks, g.Params.MinFeeSparks)
+	}
+}
+
+// MinFeeSparks is the floor a transfer must clear (audit S-3). It is pinned on
+// BOTH shipped chains, and a genesis that would re-open free transactions is
+// refused outright.
+func TestMinFeeIsPinnedPerChainAndZeroIsRefused(t *testing.T) {
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		if g.Params.MinFeeSparks != 1 {
+			t.Fatalf("%s: MinFeeSparks = %d, want the pinned 1", g.ChainID, g.Params.MinFeeSparks)
+		}
+		zeroed := g
+		*zeroed = *g
+		zeroed.Params.MinFeeSparks = 0
+		if err := zeroed.Validate(); !errors.Is(err, ErrBadGenesis) {
+			t.Fatalf("%s with MinFeeSparks 0 validated (%v), want ErrBadGenesis: a zero minimum is the free-transaction regime", g.ChainID, err)
+		}
+	}
 }
 
 func TestGenesisUsesBlake3Domain(t *testing.T) {
@@ -272,6 +300,7 @@ type genesisRecord struct {
 		HalvingIntervalBlocks uint64 `json:"halving_interval_blocks"`
 		ClaimAmountSparks     uint64 `json:"claim_amount_sparks"`
 		MaxClaimsPerBlock     uint64 `json:"max_claims_per_block"`
+		MinFeeSparks          uint64 `json:"min_fee_sparks"`
 		MinStakeSparks        uint64 `json:"min_stake_sparks"`
 		EpochBlocks           uint64 `json:"epoch_blocks"`
 		UnbondingEpochs       uint64 `json:"unbonding_epochs"`
@@ -370,6 +399,7 @@ func TestGenesisJSONRecordsMatchTheGoConstructors(t *testing.T) {
 			{"halving_interval_blocks", q.HalvingIntervalBlocks, p.HalvingIntervalBlocks},
 			{"claim_amount_sparks", q.ClaimAmountSparks, p.ClaimAmountSparks},
 			{"max_claims_per_block", q.MaxClaimsPerBlock, p.MaxClaimsPerBlock},
+			{"min_fee_sparks", q.MinFeeSparks, p.MinFeeSparks},
 			{"min_stake_sparks", q.MinStakeSparks, p.MinStakeSparks},
 			{"epoch_blocks", q.EpochBlocks, p.EpochBlocks},
 			{"unbonding_epochs", q.UnbondingEpochs, p.UnbondingEpochs},
@@ -429,7 +459,7 @@ func requiredParamsMissing(params map[string]json.RawMessage) []string {
 	for _, key := range []string{
 		"block_time_ms", "total_supply_sparks", "initial_reward_sparks",
 		"halving_interval_blocks", "claim_amount_sparks", "max_claims_per_block",
-		"min_stake_sparks",
+		"min_fee_sparks", "min_stake_sparks",
 		"epoch_blocks", "unbonding_epochs", "committee_size",
 		"faucet_pow_argon2", "faucet_pow_target",
 	} {
@@ -584,5 +614,182 @@ func TestValidateRejectsAZeroMaxClaimsPerBlock(t *testing.T) {
 	g.Params.MaxClaimsPerBlock = 0
 	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
 		t.Fatalf("expected ErrBadGenesis for MaxClaimsPerBlock == 0, got %v", err)
+	}
+}
+
+// The S-5 bounds. Each test below is a NEGATIVE test for one bound: it takes a
+// shipped, validating genesis, breaks exactly one parameter, and requires
+// Validate to refuse it. A bound with no negative test is a bound nothing
+// proves fires, and the shipped-chain validations elsewhere prove the positive
+// direction.
+
+// The faucet puzzle's memory cost is reached by every validator on every claim
+// in a block. A uint32 can name ~4 TiB; the ceiling keeps a malformed genesis
+// from OOMing the committee.
+func TestValidateRejectsFaucetPuzzleMemoryAboveTheCeiling(t *testing.T) {
+	g := Testnet()
+	g.Params.FaucetPowArgon2.MemoryKiB = maxFaucetArgon2MemoryKiB + 1
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis for MemoryKiB above the ceiling, got %v", err)
+	}
+	// The ceiling itself is legal: the bound must not be off by one.
+	g.Params.FaucetPowArgon2.MemoryKiB = maxFaucetArgon2MemoryKiB
+	if err := g.Validate(); err != nil {
+		t.Fatalf("MemoryKiB exactly at the ceiling must validate, got %v", err)
+	}
+}
+
+// A zero-valued Argon2id tuning makes applyFaucetClaim reject every claim
+// cleanly (argon2.IDKey would panic), so it bricks the faucet silently rather
+// than failing at startup.
+func TestValidateRejectsAZeroFaucetPuzzleTuning(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		breakFn func(*Params)
+	}{
+		{"zero MemoryKiB", func(p *Params) { p.FaucetPowArgon2.MemoryKiB = 0 }},
+		{"zero Iterations", func(p *Params) { p.FaucetPowArgon2.Iterations = 0 }},
+		{"zero Parallelism", func(p *Params) { p.FaucetPowArgon2.Parallelism = 0 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := Testnet()
+			tc.breakFn(&g.Params)
+			if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+				t.Fatalf("expected ErrBadGenesis for %s, got %v", tc.name, err)
+			}
+		})
+	}
+}
+
+// A claim of zero sparks pays the claimant nothing while still spending the
+// key's one-per-epoch marker: a faucet that pays zero is not a faucet.
+func TestValidateRejectsAZeroClaimAmount(t *testing.T) {
+	g := Testnet()
+	g.Params.ClaimAmountSparks = 0
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis for ClaimAmountSparks == 0, got %v", err)
+	}
+}
+
+// A block can never carry more transactions than MaxTxsPerBlock, so a claim
+// bound above it could never fire: an inert consensus parameter.
+func TestValidateRejectsAMaxClaimsPerBlockAboveTheBlockTxBound(t *testing.T) {
+	g := Testnet()
+	g.Params.MaxClaimsPerBlock = types.MaxTxsPerBlock + 1
+	if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("expected ErrBadGenesis for MaxClaimsPerBlock above MaxTxsPerBlock, got %v", err)
+	}
+	// Exactly the block transaction bound is legal.
+	g.Params.MaxClaimsPerBlock = types.MaxTxsPerBlock
+	if err := g.Validate(); err != nil {
+		t.Fatalf("MaxClaimsPerBlock == MaxTxsPerBlock must validate, got %v", err)
+	}
+}
+
+// One key must hold one seat: a duplicate makes its power count twice in the
+// quorum sum and lets the proposer draw name it twice. The check is O(n) with
+// a map over the 32-byte keys; at the 255-seat ceiling this project allows an
+// O(n^2) scan would be equally free, so the complexity does not matter here -
+// but the bound must fire.
+func TestValidateRejectsDuplicateValidatorKeys(t *testing.T) {
+	g := Devnet()
+	// Append a second entry for the SAME key with different power: a valid
+	// 32-byte key of positive power, so only the duplicate rule can refuse it.
+	g.Validators = append(g.Validators, Validator{PubKey: append([]byte(nil), g.Validators[0].PubKey...), Power: 7})
+	if err := g.Validate(); !errors.Is(err, ErrDuplicateValidator) {
+		t.Fatalf("expected ErrDuplicateValidator for a repeated key, got %v", err)
+	}
+}
+
+// CommitteeSize is a seat count encoded as a uint64 and decoded straight to
+// int: a value above MaxInt64 arrives negative, and a count above the 255-seat
+// ceiling is larger than either production path would build.
+func TestValidateRejectsAnOutOfRangeCommitteeSize(t *testing.T) {
+	for _, size := range []int{-1, maxCommitteeSize + 1} {
+		g := Testnet()
+		g.Params.CommitteeSize = size
+		if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+			t.Fatalf("expected ErrBadGenesis for CommitteeSize %d, got %v", size, err)
+		}
+	}
+}
+
+// Audit S-20: DecodeGenesis must not reinterpret an out-of-range encoded seat
+// count through int. A negative int encodes as a huge uint64 and a value above
+// the ceiling must be refused at decode time, before Validate ever sees it.
+func TestDecodeGenesisRejectsAnOutOfRangeCommitteeSize(t *testing.T) {
+	for _, size := range []int{-1, maxCommitteeSize + 1} {
+		g := Testnet()
+		g.Params.CommitteeSize = size
+		if _, err := DecodeGenesis(g.Encode()); !errors.Is(err, ErrBadGenesis) {
+			t.Fatalf("DecodeGenesis accepted CommitteeSize %d (encoded as %d), got %v",
+				size, uint64(size), err)
+		}
+	}
+}
+
+// A legal genesis must still decode to exactly the bytes it encoded, and to
+// the same genesis hash: the S-20 decode guard changed no valid input.
+func TestDecodeGenesisRoundTripsCanonicalBytes(t *testing.T) {
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		enc := g.Encode()
+		got, err := DecodeGenesis(enc)
+		if err != nil {
+			t.Fatalf("%s: DecodeGenesis: %v", g.ChainID, err)
+		}
+		if !bytes.Equal(got.Encode(), enc) {
+			t.Fatalf("%s: decode/encode changed the canonical bytes", g.ChainID)
+		}
+		if got.Hash() != g.Hash() {
+			t.Fatalf("%s: decode changed the genesis hash", g.ChainID)
+		}
+		if err := got.Validate(); err != nil {
+			t.Fatalf("%s: the decoded genesis no longer validates: %v", g.ChainID, err)
+		}
+	}
+}
+
+// Audit S-16: there is deliberately NO premine + emission <= cap rule in
+// Validate, and this test PINS that documented absence rather than a
+// validation. It records the arithmetic the audit asked to be stated: the
+// devnet fixture's premine plus the realized series exceeds the README's cap,
+// while the real testnet chain - which has no premine - cannot.
+func TestTheSupplyCapIsEmissionOnlyAndTheDevnetFixtureExceedsIt(t *testing.T) {
+	dev := Devnet()
+	var premine uint64
+	for _, d := range dev.DevAccounts {
+		premine += d.BalanceSparks
+	}
+	series := faucet.SeriesTotal(dev.Params.InitialRewardSparks, dev.Params.HalvingIntervalBlocks)
+	if premine == 0 {
+		t.Fatal("the devnet fixture is documented as premined; it has no dev accounts")
+	}
+	if premine+series <= dev.Params.TotalSupplySparks {
+		t.Fatalf("the devnet fixture no longer exceeds the cap (premine %d + series %d <= cap %d); update Devnet's and Validate's documentation with the new arithmetic",
+			premine, series, dev.Params.TotalSupplySparks)
+	}
+	if err := dev.Validate(); err != nil {
+		t.Fatalf("the devnet fixture must stay valid: %v", err)
+	}
+	// The real chain: no premine, and the relation keeps the series at or
+	// under the cap.
+	tn := Testnet()
+	if len(tn.DevAccounts) != 0 {
+		t.Fatal("the testnet must have no premine")
+	}
+	if s := faucet.SeriesTotal(tn.Params.InitialRewardSparks, tn.Params.HalvingIntervalBlocks); s > tn.Params.TotalSupplySparks {
+		t.Fatalf("the testnet emission series %d exceeds the cap %d", s, tn.Params.TotalSupplySparks)
+	}
+}
+
+// The genesis timestamp is the height-0 block's timestamp; the same > 0 rule
+// every later block obeys applies to it.
+func TestValidateRejectsANonPositiveGenesisTime(t *testing.T) {
+	for _, ts := range []int64{0, -1} {
+		g := Testnet()
+		g.Time = ts
+		if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
+			t.Fatalf("expected ErrBadGenesis for genesis Time %d, got %v", ts, err)
+		}
 	}
 }

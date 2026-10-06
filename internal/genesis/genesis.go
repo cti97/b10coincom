@@ -20,6 +20,21 @@ const SparksPerB10 = 100_000_000
 // Devnet() and by Validate's one devnet-specific rule.
 const devnetChainID = "b10coin-devnet-1"
 
+// maxFaucetArgon2MemoryKiB is the ceiling Validate puts on the faucet puzzle's
+// memory cost. The parameter is a uint32, so without a bound a genesis can name
+// up to ~4 TiB; every validator pays that allocation on every claim in a block,
+// so a malformed genesis OOMs the whole committee on the first claim. 256 MiB
+// is four times the design spec's original 64 MiB tuning and 32 times the
+// shipped testnet value (8 MiB): generous for any real tuning, far below the
+// size that would take a small validator down.
+const maxFaucetArgon2MemoryKiB = 256 * 1024
+
+// maxCommitteeSize is the seat ceiling a committee may declare. It matches the
+// cap the operator committee file (committee_file.go) and the fixture committee
+// (simnet.New) already enforce, so the general genesis contract cannot accept a
+// committee larger than either production path would build.
+const maxCommitteeSize = 255
+
 // puzzleTarget builds the shipped puzzle targets: top byte `top`, every
 // remaining byte 0xFF. A claim's digest must be strictly below this value, so
 // the expected number of Argon2id runs is 2^(zero bits at the head of `top`)
@@ -37,6 +52,10 @@ var (
 	ErrBadGenesis   = errors.New("genesis: invalid genesis")
 	ErrBadValidator = errors.New("genesis: validator public key must be 32 bytes")
 	ErrEmissionMath = errors.New("genesis: emission schedule does not reach the supply cap exactly")
+	// ErrDuplicateValidator reports two validator entries naming the same
+	// public key. One key holds one seat: a duplicate makes its power count
+	// twice in the quorum sum and lets the proposer draw name it twice.
+	ErrDuplicateValidator = errors.New("genesis: duplicate validator public key")
 )
 
 // Params are the protocol parameters fixed at genesis. FaucetPowArgon2 and
@@ -59,12 +78,19 @@ type Params struct {
 	// courtesy is pinned equal to the shipped chains' value by a test in
 	// this package. Validate refuses a genesis that leaves it zero.
 	MaxClaimsPerBlock uint64
-	MinStakeSparks    uint64
-	EpochBlocks       uint64
-	UnbondingEpochs   uint64
-	CommitteeSize     int
-	FaucetPowArgon2   faucet.Argon2Params
-	FaucetPowTarget   [32]byte
+	// MinFeeSparks is the least a transaction may pay the protocol (audit
+	// S-3). It is a consensus parameter, committed in the genesis encoding:
+	// two nodes that agreed on everything else but held different minimums
+	// would accept and reject the same blocks. state.applyTransfer enforces
+	// it, and Validate refuses a genesis that leaves it zero - a zero minimum
+	// is the free-transaction regime the finding is about.
+	MinFeeSparks    uint64
+	MinStakeSparks  uint64
+	EpochBlocks     uint64
+	UnbondingEpochs uint64
+	CommitteeSize   int
+	FaucetPowArgon2 faucet.Argon2Params
+	FaucetPowTarget [32]byte
 }
 
 // Validator is a genesis validator with its initial voting power.
@@ -113,6 +139,7 @@ func (g *Genesis) Encode() []byte {
 	e.U64(g.Params.HalvingIntervalBlocks)
 	e.U64(g.Params.ClaimAmountSparks)
 	e.U64(g.Params.MaxClaimsPerBlock)
+	e.U64(g.Params.MinFeeSparks)
 	e.U64(g.Params.MinStakeSparks)
 	e.U64(g.Params.EpochBlocks)
 	e.U64(g.Params.UnbondingEpochs)
@@ -190,6 +217,20 @@ func (g *Genesis) Validate() error {
 	if lo != p.TotalSupplySparks {
 		return ErrEmissionMath
 	}
+	// Audit S-16, stated where a reader would look for the rule: there is
+	// deliberately NO "premine + emission <= cap" check. The relation above
+	// constrains the EMISSION SERIES alone; a genesis with funded dev
+	// accounts can mint the series on top of that premine and exceed
+	// TotalSupplySparks. That is not an accident of this function but a
+	// consequence of the fixtures: Devnet (and simnet.Committee, which reuses
+	// it under a b10coin-simnet-N id) fund accounts so the transfer path is
+	// exercisable, and they exceed the README's cap by design. Enforcing the
+	// rule globally would reject every such fixture, and there is no
+	// principled way to tell a fixture premine from an operator's. The real
+	// chains are protected by the no-premine policy instead: Testnet has no
+	// dev accounts, and ParseCommitteeJSON refuses to mint any. See
+	// TestTheSupplyCapIsEmissionOnlyAndTheDevnetFixtureExceedsIt, which pins
+	// the arithmetic this comment describes rather than a validation.
 	// A zero puzzle target is unsatisfiable: a claim verifies only if its
 	// Argon2id digest is strictly below the target, and no digest is strictly
 	// below zero, so every claim on such a chain would fail forever. Every
@@ -216,6 +257,73 @@ func (g *Genesis) Validate() error {
 	// the per-block amplification this parameter exists to close.
 	if p.MaxClaimsPerBlock == 0 {
 		return fmt.Errorf("%w: MaxClaimsPerBlock must be at least 1 (an unbounded claim count per block is the amplification the state machine rejects)", ErrBadGenesis)
+	}
+	// A zero minimum is a chain whose transactions are free, which is exactly
+	// the regime audit S-3 closes. state.Params treats zero as "not engaged"
+	// for legacy unparameterized states, so without this rule a zero-valued
+	// genesis could silently ship free transactions through the one encoding
+	// the finding says must not be re-opened.
+	if p.MinFeeSparks == 0 {
+		return fmt.Errorf("%w: MinFeeSparks must be at least 1 (a zero minimum is the free-transaction regime the fee exists to end)", ErrBadGenesis)
+	}
+	// The Argon2id cost bounds (audit S-5). A zero-valued tuning is rejected
+	// cleanly by the state machine - applyFaucetClaim guards before calling
+	// argon2.IDKey, which would panic - but a genesis that validates with a
+	// zero silently ships a faucet whose every claim fails forever. The memory
+	// cost is additionally bounded ABOVE: it is reached by every validator on
+	// every claim in a block, and a uint32 can name ~4 TiB.
+	if p.FaucetPowArgon2.MemoryKiB == 0 {
+		return fmt.Errorf("%w: the faucet puzzle's MemoryKiB must be at least 1 (a zero cost cannot be evaluated and would brick the faucet)", ErrBadGenesis)
+	}
+	if p.FaucetPowArgon2.MemoryKiB > maxFaucetArgon2MemoryKiB {
+		return fmt.Errorf("%w: the faucet puzzle's MemoryKiB is %d, above the %d KiB ceiling (every validator would pay that allocation on every claim)",
+			ErrBadGenesis, p.FaucetPowArgon2.MemoryKiB, maxFaucetArgon2MemoryKiB)
+	}
+	if p.FaucetPowArgon2.Iterations == 0 {
+		return fmt.Errorf("%w: the faucet puzzle's Iterations must be at least 1 (zero rounds cannot be evaluated and would brick the faucet)", ErrBadGenesis)
+	}
+	if p.FaucetPowArgon2.Parallelism == 0 {
+		return fmt.Errorf("%w: the faucet puzzle's Parallelism must be at least 1 (zero lanes cannot be evaluated and would brick the faucet)", ErrBadGenesis)
+	}
+	// A claim of zero sparks pays the claimant nothing while still spending the
+	// key's one-claim-per-epoch marker: a genesis whose faucet pays zero has no
+	// faucet at all.
+	if p.ClaimAmountSparks == 0 {
+		return fmt.Errorf("%w: ClaimAmountSparks must be at least 1 (a zero claim pays nothing and makes the faucet useless)", ErrBadGenesis)
+	}
+	// The per-block claim bound must not exceed the block's transaction bound:
+	// a block can never carry more transactions than MaxTxsPerBlock, so a
+	// larger claim bound can never fire - an inert consensus parameter that
+	// could mask the arithmetic or wiring it exists to expose.
+	if p.MaxClaimsPerBlock > types.MaxTxsPerBlock {
+		return fmt.Errorf("%w: MaxClaimsPerBlock is %d, above the block transaction bound %d (the claim bound could never fire)",
+			ErrBadGenesis, p.MaxClaimsPerBlock, types.MaxTxsPerBlock)
+	}
+	// Duplicate validator keys: one key must hold one seat. The operator
+	// committee file already refuses this at the only place operators write by
+	// hand, but Genesis.Validate is the general contract chain.Open enforces,
+	// so it must refuse it too. The map makes the check O(n); at the 255-seat
+	// ceiling this project allows even an O(n^2) scan would be free, but there
+	// is no reason to spend it.
+	seenKeys := make(map[string]struct{}, len(g.Validators))
+	for i, v := range g.Validators {
+		if _, dup := seenKeys[string(v.PubKey)]; dup {
+			return fmt.Errorf("%w: validator %d repeats a public key already listed (one key holds one seat)", ErrDuplicateValidator, i)
+		}
+		seenKeys[string(v.PubKey)] = struct{}{}
+	}
+	// CommitteeSize is a seat COUNT. It is encoded as a uint64 and decoded
+	// straight to int, so a value above MaxInt64 arrives negative; a negative
+	// count, or one past the ceiling the operator committee file and the
+	// fixture committee enforce, is malformed.
+	if p.CommitteeSize < 0 || p.CommitteeSize > maxCommitteeSize {
+		return fmt.Errorf("%w: CommitteeSize is %d, want 0..%d", ErrBadGenesis, p.CommitteeSize, maxCommitteeSize)
+	}
+	// The genesis timestamp is the height-0 block's timestamp and obeys the
+	// same rule every later block does (types.ValidateStructure: Timestamp > 0).
+	// A non-positive genesis time is not a time.
+	if g.Time <= 0 {
+		return fmt.Errorf("%w: Time must be positive (it is the genesis block's timestamp), got %d", ErrBadGenesis, g.Time)
 	}
 	return nil
 }
@@ -281,6 +389,9 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 	if g.Params.MaxClaimsPerBlock, err = d.U64(); err != nil {
 		return nil, err
 	}
+	if g.Params.MinFeeSparks, err = d.U64(); err != nil {
+		return nil, err
+	}
 	if g.Params.MinStakeSparks, err = d.U64(); err != nil {
 		return nil, err
 	}
@@ -293,6 +404,19 @@ func DecodeGenesis(b []byte) (*Genesis, error) {
 	cs, err := d.U64()
 	if err != nil {
 		return nil, err
+	}
+	// Refuse a seat count the int conversion cannot hold, and any value above
+	// the committee ceiling (audit S-20): CommitteeSize is encoded as a
+	// uint64 and was decoded straight to int, so a value above MaxInt64
+	// arrived negative (and on a 32-bit platform a value above MaxInt32
+	// truncated). Validate rejects the negatives, but the decode itself must
+	// not silently reinterpret the number. This changes nothing for a legal
+	// genesis: Encode is untouched, so every valid genesis still encodes to
+	// exactly the same bytes, and this only refuses a value Encode could
+	// never legitimately have been handed.
+	if cs > uint64(maxCommitteeSize) {
+		return nil, fmt.Errorf("%w: encoded CommitteeSize is %d, above the %d-seat ceiling (the int conversion would wrap)",
+			ErrBadGenesis, cs, maxCommitteeSize)
 	}
 	g.Params.CommitteeSize = int(cs)
 	if g.Params.FaucetPowArgon2.MemoryKiB, err = d.U32(); err != nil {
@@ -344,14 +468,32 @@ func sharedParams(chainID string, epochBlocks, claimAmountSparks uint64, committ
 		// pinned equal to this value by a test in this package, so the pool
 		// can never hand a block producer more claims than the chain accepts.
 		MaxClaimsPerBlock: 8,
-		MinStakeSparks:    1_000 * SparksPerB10,
-		EpochBlocks:       epochBlocks,
-		UnbondingEpochs:   2,
-		CommitteeSize:     committee,
+		// The least a transfer may pay, on BOTH shipped chains. One spark is
+		// deliberately small: this change exists to put a FEE IN THE SIGNED
+		// BODY while the encoding is still free to change (audit S-3), not to
+		// set monetary policy. The level is a genesis parameter precisely so
+		// the level can be re-derived later without another fork; what is
+		// already fixed is that a zero-cost transfer is invalid.
+		MinFeeSparks:    1,
+		MinStakeSparks:  1_000 * SparksPerB10,
+		EpochBlocks:     epochBlocks,
+		UnbondingEpochs: 2,
+		CommitteeSize:   committee,
 	}
 }
 
 // Devnet is a single-validator chain with funded test accounts.
+//
+// FIXTURE, NOT MONETARY POLICY, stated plainly for audit S-16: its two dev
+// accounts hold 1,000,000 b10 between them, and the emission series mints
+// ~20,999,997 b10 more. The sum EXCEEDS the 21,000,000 b10 supply cap the
+// README states for the real chain. Validate does not reject it, because
+// there is deliberately no premine + emission rule (see Validate): the
+// fixtures need the premine to exercise transfers, and Testnet - the real
+// chain - has no premine at all and is bounded by the emission relation
+// alone. simnet.Committee is this same genesis under a b10coin-simnet-N ID,
+// so it carries the same fixture premine. Never treat devnet balances as
+// value.
 func Devnet() *Genesis {
 	pub, _, _ := deterministicKey("b10coin-devnet-validator-1")
 	devPub, _, _ := deterministicKey("b10coin-devnet-faucet-tester")

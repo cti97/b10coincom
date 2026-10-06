@@ -6,13 +6,19 @@
 // does nothing else. It does not know what a vote is. That is the design, and
 // the safety case for the whole topology: because every consensus message is
 // signed with the sender's Ed25519 key, a malicious relay can censor or delay
-// but cannot forge anything - safety is never at risk from the relay, only
-// liveness is. If the relay ever "understood" the traffic it would become a
-// place where consensus could be wrongly interpreted, so it is kept exactly
-// as smart as a length prefix.
+// but cannot forge a vote or a proposal - safety is never at risk from the
+// relay, only liveness is. THAT TRADE HOLDS ONLY FOR COMMITTEES OF HELD KEYS
+// (--genesis + --key): the development fixture committee derives every
+// member's private key from public seeds, so with it the claim is vacuous -
+// anyone can sign as any seat, no relay required - and a fixture committee
+// must never meet a relay reachable beyond the operator's own machines. If
+// the relay ever "understood" the traffic it would become a place where
+// consensus could be wrongly interpreted, so it is kept exactly as smart as a
+// length prefix.
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -29,8 +35,11 @@ import (
 const helpText = `b10coin-relay — the forwarder validators dial outbound to
 
 Usage:
-  b10coin-relay [--addr ADDR] [--max-frame-bytes N] [--max-conns N] [--write-queue N]
-                [--read-timeout SECONDS] [--keepalive SECONDS]
+  b10coin-relay [--addr ADDR] [--max-frame-bytes N] [--max-conns N]
+                [--max-conns-per-ip N] [--write-queue-bytes N]
+                [--write-queue-frames N]
+                [--write-timeout SECONDS] [--read-timeout SECONDS]
+                [--keepalive SECONDS] [--access-token-file PATH]
   b10coin-relay --help
 
 Every validator connects OUTBOUND to this relay (inbound to a home machine
@@ -50,35 +59,138 @@ THE TRUST TRADE — read before running one
   design's mitigations are multiple relays and direct connections - never a
   smarter relay.
 
-  Because the relay authenticates nothing, it must bind everything a
-  stranger controls: frame size (--max-frame-bytes, refused before
-  allocation), connection count (--max-conns), per-connection buffering
-  (--write-queue), and how long a connection may hold its slot without
-  delivering a frame (--read-timeout). A frame over the bound ends its
-  connection; a dial past the connection bound is closed at accept.
+  THAT TRADE HOLDS ONLY FOR COMMITTEES OF HELD KEYS: validators started with
+  --genesis (a shared committee file listing the members' public keys) and
+  --key (b10coin keygen). The development fixture committee
+  (--validators/--index) derives every member's private key from public
+  seeds inside the source, so with it anyone can sign as ANY validator - and
+  no property of the relay matters, because forging needs no relay at all.
+  Never point the fixture committee at a relay reachable beyond your own
+  machines.
 
-HOW LONG A STRANGER MAY HOLD A CONNECTION (both socket-level: nothing is
-parsed to enforce them)
+  Because the relay authenticates nothing, it must bind everything a
+  stranger controls - with STRUCTURAL bounds only (byte budgets, socket
+  deadlines, endpoint counts; it parses the frame length and nothing beyond
+  it): frame size (--max-frame-bytes, refused before allocation), connection
+  count in total (--max-conns) and per source PREFIX (--max-conns-per-ip,
+  IPv6 /64 or IPv4 /24, so one routed prefix cannot rotate addresses past
+  it), the per-connection write queue in PAYLOAD BYTES (--write-queue-bytes)
+  and in FRAMES (--write-queue-frames, because a byte budget cannot bound the
+  queue's per-frame entry memory when the smallest frame is a single byte),
+  with each sender source GROUP held to its capacity-relative fair share of a
+  receiver's queue (the budget divided among the sender groups contending for
+  it: one uncontended sender may use the whole queue, while two connections
+  from one host share one account and cannot split a receiver's budget),
+  and two socket deadlines (--read-timeout, --write-timeout). A frame over
+  the bound ends its connection; a dial past either connection bound is
+  closed at accept. (Zero or negative for any knob selects its default.)
+
+HOW MUCH AND HOW LONG A STRANGER MAY PIN (derivable; nothing is parsed to
+enforce any of it)
 
   --read-timeout (default 120) is a per-frame read deadline: armed before
   each frame's 4-byte header and refreshed at every completed frame, so a
   peer that is actively sending is never cut off. When it expires - a
   connection that delivered no complete frame for the whole period - the
-  connection is closed and its registry slot released the same instant.
-  The peer's outbound backoff redials it. A stranger can therefore pin at
-  most max-conns x max-frame-bytes of memory and max-conns of slots, each
-  for at most --read-timeout, never forever.
+  connection is closed and its registry slot released the same instant. The
+  peer's outbound backoff redials it.
+
+  --write-timeout (default 30) is a per-connection write deadline, anchored
+  to the instant that connection's write queue became NON-EMPTY: the queue
+  must drain back to empty inside it. A frame that cannot be written, or a
+  queue still non-empty when the bound passes, closes the connection the same
+  way and releases the bytes and entry ring queued behind the writer. This is
+  the timer that keeps a sink from pinning its queue forever, WHATEVER
+  keepalive frames it keeps sending - keepalives refresh only the READ
+  deadline - and it is anchored to the queue's age rather than re-armed per
+  frame, because a sink that accepts a trickle of every frame would make each
+  write "succeed" while the backlog never cleared (both halves are N-2). A
+  peer that drains as it goes empties its queue constantly and is never cut
+  off.
 
   --keepalive (default 15) is the TCP keepalive probe period: a HALF-OPEN
   connection (a peer that vanished without closing, e.g. a power cut) is
-  reaped by the kernel after unanswered probes - minutes, by the OS's
-  count - again without the relay looking at any byte.
+  reaped by the kernel after unanswered probes - minutes, by the OS's count.
+
+  THE MEMORY ARITHMETIC, derived rather than asserted. One connection can
+  hold, at one instant, at most: its write-queue PAYLOAD budget
+  (--write-queue-bytes); its write-queue ENTRY RING, at most
+  --write-queue-frames entries of 32 bytes each (the per-frame cost a byte
+  budget cannot bound, since the smallest legal frame is one byte); the one
+  frame in its writer's hand (<= --max-frame-bytes); and the one frame in its
+  reader's hand (<= --max-frame-bytes). The aggregate is therefore:
+
+      max-conns x (write-queue-bytes
+                   + write-queue-frames x 32
+                   + 2 x max-frame-bytes)
+
+  At the defaults: 32 x (2 MiB + 4096 x 32 B + 2 x 1 MiB) = 32 x 4.125 MiB
+  = 132 MiB. (Two earlier claims in this space were wrong: the first omitted
+  the write-queue factor - 256 conns could each queue 64 FRAMES x 1 MiB =
+  16 GiB aggregate, not the 256 MiB documented; the second omitted the
+  per-frame ENTRY cost, so a 2 MiB byte budget admitted ~2 million one-byte
+  entries and 8 connections from one source IP measured ~231.6 MiB against a
+  128 MiB claim. This derivation has all three terms, and relay.Options.
+  MaxPinnedBytes computes exactly it.) Slots are additionally bounded per
+  source PREFIX by --max-conns-per-ip (default 8), so one host - or one
+  routed prefix - cannot hold the registry.
+
+  --access-token-file (default unset) enables the relay's own access control
+  (audit N-8). When set, the file's bytes (a trailing newline is trimmed) are
+  the PRE-SHARED FIRST FRAME: every connection must send exactly those bytes
+  as its first frame or it is closed and counted unauthorized. The relay
+  compares length and bytes only - it still decodes nothing, so this is not a
+  second implementation of any wire semantics. This is the defence that works
+  where an IP allowlist cannot (home validators behind CGNAT, rotating
+  outbound addresses): the token is a secret both ends hold, not an address.
+  The token frame is consumed, never forwarded, and an unauthenticated
+  connection is never registered, so it receives nothing. With no token the
+  relay behaves exactly as before.
 
 Operation: run one instance per validator star, behind the VPS firewall
-allowlisting the validator IPs - the relay itself is too dumb to have an
-access policy, which is the point. Validators reconnect to it with
-exponential backoff if it restarts. Bandwidth is kilobytes per second.
+allowlisting the validator IPs where that is practical - and with
+--access-token-file as the in-process layer for the cases where it is not.
+The relay itself is too dumb to have an address policy, which is the point.
+Validators reconnect to it with exponential backoff if it restarts.
+Bandwidth is kilobytes per second.
+
+Observability: the relay logs a stats line every 60 seconds and on SIGUSR1
+(Unix; on Windows the timer alone), because "no error and no output" is also
+what a relay silently dropping frames looks like (audit N-9). The line
+reports conns, forwarded, dropped, refused and unauthorized counts; a rising
+dropped or refused is the signal to read, not a healthy silence.
 `
+
+// defaultStatsInterval is how often the relay writes its counters line while
+// running (audit N-9). SIGUSR1 writes one on demand as well, which is the
+// operator's "what is it doing right now?" without waiting out the timer.
+const defaultStatsInterval = 60 * time.Second
+
+// relayStatsLine renders one Stats reading as the single line both the timer
+// and the signal path print. It is a function so the test pins the exact
+// fields - Dropped and RefusedConns are the counters that reveal the relay
+// censoring (N-2's history), and a line that omit them is worse than silence.
+func relayStatsLine(s relay.Stats) string {
+	return fmt.Sprintf("b10coin-relay stats: conns=%d forwarded=%d dropped=%d refused=%d unauthorized=%d",
+		s.Conns, s.Forwarded, s.Dropped, s.RefusedConns, s.Unauthorized)
+}
+
+// logStats writes one counters line every interval and one for every value on
+// sig, until ctx is cancelled. It never touches the relay's hot path.
+func logStats(ctx context.Context, sig <-chan os.Signal, r *relay.Relay, w io.Writer, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fmt.Fprintln(w, relayStatsLine(r.Stats()))
+		case <-sig:
+			fmt.Fprintln(w, relayStatsLine(r.Stats()))
+		}
+	}
+}
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -107,14 +219,32 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout,
-		"b10coin-relay forwarding on %s (max frame %d, max conns %d, queue %d, read timeout %s, keepalive %s)\n",
-		r.Addr(), opts.MaxFrameBytes, opts.MaxConns, opts.WriteQueueSize, opts.ReadTimeout, opts.KeepAlive)
+		"b10coin-relay forwarding on %s (max frame %d, max conns %d (%d per prefix), queue %d bytes / %d frames, read timeout %s, write timeout %s, keepalive %s, access token %s)\n",
+		r.Addr(), opts.MaxFrameBytes, opts.MaxConns, opts.MaxConnsPerIP, opts.WriteQueueBytes, opts.WriteQueueFrames, opts.ReadTimeout, opts.WriteTimeout, opts.KeepAlive,
+		accessTokenMode(opts.AccessToken))
+
+	// The stats line on a timer and on SIGUSR1 (audit N-9). "No error and no
+	// output" is also what a relay quietly dropping frames looks like, so
+	// silence is not the healthy signal the older README claimed it was.
+	statsSig := make(chan os.Signal, 1)
+	notifyStatsSignal(statsSig)
+	defer signal.Stop(statsSig)
+	go logStats(ctx, statsSig, r, stderr, defaultStatsInterval)
 
 	<-ctx.Done()
 	// Stop serving before draining: no new frames are accepted while the
 	// wait below joins every reader and writer.
 	r.Close()
 	return 0
+}
+
+// accessTokenMode describes the access-control state for the startup line
+// without ever printing the token itself.
+func accessTokenMode(token []byte) string {
+	if len(token) == 0 {
+		return "off"
+	}
+	return fmt.Sprintf("on (%d bytes, hidden)", len(token))
 }
 
 // errHelp is the sentinel parseArgs returns when the operator asked for
@@ -148,9 +278,13 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 	addr := fs.String("addr", ":7001", "listen address (all interfaces; validators reach this one)")
 	maxFrame := fs.Int("max-frame-bytes", relay.DefaultMaxFrameBytes, "largest frame any connection may send; a larger declared length ends that connection")
 	maxConns := fs.Int("max-conns", relay.DefaultMaxConns, "maximum simultaneous connections; excess dials are closed at accept")
-	queue := fs.Int("write-queue", relay.DefaultWriteQueueSize, "per-connection buffered frames before forwarding drops instead of blocking")
+	maxPerIP := fs.Int("max-conns-per-ip", relay.DefaultMaxConnsPerIP, "maximum simultaneous connections from one source PREFIX (IPv6 /64, IPv4 /24); excess dials from that prefix are closed at accept")
+	queueBytes := fs.Int("write-queue-bytes", relay.DefaultWriteQueueBytes, "per-connection write-queue budget in PAYLOAD BYTES before forwarding drops instead of blocking (floored at max-frame-bytes)")
+	queueFrames := fs.Int("write-queue-frames", relay.DefaultWriteQueueFrames, "per-connection write-queue bound in FRAMES (a byte budget cannot bound the queue's per-frame entry memory, so this count does)")
+	writeTimeout := fs.Int("write-timeout", int(relay.DefaultWriteTimeout/time.Second), "seconds a connection's write queue may stay backed up before it is closed and its queued bytes and slot released; the queue must drain to empty within it")
 	readTimeout := fs.Int("read-timeout", int(relay.DefaultReadTimeout/time.Second), "seconds one frame may take to arrive; expiry closes that connection and releases its slot")
 	keepAlive := fs.Int("keepalive", int(relay.DefaultKeepAlive/time.Second), "TCP keepalive probe period in seconds; half-open connections are reaped by the kernel after unanswered probes")
+	accessTokenFile := fs.String("access-token-file", "", "path to a file whose bytes are the pre-shared first-frame access token (audit N-8); each connection must send exactly those bytes first or be closed. Compared by length and equality; the relay decodes nothing")
 
 	err := fs.Parse(args)
 	switch {
@@ -167,11 +301,29 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 		fs.Usage()
 		return "", relay.Options{}, fmt.Errorf("unknown argument %q", fs.Arg(0))
 	}
+	var token []byte
+	if *accessTokenFile != "" {
+		data, err := os.ReadFile(*accessTokenFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "reading access-token file: %v\n", err)
+			return "", relay.Options{}, fmt.Errorf("reading access-token file %q: %w", *accessTokenFile, err)
+		}
+		// A newline at the end is an editor artifact, not part of a token.
+		token = bytes.TrimRight(data, "\r\n")
+		if len(token) == 0 {
+			fmt.Fprintln(stderr, "the access-token file is empty; remove the flag or give it at least one byte")
+			return "", relay.Options{}, fmt.Errorf("access-token file %q is empty", *accessTokenFile)
+		}
+	}
 	return *addr, relay.Options{
-		MaxFrameBytes:  *maxFrame,
-		MaxConns:       *maxConns,
-		WriteQueueSize: *queue,
-		ReadTimeout:    time.Duration(*readTimeout) * time.Second,
-		KeepAlive:      time.Duration(*keepAlive) * time.Second,
+		MaxFrameBytes:    *maxFrame,
+		MaxConns:         *maxConns,
+		MaxConnsPerIP:    *maxPerIP,
+		WriteQueueBytes:  *queueBytes,
+		WriteQueueFrames: *queueFrames,
+		WriteTimeout:     time.Duration(*writeTimeout) * time.Second,
+		ReadTimeout:      time.Duration(*readTimeout) * time.Second,
+		KeepAlive:        time.Duration(*keepAlive) * time.Second,
+		AccessToken:      token,
 	}, nil
 }

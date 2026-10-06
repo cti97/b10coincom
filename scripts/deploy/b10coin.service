@@ -1,16 +1,21 @@
 # b10coin validator NODE unit — deploy this on each RASPBERRY PI, not on the
 # VPS. The relay unit (b10coin-relay.service) goes on the VPS.
 #
-# Assumes the machine already has (see scripts/deploy/README.md §§2, 6):
+# Assumes the machine already has (see scripts/deploy/README.md §§2, 3, 6):
 #   - the binary at /opt/b10coin/b10coin          (from scripts/deploy/build.sh, scp'd)
 #   - a system user and group "b10coin"
 #   - internet access OUTBOUND to the relay's TCP port 7001 (no port
 #     forwarding, no inbound rule: every connection a node makes is outbound)
 #   - /var/lib/b10coin created and owned by b10coin.b10coin, via StateDirectory
+#   - the SHARED committee file at /var/lib/b10coin/committee.json (§3.2:
+#     identical bytes on every Pi) and THIS machine's key file at
+#     /var/lib/b10coin/b10coin.key (§3.1: generated ON the Pi, mode 0600)
 #
-# The only line that MUST differ between the three Pis is B10COIN_INDEX —
-# two units left on the same index make two machines claim ONE validator
-# key, and the committee silently stops finalizing (README §8, failure 3).
+# DANGER: NEVER copy b10coin.key between two Pis. Two machines holding one
+# key file are two machines acting as ONE validator — the same seat in the
+# shared committee file — and the committee stops finalizing. Each Pi runs
+# `b10coin keygen` itself and contributes only its PRINTED PUBLIC key to the
+# committee file.
 
 [Unit]
 Description=b10coin validator node (three-Pi testnet member)
@@ -28,32 +33,84 @@ WorkingDirectory=/var/lib/b10coin
 StateDirectory=b10coin
 
 # Everything a deployment edits lives here. Edit BEFORE the first enable:
-# B10COIN_RELAY to the VPS's public address, B10COIN_INDEX to this Pi's seat.
+# B10COIN_RELAY to the VPS's public address (same on every Pi);
+# B10COIN_GENESIS is the shared committee file (byte-identical on every Pi);
+# B10COIN_KEY is THIS machine's key file (unique per Pi).
 Environment=B10COIN_DATA=/var/lib/b10coin
 Environment=B10COIN_HTTP=127.0.0.1:8645
 Environment=B10COIN_RELAY=changeme.example.com:7001
-Environment=B10COIN_VALIDATORS=3
-# This node's 0-based seat in the committee. Must be unique across the
-# committee: 0, 1 and 2 — one per Pi.
-Environment=B10COIN_INDEX=0
+Environment=B10COIN_GENESIS=/var/lib/b10coin/committee.json
+Environment=B10COIN_KEY=/var/lib/b10coin/b10coin.key
+# B10COIN_RELAY_TOKEN is the relay's pre-shared access-token file (audit N-8).
+# Leave it EMPTY for an allowlist-only relay; set it to /var/lib/b10coin/relay.token
+# (the file copied from the VPS, mode 0600) when the relay runs with
+# --access-token-file. An empty value passes an empty flag, which the node
+# treats as "no token". Empty default keeps every existing deployment working.
+Environment=B10COIN_RELAY_TOKEN=
 
+# The node's seat is derived from where its key's public half sits in the
+# committee file; a key that is not listed there REFUSES to start rather
+# than signing for a seat it does not hold (audit A-1's refusal rule).
 ExecStart=/opt/b10coin/b10coin node \
     --dir ${B10COIN_DATA} \
     --http ${B10COIN_HTTP} \
     --relay ${B10COIN_RELAY} \
-    --validators ${B10COIN_VALIDATORS} \
-    --index ${B10COIN_INDEX}
+    --relay-access-token-file ${B10COIN_RELAY_TOKEN} \
+    --genesis ${B10COIN_GENESIS} \
+    --key ${B10COIN_KEY}
 
 Restart=always
 RestartSec=5
 
-# A validator holds keys; run it with the smallest practical sandbox. The
-# chain writes only under /var/lib/b10coin (ReadWritePaths pairs with
-# ProtectSystem=strict), RPC stays on 127.0.0.1:8645 by default.
+# A validator holds a real private key; run it with the smallest practical
+# sandbox. The chain and key file write only under /var/lib/b10coin
+# (ReadWritePaths pairs with ProtectSystem=strict), RPC stays on
+# 127.0.0.1:8645 by default, and a 0600 key under a 0750 StateDirectory is
+# readable only by the b10coin user.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/b10coin
+
+# --- Cheap sandboxing (audit N-10) -----------------------------------------
+# The node unit already had the baseline; the audit's one named gap was
+# PrivateTmp, and the rest of the standard set is added here for the same
+# reason the relay has it. A validator is long-lived and holds a key, so the
+# blast radius of a compromise is the whole chain identity, not one process.
+PrivateTmp=true
+# The store holds one open segment file per shard, the lock file, the key,
+# the RPC listener and the outbound relay socket; 4096 is ample and still a
+# hard ceiling on an fd leak.
+LimitNOFILE=4096
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# Static Go binary (CGO_ENABLED=0): the pure-Go resolver and TCP only.
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+PrivateMounts=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# It listens on >1024 ports and signs with a file key: no capabilities.
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+# NOTE: no MemoryMax here. The relay's pin is DERIVED (Options.MaxPinnedBytes)
+# and the unit's ceiling matches it; the node's live set depends on the chain
+# length, the certificate archive and the mempool, and there is no derived
+# bound to sit above. A guessed ceiling would kill a validator mid-commit
+# rather than protect it. Also, MemoryDenyWriteExecute is deliberately NOT
+# set (see the relay unit's note: unverifiable on this machine, and its
+# failure mode is a binary that cannot start).
 
 [Install]
 WantedBy=multi-user.target

@@ -27,6 +27,24 @@ func evenCommittee(t *testing.T, n int, power uint64) Config {
 	return c
 }
 
+// weightedCommittee builds a committee with per-seat powers, the shape the
+// committee FILE always allowed (genesis.CommitteeEntry.Power) even though
+// every shipped genesis so far has been equal-power. Deterministic keys, one
+// per seat, so a failure is reproducible and the tests above can name seats
+// by power.
+func weightedCommittee(t *testing.T, powers ...uint64) Config {
+	t.Helper()
+	vals := make([]genesis.Validator, 0, len(powers))
+	for i, p := range powers {
+		vals = append(vals, testValidator(i, p))
+	}
+	c := Config{Committee: vals, TimeoutBase: 1, TimeoutStep: 1, PowerCapNum: 1, PowerCapDen: 4}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("weighted committee rejected: %v", err)
+	}
+	return c
+}
+
 // testValidator derives validator idx's key through the derivation every
 // test fixture in this package must use. testCommitteeKey (testkeys_test.go)
 // is the cross-task helper carrying that same derivation; the tripwire below
@@ -350,13 +368,12 @@ func TestProposerFavoursHeavierValidators(t *testing.T) {
 	for h := uint64(0); h < 400; h++ {
 		counts[string(c.Proposer(h, 0, parent))]++
 	}
-	first := string(c.Committee[0].PubKey)
 	// 250, not 400/2: 400/2 IS the uniform-selection expectation, so an unweighted
 	// mutant lands ~1 sigma above it (208 of 400 measured here) and survives. 250
 	// sits five sigmas above the uniform mean (200+/-10) and five sigmas below the
 	// 3:1 expectation (300+/-9): it kills uniform selection without failing the
-	// weighted implementation.
-	if counts[first] <= 250 {
-		t.Fatalf("a validator with 3 of 4 power proposed only %d of 400 times", counts[first])
+	// weighted implementation. Seat 0 holds 3 of 4 power here.
+	if got := counts[string(c.Committee[0].PubKey)]; got <= 250 {
+		t.Fatalf("a validator with 3 of 4 power proposed only %d of 400 times", got)
 	}
 }

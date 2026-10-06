@@ -16,6 +16,7 @@ package wire
 // adjacent network state: never renumber a tag nor reorder a field.
 
 import (
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 
@@ -24,17 +25,36 @@ import (
 
 // MsgType discriminates the wire message union. It is a wire value: never
 // renumber these.
+//
+// The wire tags live in a DISJOINT range from the consensus union
+// (consensus.MsgProposal/MsgPrevote/MsgPrecommit = 1/2/3). Design Decision 2
+// requires it, and before this renumbering they collided exactly there
+// (audit N-5): a router keyed on the first byte alone would have fed votes
+// into the sync layer, and a HELLO or BLOCK_SYNC frame made every reader
+// decode it as a vote and a proposal before failing. Nothing was deployed, so
+// the tags were moved instead of adding a workaround. The range is a wire
+// value and is part of the protocol: a peer that does not know these bytes
+// cannot speak M4.
+//
+// The wire namespace starts at 0x80 so it can never grow into the consensus
+// tags below it - the reserved boundary is 128, stated once here.
 type MsgType uint8
 
 const (
 	// MsgHello opens a connection: chain identity, the sender's validator
 	// key, and the height it is at.
-	MsgHello MsgType = 1
+	MsgHello MsgType = 0x80
 	// MsgBlockSyncReq asks a peer for a range of blocks.
-	MsgBlockSyncReq MsgType = 2
+	MsgBlockSyncReq MsgType = 0x81
 	// MsgBlockSyncResp answers a request with the encoded blocks.
-	MsgBlockSyncResp MsgType = 3
+	MsgBlockSyncResp MsgType = 0x82
 )
+
+// WireTagFloor is the lowest value the wire message union may use: every
+// wire tag is at or above it, and the consensus union (1/2/3) is strictly
+// below it. It exists so the disjointness is a named, testable boundary
+// rather than a property of three literals (audit N-5).
+const WireTagFloor MsgType = 0x80
 
 // ErrUnknownMsgType reports a frame whose tag byte is not the message the
 // decoder was asked for. Callers dispatch on the tag first; a decoder is also
@@ -80,12 +100,23 @@ func DecodeHello(b []byte) (*Hello, error) {
 		return nil, err
 	}
 	h.ChainID = string(chainID)
-	if h.Validator, err = d.VarBytes(); err != nil {
+	// The validator key has exactly one legal width, so bound it before the
+	// copy (audit N-12), the same discipline the consensus decoders apply
+	// (audit C-17). Callers check membership - SeatOfPubKey compares the key
+	// against the genesis committee - but without this bound the decoder copies
+	// a frame-sized "key" (up to 1 MiB) before that check can reject it, and a
+	// legitimate committee key is always 32 bytes. A short or empty key still
+	// decodes, so the admission policy still sees and refuses it itself.
+	if h.Validator, err = d.VarBytesMax(ed25519.PublicKeySize); err != nil {
 		return nil, err
 	}
 	if h.Height, err = d.U64(); err != nil {
 		return nil, err
 	}
+	// The signature stays bounded only by the frame: its width is a property of
+	// the signing scheme the transport's handshake policy chose, not of this
+	// decoder, and it is verified or discarded rather than interpreted as an
+	// identity. ChainID is the same: it is compared against the local chain id.
 	if h.Sig, err = d.VarBytes(); err != nil {
 		return nil, err
 	}
@@ -99,20 +130,26 @@ func DecodeHello(b []byte) (*Hello, error) {
 type BlockSyncReq struct {
 	From uint64
 	To   uint64
-	// Requester identifies who asked, so a peer can rate-limit by asker
-	// rather than by connection.
+	// Nonce makes each request unique, so a response can be correlated with
+	// the one request it answers and a replayed request can be recognised.
+	// It is covered by Sig (the consensus layer's syncReqHash): a peer cannot
+	// move it to re-label an old frame. The wire layer only frames it.
+	Nonce uint64
+	// Requester identifies who asked, so a peer can authenticate the request
+	// and rate-limit by asker rather than by connection.
 	Requester []byte
 	Sig       []byte
 }
 
 // EncodeBlockSyncReq renders r canonically, in struct order:
 //
-//	tag(1) | From(8) | To(8) | len Requester | len Sig
+//	tag(1) | From(8) | To(8) | Nonce(8) | len Requester | len Sig
 func EncodeBlockSyncReq(r *BlockSyncReq) []byte {
 	e := types.NewEncoder()
 	e.U8(uint8(MsgBlockSyncReq))
 	e.U64(r.From)
 	e.U64(r.To)
+	e.U64(r.Nonce)
 	e.VarBytes(r.Requester)
 	e.VarBytes(r.Sig)
 	return e.Bytes()
@@ -134,7 +171,15 @@ func DecodeBlockSyncReq(b []byte) (*BlockSyncReq, error) {
 	if r.To, err = d.U64(); err != nil {
 		return nil, err
 	}
-	if r.Requester, err = d.VarBytes(); err != nil {
+	if r.Nonce, err = d.U64(); err != nil {
+		return nil, err
+	}
+	// The requester key is an Ed25519 key and nothing else, so it is bounded
+	// before the copy (audit N-12) exactly as the HELLO's validator key is.
+	// verifySyncReq checks it against the committee, but that check must not be
+	// the only thing standing between a hostile length and a 1 MiB copy. The
+	// signature stays frame-bounded for the reason given at DecodeHello.
+	if r.Requester, err = d.VarBytesMax(ed25519.PublicKeySize); err != nil {
 		return nil, err
 	}
 	if r.Sig, err = d.VarBytes(); err != nil {
@@ -166,15 +211,32 @@ type BlockSyncUnit struct {
 // messages frame a justification: the decoder cannot ask a byte slice where it
 // ends, so the count must.
 type BlockSyncResp struct {
+	// Nonce echoes the request's Nonce. Without it a response carries no
+	// reference to the request it answers, so any peer could file one against
+	// whatever pull happened to be in flight. The wire layer only frames it;
+	// the syncer's Receive is what insists it matches the in-flight request.
+	Nonce uint64
 	Units []BlockSyncUnit
+	// Responder is the Ed25519 public key of the committee member that
+	// answered, and Sig is its signature over the consensus layer's
+	// domain-separated syncRespHash. They are the responder AUTHENTICATION
+	// (audit round 7, F1): a transport name is a routing key, not an identity,
+	// and through a relay every member - and every stranger - shares one name.
+	// The puller requires the answer to be signed by the member it selected,
+	// so a stranger with no committee key cannot produce a response it will
+	// accept. The wire layer only frames the two fields; the consensus layer
+	// signs and verifies them.
+	Responder []byte
+	Sig       []byte
 }
 
 // EncodeBlockSyncResp renders r canonically:
 //
-//	tag(1) | count | count x (len block | round(4) | count votes | count x (len vote))
+//	tag(1) | Nonce(8) | count | count x (len block | round(4) | count votes | count x (len vote)) | len Responder | len Sig
 func EncodeBlockSyncResp(r *BlockSyncResp) []byte {
 	e := types.NewEncoder()
 	e.U8(uint8(MsgBlockSyncResp))
+	e.U64(r.Nonce)
 	e.Len(len(r.Units))
 	for _, u := range r.Units {
 		e.VarBytes(u.Block)
@@ -184,8 +246,22 @@ func EncodeBlockSyncResp(r *BlockSyncResp) []byte {
 			e.VarBytes(v)
 		}
 	}
+	e.VarBytes(r.Responder)
+	e.VarBytes(r.Sig)
 	return e.Bytes()
 }
+
+// The minimum wire size of a BLOCK_SYNC response's unit count. It exists so
+// the decoder can cap its allocation HINT against the bytes actually
+// available (audit N-4): the count is attacker-supplied and bounded only by
+// the remaining frame bytes, while a BlockSyncUnit costs 56 bytes in memory
+// (two slice headers and a uint32), roughly 9x its 6-byte minimum wire form.
+// Capping at remaining/minBlockSyncUnitWireBytes turns "a hostile unit count"
+// from a 56x pre-allocation into at most the number of units the frame could
+// possibly carry. The bytes are still decoded exactly count times; only the
+// slice CAPACITY is capped, so a short or lying count still fails in the loop
+// below with no change in semantics.
+const minBlockSyncUnitWireBytes = 1 + 4 + 1 // len(block) varint + Round(4) + len(votes) varint
 
 func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 	d := types.NewDecoder(b)
@@ -197,11 +273,24 @@ func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 		return nil, fmt.Errorf("%w: %d is not a BLOCK_SYNC response", ErrUnknownMsgType, raw)
 	}
 	r := &BlockSyncResp{}
+	if r.Nonce, err = d.U64(); err != nil {
+		return nil, err
+	}
 	count, err := d.Len()
 	if err != nil {
 		return nil, err
 	}
-	r.Units = make([]BlockSyncUnit, 0, count)
+	// The capacity hint is capped to what the remaining bytes could hold
+	// (audit N-4): `count` is bounded only by `remaining` (Len refuses a
+	// count larger than the bytes left), and a BlockSyncUnit is 56 bytes in
+	// memory against 6 on the wire, so trusting it pre-allocates up to 56x
+	// the frame. The LOOP still runs `count` times, so the decode semantics -
+	// a lying count fails on the short buffer - are unchanged.
+	hint := count
+	if max := d.Remaining() / minBlockSyncUnitWireBytes; hint > max {
+		hint = max
+	}
+	r.Units = make([]BlockSyncUnit, 0, hint)
 	for i := 0; i < count; i++ {
 		u := BlockSyncUnit{}
 		if u.Block, err = d.VarBytes(); err != nil {
@@ -214,15 +303,29 @@ func DecodeBlockSyncResp(b []byte) (*BlockSyncResp, error) {
 		if err != nil {
 			return nil, err
 		}
-		u.Votes = make([][]byte, 0, vn)
+		// The vote count is capped by `remaining` too, but a vote is framed
+		// as an opaque length-prefixed blob whose minimum wire form is ONE
+		// byte, so no capacity hint derived from `remaining` can ever bind
+		// below `vn` - and `make([][]byte, 0, vn)` would pre-allocate 24
+		// bytes per claimed vote (audit N-4). A length-prefixed sequence
+		// needs no hint at all: append grows to the votes actually present,
+		// so a hostile `vn` with no bytes behind it costs nothing.
+		var votes [][]byte
 		for j := 0; j < vn; j++ {
 			v, err := d.VarBytes()
 			if err != nil {
 				return nil, err
 			}
-			u.Votes = append(u.Votes, v)
+			votes = append(votes, v)
 		}
+		u.Votes = votes
 		r.Units = append(r.Units, u)
+	}
+	if r.Responder, err = d.VarBytes(); err != nil {
+		return nil, err
+	}
+	if r.Sig, err = d.VarBytes(); err != nil {
+		return nil, err
 	}
 	if err := d.Done(); err != nil {
 		return nil, err

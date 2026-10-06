@@ -2,11 +2,109 @@ package wire
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	"runtime"
 	"testing"
+
+	"github.com/cti97/b10coincom/internal/types"
 )
+
+// TestWriteFrameRefusesAnEmptyPayloadWithoutWriting pins audit N-11's first
+// half: a zero-length frame is the one frame ReadFrame treats as fatal, so
+// WriteFrame must refuse an empty payload EXPLICITLY and write NOTHING. A
+// writer that emitted the 4-byte zero header instead took down every reader
+// that saw it - which is how a single Broadcast([]byte{}) ended every link.
+// The buffer assertion is what separates this fix from a refusal that already
+// wrote the header.
+func TestWriteFrameRefusesAnEmptyPayloadWithoutWriting(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, nil); !errors.Is(err, ErrEmptyFrame) {
+		t.Fatalf("WriteFrame(nil) = %v, want ErrEmptyFrame", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("WriteFrame(nil) wrote %d byte(s); a refused frame must leave the stream untouched", buf.Len())
+	}
+	if err := WriteFrame(&buf, []byte{}); !errors.Is(err, ErrEmptyFrame) {
+		t.Fatalf("WriteFrame(empty) = %v, want ErrEmptyFrame", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("WriteFrame(empty) wrote %d byte(s)", buf.Len())
+	}
+}
+
+// TestWritableLenBoundsTheLengthPrefix pins the boundary that used to truncate:
+// a payload of exactly MaxFramePayload (2^32-1) still fits the 4-byte prefix;
+// one byte more cannot be framed at all, and the pre-fix encoder wrapped it to
+// zero - the fatal zero-length frame. The check is on the LENGTH, so it needs
+// no 4-GiB allocation to exercise, which is why the bound is this separate
+// function rather than an inline condition WriteFrame can only reach with a
+// real oversized slice in hand.
+func TestWritableLenBoundsTheLengthPrefix(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want error
+	}{
+		{0, ErrEmptyFrame},
+		{1, nil},
+		{MaxFramePayload, nil},
+		{MaxFramePayload + 1, ErrFrameTooLarge},
+	}
+	for _, tc := range cases {
+		if err := WritableLen(tc.n); !errors.Is(err, tc.want) {
+			t.Fatalf("WritableLen(%d) = %v, want %v", tc.n, err, tc.want)
+		}
+	}
+}
+
+// TestDecodeRefusesAnOverLongWireKey pins audit N-12: a HELLO's validator key
+// and a BLOCK_SYNC request's requester key are Ed25519 keys of exactly one
+// legal width, so an over-long one is refused BEFORE the decoder copies it.
+// The membership checks are the second line of defence, not the first: a 1 MiB
+// "key" must not be copied only so SeatOfPubKey can fail to match it. The
+// boundary is exact - PublicKeySize decodes, one byte more does not - and the
+// signature field stays frame-bounded, so the test also shows a long Sig is
+// still accepted (it is verified, never interpreted as an identity).
+func TestDecodeRefusesAnOverLongWireKey(t *testing.T) {
+	hello := func(key []byte) []byte {
+		e := types.NewEncoder()
+		e.U8(uint8(MsgHello))
+		e.VarBytes([]byte("b10coin-devnet"))
+		e.VarBytes(key)
+		e.U64(1)
+		e.VarBytes(nil)
+		return e.Bytes()
+	}
+	for _, n := range []int{0, ed25519.PublicKeySize - 1, ed25519.PublicKeySize} {
+		if _, err := DecodeHello(hello(make([]byte, n))); err != nil {
+			t.Fatalf("a %d-byte HELLO validator key was refused (%v); a short or exactly-sized key must decode", n, err)
+		}
+	}
+	if _, err := DecodeHello(hello(make([]byte, ed25519.PublicKeySize+1))); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a %d-byte HELLO validator key decoded (%v); want ErrFieldTooLong", ed25519.PublicKeySize+1, err)
+	}
+	if _, err := DecodeHello(hello(make([]byte, 1<<20))); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a 1 MiB HELLO validator key decoded (%v); want ErrFieldTooLong", err)
+	}
+
+	req := func(key, sig []byte) []byte {
+		e := types.NewEncoder()
+		e.U8(uint8(MsgBlockSyncReq))
+		e.U64(1)
+		e.U64(2)
+		e.U64(3)
+		e.VarBytes(key)
+		e.VarBytes(sig)
+		return e.Bytes()
+	}
+	if _, err := DecodeBlockSyncReq(req(make([]byte, ed25519.PublicKeySize), make([]byte, 4096))); err != nil {
+		t.Fatalf("a 32-byte requester key with a 4 KiB signature was refused (%v); the signature stays frame-bounded", err)
+	}
+	if _, err := DecodeBlockSyncReq(req(make([]byte, 1<<20), nil)); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a 1 MiB BLOCK_SYNC requester key decoded (%v); want ErrFieldTooLong", err)
+	}
+}
 
 // TestFrameRoundTrips pins the frame layer's contract: it DELIMITS a payload
 // and nothing else. Write then read returns exactly the bytes written - and a
@@ -174,7 +272,7 @@ func TestHelloRoundTrips(t *testing.T) {
 // range carried fixed-width so a peer cannot misread an off-by-one block
 // boundary.
 func TestBlockSyncReqRoundTrips(t *testing.T) {
-	req := &BlockSyncReq{From: 1, To: 100, Requester: []byte("requester-key"), Sig: []byte("signature")}
+	req := &BlockSyncReq{From: 1, To: 100, Nonce: 42, Requester: []byte("requester-key"), Sig: []byte("signature")}
 	enc := EncodeBlockSyncReq(req)
 	if len(enc) == 0 || MsgType(enc[0]) != MsgBlockSyncReq {
 		t.Fatalf("the encoded BLOCK_SYNC request must open with its tag byte, got %v", enc)
@@ -183,7 +281,7 @@ func TestBlockSyncReqRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dec.From != req.From || dec.To != req.To ||
+	if dec.From != req.From || dec.To != req.To || dec.Nonce != req.Nonce ||
 		string(dec.Requester) != string(req.Requester) || string(dec.Sig) != string(req.Sig) {
 		t.Fatalf("round trip lost fields: want %+v, got %+v", req, dec)
 	}
@@ -199,11 +297,11 @@ func TestBlockSyncReqRoundTrips(t *testing.T) {
 // empty list round-trips too: it is an honest "I have nothing for you", and a
 // unit with no votes decodes (the puller, not the decoder, refuses it).
 func TestBlockSyncRespRoundTrips(t *testing.T) {
-	resp := &BlockSyncResp{Units: []BlockSyncUnit{
+	resp := &BlockSyncResp{Nonce: 9, Units: []BlockSyncUnit{
 		{Block: []byte{0xAA, 0xBB}, Round: 4, Votes: [][]byte{{0x01, 0x02}, {0x03}}},
 		{}, // a fully empty unit still round-trips: the wire frames bytes, it refuses nothing
 		{Block: []byte{0xCC}, Round: 0},
-	}}
+	}, Responder: []byte{0x11, 0x22}, Sig: []byte{0x33, 0x44, 0x55}}
 	enc := EncodeBlockSyncResp(resp)
 	if len(enc) == 0 || MsgType(enc[0]) != MsgBlockSyncResp {
 		t.Fatalf("the encoded BLOCK_SYNC response must open with its tag byte, got %v", enc)
@@ -211,6 +309,13 @@ func TestBlockSyncRespRoundTrips(t *testing.T) {
 	dec, err := DecodeBlockSyncResp(enc)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if dec.Nonce != resp.Nonce {
+		t.Fatalf("the response's echoed nonce was lost: want %d, got %d", resp.Nonce, dec.Nonce)
+	}
+	if !bytes.Equal(dec.Responder, resp.Responder) || !bytes.Equal(dec.Sig, resp.Sig) {
+		t.Fatalf("the response's responder authentication was lost: want %x/%x, got %x/%x",
+			resp.Responder, resp.Sig, dec.Responder, dec.Sig)
 	}
 	if len(dec.Units) != len(resp.Units) {
 		t.Fatalf("want %d units, got %d", len(resp.Units), len(dec.Units))
@@ -282,5 +387,73 @@ func TestMessagesRejectTrailingBytes(t *testing.T) {
 	padded = append(EncodeBlockSyncResp(&BlockSyncResp{}), 0xFF)
 	if _, err := DecodeBlockSyncResp(padded); err == nil {
 		t.Fatal("DecodeBlockSyncResp accepted bytes trailing its fields")
+	}
+}
+
+// TestDecodeBlockSyncRespCapsAHostileCount pins audit N-4 with a MemStats
+// assertion of the same shape as the oversized-frame test: the element COUNT
+// in a BLOCK_SYNC response is attacker bytes. Len refuses a count larger than
+// the bytes remaining, so the count can be as large as the frame - and a
+// BlockSyncUnit costs 56 bytes in memory against a 6-byte minimum on the
+// wire, while a vote's slice header costs 24 against a 1-byte minimum. A
+// decoder that pre-allocates `make([]BlockSyncUnit, 0, count)` (or
+// `make([][]byte, 0, vn)`) therefore multiplies a 1 MiB frame into tens of
+// MiB. runtime.MemStats.TotalAlloc is a monotonic heap-byte counter, so the
+// pre-allocation shows up here as a large jump even though the decode then
+// fails on the short buffer.
+//
+// The bound asserted is a small multiple of the FRAME size, not a fixed byte
+// count: the prescribed cap (audit N-4) is `remaining / minUnitBytes`, which
+// for units is a ~9x multiple, and for votes the fix is to append with no
+// hint at all because a 1-byte minimum cannot bind. 16x is comfortably above
+// the capped-unit case and far below the 56x/24x a trusted count reaches, so
+// the test fails on the pre-fix code and passes on the fix.
+func TestDecodeBlockSyncRespCapsAHostileCount(t *testing.T) {
+	const hostile = 1 << 20 // one MiB: also the payload, because Len refuses a count above the remaining bytes
+
+	// A response claiming `hostile` units, then `hostile` bytes whose leading
+	// length varint is far larger than what remains, so the first unit fails
+	// immediately after the capacity hint is made.
+	unitCount := types.NewEncoder()
+	unitCount.U8(uint8(MsgBlockSyncResp))
+	unitCount.U64(0) // Nonce
+	unitCount.Len(hostile)
+	unitCount.Raw([]byte{0xFE, 0xFF, 0xFF, 0xFF, 0x0F}) // a block length ~2^32: fails fast
+	unitCount.Raw(make([]byte, hostile-5))
+	unitFrame := unitCount.Bytes()
+
+	// A response claiming ONE unit whose vote count is `hostile`, again with
+	// `hostile` filler bytes behind it - the 24x vote-side shape of the same
+	// defect.
+	voteCount := types.NewEncoder()
+	voteCount.U8(uint8(MsgBlockSyncResp))
+	voteCount.U64(0) // Nonce
+	voteCount.Len(1)
+	voteCount.VarBytes(nil)                             // unit 0's block: empty
+	voteCount.U32(0)                                    // unit 0's Round
+	voteCount.Len(hostile)                              // unit 0's vote count
+	voteCount.Raw([]byte{0xFE, 0xFF, 0xFF, 0xFF, 0x0F}) // a vote length ~2^32: fails fast
+	voteCount.Raw(make([]byte, hostile-5))
+	voteFrame := voteCount.Bytes()
+
+	cases := []struct {
+		name  string
+		frame []byte
+	}{{"units", unitFrame}, {"votes", voteFrame}}
+	for _, tc := range cases {
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := DecodeBlockSyncResp(tc.frame)
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			t.Errorf("%s: a truncated response must fail to decode", tc.name)
+			continue
+		}
+		grown := after.TotalAlloc - before.TotalAlloc
+		t.Logf("%s: hostile count %d over a %d-byte frame allocated %d B (%.1fx)", tc.name, hostile, len(tc.frame), grown, float64(grown)/float64(len(tc.frame)))
+		if grown > 16*uint64(len(tc.frame)) {
+			t.Errorf("%s: a %d-byte frame with a hostile count allocated %d B before failing - the allocation must be bounded by the frame, not by the claimed element count (audit N-4)",
+				tc.name, len(tc.frame), grown)
+		}
 	}
 }

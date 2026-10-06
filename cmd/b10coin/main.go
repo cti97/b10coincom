@@ -2,12 +2,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,6 +24,7 @@ import (
 	"github.com/cti97/b10coincom/internal/devnet"
 	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
+	"github.com/cti97/b10coincom/internal/keystore"
 	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/node"
 	"github.com/cti97/b10coincom/internal/rpc"
@@ -37,6 +41,8 @@ func main() {
 	switch os.Args[1] {
 	case "devnet":
 		err = cmdDevnet(os.Args[2:])
+	case "keygen":
+		err = cmdKeygen(os.Args[2:])
 	case "node":
 		err = cmdNode(os.Args[2:])
 	case "claim":
@@ -60,23 +66,41 @@ func usage() {
 	fmt.Fprint(os.Stderr, `b10coin — a testnet cryptocurrency for small computers
 
 Usage:
-  b10coin devnet --blocks N [--validators N] [--dir PATH] [--claims N]   Build and verify a local chain (or, with --validators given, a consensus devnet)
+  b10coin devnet --blocks N [--validators N] [--dir PATH] [--claims N]   Build and verify a local chain (or, with --validators given, a consensus devnet over the FIXTURE committee)
+  b10coin keygen [--out PATH]                                            Generate this validator's key file (owner-only permissions; refuses to overwrite)
   b10coin node   --dir PATH [--http ADDR] [--block-time DURATION]
-                 [--peers ADDR,...] [--relay ADDR] [--listen ADDR] [--validators N] --index I
+                 [--peers ADDR,...] [--relay ADDR] [--listen ADDR]       Run the single-node devnet producer, or — with --peers/--relay/--listen — a consensus validator
+                 --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
+                 --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
   b10coin version
 
 A node with --peers/--relay/--listen runs the M4 consensus committee over real
 TCP: --peers dials the other validators (or the relay), --relay dials the dumb
 forwarder every home validator reaches outbound, --listen accepts direct
-connections. The committee and this node's seat must be named explicitly with
---validators N and --index I: every validator derives the same committee from
-the committee-size flag (chain b10coin-simnet-N) and claims the seat --index.
+connections. HOW the committee is named decides whose keys sign:
+
+  --genesis PATH --key PATH   the committee is the genesis file's list of
+                              validator PUBLIC keys; this node signs with ITS
+                              OWN held key and REFUSES TO START when that key
+                              is not in the committee. This is the mode for
+                              any node that reaches a shared network.
+  --validators N --index I    FIXTURE COMMITTEE (development only): every
+                              seat's private key is derived from the public
+                              seed "b10coin-simnet-validator" plus the seat
+                              number, so anyone with this repository can sign
+                              proposals, prevotes and precommits for ANY seat,
+                              and the chain ID b10coin-simnet-N publishes the
+                              committee size. Never point this mode at a
+                              network beyond your own machines.
 Without any of those flags the node is the M1 producer: one chain, no round
 protocol.
 
 The claim command signs with an ephemeral key that is printed and never
-stored: there is no key file and no keystore.
+stored: the key signs exactly this claim and is printed once so it can be
+reused for a follow-up transfer. Because stdout is captured by shells, CI
+logs and journalctl, --print-key=false withholds the key: safe when
+no follow-up transfer is planned, and the claimant address is still printed.
 `)
 }
 
@@ -210,14 +234,50 @@ func validatorHeightsLine(h map[int]uint64) string {
 	return strings.Join(parts, " ")
 }
 
+// cmdKeygen generates one REAL validator key and writes it to a key file with
+// owner-only permissions. It refuses to overwrite an existing file (audit
+// A-1): a careless rerun derives a DIFFERENT key, and a validator that then
+// loads the new file can no longer sign as the seat the genesis listed —
+// while anyone holding the old file still can. Only the PUBLIC key travels:
+// the printed value is what goes into the committee file (--genesis) the
+// whole committee shares.
+//
+// The printed seat address is the account this key signs from
+// (BLAKE3("b10coin-address") of the public key, rendered with its checksum),
+// the same derivation every transaction's From field carries.
+func cmdKeygen(args []string) error {
+	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
+	out := fs.String("out", "./b10coin.key", "key file to write (created owner-only 0600; refuses to overwrite an existing file)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unknown argument %q", fs.Arg(0))
+	}
+	_, priv, err := keystore.Generate(*out)
+	if err != nil {
+		return err
+	}
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	fmt.Printf("key file     %s (owner-only 0600; regenerate elsewhere, never over this one)\n", *out)
+	fmt.Printf("public key   %x\n", []byte(pub))
+	fmt.Printf("seat address %s\n", types.AddressFromPub(pub))
+	fmt.Println()
+	fmt.Println("Add the public key line above to the committee file your validators share")
+	fmt.Println("(--genesis). A node started with --key must find its public key there, or")
+	fmt.Println("it refuses to start rather than signing for a seat it does not hold.")
+	return nil
+}
+
 // claimHTTP bounds RPC round trips for the claim command; the puzzle itself
 // is solved locally before anything is sent.
 var claimHTTP = &http.Client{Timeout: 15 * time.Second}
 
-// claimPuzzleAttempts bounds the local solve. The devnet's easy target needs
-// about two attempts; a failure means the tuning changed, not that mining is
-// slow.
-const claimPuzzleAttempts = 1_000_000
+// claimPuzzleAttempts bounds the local solve. The reference claimant solves the
+// cheap outer puzzle (16 leading zero bits) as well as the devnet's easy
+// Argon2id target, so the expected scan is about 2^17 nonces; a failure means
+// the tuning changed, not that mining is slow.
+const claimPuzzleAttempts = 1 << 24
 
 // cmdClaim solves the faucet puzzle for a FRESH EPHEMERAL key and submits the
 // signed claim to a node's /tx endpoint. There is no key file and no
@@ -234,6 +294,11 @@ func cmdClaim(args []string) error {
 	// accepted so scripts built on the other commands keep working; its value
 	// is deliberately never read here.
 	fs.String("dir", "./b10coin-data", "the node's data directory (unused by the claim itself; the devnet genesis is compiled in)")
+	// Printing the key is the documented default (kept for compatibility),
+	// but stdout is captured by shells, CI and journalctl, so the opt-out is
+	// the safe choice for any run that does not intend a follow-up transfer
+	// (audit O-10). The claimant ADDRESS is printed either way.
+	printKey := fs.Bool("print-key", true, "print the ephemeral signing key to stdout; set --print-key=false to keep the secret out of shell history, CI logs and journalctl (the key is then unrecoverable and no follow-up transfer is possible)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -264,7 +329,10 @@ func cmdClaim(args []string) error {
 	if err != nil {
 		return err
 	}
-	pow, ok := faucet.Solve(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, claimPuzzleAttempts)
+	// SolveClaim also satisfies the cheap outer puzzle a node's mempool now
+	// requires at admission (audit R-1); Solve alone would be refused at the
+	// door even though the block's Argon2id rule would have accepted it.
+	pow, ok := faucet.SolveClaim(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, claimPuzzleAttempts)
 	if !ok {
 		return fmt.Errorf("no solution found within %d attempts", claimPuzzleAttempts)
 	}
@@ -277,7 +345,7 @@ func cmdClaim(args []string) error {
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(g.Hash())
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 
 	txid, err := postTxHex(base+"/tx", tx.Encode())
@@ -290,8 +358,12 @@ func cmdClaim(args []string) error {
 	fmt.Printf("claim epoch %d\n", epoch)
 	fmt.Printf("pow nonce   %d\n", pow)
 	fmt.Printf("txid        %s\n", txid)
-	fmt.Println("no key file, no keystore: the ephemeral signing key below cannot be recovered later.")
-	fmt.Printf("ephemeral key %x  <- copy now only if you plan a follow-up transfer\n", priv)
+	fmt.Println("no key file, no keystore: the ephemeral signing key cannot be recovered later.")
+	if *printKey {
+		fmt.Printf("ephemeral key %x  <- copy now only if you plan a follow-up transfer\n", priv)
+	} else {
+		fmt.Println("ephemeral key withheld (--print-key=false); no follow-up transfer from this claimant is possible")
+	}
 	fmt.Println("the claim is queued on the node; it is paid when the node's next block applies it.")
 	return nil
 }
@@ -346,78 +418,142 @@ func cmdNode(args []string) error {
 	// today, so every earlier acceptance run is untouched. --block-time is
 	// refused with networking: a committee's cadence is the round-timeout
 	// ladder, and a flag that was silently ignored would lie about the run.
+	//
+	// HOW the committee is named (audit A-1):
+	//   - --genesis PATH --key PATH is the REAL mode: the committee is the
+	//     JSON file's list of validator public keys (every member holds the
+	//     same file), this node signs with ITS OWN key, and a key that is not
+	//     in the committee refuses to start.
+	//   - --validators N --index I is the FIXTURE mode: derived keys that
+	//     anyone with the repository can reproduce, for development only.
 	peers := fs.String("peers", "", "comma-separated peer addresses to dial")
 	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
+	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8); sent as the first frame of every --relay dial, because the relay compares bytes and decodes nothing")
 	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
-	validators := fs.Int("validators", 0, "committee size (required for networking)")
-	index := fs.Int("index", 0, "this node's seat in the committee (required for networking)")
+	validators := fs.Int("validators", 0, "FIXTURE committee size (development mode; committee from --genesis otherwise)")
+	index := fs.Int("index", 0, "FIXTURE committee seat (development mode; the seat of --key is derived from --genesis otherwise)")
+	keyPath := fs.String("key", "", "this validator's key file (b10coin keygen); REQUIRED with --genesis")
+	genesisPath := fs.String("genesis", "", "shared committee file listing the validators' public keys (required for any node a shared network can reach)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	networked := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "peers", "relay", "listen", "validators", "index":
+		case "peers", "relay", "listen", "validators", "index", "genesis":
 			networked = true
 		}
 	})
-	if networked {
-		return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *validators, *index)
+	if !networked {
+		if *keyPath != "" {
+			return fmt.Errorf("--key signs for a committee seat, but this node (no networking flags) is the single-node devnet producer and signs with its fixture key: give --genesis together with --key, or drop --key")
+		}
+		if *relayTokenPath != "" {
+			return fmt.Errorf("--relay-access-token-file credentials a --relay connection, but no networking flag is set: give --relay ADDR together with it, or drop it")
+		}
+		return runProducerNode(*dir, *addr, *blockTime)
 	}
+	var relayToken []byte
+	if *relayTokenPath != "" {
+		data, err := os.ReadFile(*relayTokenPath)
+		if err != nil {
+			return fmt.Errorf("reading relay access-token file %q: %w", *relayTokenPath, err)
+		}
+		// A trailing newline is an editor artifact, not part of the token;
+		// the relay trims the same way, so both ends agree on the bytes.
+		relayToken = bytes.TrimRight(data, "\r\n")
+		if len(relayToken) == 0 {
+			return fmt.Errorf("relay access-token file %q is empty; remove the flag or give it at least one byte", *relayTokenPath)
+		}
+	}
+	return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken)
+}
 
+// runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
+// by A-1: the devnet fixture chain, one unilateral block producer on the
+// fixture key, no round protocol. It takes no key: there is exactly one
+// honest chain identity here (the devnet genesis) and its one key is part of
+// that fixture, so a --key flag here could only make a flag lie.
+// httpShutdownGrace bounds how long a shutdown waits for in-flight requests.
+// It is a bound, not a hang: Shutdown stops accepting immediately and returns
+// when active requests finish or this expires.
+const httpShutdownGrace = 5 * time.Second
+
+// shutdownHTTP drains in-flight requests instead of aborting them (audit
+// O-10). http.Server.Close aborted every active request; Shutdown stops
+// accepting, waits for the active ones up to the grace period, and returns.
+func shutdownHTTP(s *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), httpShutdownGrace)
+	defer cancel()
+	_ = s.Shutdown(ctx)
+}
+
+func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	// M1 nodes run the devnet genesis. The testnet genesis has no validator
 	// keys yet, so there is nothing to sign blocks with until M4.
-	c, err := chain.Open(genesis.Devnet(), *dir)
+	c, err := chain.Open(genesis.Devnet(), dir)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
 
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(10_000)
+	mp := mempool.New(10_000, c.Genesis().Hash(), c.AdmissionHead)
 	n := node.New(c, priv, mp)
 	srv := rpc.NewServer(c, mp)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Timeouts suit a local-node API serving small JSON bodies to trusted
-	// LAN clients: header reading is the untrusted window, reads and writes
-	// never take longer than a slow client, and idle keep-alives are
-	// reaped so a vanished peer cannot hold a connection forever.
+	// Bind before announcing, and drain rather than abort on the way out
+	// (audit O-10). The banner used to print before ListenAndServe, so a
+	// failed bind still claimed to be "listening"; a synchronous net.Listen
+	// makes the failure an error and the banner true. On shutdown, Shutdown
+	// (not Close) lets an in-flight request finish, and the caller waits for
+	// it before returning so the process does not exit under one.
+	ln, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
 	httpSrv := &http.Server{
-		Addr:              *addr,
+		Addr:              httpAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
-		_ = httpSrv.Close()
+		shutdownHTTP(httpSrv)
+		close(shutdownDone)
 	}()
 
 	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
-		version.Version, *addr, c.Genesis().ChainID, c.Height())
+		version.Version, ln.Addr(), c.Genesis().ChainID, c.Height())
 
-	// A failed listen must reach the shell as a failure, not as exit 0: the
+	// A failed Serve must reach the shell as a failure, not as exit 0: the
 	// goroutine delivers its error into the buffered channel BEFORE calling
 	// stop(), so by the time n.Run returns from that cancellation the error
 	// is already available to be read below — no window in which a failure is
 	// visible only to the node loop.
 	serveErr := make(chan error, 1)
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintln(os.Stderr, "http:", err)
 			serveErr <- err
 			stop()
 		}
 	}()
 
-	if err := n.Run(ctx, *blockTime); err != nil && ctx.Err() == nil {
+	if err := n.Run(ctx, blockTime); err != nil && ctx.Err() == nil {
 		return err
 	}
+	// Wait for the HTTP drain before returning. On the clean-signal path this
+	// is the drain; on a failed Serve path stop() has already fired, so it is
+	// already complete.
+	<-shutdownDone
 	// A cancelled context is either a clean SIGINT shutdown — success — or
 	// the consequence of a failed listen, which must fail the process. The
 	// buffered serve error is guaranteed present in the latter case and
@@ -431,35 +567,88 @@ func cmdNode(args []string) error {
 }
 
 // runNetworkedNode is the M4 consensus path of the `node` command: one
-// validator of the deterministic committee (chain b10coin-simnet-N), running
-// the same consensus stack the in-process TCP integration test drives, over
-// the transport the flags describe - direct peers, the relay, or both. The
-// single-node body above is deliberately UNTOUCHED and reachable only with
+// validator of a consensus committee over the real transport, running the same
+// consensus stack the in-process TCP integration test drives. The single-node
+// body (runProducerNode) is deliberately UNTOUCHED and reachable only with
 // none of the networking flags: the M3 acceptance runs must be byte-identical.
 //
-// --validators and --index are required explicitly. A silent default would
-// pick a committee (and a seat) the operator never chose; two nodes with
-// mismatched sizes derive different committees and can never commit, which
-// is the honest failure mode rather than a flag that lied. --block-time is
-// refused with networking: a committee's cadence is its round-timeout
-// ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay string, committee, seat int) error {
-	vSet, iSet, blockTimeSet := false, false, false
+// Since the audit's A-1 fix there are two ways to name the committee, and the
+// difference is who holds the keys:
+//
+//   - GENESIS-FILE MODE (--genesis --key): the committee is the shared file's
+//     list of PUBLIC keys; this node signs with its own key file and refuses
+//     to start when that key is nowhere in the committee. The chain ID is the
+//     file's, chosen by the operators — nothing about it publishes the
+//     committee size, and nobody can reproduce a member key from this repo.
+//   - FIXTURE MODE (--validators --index): the committee is derived from the
+//     size flag and every seat signs a publicly derivable fixture key. This
+//     is development-only, and it says so — on stderr, in the usage text, in
+//     the README and in the deploy recipe — because a warning the operator
+//     never sees cannot protect anything.
+//
+// --block-time is refused with networking: a committee's cadence is its
+// round-timeout ladder, and the flag only drives the single-node producer.
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte) error {
+	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "validators":
 			vSet = true
 		case "index":
 			iSet = true
+		case "genesis":
+			genSet = true
+		case "key":
+			keySet = true
 		case "block-time":
 			blockTimeSet = true
 		}
 	})
-	if !vSet || !iSet {
-		return fmt.Errorf("networked nodes name their committee explicitly; give --validators N and --index I (this node's 0-based seat)")
-	}
 	if blockTimeSet {
 		return fmt.Errorf("--block-time drives the single-node block producer and does not apply to a consensus committee; drop it")
+	}
+
+	var (
+		g       *genesis.Genesis
+		priv    ed25519.PrivateKey
+		keyDesc string
+	)
+	switch {
+	case genSet:
+		// Genesis-file mode. The fixture flags are meaningless here and
+		// refusing them keeps a mismatched committee-size flag from looking
+		// like it did something.
+		if vSet || iSet {
+			return fmt.Errorf("--validators/--index name the fixture committee and mean nothing alongside --genesis (the committee is the file's public-key list); drop the fixture flags, or drop --genesis for the development fixture")
+		}
+		if !keySet {
+			return fmt.Errorf("a node on the genesis-file committee %q must say who signs for it: give --key PATH (b10coin keygen creates the file)", genesisPath)
+		}
+		gFile, err := genesis.LoadCommitteeJSON(genesisPath)
+		if err != nil {
+			return err
+		}
+		priv, err = keystore.Load(keyPath)
+		if err != nil {
+			return err
+		}
+		// Passes through the membership gate inside StartValidator: a key
+		// that is not in the committee file REFUSES to start.
+		g = gFile
+		keyDesc = fmt.Sprintf("key file %s", keyPath)
+	default:
+		// Fixture mode (development). --key has no place here: the fixture
+		// derives every seat's key, so a supplied key could only be refused
+		// by the membership gate — refusing it at the flag is clearer.
+		if keySet {
+			return fmt.Errorf("--key does not apply to the fixture committee (--validators/--index derive every seat's key from public seeds, so there is no key file to load); use --genesis <committee file> --key <key file> for a committee of held keys")
+		}
+		if !vSet || !iSet {
+			return fmt.Errorf("the fixture committee is devnet-only and must be named explicitly: give --validators N and --index I (or, for a real committee, --genesis <file> --key <key file>)")
+		}
+		g = nil // StartValidator derives simnet.Committee(committee) in fixture mode
+		priv = nil
+		keyDesc = "derived fixture key (public knowledge)"
 	}
 
 	dial := make([]string, 0, 8)
@@ -470,20 +659,65 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay stri
 			}
 		}
 	}
+	// The relay is kept out of the direct dial list: its connection runs the
+	// transport's RELAY dial mode (no ID read, fixed relay:<addr> name -
+	// audit N-1), which a plain peer address must not hit.
+	relayDial := make([]string, 0, 1)
 	if r := strings.TrimSpace(relay); r != "" {
-		dial = append(dial, r)
+		relayDial = append(relayDial, r)
 	}
-	if len(dial) == 0 && listen == "" && committee > 1 {
-		return fmt.Errorf("a committee of %d needs reachable peers: give --peers, --relay, or --listen for the others to dial", committee)
+	committeeSize := committee
+	seatName := fmt.Sprintf("seat %d", seat)
+	if g != nil {
+		committeeSize = len(g.Validators)
+		seatName = fmt.Sprintf("seat %d, %s", seatFromKey(g, priv), keyDesc)
+	}
+	if len(dial) == 0 && len(relayDial) == 0 && listen == "" && committeeSize > 1 && g == nil {
+		// Fixture mode can be refused before anything starts. Genesis-file
+		// mode's membership refusal must come FIRST — a non-member key hears
+		// the refusal, not the peers hint — so StartValidator runs first for
+		// it and this guard is re-checked after that failure path.
+		return fmt.Errorf("a committee of %d needs reachable peers: give --peers, --relay, or --listen for the others to dial", committeeSize)
 	}
 
-	v, err := devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen})
+	var v *devnet.Validator
+	var err error
+	if g != nil {
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, RelayAccessToken: relayToken})
+	} else {
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, RelayAccessToken: relayToken})
+	}
 	if err != nil {
 		return err
 	}
 	defer func() { _ = v.Close() }()
+	if g != nil && len(dial) == 0 && len(relayDial) == 0 && listen == "" && committeeSize > 1 {
+		// The genesis-file mode's re-run of the guard: StartValidator has now
+		// vetted the key against the committee (a non-member key was already
+		// refused above), so this failure is exactly the peers hint.
+		_ = v.Close()
+		return fmt.Errorf("a committee of %d needs reachable peers: give --peers, --relay, or --listen for the others to dial", committeeSize)
+	}
 	if err := v.Connect(dial...); err != nil {
 		return err
+	}
+	if err := v.ConnectRelay(relayDial...); err != nil {
+		return err
+	}
+	if g == nil {
+		// The audit-mandated fixture warning. It stands directly between the
+		// operator and the committee they just started, printed to stderr
+		// where systemd captures it: a fixture this derivable must never be
+		// mistaken for a network with held keys.
+		fmt.Fprintln(os.Stderr, strings.Repeat("=", 72))
+		fmt.Fprintln(os.Stderr, "WARNING: FIXTURE COMMITTEE — the keys are PUBLIC KNOWLEDGE.")
+		fmt.Fprintf(os.Stderr, "Every member of committee b10coin-simnet-%d derives its private key from the\n", committeeSize)
+		fmt.Fprintln(os.Stderr, "public seed \"b10coin-simnet-validator\" plus the seat number, and the chain ID")
+		fmt.Fprintln(os.Stderr, "publishes the committee size: anyone with this repository can sign proposals,")
+		fmt.Fprintln(os.Stderr, "prevotes and precommits for ANY seat. Do not expose this committee to any")
+		fmt.Fprintln(os.Stderr, "network beyond your own machines. For a committee of held keys, start every")
+		fmt.Fprintln(os.Stderr, "member with --genesis <committee file> --key <key file> (see b10coin keygen).")
+		fmt.Fprintln(os.Stderr, strings.Repeat("=", 72))
 	}
 
 	srv := rpc.NewServer(v.Chain(), v.Pool())
@@ -492,7 +726,12 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay stri
 	defer stop()
 
 	// The same HTTP shape the single node runs (same timeouts, same failure
-	// plumbing) so a networked node's RPC behaves identically.
+	// plumbing, same bind-before-banner and drain-on-shutdown fixes: audit
+	// O-10) so a networked node's RPC behaves identically.
+	ln, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
 	httpSrv := &http.Server{
 		Addr:              httpAddr,
 		Handler:           srv.Handler(),
@@ -501,22 +740,27 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay stri
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
-		_ = httpSrv.Close()
+		shutdownHTTP(httpSrv)
+		close(shutdownDone)
 	}()
 
 	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
-		version.Version, httpAddr, v.Chain().Genesis().ChainID, v.Height())
+		version.Version, ln.Addr(), v.Chain().Genesis().ChainID, v.Height())
 	dialDesc := "listening for inbound connections"
 	if len(dial) > 0 {
 		dialDesc = "dialled " + strings.Join(dial, " ")
 	}
-	fmt.Printf("consensus    committee of %d, seat %d, %s\n", committee, seat, dialDesc)
+	if g == nil {
+		seatName = fmt.Sprintf("seat %d (%s)", seat, keyDesc)
+	}
+	fmt.Printf("consensus    committee of %d, %s, %s\n", committeeSize, seatName, dialDesc)
 
 	serveErr := make(chan error, 1)
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintln(os.Stderr, "http:", err)
 			serveErr <- err
 			stop()
@@ -525,11 +769,21 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay stri
 
 	<-ctx.Done()
 	// Same semantics as the single node: a clean SIGINT is success; a failed
-	// listen must fail the process.
+	// listen must fail the process. The drain is waited out so the process
+	// does not exit under an in-flight request.
+	<-shutdownDone
 	select {
 	case err := <-serveErr:
 		return err
 	default:
 		return nil
 	}
+}
+
+// seatFromKey finds the committee position a key signs as, or -1. The CLI uses
+// it only inside the seat-name banner; the hard refusal lives in
+// StartValidator, so a non-member key never gets this far.
+func seatFromKey(g *genesis.Genesis, priv ed25519.PrivateKey) int {
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	return genesis.SeatOfPubKey(g.Validators, pub)
 }

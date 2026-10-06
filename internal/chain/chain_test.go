@@ -13,6 +13,7 @@ import (
 	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/state"
+	"github.com/cti97/b10coincom/internal/store"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -210,10 +211,11 @@ func TestReplayRebuildsIdenticalState(t *testing.T) {
 			From:   from,
 			PubKey: fromPub,
 			Nonce:  c.State().Get(from).Nonce,
+			Fee:    g.Params.MinFeeSparks,
 			To:     to,
 			Amount: uint64(h) * genesis.SparksPerB10,
 		}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(c.Genesis().Hash())
 		tx.Sig = crypto.Sign(devPriv, sigHash[:])
 
 		b, err := c.Build(priv, []types.Tx{*tx}, int64(1_700_000_000+h))
@@ -272,10 +274,11 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 		From:   from,
 		PubKey: fromPub,
 		Nonce:  0,
+		Fee:    c.Genesis().Params.MinFeeSparks,
 		To:     to,
 		Amount: 250 * genesis.SparksPerB10,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(devPriv, sigHash[:])
 
 	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
@@ -286,20 +289,22 @@ func TestTransferThroughChainChangesBalances(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	if got := c.State().Get(from).Balance; got != startFrom-250*genesis.SparksPerB10 {
-		t.Fatalf("sender balance = %d, want %d", got, startFrom-250*genesis.SparksPerB10)
+	// The sender pays the amount AND the fee (audit S-3); the fee is burned, so
+	// it leaves the supply entirely and never reaches the recipient.
+	fee := c.Genesis().Params.MinFeeSparks
+	if got := c.State().Get(from).Balance; got != startFrom-250*genesis.SparksPerB10-fee {
+		t.Fatalf("sender balance = %d, want %d (amount plus the burned fee %d)", got, startFrom-250*genesis.SparksPerB10-fee, fee)
 	}
 	if got := c.State().Get(to).Balance; got != startTo+250*genesis.SparksPerB10 {
 		t.Fatalf("recipient balance = %d, want %d", got, startTo+250*genesis.SparksPerB10)
 	}
 }
 
-// Total supply must change across a block by EXACTLY the block's emission and
-// nothing else: the transfer in the block still creates nothing and destroys
-// nothing. (Supersedes the M0-M1 version, which asserted supply was IDENTICAL
-// across a transfer, legitimate now that each block also mints its Reward -
-// and stricter: the exact per-height reward must account for the whole
-// delta.)
+// Total supply must change across a block by EXACTLY the block's emission minus
+// the fees the block's transactions paid: a transfer still creates nothing, and
+// since audit S-3 it DESTROYS its fee (the fee is burned - the protocol has no
+// proposer-reward rule yet). The delta is still fully accounted for, which is
+// the point: nothing minted or destroyed can go unaccounted.)
 func TestTotalSupplyChangesOnlyByTheBlockEmission(t *testing.T) {
 	c, priv := devChain(t)
 	before := c.State().TotalBalance()
@@ -317,10 +322,11 @@ func TestTotalSupplyChangesOnlyByTheBlockEmission(t *testing.T) {
 		From:   from,
 		PubKey: fromPub,
 		Nonce:  c.State().Get(from).Nonce,
+		Fee:    c.Genesis().Params.MinFeeSparks,
 		To:     types.AddressFromPub(toPub),
 		Amount: 123 * genesis.SparksPerB10,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(devPrivateKey(t), sigHash[:])
 
 	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
@@ -330,9 +336,11 @@ func TestTotalSupplyChangesOnlyByTheBlockEmission(t *testing.T) {
 	if err := c.Append(b); err != nil {
 		t.Fatal(err)
 	}
-	want := before + faucet.Reward(b.Header.Height, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks)
+	want := before +
+		faucet.Reward(b.Header.Height, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks) -
+		c.Genesis().Params.MinFeeSparks
 	if got := c.State().TotalBalance(); got != want {
-		t.Fatalf("total supply = %d, want %d (before %d plus exactly one block's emission)",
+		t.Fatalf("total supply = %d, want %d (before %d plus one block's emission minus the burned fee)",
 			got, want, before)
 	}
 }
@@ -399,12 +407,14 @@ func TestOpenRejectsRenumberedStoredChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Skip record 1 entirely: uvarint length prefix, payload, uint32be CRC.
-	recLen, m := binary.Uvarint(raw)
-	if m <= 0 || m+int(recLen)+4 > len(raw) {
+	// Skip record 1 entirely: framed header (length || its checksum), payload,
+	// trailer checksum.
+	recLen := binary.BigEndian.Uint64(raw)
+	span := store.RecordHeaderLen + int(recLen) + store.RecordTrailerLen
+	if len(raw) < span {
 		t.Fatalf("malformed first record in %s; cannot drop it", seg)
 	}
-	if err := os.WriteFile(seg, raw[m+int(recLen)+4:], 0o644); err != nil {
+	if err := os.WriteFile(seg, raw[span:], 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -480,7 +490,7 @@ func TestClaimMaySpendTheBlocksOwnEmission(t *testing.T) {
 	}
 	tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: pow}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(key, sigHash[:])
 
 	b, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_100)
@@ -536,7 +546,7 @@ func TestClaimVerifiesTheCurrentEpochThroughTheTransition(t *testing.T) {
 	}
 	tx := &types.Tx{Type: types.TxFaucetClaim, From: claimant, PubKey: pub,
 		Nonce: 0, Epoch: 2, PowNonce: pow}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(key, sigHash[:])
 
 	b2, err := c.Build(priv, []types.Tx{*tx}, 1_700_000_101)
@@ -575,7 +585,7 @@ func TestProbeMirrorsTheBlockTransition(t *testing.T) {
 	}
 	claim := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: pow}
-	sigHash := claim.SigningHash()
+	sigHash := claim.SigningHash(c.Genesis().Hash())
 	claim.Sig = crypto.Sign(key, sigHash[:])
 
 	// Fixture guard: the claim must NEED the block's own emission, or this
@@ -651,7 +661,7 @@ func TestProbeUsesTheNextBlocksEpoch(t *testing.T) {
 	}
 	claim := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 2, PowNonce: pow}
-	sigHash := claim.SigningHash()
+	sigHash := claim.SigningHash(c.Genesis().Hash())
 	claim.Sig = crypto.Sign(key, sigHash[:])
 
 	probed, err := c.Probe([]types.Tx{*claim})
@@ -768,7 +778,7 @@ func TestChainRejectsABlockOverTheGenesisClaimBound(t *testing.T) {
 		}
 		tx := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(claimantPub), PubKey: claimantPub,
 			Nonce: 0, Epoch: 1, PowNonce: pow}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(c.Genesis().Hash())
 		tx.Sig = crypto.Sign(key, sigHash[:])
 		txs = append(txs, *tx)
 	}
@@ -855,10 +865,11 @@ func TestTransfersDoNotCountAgainstTheClaimBound(t *testing.T) {
 			From:   from,
 			PubKey: fromPub,
 			Nonce:  uint64(i),
+			Fee:    g.Params.MinFeeSparks,
 			To:     to,
 			Amount: 1,
 		}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(c.Genesis().Hash())
 		tx.Sig = crypto.Sign(devPriv, sigHash[:])
 		txs = append(txs, *tx)
 	}
@@ -881,4 +892,271 @@ func TestTransfersDoNotCountAgainstTheClaimBound(t *testing.T) {
 	if c.Height() != 1 {
 		t.Fatalf("height after the transfers-only block = %d, want 1", c.Height())
 	}
+}
+
+// ---- Pre-vote block validation (audit C-1) ----
+//
+// The consensus engine's validation seam calls ValidateNext before prevoting
+// a proposal. The seam's content must be EXACTLY what Append demands, so this
+// test pins the two against each other: every way a block can be refused at
+// append time must already be refused by ValidateNext, the valid case must
+// pass, and no refusal may mutate the chain.
+
+// pristineHeadPlusOne builds a block that is valid for this chain's head+1:
+// signed by the devnet validator through the chain's own Build. It is the
+// table's shared base; each case corrupts exactly one thing of its own, so a
+// corruptor that does nothing fails loudly against the valid-case expectation.
+func pristineHeadPlusOne(t *testing.T, c *Chain) *types.Block {
+	t.Helper()
+	_, priv := devKey()
+	b, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatalf("fixture Build: %v", err)
+	}
+	return b
+}
+
+func TestValidateNextAcceptsExactlyWhatAppendAccepts(t *testing.T) {
+	c, _ := devChain(t)
+
+	// The valid case: the block Build produces must pass ValidateNext
+	// unchanged, and passing must not move the chain.
+	valid := pristineHeadPlusOne(t, c)
+	heightBefore, headBefore := c.Height(), c.Head().ID()
+	if err := c.ValidateNext(valid); err != nil {
+		t.Fatalf("ValidateNext refused a block Build signed for head+1: %v", err)
+	}
+	if c.Height() != heightBefore || c.Head().ID() != headBefore {
+		t.Fatal("ValidateNext mutated the chain on a passing block")
+	}
+
+	// Case table: every refusal Append makes. Each case asserts the REFUSAL
+	// by its named sentinel (not any error), so a wrong check failing on the
+	// wrong defect cannot pass as this test's evidence.
+	cases := []struct {
+		name    string
+		corrupt func(b *types.Block)
+		want    error
+	}{
+		{
+			name:    "wrong parent",
+			corrupt: func(b *types.Block) { b.Header.ParentHash = crypto.HashParts([]byte("not-the-parent")) },
+			want:    ErrBadParent,
+		},
+		{
+			name:    "wrong height",
+			corrupt: func(b *types.Block) { b.Header.Height = b.Header.Height + 7 },
+			want:    ErrBadHeight,
+		},
+		{
+			name:    "tx root mismatch",
+			corrupt: func(b *types.Block) { b.Header.TxRoot = crypto.HashParts([]byte("not-the-tx-root")) },
+			want:    types.ErrTxRootMismatch,
+		},
+		{
+			name: "non-validator proposer",
+			corrupt: func(b *types.Block) {
+				_, strangerKey, _ := crypto.GenerateKey()
+				b.Header.Proposer = strangerKey.Public().(ed25519.PublicKey)
+				hh := b.Header.SigningHash()
+				b.Sig = crypto.Sign(strangerKey, hh[:])
+			},
+			want: ErrNotValidator,
+		},
+		{
+			name:    "missing proposer signature",
+			corrupt: func(b *types.Block) { b.Sig = nil },
+			want:    ErrBadProposerSig,
+		},
+		{
+			name: "bad proposer signature",
+			corrupt: func(b *types.Block) {
+				b.Sig = append([]byte(nil), b.Sig...)
+				b.Sig[3] ^= 0xff
+			},
+			want: ErrBadProposerSig,
+		},
+		{
+			name: "garbage state root",
+			corrupt: func(b *types.Block) {
+				// The attack exactly as audit C-1 describes it: the proposer
+				// builds a normal block, overwrites Header.StateRoot with
+				// garbage and RE-SIGNS. The signature then verifies - it was
+				// made over the tampered header - and the refusal must come
+				// from the recomputed root, not from the signature.
+				b.Header.StateRoot = [32]byte{0xde, 0xad, 0xbe, 0xef}
+				_, key := devKey()
+				hh := b.Header.SigningHash()
+				b.Sig = crypto.Sign(key, hh[:])
+			},
+			want: ErrBadStateRoot,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := pristineHeadPlusOne(t, c)
+			tc.corrupt(b)
+			heightBefore, headBefore := c.Height(), c.Head().ID()
+			if err := c.ValidateNext(b); !errors.Is(err, tc.want) {
+				t.Fatalf("ValidateNext err = %v, want %v", err, tc.want)
+			}
+			// For the re-signed case the signature must genuinely verify: a
+			// refusal named for the state-root sentinel would not name it if
+			// the block were merely unsigned - this pins the attack shape.
+			if tc.name == "garbage state root" {
+				hh := b.Header.SigningHash()
+				if !crypto.Verify(b.Header.Proposer, hh[:], b.Sig) {
+					t.Fatal("fixture: the re-signed attack block does not verify; the case would not name the state-root check")
+				}
+			}
+			if c.Height() != heightBefore || c.Head().ID() != headBefore {
+				t.Fatal("ValidateNext mutated the chain on a refused block")
+			}
+			// Append must refuse the SAME block with the SAME sentinel: the
+			// two entries to the one policy cannot drift apart.
+			if err := c.Append(b); !errors.Is(err, tc.want) {
+				t.Fatalf("Append err = %v, want %v (the seam and the gate disagree)", err, tc.want)
+			}
+		})
+	}
+}
+
+// Audit O-6: Build must return an error, not panic, for a proposer key that
+// cannot be used. ed25519.PrivateKey.Public() indexes the key and panics on a
+// short one, so a nil wiring bug used to crash the node.
+func TestBuildRefusesANilProposerInsteadOfPanicking(t *testing.T) {
+	c, _ := devChain(t)
+	for _, key := range []ed25519.PrivateKey{nil, {}} {
+		if _, err := c.Build(key, nil, 1_700_000_100); !errors.Is(err, ErrUnknownProposer) {
+			t.Fatalf("Build with a %d-byte proposer gave %v, want ErrUnknownProposer", len(key), err)
+		}
+	}
+}
+
+// Audit O-5: a data directory belongs to one genesis. Opening it with another
+// must be reported as a genesis mismatch BEFORE any block is replayed, not as
+// an opaque "replay diverged" after the fact.
+func TestOpenRefusesADifferentGenesisUpFront(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	_, priv := devKey()
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := c.Build(priv, nil, 1_700_000_100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Append(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if c2, err := Open(genesis.Testnet(), dir); err == nil {
+		_ = c2.Close()
+		t.Fatal("opening a devnet directory with the testnet genesis must fail")
+	} else if !errors.Is(err, ErrWrongGenesis) {
+		t.Fatalf("wrong genesis reported as %v, want ErrWrongGenesis", err)
+	} else if errors.Is(err, ErrGenesisReplay) {
+		t.Fatal("a wrong genesis must not be reported as a replay divergence")
+	}
+}
+
+// Audit S-14 evidence: a stray/duplicated segment does NOT silently renumber
+// the chain. The store numbers heights by record count, but replay refuses a
+// stored block whose own header does not claim its position, so the extra
+// copy fails Open instead of shifting every later height.
+func TestOpenRefusesADuplicatedSegment(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	_, priv := devKey()
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for h := 1; h <= 3; h++ {
+		b, err := c.Build(priv, nil, int64(1_700_000_000+h))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stray copy sorted AFTER the real segment: its three records are
+	// re-indexed as heights 4..6 while still claiming heights 1..3.
+	if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%08d.seg", 1)), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c2, err := Open(g, dir); err == nil {
+		_ = c2.Close()
+		t.Fatal("a duplicated segment silently renumbered the chain")
+	} else if !errors.Is(err, ErrGenesisReplay) {
+		t.Fatalf("a duplicated segment reported as %v, want ErrGenesisReplay", err)
+	}
+}
+
+// Audit O-8: /status reads the head height, ID and root from one critical
+// section. The invariant is checked while blocks are appended concurrently:
+// every snapshot's ID and root must belong to a real block at that height.
+// The outcome does not depend on interleaving, so it cannot flake.
+func TestHeadSnapshotIsConsistentUnderAppends(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, priv := devKey()
+
+	stop := make(chan struct{})
+	checked := make(chan struct{})
+	go func() {
+		defer close(checked)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			height, id, stateRoot := c.HeadSnapshot()
+			blk, err := c.BlockAt(height)
+			if err != nil {
+				t.Errorf("BlockAt(%d) after HeadSnapshot: %v", height, err)
+				return
+			}
+			if got := blk.ID(); got != id {
+				t.Errorf("head snapshot height %d: ID %x does not match the block at that height (%x)", height, id[:8], got[:8])
+				return
+			}
+			if blk.Header.StateRoot != stateRoot {
+				t.Errorf("head snapshot height %d: state root %x does not match the block at that height", height, stateRoot[:8])
+				return
+			}
+		}
+	}()
+	for h := 1; h <= 60; h++ {
+		b, err := c.Build(priv, nil, c.Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	<-checked
 }

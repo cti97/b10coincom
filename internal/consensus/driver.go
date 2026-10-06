@@ -91,6 +91,16 @@ type Driver struct {
 	appendRefused bool
 }
 
+// maxRoundEscalation caps the timeout ladder (audit C-2): a round's deadline
+// is TimeoutBase + min(round, maxRoundEscalation)*TimeoutStep from the clock
+// reading, so an undecided height settles into a FIXED round cadence instead
+// of growing its timeouts without bound. The escalation exists to let slow
+// committees converge; past this many rounds it has done all the good it can
+// and only makes recovery after a stall linearly slower. With the shipped
+// defaults (200ms base, 100ms step) rounds top out at 1.8s; a testnet keeps
+// proposing steadily instead of crawling to multi-second rounds.
+const maxRoundEscalation = uint32(16)
+
 // NewDriver starts a driver that will extend ch from its current head.
 //
 // pool is the driver's transaction source and may be nil: a validator with no
@@ -107,9 +117,24 @@ type Driver struct {
 // precommitted at head+1 and crashed before the height was decided, the lock
 // it persisted is restored here (newEngine) - a restart may not re-enter a
 // height the validator has already promised about.
-func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) *Driver {
+//
+// A signing key that is not one of the committee's seats is REFUSED with an
+// error (audit C-11): the engine cannot tally its own vote, so driving it would
+// only reach emitVote's refusal on the first timeout. Returning the error at
+// construction is the loud, non-panicking form of that refusal; the production
+// node already checks the same key against the genesis committee before it gets
+// here, and this makes the consensus layer enforce it for every caller.
+func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) (*Driver, error) {
 	d := &Driver{cfg: cfg, ch: ch, pool: pool, priv: priv, tp: tp}
 	d.eng = d.newEngine(ch.Height()+1, ch.Head().ID())
+	// The membership gate (audit C-11): the engine computed its committee
+	// index at construction but never used it, so a key outside the committee
+	// reached emitVote and panicked there. Refuse it before the transport is
+	// wired, so a misconfigured validator fails to start instead of failing to
+	// vote.
+	if err := d.eng.CheckMembership(); err != nil {
+		return nil, err
+	}
 	// timeoutAt is ARMED ON THE FIRST TICK, not at construction (the sentinel
 	// below). Anchoring it at construction means assuming the caller's clock
 	// starts at zero - true for a fresh simnet run, FALSE for every rebuild
@@ -126,7 +151,7 @@ func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transpor
 	// scenario's assertions are property assertions, not schedule assertions.
 	d.timeoutAt = -1
 	tp.OnMessage(d.OnMessage)
-	return d
+	return d, nil
 }
 
 // newEngine builds the engine for (height, parent) and connects it to the
@@ -148,10 +173,84 @@ func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transpor
 func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
 	eng := NewEngine(d.cfg, height, parent, d.priv, d.build)
 	eng.persistLock = d.persistLock
+	eng.persistRound = d.persistRound
+	// The validation seam (audit C-1): every engine the driver builds judges
+	// proposals through ValidateNext - the chain's own pre-vote check, the
+	// same method Append's shared validation runs. A proposer's Build and a
+	// validator's seam and the final Append all run one policy, so a block
+	// this engine would prevote is a block the chain must accept: the case
+	// where they could disagree (a garbage state root carrying a polka to a
+	// commit and then refusing at Append, parking the whole committee) is
+	// closed before any vote is cast.
+	//
+	// The seam's COST is deliberate and bounded: it runs the full head+1
+	// state transition (including any Argon2id claim verification, the block's
+	// own bounds applying) under the chain's read lock on each judged proposal,
+	// at most once per round - a Byzantine proposer can therefore force that
+	// one transition per round for a block it knows fails the root compare.
+	// The cost statement lives with the seam itself: chain.ValidateNext's doc,
+	// "COST" paragraph (audit round 3, F4).
+	//
+	// ValidateConsensusNext, not bare ValidateNext: the consensus path also
+	// pins the block timestamp to parent+1 (audit S-8), so a proposal carrying
+	// any other timestamp is nil-prevoted here rather than merely being
+	// monotonic. Every honest driver builds parent+1, so the pin never binds
+	// an honest proposer.
+	eng.SetValidate(func(b *types.Block) error { return d.ch.ValidateConsensusNext(b) })
 	if rec, ok := d.ch.LockAt(height); ok {
 		eng.restoreLock(rec.Round, rec.BlockID)
 	}
+	// The round a previous life of this height had reached (audit C-3):
+	// restored AFTER the lock, because restoreRound floors itself at the
+	// lock's round - a torn round log must not resume the engine behind its
+	// own promise. Absence is round 0, the legitimate fresh-start value.
+	if r, ok := d.ch.RoundAt(height); ok {
+		eng.restoreRound(r)
+	}
 	return eng
+}
+
+// persistRound is the hook the engine calls the moment it enters a later
+// round, before it emits any vote in that round (audit C-3): the round must
+// be durable first, or a crash between the write and the vote leaves a
+// restarted validator re-entering round 0 for a height the committee has
+// already carried into round 3 - every proposal and vote wrong-round in both
+// directions until it times out its way back.
+//
+// A persistence failure PANICS deliberately, exactly as persistLock's does:
+// the engine is about to cast a vote in a round a restart could not
+// remember, and a node that cannot keep its position durable must stop rather
+// than vote from a state it cannot reproduce.
+//
+// PREVOTES ARE DELIBERATELY NOT PERSISTED (audit C-10). Only the lock and the
+// round are durable; the signed prevote a validator cast at (height, round) is
+// not written anywhere. A validator that prevotes and crashes before its round
+// advances therefore comes back with its round (restoreRound) and its lock
+// (restoreLock) restored but with NO memory of the prevote, and may honestly
+// cast a second prevote at that same round: a proposal re-delivered for the
+// round makes it prevote the same block again, and - the realistic case, since
+// this protocol does not retransmit proposals - its timeout makes it prevote
+// NIL, so the two signed prevotes at one (height, round) need not agree.
+//
+// This does not weaken commit safety, and the argument is why the omission is
+// acceptable rather than deferred: two conflicting commits at one height need
+// two quorums of more than two thirds of the power, whose intersection is more
+// than one third, so two conflicting quorums require more than one third of the
+// power to have double-voted. One validator's weight is capped below a quarter
+// of the total, so a single restarted validator can never supply that
+// intersection; and every honest validator in a quorum also precommitted, and
+// the lock IS persisted before that precommit is signed. What the omission
+// produces is therefore EVIDENCE, not an unsafe commit: the two signed prevotes
+// are exactly the equivocation M5 slashing must punish. M5 therefore either
+// persists the prevote before it is emitted (the same persist-before-emit
+// ordering the lock uses) or defines its evidence to include a re-cast prevote;
+// until slashing exists, this behaviour is documented here rather than assumed
+// away, and TestARestartDoesNotRememberAPrevote pins it.
+func (d *Driver) persistRound(height uint64, round uint32) {
+	rec := store.RoundRecord{Height: height, Round: round}
+	if err := d.ch.PutRound(rec); err != nil {
+		panic(fmt.Sprintf("consensus: the round reached at height %d round %d could not be made durable: %v", height, round, err))
+	}
 }
 
 // persistLock is the hook the engine calls the moment its lock moves, before
@@ -310,13 +409,29 @@ func (d *Driver) Tick(nowMillis int64) {
 		// one does (see NewDriver).
 		d.timeoutAt = nowMillis + d.cfg.TimeoutBase
 	} else if d.now >= d.timeoutAt {
-		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+		// The returned error (audit C-11) is discarded for the same reason
+		// StartProposing's is: NewDriver refused a signing key outside the
+		// committee, so the only emission this can refuse is a vote the
+		// engine's own tally would not admit - unreachable for a driver that
+		// was constructed at all. The driver has no error channel here (Tick
+		// is the clock's callback), and a key that cannot vote must fail at
+		// construction, which is where CheckMembership now puts it.
+		_ = d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 		// The round the engine is in NOW, after OnTimeout advanced it, gets
-		// the base timeout plus its own step. Each round therefore runs
-		// longer than the one before it, and a new round's propose phase
-		// runs before the next timer can fire: the deadline is at least
-		// TimeoutBase from a clock reading taken this tick.
-		d.timeoutAt = d.now + d.cfg.TimeoutBase + int64(d.eng.Round())*d.cfg.TimeoutStep
+		// the base timeout plus its own step - CAPPED at maxRoundEscalation
+		// steps (audit C-2): each round therefore runs longer than the one
+		// before it until the cap, after which every round runs the same
+		// fixed cadence. A height that cannot decide must not grow its
+		// timeouts without bound: unbounded growth made every later round
+		// linearly slower forever, so a committee that recovered late would
+		// still crawl. A new round's propose phase still runs before the
+		// next timer can fire: the deadline is at least TimeoutBase from a
+		// clock reading taken this tick.
+		escalation := d.eng.Round()
+		if escalation > maxRoundEscalation {
+			escalation = maxRoundEscalation
+		}
+		d.timeoutAt = d.now + d.cfg.TimeoutBase + int64(escalation)*d.cfg.TimeoutStep
 	}
 	d.flush()
 }
@@ -360,15 +475,19 @@ func (d *Driver) flush() {
 		return
 	}
 	// The committed block is the proposal this engine accepted: the driver can
-	// only append bytes it actually holds, and only the proposal it judged
-	// carries them. A quorum CAN precommit a block whose proposal this engine
-	// never received (the proposal is lost while the precommits it caused
-	// still arrive): the engine has legitimately judged that ID on its
-	// precommit evidence, but this node holds no block bytes to append and
-	// must not guess or reconstruct any. It appends nothing and stays at the
-	// undecided height - reporting a lower height than the peers that did
-	// receive the proposal, never a fabricated one.
-	if d.eng.proposal == nil || d.eng.proposal.ID() != id {
+	// only append bytes it actually holds. A quorum CAN precommit a block
+	// whose proposal this engine never received, or one it received and then
+	// cleared when the round changed (audit C-3 commits from ANY retained
+	// round, so the committing round need not be the current one): the engine
+	// has legitimately judged that ID on its precommit evidence, and the bytes
+	// may still be retained with the committing round's tallies or as the
+	// proof-of-lock copy. committedBlock is where those copies are collected;
+	// a node that holds none appends nothing and stays at the undecided
+	// height - reporting a lower height than the peers that did receive the
+	// proposal, never a fabricated one - and catch-up from a peer that DID
+	// append is its recovery.
+	blk := d.eng.committedBlock(id)
+	if blk == nil {
 		return
 	}
 	// Append re-validates the block against the chain - parent link, height,
@@ -376,7 +495,7 @@ func (d *Driver) flush() {
 	// inject an invalid block: it fails here and the chain stays untouched.
 	// The failure is recorded so no later flush re-offers the same refused
 	// block to the chain's write lock.
-	if err := d.ch.Append(d.eng.proposal); err != nil {
+	if err := d.ch.Append(blk); err != nil {
 		d.appendRefused = true
 		return
 	}
@@ -388,9 +507,9 @@ func (d *Driver) flush() {
 	// evidence for this block and do not travel.
 	if w := d.CommitWitness; w != nil {
 		id, _ := d.eng.Committed()
-		round := d.eng.round
-		cert := make([]*Vote, 0, len(d.eng.precommits.Votes()))
-		for _, v := range d.eng.precommits.Votes() {
+		round := d.eng.commitRound
+		cert := make([]*Vote, 0, len(d.eng.committedPrecommits()))
+		for _, v := range d.eng.committedPrecommits() {
 			if v.BlockID == id {
 				cert = append(cert, v)
 			}

@@ -616,6 +616,12 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 		}
 	}
 	eng := consensus.NewEngine(cfg, h, parent, n.keys[actor].priv, nil)
+	// Wire the honest validator's seam (audit round 3, F3): NewEngine's
+	// default REFUSES every block - a driver-less engine never prevotes FOR
+	// unjudged bytes - and this replica judges against n.ch[0], the chain the
+	// scenario's proposals were built over, exactly as the driver wires
+	// ValidateNext in production.
+	eng.SetValidate(n.ch[0].ValidateNext)
 
 	signedVote := func(signer int, round uint32, id [32]byte) *consensus.Vote {
 		v := &consensus.Vote{Type: consensus.MsgPrevote, Height: h, Round: round, BlockID: id, Validator: n.keys[signer].priv.Public().(ed25519.PublicKey)}
@@ -651,9 +657,9 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 
 	// Two rounds pass without a decided alternative (the timeouts leave behind
 	// only nil prevotes for rounds the engine held no proposal in).
-	eng.OnTimeout(consensus.TimeoutEvent{Height: h, Round: eng.Round(), Step: eng.Step()})
+	eng.OnTimeout(consensus.TimeoutEvent{Height: h, Round: eng.Round()})
 	eng.Drain()
-	eng.OnTimeout(consensus.TimeoutEvent{Height: h, Round: eng.Round(), Step: eng.Step()})
+	eng.OnTimeout(consensus.TimeoutEvent{Height: h, Round: eng.Round()})
 	eng.Drain()
 
 	// The attack: a conflicting proposal at round 2 claiming a polka from round
@@ -688,7 +694,7 @@ func TestScenarioByzantineEquivocatorDoesNotFork(t *testing.T) {
 	// prevotes. The lock must yield to that - evidence, honestly given. Without
 	// this control, "no prevote" could pass for a silenced engine rather than a
 	// working gate.
-	eng.OnTimeout(consensus.TimeoutEvent{Height: h, Round: eng.Round(), Step: eng.Step()})
+	eng.OnTimeout(consensus.TimeoutEvent{Height: h, Round: eng.Round()})
 	eng.Drain()
 	evidence, err := n.ch[0].Build(n.keys[proposerOf(eng.Round())].priv, nil, parentTimestamp(n)+13)
 	if err != nil {
@@ -923,7 +929,9 @@ func TestScenarioRestartMidEpoch(t *testing.T) {
 	// OnMessage registration is what lifts the power-off cut. A restarted
 	// validator that is merely behind must remain harmless.
 	n.offline[3] = false
-	n.reseat(3, reopened)
+	if err := n.reseat(3, reopened); err != nil {
+		t.Fatalf("reseat: %v", err)
+	}
 	if err := n.AssertPrefix(3); err != nil {
 		t.Fatalf("the restarted validator holds a conflicting history: %v", err)
 	}

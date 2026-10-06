@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cti97/b10coincom/internal/relay"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/wire"
 )
@@ -93,6 +94,42 @@ func waitPeersIs(t *testing.T, tp *TcpTransport, want string) {
 	})
 }
 
+// rawDial opens one plain socket to addr (no transport behind it - the
+// stranger's shape), closed when the test ends.
+func rawDial(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("raw dial %s: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// waitClosedConn asserts the transport closed OUR end of the connection: the
+// next read fails (EOF or reset) inside the deadline, never delivering data
+// first. A read that merely runs out of its own deadline is NOT a close, and
+// fails here instead of passing by accident.
+func waitClosedConn(t *testing.T, c net.Conn, what string) {
+	t.Helper()
+	if err := c.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 1)
+	for {
+		n, err := c.Read(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				t.Fatalf("%s: the connection stayed open (read timed out instead of closing)", what)
+			}
+			return // EOF (clean close) or reset: the socket was shut
+		}
+		if n > 0 {
+			t.Fatalf("%s: data arrived instead of the connection closing", what)
+		}
+	}
+}
+
 // TestTwoTransportsExchangeAMessage is the brief's smoke test: listen, dial,
 // broadcast, receive - with the peer's identity riding the message, because
 // From is what the driver keys its tally on.
@@ -133,6 +170,124 @@ func TestTwoTransportsExchangeAMessage(t *testing.T) {
 		if got := a.Peers(); len(got) != 1 || got[0] != "b" {
 			t.Fatalf("Peers() = %v, want [b] every call", got)
 		}
+	}
+}
+
+// TestBroadcastRefusesAnEmptyFrameAndKeepsEveryLink pins audit N-11 end to end.
+// Broadcast([]byte{}) used to enqueue a zero-length frame to every peer, and
+// every reader treats that as fatal, so one bad caller tore down every link it
+// fanned out to - the failure surfaced on the PEERS' side, as a broken reader,
+// while the caller saw nil. Now the call names the malformed request and
+// returns, touching no queue; both connections are still usable afterwards,
+// proven by exchanging a real frame in each direction. The direct-enqueue case
+// then shows the writer's own gate: a frame that reached the queue WITHOUT
+// passing Broadcast/Send is dropped, not written, and the link survives too.
+func TestBroadcastRefusesAnEmptyFrameAndKeepsEveryLink(t *testing.T) {
+	a := listen(t, Options{LocalID: "a"})
+	b := listen(t, Options{LocalID: "b"})
+	if err := b.Dial(a.Addr().String()); err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	waitPeersIs(t, a, "[b]")
+	waitPeersIs(t, b, "[a]")
+
+	if err := a.Broadcast([]byte{}); !errors.Is(err, wire.ErrEmptyFrame) {
+		t.Fatalf("Broadcast(empty) = %v, want ErrEmptyFrame", err)
+	}
+	if err := a.Broadcast(nil); !errors.Is(err, wire.ErrEmptyFrame) {
+		t.Fatalf("Broadcast(nil) = %v, want ErrEmptyFrame", err)
+	}
+	if err := a.Send("b", nil); !errors.Is(err, wire.ErrEmptyFrame) {
+		t.Fatalf("Send(empty) = %v, want ErrEmptyFrame", err)
+	}
+
+	// The writer's gate, reached by enqueueing directly (what a future caller
+	// that skipped the checks above would do): an unframable frame is dropped,
+	// the socket stream stays aligned, and the connection is not ended.
+	a.mu.Lock()
+	c := a.conns["b"]
+	a.mu.Unlock()
+	if c == nil {
+		t.Fatal("fixture: a has no connection to b to enqueue on")
+	}
+	if !c.enqueue([]byte{}) {
+		t.Fatal("fixture: the queue refused an empty frame before the writer could; the writer gate is not what this asserts")
+	}
+
+	// The links must be untouched: a real frame still crosses both ways.
+	gotA, gotB := new(recorder), new(recorder)
+	a.OnMessage(gotA.collect)
+	b.OnMessage(gotB.collect)
+	if err := a.Broadcast([]byte("still-alive")); err != nil {
+		t.Fatalf("Broadcast after the refusal: %v", err)
+	}
+	waitFor(t, "b receiving the frame after the refused empty one", 5*time.Second, func() bool {
+		return len(gotB.payloads()) == 1 && gotB.payloads()[0] == "still-alive"
+	})
+	if err := b.Broadcast([]byte("still-alive-back")); err != nil {
+		t.Fatalf("Broadcast back after the refusal: %v", err)
+	}
+	waitFor(t, "a receiving the return frame", 5*time.Second, func() bool {
+		return len(gotA.payloads()) == 1 && gotA.payloads()[0] == "still-alive-back"
+	})
+	waitPeersIs(t, a, "[b]")
+	waitPeersIs(t, b, "[a]")
+}
+
+// TestSkipOversizedIsBoundedByAReadDeadline is audit N-13's construct: a peer
+// declares an oversized frame and then sends none of its payload. skipOversized
+// must return - ending the connection - within a bounded multiple of the idle
+// read deadline, not park the reader (and the connection's goroutine and slot)
+// forever. The stall is CONSTRUCTED (header only, then silence), never raced,
+// and the 5 s wait is 50x the 100 ms deadline so a slow machine cannot flake it:
+// the only outcome the wait separates is "returned" from "never returns".
+func TestSkipOversizedIsBoundedByAReadDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var server net.Conn
+	select {
+	case server = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture: the loopback accept never happened")
+	}
+	defer server.Close()
+
+	// The 4-byte header claims a 1 MiB payload; the peer then stops writing.
+	if _, err := client.Write([]byte{0x00, 0x10, 0x00, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+
+	tp, err := New(Options{LocalID: "t", IdleReadTimeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tp.Close() })
+
+	done := make(chan bool, 1)
+	go func() { done <- tp.skipOversized(&conn{nc: server}, &wire.FrameTooLarge{Declared: 1 << 20, Max: 1024}) }()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("skipOversized reported a stalled 1 MiB payload fully drained")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("skipOversized did not return within 5s on a stalled payload: the drain is unbounded (audit N-13)")
 	}
 }
 
@@ -1153,15 +1308,28 @@ func TestConcurrentSameIDHandshakesLeaveOneConnection(t *testing.T) {
 	}
 }
 
-// TestSupersededMaintainerReleasesItsRegistration pins F2: when a maintainer's
-// connection is superseded (here: the transport's own dial loses a duplicate
-// race to the peer's incoming dial, which the rank gives to the remote because
-// the remote's id is smaller), the maintainer must go dormant AND release its
-// address registration. The pre-fix code kept the stale entry, so Dial was
-// waved off as idempotent "nil" while nothing redialled - a peer set that
-// stayed empty forever. After the release, a fresh Dial must spawn a real
-// maintainer and reconnect.
-func TestSupersededMaintainerReleasesItsRegistration(t *testing.T) {
+// TestSupersededMaintainerRedialsAndHeals is the REAL shape of audit N-1's
+// second pass, and the one the first attempt's test dodged: the incumbent is
+// this transport's own OUTBOUND, EVICTED by a squatter's ACCEPTED connection.
+// The order is load-bearing. The transport dials a genuine peer and the link
+// installs; only then does a stranger dial the transport's OWN listener and
+// claim the same, lower-sorting peer ID. Because the local ID sorts above the
+// claimed one, the rank gives the squatter's accepted connection the registry
+// and SUPERSEDES the established outbound - exactly what any stranger who can
+// open a TCP connection to a validator's --listen port can do.
+//
+// Pre-fix, the superseded maintainer RETURNED at the supersede branch:
+// permanent dormancy, the link never restored until process restart, the peer
+// set empty indefinitely with the listener still accepting (the audit
+// reproduced it twice). The fix makes a supersede an ordinary failure - back
+// off, redial - so when the squatter leaves the next retry installs the real
+// peer, with NO new Dial and no restart.
+//
+// The reverting mutant (maintain returns on a superseded conn) fails the
+// healing wait below: the registry stays empty forever. That is the exact
+// permanent state, and it is why this test cannot be passed by the
+// losing-newcomer branch alone - the eviction must be observed first.
+func TestSupersededMaintainerRedialsAndHeals(t *testing.T) {
 	// A raw remote end, fully controlled: answers every handshake as "aaa"
 	// and holds its sockets open until closed or abandoned.
 	rl, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1178,9 +1346,9 @@ func TestSupersededMaintainerReleasesItsRegistration(t *testing.T) {
 			go func(nc net.Conn) {
 				defer nc.Close()
 				br := bufio.NewReader(nc)
-				nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+				_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
 				id, rerr := wire.ReadFrame(br, 4096)
-				nc.SetReadDeadline(time.Time{})
+				_ = nc.SetReadDeadline(time.Time{})
 				if rerr != nil || string(id) != "zzz" {
 					return
 				}
@@ -1198,60 +1366,123 @@ func TestSupersededMaintainerReleasesItsRegistration(t *testing.T) {
 	}()
 	addr := rl.Addr().String()
 
-	// zzz > aaa, so per newcomerWins the peer's dial (the smaller id's dial
-	// wins the rank) supersedes this transport's own outbound - the
-	// maintainer's connection is the one replaced.
-	tp, err := New(Options{LocalID: "zzz"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = tp.Close() })
-	// It must also listen: the superseding duplicate arrives as an INBOUND
-	// connection on this transport's own listener.
-	if err := tp.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("Listen: %v", err)
-	}
+	// zzz > aaa, so an ACCEPTED "aaa" outranks this transport's own outbound
+	// under the rank - the eviction direction the attack needs.
+	tp := listen(t, Options{
+		LocalID:     "zzz",
+		BackoffBase: 10 * time.Millisecond,
+		BackoffMax:  100 * time.Millisecond,
+		Rand:        rand.New(rand.NewSource(7)),
+	})
 	if err := tp.Dial(addr); err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	waitPeersIs(t, tp, "[aaa]")
-
-	// The duplicate: an inbound connection announcing the same peer id. It
-	// outranks our outbound, so our maintainer's connection is superseded.
-	hc, err := net.Dial("tcp", tp.Addr().String())
-	if err != nil {
-		t.Fatal(err)
+	// Pin the incumbent's direction before the eviction, so the test cannot
+	// pass on the wrong socket: it must be THIS transport's own dial.
+	tp.mu.Lock()
+	inc := tp.conns["aaa"]
+	incDialled, incRemote := inc != nil && inc.dialled, ""
+	if inc != nil {
+		incRemote = inc.nc.RemoteAddr().String()
 	}
-	t.Cleanup(func() { _ = hc.Close() })
+	tp.mu.Unlock()
+	if !incDialled || incRemote != addr {
+		t.Fatalf("the established link is not this transport's own dial to the peer (dialled=%v remote=%s): the constructed attack needs that incumbent", incDialled, incRemote)
+	}
+
+	// THE attack: the stranger claims the peer's lower-sorting ID on the
+	// transport's OWN listener. Accepted (dialled=false) outranks the
+	// maintainer's dial, so it evicts the established link.
+	hc := rawDial(t, tp.Addr().String())
 	if err := wire.WriteFrame(hc, []byte("aaa")); err != nil {
 		t.Fatal(err)
 	}
-	waitPeersIs(t, tp, "[aaa]") // still exactly one connection - the winner's
-
-	// The registration must be RELEASED (the winner here has no local
-	// maintainer - the peer's own dial holds the link from ITS side - so
-	// release, not transfer, is what honest bookkeeping looks like). A stale
-	// entry here is precisely the lie that made Dial return nil forever.
-	waitFor(t, "the superseded maintainer's registration being released", 2*time.Second, func() bool {
+	// Exactly one connection throughout; after the eviction it is the
+	// squatter's accepted socket, not the real peer's.
+	waitFor(t, "the squatter's accepted connection evicting the outbound link", 5*time.Second, func() bool {
 		tp.mu.Lock()
 		defer tp.mu.Unlock()
-		return len(tp.outbounds) == 0
+		if len(tp.conns) != 1 {
+			return false
+		}
+		c := tp.conns["aaa"]
+		return c != nil && !c.dialled && c.nc.RemoteAddr().String() != addr
 	})
 
-	// Kill the winner from the raw side. Nothing redials - the registration
-	// is gone, and pretending otherwise would be the lie above. The peer set
-	// drains to empty and STAYS empty until someone dials again.
-	hc.Close()
-	waitPeersIs(t, tp, "[]")
-
-	// Now Dial must spawn a FRESH maintainer: a maintainer exists again, and
-	// the reconnection the transport promises actually happens.
-	if err := tp.Dial(addr); err != nil {
-		t.Fatalf("Dial after the supersede released the registration: %v", err)
+	// The squatter leaves. The maintainer must heal the link with NO further
+	// Dial: the supersede was an ordinary failure, and the registry must name
+	// the real peer's listener again, dialled by this side.
+	_ = hc.Close()
+	waitFor(t, "the superseded maintainer redialling and restoring the real peer", 5*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		c := tp.conns["aaa"]
+		return len(tp.conns) == 1 && c != nil && c.dialled && !c.superseded && c.nc.RemoteAddr().String() == addr
+	})
+	if err := tp.Send("aaa", []byte("healed")); err != nil {
+		t.Fatalf("Send over the self-healed link: %v", err)
 	}
-	waitPeersIs(t, tp, "[aaa]")
-	if err := tp.Send("aaa", []byte("sync")); err != nil {
-		t.Fatalf("Send over the re-established link: %v", err)
+}
+
+// TestAnAcceptedConnectionCannotClaimTheRelayName pins the other half of the
+// N-1 second-pass fix: the deterministic relay:<addr> name is RESERVED for
+// this transport's own outbound relay registration, and an ACCEPTED
+// connection may not claim it. The name is produced only by RelayPeerName on
+// the dialling side, so an inbound peer presenting it is a stranger; without
+// the reservation it enters install's duplicate path with a deterministic,
+// public name and - because "v0" sorts above "relay:..." - evicts the real
+// relay link for free.
+//
+// The assertion is the registry's REMOTE address, not its name: the name is
+// identical either way, so only the socket distinguishes the real relay link
+// from the squatter's. Under the mutant that drops the reservation the
+// registry names the squatter's ephemeral socket and this fails.
+func TestAnAcceptedConnectionCannotClaimTheRelayName(t *testing.T) {
+	rl := relay.New(relay.Options{})
+	if err := rl.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	t.Cleanup(rl.Close)
+	raddr := rl.Addr().String()
+
+	tp := listen(t, Options{
+		LocalID:     "v0",
+		BackoffBase: 10 * time.Millisecond,
+		BackoffMax:  100 * time.Millisecond,
+		Rand:        rand.New(rand.NewSource(11)),
+	})
+	if err := tp.AddRelay(raddr); err != nil {
+		t.Fatalf("AddRelay: %v", err)
+	}
+	relayName := RelayPeerName(raddr)
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", relayName))
+
+	// The squatter on the transport's OWN listener, claiming the public,
+	// deterministic relay name.
+	sq := rawDial(t, tp.Addr().String())
+	if err := wire.WriteFrame(sq, []byte(relayName)); err != nil {
+		t.Fatal(err)
+	}
+	// The claim is refused: the registry still holds the REAL relay link
+	// (remote == the relay's listener), never the squatter's socket.
+	waitFor(t, "the accepted relay-name claim being refused", 5*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		c := tp.conns[relayName]
+		return len(tp.conns) == 1 && c != nil && c.nc.RemoteAddr().String() == raddr
+	})
+	// The transport greeted the squatter first (both sides write before
+	// reading), so consume that greeting, then the refusal closes the socket.
+	_ = sq.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := wire.ReadFrame(bufio.NewReader(sq), maxHandshakeIDBytes); err != nil {
+		t.Fatalf("reading the transport's greeting before the relay-name refusal: %v", err)
+	}
+	waitClosedConn(t, sq, "an accepted connection claiming the reserved relay name")
+
+	// The relay link is still a working link.
+	if err := tp.Send(relayName, []byte("still-alive")); err != nil {
+		t.Fatalf("Send over the untouched relay link: %v", err)
 	}
 }
 
@@ -1282,5 +1513,583 @@ func TestBackoffClampsAtMax(t *testing.T) {
 		if d := b2.Next(attempt); d >= 20*time.Millisecond {
 			t.Fatalf("attempt %d delay %v with base 100ms > max 20ms: the clamp did not pull the curve down", attempt, d)
 		}
+	}
+}
+
+// TestAStrangerThroughTheRelayCannotSilenceAValidator is the audit's N-1
+// flagship, run as the attack describes it: a stranger connected to the
+// relay streams a validator's own name ("v0") forever, FROM BEFORE the
+// validator exists, so the attack is in place for every connect, reconnect
+// and relay restart the validator ever does. Pre-fix, the handshake read
+// "whatever frame arrives first" as the peer's identity: a stranger's frame
+// naming v0 was consumed as v0's identity, the adopt refused it as a
+// self-connection, and the maintainer RETURNED - that address was never
+// redialled again, so the validator sat off the network until someone
+// restarted the process. What MAKES it self-healing now is two independent
+// properties, each load-bearing:
+//
+//   - the relay-mode handshake READS NOTHING (adoptRelay): no frame is ever
+//     consumed as an identity, so no stranger's bytes can produce a
+//     self/duplicate refusal on this link at all; and
+//   - the outbound maintainer treats every refusal - self, duplicate, ID
+//     too large, timeout - as an ordinary failure and backs off and redials
+//     forever, so even a refusal that does fire (a squatter on a direct
+//     link) cannot outlive the process (pinned separately, in
+//     TestADuplicateRefusalHealsWhenTheSquatterLeaves).
+//
+// The assertions, in order: the connection installs under the FIXED name
+// relay:<addr> (never a name any frame could supply); the stranger's very
+// bytes - the attack payload "v0" - arrive as DELIVERED MESSAGES under that
+// name, intact for the node layer to decode and drop; the link carries
+// traffic the other way (the validator's broadcast reaches a reader behind
+// the relay); and after the relay is torn down and a NEW relay is listening
+// on the same port, the maintainer redials and the whole shape restores.
+// The mutant "relay connections still read the first frame as the identity"
+// fails at the first assertion, with the registry holding either nothing
+// (a self-connection refusal, the audit's dormancy) or a name the stranger
+// picked - never the fixed relay name this test demands.
+func TestAStrangerThroughTheRelayCannotSilenceAValidator(t *testing.T) {
+	rl := relay.New(relay.Options{})
+	if err := rl.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	raddr := rl.Addr().String()
+
+	// The stranger: a raw socket with no transport behind it, flooding the
+	// validator's predictable ID through the relay every 100ms, forever,
+	// redialling the relay across restarts so the attack never lapses.
+	floodStop := make(chan struct{})
+	defer close(floodStop)
+	go func() {
+		for {
+			select {
+			case <-floodStop:
+				return
+			default:
+			}
+			sc, err := net.DialTimeout("tcp", raddr, 5*time.Second)
+			if err != nil {
+				select {
+				case <-floodStop:
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue // the relay is down; keep the attack pending until it returns
+			}
+			for {
+				if err := sc.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					break
+				}
+				if err := wire.WriteFrame(sc, []byte("v0")); err != nil {
+					break // the relay closed us (restart, write deadline): re-dial
+				}
+				select {
+				case <-floodStop:
+					_ = sc.Close()
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			_ = sc.Close()
+		}
+	}()
+	// The attack is only in place once the stranger's connection is IN the
+	// registry (a frame sent before registration is never forwarded -
+	// message-bus semantics): wait for it.
+	waitFor(t, "the stranger's flood connection registering", 5*time.Second, func() bool {
+		return relayStubStats(rl) == 1
+	})
+
+	tp, err := New(Options{
+		LocalID:     "v0",
+		BackoffBase: 10 * time.Millisecond,
+		BackoffMax:  200 * time.Millisecond,
+		Rand:        rand.New(rand.NewSource(7)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tp.Close() })
+
+	// The validator's first delivered message is observed (not consumed as
+	// the peer's identity), so OnMessage is registered BEFORE the dial.
+	rec := new(recorder)
+	tp.OnMessage(rec.collect)
+	if err := tp.AddRelay(raddr); err != nil {
+		t.Fatalf("AddRelay: %v", err)
+	}
+
+	// 1. The registry name is the FIXED relay name - through every frame the
+	// stranger sends. (Pre-fix this is where the attack lands: the handshake
+	// consumes a stranger frame and the name is the stranger's pick, or the
+	// connection is refused outright as a self-connection and the maintainer
+	// goes dormant.)
+	relayName := RelayPeerName(raddr)
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", relayName))
+
+	// 2. The attack bytes arrive as messages - identity read never happened.
+	waitFor(t, "the stranger's v0 frame arriving as a delivered message", 5*time.Second, func() bool {
+		ms := rec.snapshot()
+		return len(ms) >= 1 && ms[0].From == relayName && string(ms[0].Data) == "v0"
+	})
+
+	// 3. The link carries the validator's traffic out too: a reader behind
+	// the relay receives the validator's broadcast (its own "v0" flood is
+	// interleaved, so read until the probe appears - sender order per pair
+	// is what the relay promises). TWO deterministic gates, because a one-
+	// shot broadcast races the relay's accept: the probe's connection must
+	// be REGISTERED before anything can be forwarded to it (message-bus
+	// semantics - a frame sent inside the dial-to-register window is not
+	// queued up for anyone), and each poll then BROADCASTS (validators
+	// broadcast on a cadence; one probe frame per poll is what a real
+	// committee produces) and DRAINS until it sees one.
+	rlProbe := rawDial(t, raddr)
+	probeBroadcastAndDrain := func() bool {
+		_ = tp.Broadcast([]byte("validator-alive"))
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			_ = rlProbe.SetReadDeadline(deadline)
+			frame, err := wire.ReadFrame(rlProbe, 4096)
+			if err != nil {
+				return false
+			}
+			if string(frame) == "validator-alive" {
+				return true
+			}
+		}
+	}
+	waitFor(t, "the probe's connection registering at the relay", 5*time.Second, func() bool {
+		return relayStubStats(rl) == 3 // stranger + validator + probe
+	})
+	waitFor(t, "the validator's broadcast reaching a reader behind the relay", 5*time.Second, probeBroadcastAndDrain)
+
+	// 4. While the stranger keeps flooding, the link does not flap away.
+	time.Sleep(500 * time.Millisecond)
+	if got := tp.Peers(); len(got) != 1 || got[0] != relayName {
+		t.Fatalf("under a continuing stranger flood the validator's peers are %v, want [%s]: the link did not hold its fixed name", got, relayName)
+	}
+
+	// 5. THE dormancy clause: the relay restarts on the same port (boot, any
+	// blip). The maintainer must redial and restore the link - and it must
+	// do so while the stranger's flood is already renewed against the new
+	// relay, exactly the window in which the audit's attack used to park the
+	// validator until process restart.
+	rl.Close()
+	rl2 := relay.New(relay.Options{})
+	defer rl2.Close()
+	if err := rl2.Listen(raddr); err != nil {
+		t.Fatalf("the restarted relay could not bind %s: %v", raddr, err)
+	}
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", RelayPeerName(raddr)))
+	waitFor(t, "a delivered message after the relay restart", 5*time.Second, func() bool {
+		ms := rec.snapshot()
+		return len(ms) >= 2 && ms[len(ms)-1].From == RelayPeerName(raddr)
+	})
+}
+
+// relayStubStats reads the relay registry size without importing relay's
+// test helpers: one number, the count of registered connections.
+func relayStubStats(r *relay.Relay) int { return r.Stats().Conns }
+
+// TestADuplicateRefusalHealsWhenTheSquatterLeaves pins the OTHER half of the
+// N-1 fix: an outbound maintainer that loses a duplicate race must not
+// retire - the pre-fix code returned from maintain on ErrDuplicatePeer,
+// which made the refusal PERMANENT whenever the incumbent was a squatter
+// that had claimed the peer's name first (the audit's `--listen` variant).
+// The state is CONSTRUCTED, not raced: a raw squatter announces "aaa" into
+// this transport's listener and is INSTALLED before the maintainer is given
+// the real peer's address; "zzz" > "aaa" ranks the real link's dial as the
+// loser, so the maintainer's adopt is refused as a duplicate while the
+// squatter is present - deterministically, on every host. The fix then
+// shows exactly where dormancy used to begin: with the squatter gone, the
+// registry drains and the NEXT backoff retry installs the real peer. Under
+// the mutant (maintain returns on ErrDuplicatePeer again), the registry
+// stays empty forever after the squatter leaves: the test's waitPeersIs is
+// precisely what fails, for the reason it names.
+func TestADuplicateRefusalHealsWhenTheSquatterLeaves(t *testing.T) {
+	tp := listen(t, Options{LocalID: "zzz", BackoffBase: 20 * time.Millisecond, BackoffMax: 200 * time.Millisecond})
+
+	// The squatter: announces the real peer's ID into OUR listener before
+	// the real link is ever dialled, so the incumbent is in place BEFORE the
+	// maintainer starts. It is closed deliberately mid-test.
+	hc, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hc.Close() })
+	if err := wire.WriteFrame(hc, []byte("aaa")); err != nil {
+		t.Fatal(err)
+	}
+	waitPeersIs(t, tp, "[aaa]") // the constructed incumbent: the squatter holds the peer's name
+
+	// The real peer: a raw server that answers every handshake as "aaa" (the
+	// transport dials with local ID "zzz", so rawHandshake's "t" does not
+	// fit) and then holds its sockets open, draining whatever arrives. A
+	// stand-in for anything the squatter's presence currently refuses.
+	rl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rl.Close() })
+	go func() {
+		for {
+			nc, aerr := rl.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(nc net.Conn) {
+				defer nc.Close()
+				br := bufio.NewReader(nc)
+				_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+				if _, rerr := wire.ReadFrame(br, maxHandshakeIDBytes); rerr != nil {
+					return // the dialer's greeting ("zzz")
+				}
+				_ = nc.SetReadDeadline(time.Time{})
+				if werr := wire.WriteFrame(nc, []byte("aaa")); werr != nil {
+					return
+				}
+				buf := make([]byte, 64)
+				for {
+					if _, err := nc.Read(buf); err != nil {
+						return
+					}
+				}
+			}(nc)
+		}
+	}()
+
+	if err := tp.AddPeer(rl.Addr().String()); err != nil {
+		t.Fatalf("AddPeer: %v", err)
+	}
+	// While the squatter is present, the retries are refused (the rank keeps
+	// the incumbent): the registry still names ONLY the squatter's conn -
+	// churn is the backoff curve's, not the registry's.
+	time.Sleep(300 * time.Millisecond)
+	if got := tp.Peers(); fmt.Sprint(got) != "[aaa]" {
+		t.Fatalf("peers while the squatter is present: %v, want [aaa] held by the constructed incumbent", got)
+	}
+
+	// THE clause: the squatter leaves. Nothing about the maintainer's
+	// refusal was ever allowed to become permanent - the next redial wins.
+	// The wait names the exact outcome (a conn to "aaa" whose REMOTE is the
+	// real peer's listener), not just the peer name: between the squatter's
+	// Close and its reader's EOF the OLD squatter conn is still the [aaa]
+	// entry, and a name-only wait would pass on it.
+	hc.Close()
+	waitFor(t, "the real peer's connection replacing the squatter's", 5*time.Second, func() bool {
+		tp.mu.Lock()
+		defer tp.mu.Unlock()
+		c := tp.conns["aaa"]
+		return c != nil && c.nc.RemoteAddr().String() == rl.Addr().String() && !c.superseded
+	})
+	if err := tp.Send("aaa", []byte("healed")); err != nil {
+		t.Fatalf("Send over the healed link: %v", err)
+	}
+}
+
+// TestHandshakeIDLargerThanTheBoundIsRefused pins the identity bound (audit
+// N-1's third prescription): a DIRECT handshake may announce a few hundred
+// bytes of name, never the 1 MiB frame bound. A first frame declaring more
+// than maxHandshakeIDBytes is refused and the connection ends - no skip,
+// because the reader would be left mid-frame with no identity - and the
+// exact bound stays legal, so the check is "over", not "at or over".
+func TestHandshakeIDLargerThanTheBoundIsRefused(t *testing.T) {
+	tp := listen(t, Options{LocalID: "t"})
+
+	// Over the bound: a header declaring 2000 bytes, WITH its full payload on
+	// the wire - under the fix the bound refuses at the header and closes;
+	// under a mutant that reads with the full 1 MiB frame bound instead, the
+	// 2000 bytes decode as a (legal-shaped) identity and INSTALL, which the
+	// empty-registry assertion below names: the mutant fails for reading it,
+	// not for being slow.
+	over, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = over.Close() })
+	if err := over.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := over.Write([]byte{0, 0, 0x07, 0xD0}); err != nil { // 2000 > 512
+		t.Fatal(err)
+	}
+	if _, err := over.Write(make([]byte, 2000)); err != nil {
+		t.Fatal(err)
+	}
+	// The transport DID answer its own greeting first (both sides write
+	// ID-first); a plain read of one frame discards it, then the refusal is
+	// what the NEXT observations see: nothing in the registry (named first -
+	// a mutant reading with the full frame bound installs the 2000 bytes as
+	// an identity and fails HERE, with the peer list it accepted), and the
+	// connection closing.
+	_ = over.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(over)
+	if _, err := wire.ReadFrame(br, maxHandshakeIDBytes); err != nil {
+		t.Fatalf("reading the transport's greeting before the refusal: %v", err)
+	}
+	waitPeersIs(t, tp, "[]")
+	waitClosedConn(t, over, "a handshake ID declaring more than the identity bound")
+
+	// EXACTLY at the bound is a legal name, oversized as it looks.
+	at, err := net.Dial("tcp", tp.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = at.Close() })
+	id := make([]byte, maxHandshakeIDBytes)
+	id[0] = 'A'
+	id[maxHandshakeIDBytes-1] = 'Z'
+	if err := wire.WriteFrame(at, id); err != nil {
+		t.Fatal(err)
+	}
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", string(id)))
+}
+
+// TestAnUnadmittedStrangerIsNotAPeerAndReceivesNoBroadcast is audit N-3's
+// admission rule, pinned from BOTH sides: a connection that completes the ID
+// handshake but never presents a frame Options.Admit accepts is a SOCKET, not
+// a peer - absent from Peers(), never enqueued for a Broadcast, and its
+// frames never reach OnMessage. A valid admitting frame turns it into a peer
+// and is dispatched. Every assertion is over CONSTRUCTED state (the registry,
+// the queue length, the gated counter), not over a timing race: the only
+// waits are for the server side to have installed the socket and then to have
+// processed a frame, both of which the test drives.
+func TestAnUnadmittedStrangerIsNotAPeerAndReceivesNoBroadcast(t *testing.T) {
+	const memberFrame = "member-hello"
+	delivered := make(chan transport.Message, 8)
+	a := listen(t, Options{
+		LocalID: "validator",
+		Admit:   func(frame []byte) bool { return string(frame) == memberFrame },
+	})
+	a.OnMessage(func(m transport.Message) { delivered <- m })
+
+	// The stranger dials the listener and completes the transport ID
+	// handshake - exactly the shape audit N-3 calls "a dialer with a
+	// distinct 1-byte ID".
+	nc := rawDial(t, a.Addr().String())
+	if err := wire.WriteFrame(nc, []byte("stranger")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.ReadFrame(nc, maxHandshakeIDBytes); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the pending connection to install", 5*time.Second, func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return len(a.conns) == 1
+	})
+	a.mu.Lock()
+	var pending *conn
+	for _, c := range a.conns {
+		pending = c
+	}
+	a.mu.Unlock()
+	if pending == nil {
+		t.Fatal("the connection did not install")
+	}
+
+	// NOT a peer, and a Broadcast reaches it not at all: the frame is not
+	// even enqueued (Broadcast filters on admission), which is deterministic
+	// to read off the bounded queue.
+	if got := a.Peers(); len(got) != 0 {
+		t.Fatalf("an unadmitted stranger is in Peers(): %v", got)
+	}
+	if err := a.Broadcast([]byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(pending.tq); n != 0 {
+		t.Fatalf("an unadmitted stranger received %d broadcast frames", n)
+	}
+
+	// A frame the gate refuses is dropped before OnMessage.
+	if err := wire.WriteFrame(nc, []byte("not-a-hello")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the stranger frame to be gated", 5*time.Second, func() bool { return a.GatedFrames() >= 1 })
+	if len(delivered) != 0 {
+		t.Fatal("a gated frame reached OnMessage")
+	}
+
+	// A frame the gate accepts admits it: it becomes a peer, the admitting
+	// frame dispatches, and broadcasts now reach it.
+	if err := wire.WriteFrame(nc, []byte(memberFrame)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the member to be admitted", 5*time.Second, func() bool { return len(a.Peers()) == 1 })
+	select {
+	case m := <-delivered:
+		if string(m.Data) != memberFrame {
+			t.Fatalf("the admitting frame was dispatched as %q", m.Data)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the admitting frame was not dispatched")
+	}
+	if err := a.Broadcast([]byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	// The admitted peer's writer drains the queue onto the socket, so the
+	// observable is the frame arriving at the dialer, not the queue length.
+	_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	payload, err := wire.ReadFrame(nc, a.opts.MaxFrameBytes)
+	if err != nil {
+		t.Fatalf("an admitted peer did not receive the broadcast: %v", err)
+	}
+	if string(payload) != "after" {
+		t.Fatalf("an admitted peer received %q, want the broadcast", payload)
+	}
+}
+
+// TestTheAcceptCapRefusesDialsPastMaxConns is audit N-3's connection cap:
+// the listener holds at most MaxConns accepted connections, and a dial past
+// the cap is closed at accept and counted. The first two are real handshakes
+// and become peers; the third is refused BEFORE the handshake, which the
+// closed socket (not a timeout) proves.
+func TestTheAcceptCapRefusesDialsPastMaxConns(t *testing.T) {
+	a := listen(t, Options{LocalID: "validator", MaxConns: 2})
+
+	var live []net.Conn
+	for i := 0; i < 2; i++ {
+		nc := rawDial(t, a.Addr().String())
+		if err := wire.WriteFrame(nc, []byte(fmt.Sprintf("peer%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := wire.ReadFrame(nc, maxHandshakeIDBytes); err != nil {
+			t.Fatalf("handshake %d: %v", i, err)
+		}
+		live = append(live, nc)
+	}
+	waitPeersIs(t, a, "[peer0 peer1]")
+
+	third := rawDial(t, a.Addr().String())
+	waitClosedConn(t, third, "a dial past MaxConns")
+	waitFor(t, "the refusal counter", 5*time.Second, func() bool { return a.RefusedConns() >= 1 })
+	// The admitted two are untouched by the refusal.
+	waitPeersIs(t, a, "[peer0 peer1]")
+	_ = live
+}
+
+// TestAnIdleConnectionIsClosedByTheReadDeadline is audit N-3's idle deadline:
+// after the handshake the reader re-arms a read deadline before every frame,
+// so a connection that delivers nothing for the whole timeout is closed and
+// its slot released. The pre-fix code CLEARED the deadline after the
+// handshake, so this connection stayed open forever - the test fails by the
+// socket never closing, not by a slow runner.
+func TestAnIdleConnectionIsClosedByTheReadDeadline(t *testing.T) {
+	a := listen(t, Options{LocalID: "validator", IdleReadTimeout: 100 * time.Millisecond})
+	nc := rawDial(t, a.Addr().String())
+	if err := wire.WriteFrame(nc, []byte("peer")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.ReadFrame(nc, maxHandshakeIDBytes); err != nil {
+		t.Fatal(err)
+	}
+	waitPeersIs(t, a, "[peer]")
+	// Say nothing at all; the idle deadline ends the connection.
+	waitClosedConn(t, nc, "a connection idle past the read deadline")
+}
+
+// TestAPeerThatStopsReadingIsCutOffByTheWriteDeadline is audit N-3's per-frame
+// write deadline. It uses net.Pipe (a synchronous, socket-like net.Conn, no
+// kernel buffer) so the write blocks deterministically until the deadline:
+// a peer that never reads cannot park the writer, its frame and the queue
+// behind it forever.
+func TestAPeerThatStopsReadingIsCutOffByTheWriteDeadline(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	a, err := New(Options{LocalID: "validator", WriteTimeout: 150 * time.Millisecond, IdleReadTimeout: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	c, err := a.install(server, "pipe-peer", true, "pipe-peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.enqueue([]byte("frame")) {
+		t.Fatal("enqueue refused")
+	}
+	waitFor(t, "the per-frame write deadline to end the connection", 5*time.Second, func() bool {
+		select {
+		case <-c.dead:
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// TestTheRateLimiterShedsAFloodUnderAConstructedClock pins audit N-6's token
+// bucket with NO sleeping and no socket: refill is driven by a constructed
+// instant, so the burst, the cap and the sub-token boundary are exact.
+func TestTheRateLimiterShedsAFloodUnderAConstructedClock(t *testing.T) {
+	now := time.Unix(0, 0)
+	l := newRateLimiter(10, 5)
+	l.now = func() time.Time { return now }
+	l.last = now
+
+	for i := 0; i < 5; i++ {
+		if !l.allow() {
+			t.Fatalf("burst token %d was refused", i)
+		}
+	}
+	if l.allow() {
+		t.Fatal("a sixth frame in the same instant was admitted past the burst")
+	}
+	now = now.Add(time.Second) // 10 tokens earned, capped at the burst
+	for i := 0; i < 5; i++ {
+		if !l.allow() {
+			t.Fatalf("refilled token %d was refused", i)
+		}
+	}
+	if l.allow() {
+		t.Fatal("the refill admitted more than the burst")
+	}
+	now = now.Add(50 * time.Millisecond) // half a token: not enough
+	if l.allow() {
+		t.Fatal("half a token admitted a frame")
+	}
+	now = now.Add(50 * time.Millisecond) // the second half: exactly one
+	if !l.allow() {
+		t.Fatal("a full token after refill was refused")
+	}
+}
+
+// TestTheReaderShedsFramesOverThePerConnectionRateLimit places the limiter
+// where it changes behaviour: the reader. With a tiny rate the reader admits
+// the burst and sheds the rest - over a synchronous pipe, so the frame count
+// is exact and no timing race decides the outcome. A mutant that removes the
+// allow() call dispatches all 50 and fails the upper bound.
+func TestTheReaderShedsFramesOverThePerConnectionRateLimit(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	var got atomic.Uint64
+	a, err := New(Options{LocalID: "validator", RateLimitPerSec: 1, RateLimitBurst: 4, IdleReadTimeout: time.Hour, WriteTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	a.OnMessage(func(transport.Message) { got.Add(1) })
+	c, err := a.install(server, "pipe-peer", true, "pipe-peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for i := 0; i < 50; i++ {
+			if err := wire.WriteFrame(client, []byte{0xAA}); err != nil {
+				return
+			}
+		}
+	}()
+	waitFor(t, "all 50 frames to be read and either dispatched or shed", 10*time.Second, func() bool {
+		return got.Load()+c.rateLimited.Load() >= 50
+	})
+	// The burst is 4; a rate of 1/s can add at most a handful over the
+	// sub-second the loop takes. 8 is slack, and far below the 50 a missing
+	// limiter dispatches.
+	if n := got.Load(); n > 8 {
+		t.Fatalf("the rate limiter admitted %d of 50 frames; the burst is 4", n)
+	}
+	if c.rateLimited.Load() == 0 {
+		t.Fatal("no frame was shed: the reader did not consult the rate limiter")
 	}
 }

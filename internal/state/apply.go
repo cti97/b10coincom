@@ -20,6 +20,17 @@ var (
 	ErrClaimTooSoon      = errors.New("state: this key has already claimed in this epoch")
 	ErrBadProofOfWork    = errors.New("state: proof of work does not meet the target")
 	ErrFaucetEmpty       = errors.New("state: the faucet account cannot cover a claim")
+	// ErrFeeTooLow reports a transfer whose fee is under the chain's minimum.
+	// The fee is a signed field (audit S-3) and the minimum is a consensus
+	// parameter, so a transaction that underpayed is invalid, not a policy
+	// refusal.
+	ErrFeeTooLow = errors.New("state: transfer fee is below the chain's minimum")
+	// ErrClaimCarriesFee reports a faucet claim with a non-zero fee. A claim
+	// is paid BY the protocol and may come from an account holding nothing, so
+	// charging one would close the faucet; and the fee is signed for every
+	// type, so a claim must commit to zero rather than carry an unauthenticated
+	// number.
+	ErrClaimCarriesFee = errors.New("state: a faucet claim must not carry a fee")
 	// ErrTooManyClaims rejects a whole BLOCK, not a single claim: a block is
 	// attacker-chosen input, and the count is the only thing that can be
 	// checked without paying for it. See ApplyBlock.
@@ -31,7 +42,10 @@ var (
 // ApplyBlock still clones, so that one transaction's success is not persisted
 // when a later transaction in the same block fails.
 func (s *State) ApplyTx(tx *types.Tx) error {
-	if err := tx.VerifySignature(); err != nil {
+	// The chain identifier is part of the signed preimage (audit S-1): a
+	// transaction signed for a different chain fails here, before any state is
+	// read.
+	if err := tx.VerifySignature(s.params.GenesisHash); err != nil {
 		return err
 	}
 	switch tx.Type {
@@ -53,13 +67,26 @@ func (s *State) applyTransfer(tx *types.Tx) error {
 	if tx.From == tx.To {
 		return ErrSelfTransfer
 	}
+	// The fee floor (audit S-3) is checked before the balance, so an
+	// underpaying transaction is refused for what it got wrong rather than for
+	// an incidental lack of funds.
+	if tx.Fee < s.params.MinFee {
+		return fmt.Errorf("%w: fee %d is below the chain's minimum %d", ErrFeeTooLow, tx.Fee, s.params.MinFee)
+	}
+	// The sender pays the amount AND the fee. The sum is formed once, with the
+	// overflow check, so a crafted pair cannot wrap it below the balance and
+	// debit less than it says.
+	total := tx.Amount + tx.Fee
+	if total < tx.Amount {
+		return ErrBalanceOverflow
+	}
 
 	from := s.Get(tx.From)
 	if from.Nonce != tx.Nonce {
 		return fmt.Errorf("%w: got %d, want %d", ErrBadNonce, tx.Nonce, from.Nonce)
 	}
-	if from.Balance < tx.Amount {
-		return fmt.Errorf("%w: have %d, need %d", ErrInsufficientFunds, from.Balance, tx.Amount)
+	if from.Balance < total {
+		return fmt.Errorf("%w: have %d, need %d (amount %d + fee %d)", ErrInsufficientFunds, from.Balance, total, tx.Amount, tx.Fee)
 	}
 
 	to := s.Get(tx.To)
@@ -67,7 +94,12 @@ func (s *State) applyTransfer(tx *types.Tx) error {
 		return ErrBalanceOverflow
 	}
 
-	from.Balance -= tx.Amount
+	// The fee is BURNED, not credited: the protocol has no proposer-reward
+	// rule yet, and inventing one here would be monetary policy this finding
+	// did not ask for. Burning is the conservative half - supply only ever
+	// decreases - and the endgame the README describes ("the chain then runs
+	// on fees only") still needs a recipient rule of its own.
+	from.Balance -= total
 	from.Nonce++
 	s.Set(tx.From, from)
 
@@ -80,6 +112,12 @@ func (s *State) applyTransfer(tx *types.Tx) error {
 // key per epoch, debit the faucet, credit the claimant. The guards run in a
 // deliberate order cheap-to-expensive, each before the first write.
 func (s *State) applyFaucetClaim(tx *types.Tx) error {
+	// A fee on a claim is invalid, not ignored: the claimant may hold nothing
+	// (the protocol pays them), and the fee field is signed for every type, so
+	// a claim must commit to zero instead of carrying a number nothing checks.
+	if tx.Fee != 0 {
+		return fmt.Errorf("%w: claim carries fee %d", ErrClaimCarriesFee, tx.Fee)
+	}
 	// A zero-valued Argon2Params makes argon2.IDKey PANIC ("argon2: number of
 	// rounds too small") rather than return an error, and a zero EpochBlocks
 	// makes the epoch derivation below divide by zero. New() deliberately

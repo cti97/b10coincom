@@ -72,5 +72,25 @@ for f in "bin/b10coin-$os-$arch$ext" "bin/b10coin-relay-$os-$arch$ext"; do
     fi
 done
 
-file bin/b10coin-"$os"-"$arch$ext" bin/b10coin-relay-"$os"-"$arch$ext"
+file "bin/b10coin-$os-$arch$ext" "bin/b10coin-relay-$os-$arch$ext"
+
+# bin/SHA256SUMS over the STABLE names, so the recipe can copy a checksum file
+# to each machine and verify what it copied ON THE TARGET (audit B-2; the
+# README told operators to verify and gave them nothing to verify against).
+# Regenerated over every b10coin-* file present, so a later invocation for a
+# second target (e.g. the amd64 relay for an amd64 VPS) ADDS its pair instead
+# of replacing the file. dist/SHA256SUMS still covers the versioned artifacts.
+if command -v sha256sum >/dev/null 2>&1; then
+    sum="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+    sum="shasum -a 256"
+else
+    echo "FAIL: neither sha256sum nor shasum is available to write bin/SHA256SUMS" >&2
+    exit 1
+fi
+( cd bin && $sum b10coin-* > SHA256SUMS ) || {
+    echo "FAIL: writing bin/SHA256SUMS failed" >&2
+    exit 1
+}
+echo "checksums  bin/SHA256SUMS covers $(wc -l < bin/SHA256SUMS | tr -d ' ') stable-name artifact(s); verify on each target with: sha256sum -c --ignore-missing SHA256SUMS"
 echo "OK: $osarch pair in bin/ under stable names (built via scripts/build-release.sh; dist/ also holds the versioned copies and their SHA256SUMS)"

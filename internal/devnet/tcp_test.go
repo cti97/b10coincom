@@ -279,7 +279,10 @@ func TestAValidatorThatJoinsLateCatchesUpOverTCP(t *testing.T) {
 // Every validator dials OUT to one dumb forwarder and consensus flows over
 // the forwarded stream; the fourth joins late through the same relay and
 // must catch up over it too, first-response-filed-wins with every answer
-// certificate-gated.
+// certificate-gated. The dial is ConnectRelay: the connection carries NO ID
+// handshake read (audit N-1), so the frames the relay forwards — including
+// everything any stranger writes to it — can neither name nor sever the
+// links; consensus frames arrive under the one fixed relay connection name.
 func TestFourValidatorsFinaliseThroughTheRelayStar(t *testing.T) {
 	rl := relay.New(relay.Options{})
 	defer rl.Close()
@@ -295,7 +298,7 @@ func TestFourValidatorsFinaliseThroughTheRelayStar(t *testing.T) {
 			t.Fatal(err)
 		}
 		vs[i] = v
-		if err := v.Connect(raddr); err != nil {
+		if err := v.ConnectRelay(raddr); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -307,7 +310,7 @@ func TestFourValidatorsFinaliseThroughTheRelayStar(t *testing.T) {
 		t.Fatal(err)
 	}
 	vs[3] = late
-	if err := late.Connect(raddr); err != nil {
+	if err := late.ConnectRelay(raddr); err != nil {
 		t.Fatal(err)
 	}
 

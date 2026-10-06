@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -223,7 +224,7 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 	}
 	defer c.Close()
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(100)
+	mp := mempool.New(100, g.Hash(), c.AdmissionHead)
 	n := node.New(c, priv, mp)
 
 	pub, key, err := crypto.GenerateKey()
@@ -247,7 +248,7 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 	epoch := c.Height()/params.EpochBlocks + 1
 
 	claim := func(nonce uint64) *types.Tx {
-		pow, ok := faucet.Solve(pub, epoch, params.PowTarget, params.PowArgon2, 5_000_000)
+		pow, ok := faucet.SolveClaim(pub, epoch, params.PowTarget, params.PowArgon2, 5_000_000)
 		if !ok {
 			t.Fatal("could not solve the devnet puzzle")
 		}
@@ -255,7 +256,7 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 			Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 			Nonce: nonce, Epoch: epoch, PowNonce: pow,
 		}
-		sigHash := tx.SigningHash()
+		sigHash := tx.SigningHash(g.Hash())
 		tx.Sig = crypto.Sign(key, sigHash[:])
 		return tx
 	}
@@ -272,11 +273,15 @@ func TestDevnetRefusesASecondClaimInTheSameEpoch(t *testing.T) {
 	}
 
 	second := claim(c.State().Get(types.AddressFromPub(pub)).Nonce)
-	if errs := mp.Add([]types.Tx{*second}); errs[0] != nil {
-		t.Fatalf("mempool.Add: %v", errs[0])
+	// Since audit R-1 the mempool enforces the one-claim-per-epoch rule at
+	// ADMISSION: the second claim is refused at the door, so the pool never
+	// holds it and never pays for its puzzle. The rule's own sentinel pins the
+	// reason, exactly as the direct-state check at the end of this test does.
+	if err := mp.Add([]types.Tx{*second})[0]; !errors.Is(err, state.ErrClaimTooSoon) {
+		t.Fatalf("second same-epoch claim at admission: err = %v, want state.ErrClaimTooSoon", err)
 	}
-	// RunOnce evicts a transaction that cannot apply rather than failing, so the
-	// block is produced but must not contain the claim.
+	// The block is still produced (Take returns nothing) and must not contain
+	// the claim.
 	b, err := n.RunOnce(g0Time + 3)
 	if err != nil {
 		t.Fatalf("second claim block: %v", err)
@@ -525,18 +530,23 @@ func forkedCommittee(t *testing.T, fork bool) *forkNet {
 	}
 	t.Cleanup(func() { _ = b.Close() })
 
-	ts := int64(1000)
+	// Timestamps must be strictly greater than the genesis time (audit S-8:
+	// chain.Append enforces monotonicity now). The fork is still carried by a
+	// timestamp difference: fork gives the two chains different blocks at
+	// height 1, and the control keeps them byte-identical.
+	parent := a.Head().Header.Timestamp
+	tsB := parent + 1
 	if fork {
-		ts = 2000
+		tsB = parent + 2
 	}
-	bA, err := a.Build(priv, nil, 1000)
+	bA, err := a.Build(priv, nil, parent+1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Append(bA); err != nil {
 		t.Fatal(err)
 	}
-	bB, err := b.Build(priv, nil, ts)
+	bB, err := b.Build(priv, nil, tsB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,5 +591,41 @@ func TestDriveReportsAgreedFalseAndFailsWhenValidatorsDisagree(t *testing.T) {
 	}
 	if !s.Agreed {
 		t.Fatal("the disagreement detector fired on chains that are identical")
+	}
+}
+
+// Audit O-11: the driver's clock accumulates real tick durations. The old
+// per-tick `TickEvery / time.Millisecond` truncated a sub-millisecond cadence
+// to zero, so the clock never advanced and consensus time froze.
+func TestConsensusClockDoesNotFreezeBelowOneMillisecond(t *testing.T) {
+	var c consensusClock
+	if got := c.tick(200 * time.Microsecond); got != 0 {
+		t.Fatalf("the first 200µs tick advanced the clock to %dms, want 0", got)
+	}
+	for i := 0; i < 3; i++ {
+		c.tick(200 * time.Microsecond)
+	}
+	if got := c.tick(200 * time.Microsecond); got != 1 {
+		t.Fatalf("five 200µs ticks reached %dms, want 1ms (the old code froze at 0)", got)
+	}
+	if got := c.tick(50 * time.Millisecond); got != 51 {
+		t.Fatalf("a following 50ms tick reached %dms, want 51ms", got)
+	}
+}
+
+// Audit O-10: Run builds a fresh chain, so pointing it at a directory that
+// already holds one must fail with a clear message, not extend the chain and
+// then fail the caller's height arithmetic.
+func TestRunRefusesANonEmptyDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Run(Options{Dir: dir, Blocks: 5}); err != nil {
+		t.Fatalf("the first run on an empty dir: %v", err)
+	}
+	_, err := Run(Options{Dir: dir, Blocks: 5})
+	if err == nil {
+		t.Fatal("a second Run on the same directory must be refused")
+	}
+	if !strings.Contains(err.Error(), "already holds a chain") {
+		t.Fatalf("the refusal did not explain the existing chain: %v", err)
 	}
 }

@@ -4,11 +4,30 @@
 # Assumes the machine already has (see scripts/deploy/README.md §§2, 6):
 #   - the binary at /opt/b10coin/b10coin-relay    (from scripts/deploy/build.sh, scp'd)
 #   - a system user and group "b10coin"
-#   - TCP port 7001 reachable from the internet: cloud/security-group rule,
-#     plus `ufw allow 7001/tcp` if a host firewall is in use
+#   - TCP port 7001 reachable ONLY from the validators: a cloud/security-group
+#     rule restricting the port plus, if a host firewall is in use, one ufw
+#     ALLOWLIST line per validator IP (§4) — NEVER `ufw allow 7001/tcp`, which
+#     opens the relay to the whole internet
 #
 # The relay persists nothing and reads no config; everything in /opt is read
 # as a static binary, so ProtectSystem=strict is exact, not aspirational.
+#
+# MemoryMax is the audit's N-2 ceiling for the one component a stranger can
+# reach, and its number is DERIVED from the relay's own defaults, not guessed:
+# one CONNECTION holds at most (write-queue-bytes + write-queue-frames x 32 B
+# + 2 x max-frame-bytes) = 2 MiB of queued payload + 4096 x 32 B = 128 KiB of
+# queue entry ring + the 1 MiB frame in the writer's hand + the 1 MiB frame in
+# the reader's hand = 4.125 MiB, and there are MaxConns=32 of them, so the pin
+# is 32 x 4.125 MiB = 132 MiB (relay.Options.MaxPinnedBytes computes exactly
+# this; any change to a relay default must move that number AND this unit).
+# The per-frame entry ring term is the one the previous revision of this
+# comment omitted: a byte budget of 2 MiB admits ~2 million one-byte frames,
+# ~64 MiB of entries per connection, which is how 8 connections from one IP
+# measured 231.6 MiB and the full registry over 1 GiB against a 128 MiB claim.
+# 256M buys the 132 MiB worst case plus the Go runtime's own heap/goroutine
+# overhead with clear headroom; if the bound ever lies, systemd kills this
+# process instead of the host dying, and Restart=always brings the relay
+# back (validators redial through their own backoff).
 
 [Unit]
 Description=b10coin relay (dumb frame forwarder for the home validators)
@@ -27,8 +46,15 @@ WorkingDirectory=/opt/b10coin
 # the same decision, in the same file. (NOTE: the relay's flag is --addr, not
 # --listen — --listen is the node command's optional direct-peer listener.)
 Environment=B10COIN_RELAY_ADDR=:7001
+# B10COIN_RELAY_TOKEN is the pre-shared access-token file (audit N-8). Leave it
+# EMPTY for the allowlist-only behaviour; set it (e.g. to
+# /var/lib/b10coin/relay.token, owned by b10coin, mode 0600) to require every
+# connection to present the token as its first frame. ProtectSystem=strict
+# leaves the file readable; the relay only compares its bytes.
+Environment=B10COIN_RELAY_TOKEN=
 
-ExecStart=/opt/b10coin/b10coin-relay --addr ${B10COIN_RELAY_ADDR}
+ExecStart=/opt/b10coin/b10coin-relay --addr ${B10COIN_RELAY_ADDR} \
+    --access-token-file ${B10COIN_RELAY_TOKEN}
 
 Restart=always
 RestartSec=5
@@ -39,6 +65,57 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# 32 conns x (2 MiB queue payload + 4096 x 32 B entry ring + 2 x 1 MiB in the
+# writer's/reader's hands) = 132 MiB of pin at the relay's defaults, derived
+# above; 256M is that plus the Go runtime with headroom.
+MemoryMax=256M
+
+# --- Cheap sandboxing (audit N-10) -----------------------------------------
+# The relay is the one component a stranger can reach, so it gets the smallest
+# sandbox a static Go binary can run in. Every line below is a property this
+# program does not need; none changes its behaviour.
+#
+# LimitNOFILE: the registry cap is 32 connections, each with one accept fd and
+# one socket fd, plus the listener; 4096 is two orders of magnitude of
+# headroom and still far below the host default, so an fd leak cannot exhaust
+# the machine.
+LimitNOFILE=4096
+# No device nodes: it opens sockets, nothing in /dev.
+PrivateDevices=true
+# Nothing it does writes a kernel tunable, loads a module, logs to the kernel,
+# touches cgroups or the clock, or renames the host.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# A static Go binary (CGO_ENABLED=0, scripts/build-release.sh) resolves DNS
+# with the pure-Go resolver over AF_INET/AF_INET6 and speaks only TCP: Unix
+# sockets, netlink and packet sockets are not needed.
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+PrivateMounts=true
+SystemCallArchitectures=native
+# @system-service is the syscall set a normal service uses; anything outside
+# it is denied (EPERM), not fatal.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# It binds port 7001 (>1024) as an unprivileged user and needs no capability
+# at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# New files are owner-only even if a future edit makes it write one.
+UMask=0077
+# NOTE: MemoryDenyWriteExecute is deliberately NOT set. The Go runtime does
+# not need simultaneous W+X today, but it is the one directive here whose
+# failure mode would be a binary that cannot start, and it could not be
+# exercised on this machine (no Linux, no systemd). Add it only after a
+# `systemd-analyze security` + live start on the target.
 
 [Install]
 WantedBy=multi-user.target

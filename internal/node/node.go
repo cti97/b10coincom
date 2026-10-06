@@ -96,6 +96,17 @@ func reAdd(mp *mempool.Mempool, txs []types.Tx, cause error) error {
 }
 
 // Run produces blocks every interval until ctx is cancelled.
+//
+// ERROR POLICY (audit O-7), stated because it is a deliberate choice: the
+// first RunOnce error STOPS the loop and is returned to main, which exits the
+// process. RunOnce itself already returns the block's candidates to the pool
+// on a failed attempt (reAdd), but the pool is in memory and is NOT persisted,
+// so a restart begins empty and any transaction still pending is lost. That
+// is acceptable for a storage or wiring failure that needs operator attention
+// (continuing to tick against a broken store would only lose more); callers
+// that want the node to survive transient failures must restart it. There is
+// deliberately no retry-with-backoff here: an error this loop can see is not
+// classified as transient, and guessing wrong would hide a real fault.
 func (n *Node) Run(ctx context.Context, interval time.Duration) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

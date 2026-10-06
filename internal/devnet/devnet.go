@@ -27,6 +27,7 @@ import (
 	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/node"
 	"github.com/cti97/b10coincom/internal/simnet"
+	"github.com/cti97/b10coincom/internal/state"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -46,10 +47,11 @@ var (
 	ErrClaimsAreMultiUnsupported = errors.New("devnet: the faucet-claim scenario runs on the single-node path only; a multi-validator run carries no transaction path")
 )
 
-// maxPuzzleAttempts bounds one claim's solve. The devnet's easy target needs
-// about two attempts, so a failure here means the fixture tuning broke, not
-// that mining is slow.
-const maxPuzzleAttempts = 1_000_000
+// maxPuzzleAttempts bounds one claim's solve. Since audit R-1 the reference
+// claimant solves the cheap outer puzzle (16 leading zero bits) as well as the
+// devnet's easy Argon2id target, so the expected scan is about 2^17 nonces; a
+// failure here means the fixture tuning broke, not that mining is slow.
+const maxPuzzleAttempts = 1 << 24
 
 // Options configures a devnet run.
 type Options struct {
@@ -80,8 +82,9 @@ type Options struct {
 	// two-thirds-of-TOTAL-power bar is unmoved. It is the devnet surface's
 	// liveness dial: with Validators 4 and one validator offline, the three
 	// online validators hold exactly the bar and the chain must still
-	// advance. An offline validator has no catch-up path in M3, so its
-	// height stays frozen wherever it stood when the run began; its frozen
+	// advance. RunMulti never pulls for an offline validator - it models a
+	// powered-off machine and drives only the online set - so its height
+	// stays frozen wherever it stood when the run began; its frozen
 	// history must remain a strict prefix of the longest chain. Run/Replay
 	// ignore it.
 	OfflineValidators []int
@@ -167,9 +170,18 @@ func Run(o Options) (Summary, error) {
 		return Summary{}, err
 	}
 	defer c.Close()
+	// Run builds a FRESH chain and counts the blocks it appends; pointed at a
+	// directory that already holds a chain it used to extend that chain and
+	// then fail the caller's height arithmetic with a confusing "expected
+	// height N, got M" (audit O-10). Refuse the reuse plainly instead.
+	// (devnet.Replay is the package API that reads an existing directory back;
+	// the CLI has no command that extends one.)
+	if h := c.Height(); h != 0 {
+		return Summary{}, fmt.Errorf("devnet: the data directory %q already holds a chain at height %d; devnet builds a fresh chain — use an empty --dir, or `b10coin devnet` with no --dir for a temporary one", o.Dir, h)
+	}
 
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(1000)
+	mp := mempool.New(1000, g.Hash(), c.AdmissionHead)
 	n := node.New(c, priv, mp)
 
 	tx, err := devTransfer(c, 250*genesis.SparksPerB10)
@@ -212,11 +224,11 @@ func Run(o Options) (Summary, error) {
 		pub, priv := claimantKey(attempt)
 		claimant := types.AddressFromPub(pub)
 		epoch := (c.Height()+1)/g.Params.EpochBlocks + 1
-		pow, ok := faucet.Solve(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, maxPuzzleAttempts)
+		pow, ok := faucet.SolveClaim(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, maxPuzzleAttempts)
 		if !ok {
 			return Summary{}, fmt.Errorf("devnet: claim attempt %d of %d did not solve the fixture puzzle", attempt+1, o.Claims)
 		}
-		claim := devClaim(pub, priv, c.State().Get(claimant).Nonce, epoch, pow)
+		claim := devClaim(pub, priv, c.Genesis().Hash(), c.State().Get(claimant).Nonce, epoch, pow)
 		if err := mp.Add([]types.Tx{*claim})[0]; err != nil {
 			return Summary{}, err
 		}
@@ -249,19 +261,27 @@ func Run(o Options) (Summary, error) {
 		// The double claim reuses the first claim's solution (the puzzle binds
 		// pubkey, epoch and nonce, not the transaction) and spends the account
 		// nonce the paid claim just advanced.
-		double := devClaim(pub, priv, c.State().Get(claimant).Nonce, epoch, pow)
-		if err := mp.Add([]types.Tx{*double})[0]; err != nil {
-			return Summary{}, err
+		//
+		// Since audit R-1 the mempool enforces the one-claim-per-epoch rule at
+		// ADMISSION, so this attempt is normally refused at the door with
+		// state.ErrClaimTooSoon rather than admitted and evicted by the block
+		// probe. Both are refusals of the same rule and both leave an empty
+		// block behind, so the run's block sequence - and its state root - is
+		// unchanged; a pool that admitted it is still handled below.
+		double := devClaim(pub, priv, c.Genesis().Hash(), c.State().Get(claimant).Nonce, epoch, pow)
+		addErr := mp.Add([]types.Tx{*double})[0]
+		if addErr != nil && !errors.Is(addErr, state.ErrClaimTooSoon) {
+			return Summary{}, fmt.Errorf("devnet: the double claim was neither admitted nor refused for the one-claim-per-epoch rule: %w", addErr)
 		}
 		ts++
 		bd, err := n.RunOnce(ts)
 		if err != nil {
 			return Summary{}, err
 		}
-		// An empty double-claim block is EXPECTED: the probe refused the
-		// transaction, so it is evicted, never stored, and the replayed chain
-		// cannot even tell it happened. Inclusion is the one outcome this
-		// scenario must never accept.
+		// An empty double-claim block is EXPECTED: the transaction was refused
+		// (at admission, or by the probe if it was admitted), so it is never
+		// stored, and the replayed chain cannot even tell it happened.
+		// Inclusion is the one outcome this scenario must never accept.
 		doubleID := double.ID()
 		for i := range bd.Txs {
 			if bd.Txs[i].ID() == doubleID {
@@ -346,10 +366,14 @@ func RunMulti(o Options) (Summary, error) {
 		TempDir:   o.Dir,
 		Seed:      runMultiSeed,
 		LatencyMS: runMultiLatencyMS,
-		// DropPercent stays 0 on purpose: a validator whose quorum-committing
+		// DropPercent stays 0 on purpose: RunMulti advances only through
+		// RunBlocks and never pulls, so a validator whose quorum-committing
 		// proposal is dropped holds no block bytes and parks at that height
-		// forever (M3 has no catch-up), so any run asserting "the chain
-		// advanced" must be drop-free. Latency alone is the honest fixture.
+		// for the rest of the run; any run asserting "the chain advanced"
+		// must therefore be drop-free. Latency alone is the honest fixture.
+		// (The simnet harness CAN recover dropped commits through CatchUp -
+		// TestScenarioLossAndReorderStillFinalises does - but this CLI fixture
+		// deliberately does not pull.)
 	})
 	if err != nil {
 		return Summary{}, err
@@ -525,8 +549,9 @@ func devTransfer(c *chain.Chain, amount uint64) (*types.Tx, error) {
 		Nonce:  c.State().Get(from).Nonce,
 		To:     types.AddressFromPub(toPub),
 		Amount: amount,
+		Fee:    c.Genesis().Params.MinFeeSparks,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 	return tx, nil
 }
@@ -536,7 +561,7 @@ func devTransfer(c *chain.Chain, amount uint64) (*types.Tx, error) {
 // counter at application time: zero for a claimant key that has never
 // transacted, and the value the paid claim advanced for the same key's
 // double claim.
-func devClaim(pub ed25519.PublicKey, priv ed25519.PrivateKey, nonce, epoch, pow uint64) *types.Tx {
+func devClaim(pub ed25519.PublicKey, priv ed25519.PrivateKey, chainHash [32]byte, nonce, epoch, pow uint64) *types.Tx {
 	tx := &types.Tx{
 		Type:     types.TxFaucetClaim,
 		From:     types.AddressFromPub(pub),
@@ -545,7 +570,7 @@ func devClaim(pub ed25519.PublicKey, priv ed25519.PrivateKey, nonce, epoch, pow 
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(chainHash)
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 	return tx
 }

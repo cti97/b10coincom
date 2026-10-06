@@ -67,6 +67,16 @@ func NewVoteSet(cfg Config, height uint64, round uint32, typ MsgType) *VoteSet {
 // placement error and a test asserting ErrBadVoteSignature can never name it.
 // A nil vote and a vote with no validator key are refused before Verify(), since
 // neither can carry a meaningful signature (and a nil one cannot be read).
+//
+// MEMBERSHIP, however, is checked BEFORE Verify() (audit C-8's discipline on
+// the tally path): IndexOf is a linear scan of the committee and an Ed25519
+// verification is not, so a non-member must not be able to force the expensive
+// check with a self-signed frame. The order is otherwise unchanged - a member's
+// vote still fails Verify() before it can be misreported as a placement error,
+// and the height/round guard still runs after the signature. A non-member with
+// a corrupted signature now reports ErrNotValidator rather than
+// ErrBadVoteSignature; the vote is refused either way, and no caller's
+// behaviour depends on which of two true reasons is named.
 func (vs *VoteSet) Add(v *Vote) (bool, error) {
 	if v == nil {
 		return false, ErrNilVote
@@ -77,16 +87,16 @@ func (vs *VoteSet) Add(v *Vote) (bool, error) {
 	if len(v.Validator) == 0 {
 		return false, ErrMissingValidatorKey
 	}
+	idx := vs.cfg.IndexOf(v.Validator)
+	if idx < 0 {
+		return false, ErrNotValidator
+	}
 	if err := v.Verify(); err != nil {
 		return false, err
 	}
 	if v.Height != vs.height || v.Round != vs.round {
 		return false, fmt.Errorf("%w: vote for (%d,%d) in a set for (%d,%d)",
 			ErrWrongHeightRound, v.Height, v.Round, vs.height, vs.round)
-	}
-	idx := vs.cfg.IndexOf(v.Validator)
-	if idx < 0 {
-		return false, ErrNotValidator
 	}
 	if _, dup := vs.seen[string(v.Validator)]; dup {
 		return false, nil
@@ -111,6 +121,12 @@ func (vs *VoteSet) Votes() []*Vote { return vs.votes }
 func (vs *VoteSet) PowerFor(blockID [32]byte) uint64 { return vs.power[blockID] }
 
 // NilPower is the weight behind nil votes for this round.
+//
+// Nothing in this milestone READS it (audit C-12): rounds end on their timeout,
+// not on a nil polka, and AnyQuorum skips the nil block ID. It is retained so a
+// nil-polka fast round change has the tally it would need, and so the
+// observation is testable; the engine's comments must not claim it leaves the
+// round.
 func (vs *VoteSet) NilPower() uint64 { return vs.power[[32]byte{}] }
 
 // HasQuorum reports whether a block has reached the two-thirds threshold.

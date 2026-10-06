@@ -7,13 +7,11 @@ import (
 	"github.com/cti97/b10coincom/internal/transport"
 )
 
-// The recording tap's logs (`sent`, `recv`) are appended from at least two
-// goroutines on the SAME validator: a catch-up pull runs
-// Syncer.PullAndAdopt's Send on its own goroutine while CatchUp's goroutine
-// keeps advancing the sim, whose deliveries drive engine Broadcasts and
-// inbound OnMessage appends. Before the fix (Task 6 review carry-forward)
-// those appends were unlocked — a latent data race, unobserved because a pull
-// rarely overlaps an engine broadcast at the right instant.
+// The recording tap's logs (`sent`, `recv`) are guarded by one mutex because
+// Transport is a concurrent-interface: nothing in the harness drives two
+// writers at once any more (CatchUp runs its pull synchronously on the
+// caller's goroutine - audit T-1), but a caller of this wrapper may, and an
+// unsynchronised append is a latent data race exactly hidden from scheduling.
 //
 // This test drives the exact racing PAIR of calls — Send and Broadcast (and
 // the recv append the delivery callback makes) on the production tap of a

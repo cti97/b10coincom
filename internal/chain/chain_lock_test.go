@@ -78,3 +78,51 @@ func TestChainLockSurvivesReplayAndReopen(t *testing.T) {
 		t.Fatal("a height that was never locked must report no lock after the replay")
 	}
 }
+
+// Append prunes the locks of heights the chain has left (audit C-13), while
+// keeping the head's own record and the head+1 promise. It is the LIVE half of
+// the fix: the file and map stop growing one record per height.
+func TestAppendPrunesLocksBelowTheNewHead(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	_, priv := devKey()
+	c, err := Open(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	appendBlock := func(h uint64) {
+		t.Helper()
+		b, err := c.Build(priv, nil, 1_700_000_000+int64(h))
+		if err != nil {
+			t.Fatalf("Build(%d): %v", h, err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatalf("Append(%d): %v", h, err)
+		}
+	}
+
+	appendBlock(1)
+	if err := c.PutLock(lockRecAt(1, 0, chainLockID(1))); err != nil {
+		t.Fatal(err)
+	}
+	appendBlock(2) // committing 2 leaves height 1 behind
+	if _, ok := c.LockAt(1); ok {
+		t.Fatal("Append(2) did not prune the lock at the height it left (1)")
+	}
+	if err := c.PutLock(lockRecAt(2, 0, chainLockID(2))); err != nil {
+		t.Fatal(err)
+	}
+	// The head+1 promise, written while height 3 is being judged.
+	if err := c.PutLock(lockRecAt(3, 0, chainLockID(3))); err != nil {
+		t.Fatal(err)
+	}
+	appendBlock(3) // committing 3 must keep 3 and prune 2
+	if _, ok := c.LockAt(2); ok {
+		t.Fatal("Append(3) did not prune the lock at the height it left (2)")
+	}
+	if _, ok := c.LockAt(3); !ok {
+		t.Fatal("Append(3) pruned the committed head's own lock; the fix keeps it")
+	}
+}

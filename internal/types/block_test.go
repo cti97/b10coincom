@@ -1,6 +1,7 @@
 package types
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -155,6 +156,25 @@ func TestValidateStructureRejectsOversizedCanonicalEncoding(t *testing.T) {
 	}
 	if err := b.ValidateStructure(); !errors.Is(err, ErrBlockTooLarge) {
 		t.Fatalf("expected ErrBlockTooLarge, got %v", err)
+	}
+}
+
+// A block larger than MaxBlockBytes is refused on its length, before a single
+// field is parsed (audit S-17). The guard must not change a LEGAL encoding:
+// the same test re-encodes a valid block and demands the identical bytes.
+func TestDecodeBlockSizeGuardAndCanonicalReEncode(t *testing.T) {
+	if _, err := DecodeBlock(make([]byte, MaxBlockBytes+1)); !errors.Is(err, ErrBlockTooLarge) {
+		t.Fatalf("an oversized input gave %v, want ErrBlockTooLarge", err)
+	}
+
+	b := testBlock(t, *signedTransfer(t, 1, 50))
+	enc := b.Encode()
+	got, err := DecodeBlock(enc)
+	if err != nil {
+		t.Fatalf("a legal block was refused: %v", err)
+	}
+	if !bytes.Equal(got.Encode(), enc) {
+		t.Fatal("DecodeBlock/Encode changed the bytes of a legal block")
 	}
 }
 

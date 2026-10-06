@@ -166,6 +166,17 @@ func quorumFor(total uint64) uint64 {
 // changes take effect at epoch boundaries in M5 (staking); until then this is the
 // genesis set at every height, and the seam exists so M5 has somewhere to plug in
 // without touching the engine.
+//
+// It has NO READER yet (audit C-17), and that is a recorded decision rather than
+// an oversight: every current reader uses cfg.Committee directly, because with
+// one fixed committee a height-taking accessor is a no-op no test could
+// distinguish from the field read. The seam is a signature M5 fills in, not a
+// working indirection. When epoch-bound set changes arrive, the readers that
+// must vary by height - Proposer, VoteSet.Add's membership and power lookup,
+// IndexOf - take the height and call THIS method, and that change is reviewable
+// as the behavioural change it is. Routing those readers through this method
+// today would create call sites that pass a height the method ignores: the
+// appearance of a seam without a single changed decision.
 func (c Config) CommitteeAt(height uint64) []genesis.Validator { return c.Committee }
 
 // IndexOf returns the committee index of a public key, or -1.
@@ -197,6 +208,18 @@ func (c Config) IndexOf(pub []byte) int {
 // liveness/fairness bias only: it cannot forge another validator's proposal
 // or break safety, and each next proposer holds the same lever on the height
 // after.
+//
+// The grind's FREE input is closed (audit C-14). The audit's cost model rested
+// on timestamps being unconstrained; S-8 pinned them. The consensus engine's
+// pre-vote seam is Chain.ValidateConsensusNext, which requires the block's
+// timestamp to be EXACTLY its parent's plus one, and Driver.build constructs
+// exactly that - so a proposer cannot vary the timestamp to re-roll parent(h)
+// and expect any honest validator to prevote the result. What is left is the
+// block's transaction content, bounded by the mempool and priced by S-3's
+// minimum fee, and a proposer grinding that content is choosing among a
+// genuinely small space per height. The pin itself is pinned by
+// timestamp_test.go's ValidateConsensusNext cases; this comment states where
+// C-14's unbounded-cost claim stops being true.
 //
 // A divergence here would not break safety - the other validators would simply
 // refuse to prevote - but it would stall liveness on every round, which is why it

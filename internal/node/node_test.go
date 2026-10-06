@@ -21,7 +21,7 @@ func TestRunOnceProducesAndAppends(t *testing.T) {
 	defer c.Close()
 	_, priv := genesis.DevValidatorKey()
 
-	n := New(c, priv, mempool.New(100))
+	n := New(c, priv, mempool.New(100, c.Genesis().Hash(), c.AdmissionHead))
 	b, err := n.RunOnce(1_700_000_100)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -51,13 +51,14 @@ func TestRunOnceIncludesMempoolTransactions(t *testing.T) {
 		From:   from,
 		PubKey: fromPub,
 		Nonce:  c.State().Get(from).Nonce,
+		Fee:    c.Genesis().Params.MinFeeSparks,
 		To:     types.AddressFromPub(toPub),
 		Amount: 10 * genesis.SparksPerB10,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(c.Genesis().Hash())
 	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 
-	mp := mempool.New(100)
+	mp := mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)
 	if err := mp.Add([]types.Tx{*tx})[0]; err != nil {
 		t.Fatalf("mempool.Add: %v", err)
 	}
@@ -92,10 +93,11 @@ func mkTransfer(t *testing.T, nonce uint64) types.Tx {
 		From:   types.AddressFromPub(fromPub),
 		PubKey: fromPub,
 		Nonce:  nonce,
+		Fee:    1, // mkTransfer's callers open devnet chains, whose minimum is 1
 		To:     types.AddressFromPub(toPub),
 		Amount: 1,
 	}
-	sigHash := tx.SigningHash()
+	sigHash := tx.SigningHash(genesis.Devnet().Hash())
 	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
 	return *tx
 }
@@ -110,7 +112,7 @@ func TestRunOnceEvictsOnlyInvalidTransactions(t *testing.T) {
 	}
 	defer c.Close()
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(100)
+	mp := mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)
 
 	good := mkTransfer(t, 0)
 	bad := mkTransfer(t, 99) // valid signature, impossible nonce
@@ -157,13 +159,13 @@ func TestRunOnceKeepsAValidClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := c.Genesis().Params
-	pow, ok := faucet.Solve(pub, 1, p.FaucetPowTarget, p.FaucetPowArgon2, 1_000_000)
+	pow, ok := faucet.SolveClaim(pub, 1, p.FaucetPowTarget, p.FaucetPowArgon2, 1<<24)
 	if !ok {
 		t.Fatal("could not solve the test puzzle")
 	}
 	claim := &types.Tx{Type: types.TxFaucetClaim, From: types.AddressFromPub(pub), PubKey: pub,
 		Nonce: 0, Epoch: 1, PowNonce: pow}
-	sigHash := claim.SigningHash()
+	sigHash := claim.SigningHash(c.Genesis().Hash())
 	claim.Sig = crypto.Sign(key, sigHash[:])
 
 	// Fixture guard: the claim must NEED the block's own emission, so this
@@ -173,7 +175,7 @@ func TestRunOnceKeepsAValidClaim(t *testing.T) {
 		t.Fatalf("fixture error: the faucet already holds %d; the claim no longer needs block 1's emission", c.State().Get(faucet).Balance)
 	}
 
-	mp := mempool.New(100)
+	mp := mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)
 	if err := mp.Add([]types.Tx{*claim})[0]; err != nil {
 		t.Fatalf("mempool.Add: %v", err)
 	}
@@ -205,7 +207,7 @@ func TestRunOnceProbeFeedsAcceptedTransactionsForward(t *testing.T) {
 	}
 	defer c.Close()
 	_, priv := genesis.DevValidatorKey()
-	mp := mempool.New(100)
+	mp := mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)
 
 	first, second := mkTransfer(t, 0), mkTransfer(t, 1)
 	for i, e := range mp.Add([]types.Tx{first, second}) {
@@ -231,8 +233,21 @@ func TestRunOnceProbeFeedsAcceptedTransactionsForward(t *testing.T) {
 // re-add; Mempool.Add then reports ErrDuplicate. That transaction is not
 // lost — it is already queued for a later block — so it must not inflate
 // the lost count or appear in the lost list.
+// devnetHead opens a throwaway devnet chain only to supply the head-state view
+// the pool's stateful admission requires. Pools in this file's fixtures are
+// otherwise chain-free.
+func devnetHead(t *testing.T) mempool.HeadView {
+	t.Helper()
+	c, err := chain.Open(genesis.Devnet(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c.AdmissionHead
+}
+
 func TestReAddDoesNotCountDuplicatesAsLost(t *testing.T) {
-	mp := mempool.New(10)
+	mp := mempool.New(10, genesis.Devnet().Hash(), devnetHead(t))
 	tx := mkTransfer(t, 0)
 	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatalf("mempool.Add: %v", err)
@@ -258,7 +273,7 @@ func TestReAddDoesNotCountDuplicatesAsLost(t *testing.T) {
 // and must be surfaced: cause kept, count and reasons wrapped with exactly
 // one %w so errors.Is keeps working.
 func TestReAddCountsRealFailuresAsLost(t *testing.T) {
-	mp := mempool.New(1)
+	mp := mempool.New(1, genesis.Devnet().Hash(), devnetHead(t))
 	if err := mp.Add([]types.Tx{mkTransfer(t, 0)})[0]; err != nil {
 		t.Fatalf("mempool.Add: %v", err)
 	}

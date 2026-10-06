@@ -2,7 +2,9 @@ package consensus
 
 import (
 	"crypto/ed25519"
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -30,6 +32,18 @@ const (
 	roundStep = int64(10) // TimeoutStep for every driver fixture
 	netStep   = 10 * time.Millisecond
 )
+
+// mustDriver is NewDriver with the membership gate (audit C-11) turned into a
+// test fixture failure. Every driver fixture signs with a committee seat, so a
+// refusal here is a broken fixture, not the behaviour under test.
+func mustDriver(t *testing.T, cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) *Driver {
+	t.Helper()
+	d, err := NewDriver(cfg, ch, priv, tp, pool)
+	if err != nil {
+		t.Fatalf("NewDriver refused a committee seat: %v", err)
+	}
+	return d
+}
 
 // recordingTransport wraps the sim endpoint the driver is wired to and keeps
 // every payload the driver hands to Broadcast. It is the seam that lets the
@@ -153,8 +167,8 @@ func oneValidatorFixtureOnGenesis(t *testing.T, g *genesis.Genesis) (d *Driver, 
 	// The fixture's mempool is returned precisely so tests can fill it: an
 	// empty pool proposes empty blocks, the behaviour every pre-existing
 	// driver test ran under before transactions had a source.
-	mp = mempool.New(1000)
-	d = NewDriver(cfg, ch, priv, rec, mp)
+	mp = mempool.New(1000, g.Hash(), ch.AdmissionHead)
+	d = mustDriver(t, cfg, ch, priv, rec, mp)
 	return d, ch, rec, net, pub, priv, g, dir, mp
 }
 
@@ -191,8 +205,8 @@ func blockedQuorumFixture(t *testing.T) (d *Driver, ch *chain.Chain, rec *record
 	net.AddPeer("v0")
 	net.AddPeer("ghost") // listens, never sends: the absent second validator
 	rec = &recordingTransport{Transport: net.TransportFor("v0")}
-	mp = mempool.New(1000)
-	d = NewDriver(cfg, ch, priv, rec, mp)
+	mp = mempool.New(1000, g.Hash(), ch.AdmissionHead)
+	d = mustDriver(t, cfg, ch, priv, rec, mp)
 	return d, ch, rec, net, pub, mp
 }
 
@@ -283,37 +297,44 @@ func TestDriverAppendsOnCommit(t *testing.T) {
 // constructor silently makes every engine after the first commit persist
 // NOTHING and restore NO lock - memory-only locks from height 2 on, i.e. the
 // exact defect persisting the lock exists to fix, arrived through one
-// unreviewed line. The test drives far enough that the post-commit swap has
-// created the engines judging heights 2 and 3, then requires those engines'
-// own lock moves to be in the store: if the swap lost its restore/persist
-// wiring, nothing reaches the lock log after height 1 and this fails.
+// unreviewed line. Height 2's promise is asserted while 2 is still the HEAD,
+// because audit C-13's pruning (which keeps the head's own record and drops
+// records below it) would otherwise hide a missing persist wiring; the test
+// then commits height 3 and checks that the height-3 engine - the NEXT swap -
+// left its promise too, and that the height-2 record is pruned exactly as
+// C-13 requires.
 func TestDriverPostCommitSwapStillCarriesTheLock(t *testing.T) {
 	d, ch, rec, net, _, _, _, _, _ := oneValidatorFixture(t)
 
-	// Three commits: heights 1, 2 and 3. The first engine is NewDriver's
-	// creation; every engine after it comes from flush's post-commit swap,
-	// which is the line the mutant reverts.
-	drive(t, d, net, 200, func() bool { return ch.Height() >= 3 })
-	if ch.Height() < 3 {
+	// The first engine is NewDriver's creation; every engine after it comes
+	// from flush's post-commit swap, which is the line the mutant reverts.
+	drive(t, d, net, 200, func() bool { return ch.Height() >= 2 })
+	if ch.Height() < 2 {
 		t.Fatalf("only %d block(s) committed in 200 drive iterations (%d messages): the post-commit swap never ran, the assertion below would be vacuous", ch.Height(), len(rec.broadcasts))
 	}
+	blk2, err := ch.BlockAt(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ch.LockAt(2); !ok || got != (store.LockRecord{Height: 2, Round: 0, BlockID: blk2.ID()}) {
+		t.Fatalf("the lock taken at the committed head 2 is %+v, %v; want the height-2 engine's own-proposal lock - the post-commit swap is holding locks in memory only and a restart would re-enter unlocked", got, ok)
+	}
 
-	for _, h := range []uint64{2, 3} {
-		blk, err := ch.BlockAt(h)
-		if err != nil {
-			t.Fatal(err)
-		}
-		wantID := blk.ID()
-		// Height h's engine precommitted its own proposal before committing it,
-		// so its lock (round 0, the committed block) must be durable - no
-		// pruning exists yet, a committed lock record stays readable.
-		got, ok := ch.LockAt(h)
-		if !ok {
-			t.Fatalf("the lock taken at committed height %d never reached the store: the engine the post-commit swap created is holding locks in memory only - a restart would re-enter unlocked", h)
-		}
-		if got != (store.LockRecord{Height: h, Round: 0, BlockID: wantID}) {
-			t.Fatalf("LockAt(%d) = %+v, want the own-proposal lock (round 0, block %x) the commit itself proves was taken", h, got, wantID[:8])
-		}
+	// One more swap: the height-3 engine must leave its promise too, and C-13
+	// then drops the height-2 record the chain has left.
+	drive(t, d, net, 200, func() bool { return ch.Height() >= 3 })
+	if ch.Height() < 3 {
+		t.Fatalf("only %d block(s) committed in 200 drive iterations: the height-3 swap never ran", ch.Height())
+	}
+	blk3, err := ch.BlockAt(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := ch.LockAt(3); !ok || got != (store.LockRecord{Height: 3, Round: 0, BlockID: blk3.ID()}) {
+		t.Fatalf("LockAt(3) = %+v, %v; want the height-3 engine's own-proposal lock", got, ok)
+	}
+	if _, ok := ch.LockAt(2); ok {
+		t.Fatal("the committed height 2's lock survived Append(3): C-13 prunes records below the new head")
 	}
 }
 
@@ -364,68 +385,113 @@ func TestDriverLeavesChainUntouchedWithoutQuorum(t *testing.T) {
 }
 
 // A rejected Append must leave the driver at the same height rather than
-// advancing or corrupting state. The engine cannot validate a block's state
-// root (it holds no state by design), so the realistic way a commit fails is
-// exactly this: a block the engine accepted that the chain refuses. The driver
-// must not swap in a new engine for the next height - the height is not
-// decided for THIS node, and silently moving on would diverge it from every
-// peer that did accept the block.
+// advancing or corrupting state (Design Decision 8: a refused block is never
+// silently skipped).
+//
+// Since the pre-vote validation seam (audit C-1), the COMMON way a commit
+// would fail - a proposal whose bytes the chain cannot accept - now ends
+// earlier: the engine nil-prevotes it and no commit ever forms (see
+// TestDriverNilPrevotesAGarbageRootProposal). What remains reachable is the
+// race against a chain that moved under the engine: a peer's committed block
+// adopted mid-round (exactly what a catch-up wave does, before the driver is
+// rebuilt) leaves the engine judging a height the head has already passed.
+// The engine's commit of its own proposal then fails Append honestly, and
+// this test pins the refusal's consequences: same height, no engine swap, no
+// retry.
+//
+// The harness stages exactly that over the blocked-quorum fixture (quorum 2,
+// the peer a ghost whose only participation is the votes the test injects by
+// hand): one valid proposal prevoted by this validator, a foreign block
+// appended straight to the chain (the adopted peer block), then the ghost's
+// prevote and precommit completing the polka and the precommit quorum for
+// the - now stale - proposal.
 func TestDriverRejectedAppendStaysAtSameHeight(t *testing.T) {
-	d, ch, _, net, pub, priv, _, _, _ := oneValidatorFixture(t)
+	d, ch, _, net, _, _ := blockedQuorumFixture(t)
 
-	// A proposal whose state root is a lie. It passes every engine-level check
-	// (envelope signature, membership, justification) because the engine owns
-	// no state to check it against; chain.Append rejects it on the root.
-	head0 := ch.Head()
-	lied := &types.Block{Header: types.Header{
-		Height:     head0.Header.Height + 1,
-		ParentHash: head0.ID(),
-		StateRoot:  [32]byte{0xde, 0xad, 0xbe, 0xef},
-		TxRoot:     types.ComputeTxRoot(nil),
-		Timestamp:  head0.Header.Timestamp + 1,
-		Proposer:   pub,
-	}}
-	liedHeaderHash := lied.Header.SigningHash()
-	lied.Sig = crypto.Sign(priv, liedHeaderHash[:])
-	prop := &Proposal{
-		Height:     lied.Header.Height,
-		Round:      0,
-		Block:      *lied,
-		ValidRound: -1,
-		Validator:  pub,
-	}
-	propHash := prop.SigningHash()
-	prop.Sig = crypto.Sign(priv, propHash[:])
-
+	parentID := ch.Head().ID()
 	engAtStart := d.eng
-	d.OnMessage(transport.Message{From: "v0", Data: EncodeProposal(prop)})
+	heightJudged := d.eng.Height()
+	roundJudged := d.eng.Round()
 
-	drive(t, d, net, 50, func() bool { return d.eng.hasCommitted })
+	// The proposal P this validator will judge: built by the ROUND proposer
+	// through the chain itself, so it carries a genuine state root and passes
+	// the seam while the head still stands where P was built for.
+	proposerPub := d.cfg.Proposer(heightJudged, roundJudged, parentID)
+	proposerIdx := d.cfg.IndexOf(proposerPub)
+	prop, err := ch.Build(testCommitteeKey(proposerIdx), nil, ch.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &Proposal{
+		Height: heightJudged, Round: roundJudged, Block: *prop, ValidRound: -1,
+		Validator: proposerPub,
+	}
+	env.Sig = signProposal(t, d.cfg, env)
+
+	// Deliver P: the engine accepts and prevotes it (its own weight only -
+	// the quorum of 2 needs the peer too, so nothing commits yet).
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeProposal(env)})
+	if d.eng.proposal == nil || d.eng.proposal.ID() != prop.ID() {
+		t.Fatal("fixture: the engine did not accept the staged proposal")
+	}
+
+	// The chain moves under the engine, the way an adopted peer block does:
+	// a DIFFERENT valid block at the same height, carried by a genuine
+	// transfer transaction so it cannot byte-match P.
+	foreign, err := ch.Build(testCommitteeKey(0), []types.Tx{transferTx(ch.Genesis(), 0, 1, 0, 1)}, ch.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ch.Append(foreign); err != nil {
+		t.Fatalf("fixture: the foreign block must append against the pre-move head: %v", err)
+	}
+	if ch.Height() != 1 {
+		t.Fatalf("fixture: the foreign block did not move the chain (height %d)", ch.Height())
+	}
+
+	// The peer's prevote and precommit for P arrive; the polka and the
+	// precommit quorum (2 of 2) complete, the engine commits P, and flush
+	// offers the block bytes to a head that has already moved on.
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeVote(voteFrom(t, d.cfg, 1, MsgPrevote, heightJudged, roundJudged, prop.ID()))})
+	d.OnMessage(transport.Message{From: "v1", Data: EncodeVote(voteFrom(t, d.cfg, 1, MsgPrecommit, heightJudged, roundJudged, prop.ID()))})
 	if !d.eng.hasCommitted {
-		t.Fatal("the engine never reached its own commit: the test did not exercise the real append path")
+		t.Fatalf("fixture: the engine did not commit the staged proposal (the polka needed the peer's own precommit)")
 	}
-	if ch.Height() != 0 {
-		t.Fatalf("the chain advanced to height %d although Append must reject the lied-about block", ch.Height())
+	if !d.appendRefused {
+		t.Fatal("the refused append was not recorded; the harness did not reach the refusal path")
 	}
-	if d.Height() != 0 {
-		t.Fatalf("driver height is %d, want 0", d.Height())
-	}
-	if _, err := ch.BlockAt(1); err == nil {
-		t.Fatal("the rejected block was durably stored")
+
+	// The refusal's consequences: the driver stays at the height whose commit
+	// was refused and never swaps in a next-height engine.
+	if d.Height() != 1 {
+		t.Fatalf("driver height is %d, want 1 (the chain's only adopted height)", d.Height())
 	}
 	if d.eng != engAtStart {
 		t.Fatal("the driver swapped in a new engine although Append rejected the block: the next height would start from a chain state the validator never agreed to")
 	}
-	if d.eng.Height() != 1 {
+	if d.eng.Height() != heightJudged {
 		t.Fatalf("the driver moved to height %d; a rejected append must stay at the undecided height", d.eng.Height())
+	}
+	// The refused block is not on disk either: height 1 holds the foreign
+	// block, exactly once, and nothing exists at height 2.
+	stored, err := ch.BlockAt(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignID := foreign.ID()
+	if stored.ID() != foreignID {
+		t.Fatal("the refused append found its way into the store")
+	}
+	if _, err := ch.BlockAt(2); err == nil {
+		t.Fatalf("a block exists at height %d: the refused commit appended after all", ch.Height()+1)
 	}
 
 	// The stall is stable, not a pending retry that leaks an append: keep
 	// driving and the chain stays exactly where it was.
 	drive(t, d, net, 20, nil)
-	if ch.Height() != 0 || d.eng != engAtStart || !d.eng.hasCommitted {
-		t.Fatalf("the driver did not stay put after the rejected append: height %d, engine swapped %v, still committed %v",
-			ch.Height(), d.eng != engAtStart, !d.eng.hasCommitted)
+	if !d.appendRefused || d.eng != engAtStart || d.eng.Height() != heightJudged {
+		t.Fatalf("the driver did not stay put after the rejected append: refused %v, engine swapped %v, height %d",
+			d.appendRefused, d.eng != engAtStart, d.eng.Height())
 	}
 }
 
@@ -557,8 +623,8 @@ func fourValidatorsOneSilentFixture(t *testing.T) (ds []*Driver, chs []*chain.Ch
 		// The pools are handed back so tests can fill them: filling a
 		// validator's pool is what M4's relay tasks will do, and a scenario
 		// that wants transactions on the wire puts them here.
-		pool := mempool.New(1000)
-		ds = append(ds, NewDriver(cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)), pool))
+		pool := mempool.New(1000, g.Hash(), ch.AdmissionHead)
+		ds = append(ds, mustDriver(t, cfg, ch, testCommitteeKey(i), net.TransportFor(fmt.Sprintf("v%d", i)), pool))
 		chs = append(chs, ch)
 		pools = append(pools, pool)
 	}
@@ -733,8 +799,8 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	}
 	parent := ch1.Head().ID()
 	tp1 := &stalledTransport{}
-	d1 := NewDriver(cfg, ch1, priv0, tp1, nil) // no pool: this test wires no transaction source
-	d1Engine := d1.eng                         // kept only to prove the restart built a different engine
+	d1 := mustDriver(t, cfg, ch1, priv0, tp1, nil) // no pool: this test wires no transaction source
+	d1Engine := d1.eng                             // kept only to prove the restart built a different engine
 
 	// Walk the rounds until this validator is drawn as proposer at (1, r),
 	// then play the rest of the committee with one signed prevote for the
@@ -762,7 +828,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 			}
 		}
 		if lockRoundInt < 0 {
-			d1.eng.OnTimeout(TimeoutEvent{Height: d1.eng.Height(), Round: d1.eng.Round(), Step: d1.eng.Step()})
+			d1.eng.OnTimeout(TimeoutEvent{Height: d1.eng.Height(), Round: d1.eng.Round()})
 		}
 	}
 	if lockRoundInt < 0 {
@@ -804,7 +870,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 		t.Fatalf("the replayed chain sits at height %d; the restart must re-judge the undecided height 1", ch2.Height())
 	}
 	tp2 := &stalledTransport{}
-	d2 := NewDriver(cfg, ch2, priv0, tp2, nil) // no pool: this test wires no transaction source
+	d2 := mustDriver(t, cfg, ch2, priv0, tp2, nil) // no pool: this test wires no transaction source
 
 	// The restored lock, checked the instant the engine exists - before the
 	// engine has seen one message or one tick, i.e. before anything in run 2
@@ -829,12 +895,22 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	}
 
 	// ---- The conflicting block, with NO justification, at the height held. ----
-	badBlock := conflictingBlock(t, cfg, 1, 0, parent, 0xB7)
+	// Since the pre-vote validation seam, a driver-level conflicting proposal
+	// must be a block the chain would genuinely accept - a real state root,
+	// built through the chain by the round's proposer - so the refusal below
+	// is the LOCK's refusal and not the seam's (the seam's refusal has its
+	// own test): the lock must still refuse a VALID conflicting block that
+	// carries no evidence.
+	badRound0Proposer := cfg.Proposer(1, 0, parent)
+	badBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(badRound0Proposer)), []types.Tx{transferTx(ch2.Genesis(), 0, 1, 0, 1)}, ch2.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	badProp := &Proposal{
-		Height: 1, Round: 0, Block: badBlock,
+		Height: 1, Round: 0, Block: *badBlock,
 		ValidRound:    -1,
 		Justification: nil, // NO justification: a claim with no evidence behind it
-		Validator:     cfg.Proposer(1, 0, parent),
+		Validator:     badRound0Proposer,
 	}
 	badProp.Sig = signProposal(t, cfg, badProp)
 
@@ -876,14 +952,33 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	// ---- The restored lock is a REAL lock: it survives the round change, ----
 	// and it still releases the validator on verified evidence from a round
 	// strictly beyond its promise - persistence must not revoke liveness.
-	d2.eng.OnTimeout(TimeoutEvent{Height: d2.eng.Height(), Round: d2.eng.Round(), Step: d2.eng.Step()})
+	d2.eng.OnTimeout(TimeoutEvent{Height: d2.eng.Height(), Round: d2.eng.Round()})
 	if !d2.eng.lk.locked() || d2.eng.lk.blockID() != lockID || d2.eng.lk.round() != int64(lockRound) {
 		survivedID := d2.eng.lk.blockID()
 		t.Fatalf("the restored lock did not survive enterRound: now locked=%v (round %d, block %x)",
 			d2.eng.lk.locked(), d2.eng.lk.round(), survivedID[:8])
 	}
 
-	newBlock := conflictingBlock(t, cfg, 1, 1, parent, 0xA7)
+	// The justified proposal's block is a REAL block too - built through the
+	// chain by the round's actual proposer, so it passes the seam and reaches
+	// the lock rule: persistence must not revoke liveness (the unlock is
+	// exactly what a justified, strictly-newer-polka proposal exists to do).
+	// Only dev account 0 is funded on this genesis, so the second block keeps
+	// the same nonce but a different amount - a different tx, hence a
+	// different block ID from the bad block's.
+	//
+	// Audit C-9's standard shape: the polka forms at propRound (strictly newer
+	// than the stored lock, so it can unlock), and the re-proposal is offered
+	// ONE round later still, so ValidRound < Round. The engine is moved to that
+	// offering round before the envelope arrives.
+	propRound := lockRound + 1
+	offerRound := lockRound + 2
+	d2.eng.enterRound(offerRound)
+	p1 := cfg.Proposer(1, offerRound, parent)
+	newBlock, err := ch2.Build(testCommitteeKey(cfg.IndexOf(p1)), []types.Tx{transferTx(ch2.Genesis(), 0, 1, 0, 5)}, ch2.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	newID := newBlock.ID()
 	if newID == lockID || newID == badBlock.ID() {
 		t.Fatal("the justified block must genuinely differ from both the locked and the refused one")
@@ -893,9 +988,8 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 	// stored lock. The quorum of 2 needs both committee members' signatures,
 	// and this test holds both keys - which is exactly why it can fabricate
 	// evidence the verification gate will accept.
-	propRound := lockRound + 1
 	goodProp := &Proposal{
-		Height: 1, Round: 1, Block: newBlock, ValidRound: int64(propRound), Validator: cfg.Proposer(1, 1, parent),
+		Height: 1, Round: offerRound, Block: *newBlock, ValidRound: int64(propRound), Validator: p1,
 		Justification: encodeJustification([]*Vote{
 			voteFrom(t, cfg, 0, MsgPrevote, 1, propRound, newID),
 			voteFrom(t, cfg, 1, MsgPrevote, 1, propRound, newID),
@@ -906,7 +1000,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 		t.Fatal("the justified proposal must genuinely carry its polka")
 	}
 	d2.OnMessage(transport.Message{From: "v1", Data: EncodeProposal(goodProp)})
-	if nonNilPrevoteFor(t, tp2, 1, 1, newID) == nil {
+	if nonNilPrevoteFor(t, tp2, 1, offerRound, newID) == nil {
 		t.Fatal("a restored lock that refuses verified evidence from a strictly newer round would turn persistence into a permanent stop")
 	}
 
@@ -932,7 +1026,7 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 // transferTx builds a signed transfer from devnet dev account from to dev
 // account to at the given nonce and amount. Account 0 holds one million b10 on
 // a fresh chain, so transfers out of it apply.
-func transferTx(from, to int, nonce, amount uint64) types.Tx {
+func transferTx(g *genesis.Genesis, from, to int, nonce, amount uint64) types.Tx {
 	fromPub, fromPriv := genesis.DevAccountKey(from)
 	toPub, _ := genesis.DevAccountKey(to)
 	tx := &types.Tx{
@@ -940,10 +1034,11 @@ func transferTx(from, to int, nonce, amount uint64) types.Tx {
 		From:   types.AddressFromPub(fromPub),
 		PubKey: fromPub,
 		Nonce:  nonce,
+		Fee:    g.Params.MinFeeSparks,
 		To:     types.AddressFromPub(toPub),
 		Amount: amount,
 	}
-	sig := tx.SigningHash()
+	sig := tx.SigningHash(g.Hash())
 	tx.Sig = crypto.Sign(fromPriv, sig[:])
 	return *tx
 }
@@ -957,9 +1052,9 @@ func claimTx(t *testing.T, g *genesis.Genesis, index int, epoch uint64) types.Tx
 	h := crypto.HashParts([]byte("b10coin-driver-test-claimant"), []byte(strconv.Itoa(index)))
 	priv := ed25519.NewKeyFromSeed(h[:])
 	pub := priv.Public().(ed25519.PublicKey)
-	pow, ok := faucet.Solve(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1_000_000)
+	pow, ok := faucet.SolveClaim(pub, epoch, g.Params.FaucetPowTarget, g.Params.FaucetPowArgon2, 1<<24)
 	if !ok {
-		t.Fatalf("test claimant %d did not solve the fixture puzzle in 1,000,000 attempts", index)
+		t.Fatalf("test claimant %d did not solve the fixture puzzle in 16,777,216 attempts", index)
 	}
 	tx := &types.Tx{
 		Type:     types.TxFaucetClaim,
@@ -969,7 +1064,7 @@ func claimTx(t *testing.T, g *genesis.Genesis, index int, epoch uint64) types.Tx
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
-	sig := tx.SigningHash()
+	sig := tx.SigningHash(g.Hash())
 	tx.Sig = crypto.Sign(priv, sig[:])
 	return *tx
 }
@@ -1000,7 +1095,7 @@ func committedBlock(t *testing.T, ch *chain.Chain, height uint64) *types.Block {
 func TestAConsensusBlockCarriesMempoolTransactions(t *testing.T) {
 	d, ch, rec, net, _, _, _, _, mp := oneValidatorFixture(t)
 
-	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	tx := transferTx(ch.Genesis(), 0, 1, 0, 250*genesis.SparksPerB10)
 	txID := tx.ID()
 	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatal(err)
@@ -1024,15 +1119,17 @@ func TestAConsensusBlockCarriesMempoolTransactions(t *testing.T) {
 		t.Fatalf("the committed block carries %d transaction(s) but not the mempool's transfer %x: it proposed something else", len(blk.Txs), txID[:8])
 	}
 	// The transfer must have been APPLIED, not merely carried: account 0's
-	// balance dropped by the amount and its nonce advanced, account 1 was
-	// credited, and the state root Append verified is the one that says so.
+	// balance dropped by the amount AND the burned fee (audit S-3), its nonce
+	// advanced, account 1 was credited, and the state root Append verified is
+	// the one that says so.
 	fromPub, _ := genesis.DevAccountKey(0)
 	toPub, _ := genesis.DevAccountKey(1)
 	if got := ch.State().Get(types.AddressFromPub(toPub)).Balance; got != 250*genesis.SparksPerB10 {
 		t.Fatalf("the recipient holds %d, want the transferred %d: the block carried bytes, it did not pay", got, 250*genesis.SparksPerB10)
 	}
-	if got := ch.State().Get(types.AddressFromPub(fromPub)); got.Balance != 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10 || got.Nonce != 1 {
-		t.Fatalf("the sender holds (balance %d, nonce %d), want (balance %d, nonce 1): the debit side did not run", got.Balance, got.Nonce, 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10)
+	fee := ch.Genesis().Params.MinFeeSparks
+	if got := ch.State().Get(types.AddressFromPub(fromPub)); got.Balance != 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10-fee || got.Nonce != 1 {
+		t.Fatalf("the sender holds (balance %d, nonce %d), want (balance %d, nonce 1): the debit side did not run", got.Balance, got.Nonce, 1_000_000*genesis.SparksPerB10-250*genesis.SparksPerB10-fee)
 	}
 }
 
@@ -1089,9 +1186,9 @@ func TestAConsensusBlockPaysAFaucetClaimThroughConsensus(t *testing.T) {
 func TestInapplicableTransactionsAreExcludedNotFatal(t *testing.T) {
 	d, ch, _, net, _, _, _, _, mp := oneValidatorFixture(t)
 
-	good := transferTx(0, 1, 0, 250*genesis.SparksPerB10)               // applies: dev 0's nonce is 0
-	badNonce := transferTx(0, 1, 7, 100*genesis.SparksPerB10)           // nonce 7, dev 0 is at 0
-	insufficient := transferTx(0, 1, 1, 2_000_000*genesis.SparksPerB10) // after `good`, dev 0 cannot cover two million b10
+	good := transferTx(ch.Genesis(), 0, 1, 0, 250*genesis.SparksPerB10)               // applies: dev 0's nonce is 0
+	badNonce := transferTx(ch.Genesis(), 0, 1, 7, 100*genesis.SparksPerB10)           // nonce 7, dev 0 is at 0
+	insufficient := transferTx(ch.Genesis(), 0, 1, 1, 2_000_000*genesis.SparksPerB10) // after `good`, dev 0 cannot cover two million b10
 	txs := []types.Tx{good, badNonce, insufficient}
 	if errs := mp.Add(txs); errs[0] != nil || errs[1] != nil || errs[2] != nil {
 		t.Fatalf("the fixture's transactions failed the pool's signature checks: %v", errs)
@@ -1184,7 +1281,7 @@ func countFaucetClaims(blk *types.Block) int {
 func TestAnAbandonedRoundDoesNotEvaporateItsTransactions(t *testing.T) {
 	d, ch, rec, net, _, mp := blockedQuorumFixture(t)
 
-	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	tx := transferTx(ch.Genesis(), 0, 1, 0, 250*genesis.SparksPerB10)
 	txID := tx.ID()
 	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatal(err)
@@ -1272,12 +1369,12 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	rec := &stalledTransport{}
-	mp := mempool.New(1000)
-	d := NewDriver(cfg, ch, priv0, rec, mp)
+	mp := mempool.New(1000, g.Hash(), ch.AdmissionHead)
+	d := mustDriver(t, cfg, ch, priv0, rec, mp)
 
 	parent := ch.Head().ID()
 
-	tx := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	tx := transferTx(ch.Genesis(), 0, 1, 0, 250*genesis.SparksPerB10)
 	txID := tx.ID()
 	if err := mp.Add([]types.Tx{tx})[0]; err != nil {
 		t.Fatal(err)
@@ -1289,7 +1386,7 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 	// now=5, below the round timeout, so no timeout fires with it.
 	now := int64(5)
 	for r := 0; r < 64 && string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub0); r++ {
-		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 	}
 	if string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub0) {
 		t.Fatal("in 64 rounds the fixture never drew v0 as the proposer at height 1: no batch was ever built")
@@ -1321,7 +1418,7 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 
 	// The peer proposes an EMPTY block at the same height, in a later round.
 	for r := 0; r < 64 && string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub1); r++ {
-		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 	}
 	if string(cfg.Proposer(1, d.eng.Round(), parent)) != string(pub1) {
 		t.Fatal("in 64 rounds the fixture never drew v1 as the proposer: no foreign commit could happen")
@@ -1366,7 +1463,7 @@ func TestAForeignCommitDoesNotEvaporateTheAbandonedBatch(t *testing.T) {
 	// Tick(16) commit re-armed: the Tick proposes and nothing else.
 	parent2 := p2.ID()
 	for r := 0; r < 64 && string(cfg.Proposer(2, d.eng.Round(), parent2)) != string(pub0); r++ {
-		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round(), Step: d.eng.Step()})
+		d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 	}
 	if string(cfg.Proposer(2, d.eng.Round(), parent2)) != string(pub0) {
 		t.Fatal("in 64 rounds the fixture never drew v0 as the proposer at height 2: the reclaim had no proposal to ride")
@@ -1423,7 +1520,7 @@ func TestThreeValidatorsAgreeOnABlockThatCarriesATransferAndAClaim(t *testing.T)
 	g := chs[0].Genesis()
 
 	claim := claimTx(t, g, 900, 1) // epoch 1, applied at height 1; index 900 stays clear of the bound test's keys
-	transfer := transferTx(0, 1, 0, 250*genesis.SparksPerB10)
+	transfer := transferTx(g, 0, 1, 0, 250*genesis.SparksPerB10)
 	claimID, transferID := claim.ID(), transfer.ID()
 	for _, mp := range pools {
 		if errs := mp.Add([]types.Tx{transfer, claim}); errs[0] != nil || errs[1] != nil {
@@ -1521,7 +1618,7 @@ func TestARebuiltDriverDoesNotBurnRoundZeroOnARunningClock(t *testing.T) {
 		t.Skip("fixture: seat 0 drew the height-1 round-0 proposition; the fixture needs a follower seat")
 	}
 	rec := &recordingTransport{Transport: silentTransport{}}
-	d := NewDriver(cfg, ch, testCommitteeKey(0), rec, nil)
+	d := mustDriver(t, cfg, ch, testCommitteeKey(0), rec, nil)
 
 	// The rebuilder's clock is ALREADY running (the net's step counter is at
 	// six figures by the time a catch-up rebuild happens).
@@ -1563,4 +1660,752 @@ func fourValCommitteeGenesis(t *testing.T, vals []genesis.Validator) *genesis.Ge
 	g.Validators = vals
 	g.Params.CommitteeSize = len(vals)
 	return g
+}
+
+// ---- The committee-level proofs for the two consensus liveness findings ----
+//
+// C-1: a Byzantine proposer who signs an otherwise-honest envelope carrying a
+// block with a garbage state root gets, from every honest validator, a NIL
+// prevote; no polka, no lock, no parked committee; the height commits in a
+// later round on an honest proposal.
+//
+// C-2: a committee whose round-0 precommit quorum is lost (everyone locked on
+// B, nobody commits) recovers in the very next round through the locked
+// proposer re-proposing B with the proof-of-lock.
+
+// dropFirstTP wraps a transport and silently discards the first frame matching
+// pred. It is how the tests model one specific loss (a commit-critical
+// delivery) with nothing else changed: deterministic, one-shot, recorded.
+type dropFirstTP struct {
+	transport.Transport
+	pred    func(raw []byte) bool
+	dropped [][]byte
+}
+
+func (d *dropFirstTP) Broadcast(data []byte) error {
+	if d.pred != nil && len(d.dropped) == 0 && d.pred(data) {
+		d.dropped = append(d.dropped, append([]byte(nil), data...))
+		return nil // swallow: the frame never leaves this validator
+	}
+	return d.Transport.Broadcast(data)
+}
+
+// fourValidatorFixture brings up a four-equal-power committee, all four with
+// live drivers over one sim, plus a genesis whose Time is searched just enough
+// that the round-1 proposer differs from the round-0 proposer at height 1 (the
+// mutant-kill condition of the recovery test: a reverted re-proposal shows
+// itself as a fresh, different block the moment a locked non-builder is drawn).
+func fourValidatorFixture(t *testing.T) (ds []*Driver, chs []*chain.Chain, recs []*recordingTransport, net *sim.Net, cfg Config, g *genesis.Genesis, parent [32]byte) {
+	t.Helper()
+	vals := make([]genesis.Validator, 0, 4)
+	for i := 0; i < 4; i++ {
+		vals = append(vals, testValidator(i, 1))
+	}
+	var chosen *genesis.Genesis
+	var chosenCfg Config
+	for try := 0; try < 64; try++ {
+		gg := genesis.Devnet()
+		gg.Validators = append([]genesis.Validator(nil), vals...)
+		gg.Params.CommitteeSize = 4
+		gg.Time += int64(try)
+		ccfg := Config{Committee: gg.Validators, TimeoutBase: roundBase, TimeoutStep: roundStep, PowerCapNum: 1, PowerCapDen: 4}
+		if err := ccfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		parent = chainGenesisParent(t, gg)
+		if string(ccfg.Proposer(1, 1, parent)) != string(ccfg.Proposer(1, 0, parent)) {
+			chosen, chosenCfg = gg, ccfg
+			break
+		}
+		if try == 63 {
+			t.Fatal("fixture: no genesis time split the round-0 and round-1 proposers")
+		}
+	}
+	cfg, g = chosenCfg, chosen
+
+	net = sim.New(sim.Options{Seed: 1, Latency: 1})
+	for i := 0; i < 4; i++ {
+		net.AddPeer(fmt.Sprintf("v%d", i))
+	}
+	for i := 0; i < 4; i++ {
+		ch, err := chain.Open(g, t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		mp := mempool.New(1000, g.Hash(), ch.AdmissionHead)
+		rec := &recordingTransport{Transport: net.TransportFor(fmt.Sprintf("v%d", i))}
+		ds = append(ds, mustDriver(t, cfg, ch, testCommitteeKey(i), rec, mp))
+		chs = append(chs, ch)
+		recs = append(recs, rec)
+	}
+	return ds, chs, recs, net, cfg, g, parent
+}
+
+// chainGenesisParent reports the genesis block ID a chain opened from g would
+// carry: open a throwaway chain and read its head.
+func chainGenesisParent(t *testing.T, g *genesis.Genesis) [32]byte {
+	t.Helper()
+	c, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := c.Head().ID()
+	_ = c.Close()
+	return parent
+}
+
+// THE C-1 ATTACK, AT THE COMMITTEE: the validator drawn as proposer at height 1
+// round 0 is Byzantine: it builds a normal block, overwrites StateRoot with
+// garbage, re-signs the envelope, and proposes. Pre-fix every honest validator
+// prevoted it (the envelope and proposer checks all pass), the polka formed,
+// every validator LOCKED on the garbage block and committed it, every node's
+// Append refused it, and the whole committee parked forever - restart included,
+// because the lock on the garbage block was durable.
+//
+// Post-fix: every honest validator's pre-vote seam judges the block - state
+// root included - BEFORE voting. The attack collects only nil prevotes from
+// the honest members, never a polka (the attacker's own vote is 1 of the
+// quorum of 3), never a lock, never a commit.
+//
+// The height MUST still commit in a later round: an honest proposer's honest
+// block reaches the same quorum of three live validators. The halt was the
+// finding; one round of delay is the honest cost of refusing.
+func TestCommitteeNilPrevotesAGarbageRootProposalAndStillCommits(t *testing.T) {
+	ds, chs, recs, net, cfg, g, parent := fourValidatorFixture(t)
+	defer func() {
+		for _, ch := range chs {
+			_ = ch.Close()
+		}
+	}()
+
+	// The attacker is whoever the committee draws at (1, 0); the honest
+	// validators are the other three.
+	attackPub := cfg.Proposer(1, 0, parent)
+	attackIdx := cfg.IndexOf(attackPub)
+	attPriv := testCommitteeKey(attackIdx)
+	attackID := [32]byte{}
+	{
+		// The attack block: structurally valid, garbage state root.
+		b := types.Block{Header: types.Header{
+			Height:     1,
+			ParentHash: parent,
+			StateRoot:  [32]byte{0xde, 0xad, 0xbe, 0xef},
+			TxRoot:     types.ComputeTxRoot(nil),
+			Timestamp:  1_700_000_001,
+			Proposer:   attackPub,
+		}}
+		if err := b.ValidateStructure(); err != nil {
+			t.Fatalf("fixture: the attack block must be structurally valid: %v", err)
+		}
+		p := &Proposal{Height: 1, Round: 0, Block: b, ValidRound: -1, Validator: attackPub}
+		h := p.SigningHash()
+		p.Sig = crypto.Sign(attPriv, h[:])
+		attackID = b.ID()
+		// Broadcast through the attacker's own sim peer, exactly one proposal.
+		_ = net.TransportFor(fmt.Sprintf("v%d", attackIdx)).Broadcast(EncodeProposal(p))
+	}
+
+	// The attacker also prevotes its own block (a Byzantine proposer helps its
+	// proposal along); the honest validators must outvote it with nils.
+	attackPrevote := voteFrom(t, cfg, attackIdx, MsgPrevote, 1, 0, attackID)
+	_ = net.TransportFor(fmt.Sprintf("v%d", attackIdx)).Broadcast(EncodeVote(attackPrevote))
+
+	// Drive the three honest drivers in lockstep: the attack round must end
+	// with exactly one nil prevote from each of them and NOT ONE prevote for
+	// the garbage block; the height must then commit in a later round.
+	commit := false
+	for i := 0; i < 600 && !commit; i++ {
+		now := int64(i) * driveStep
+		for idx, d := range ds {
+			if idx == attackIdx {
+				continue
+			}
+			d.Tick(now)
+		}
+		net.Advance(netStep)
+		for idx, d := range ds {
+			if idx == attackIdx {
+				continue
+			}
+			d.Tick(now + driveStep/2)
+		}
+		commit = true
+		for idx, ch := range chs {
+			if idx == attackIdx {
+				continue
+			}
+			if ch.Height() < 1 {
+				commit = false
+			}
+		}
+	}
+	if !commit {
+		t.Fatalf("the committee never recovered past the attack: the honest validators stalled below height 1 after 600 ticks - refusing a garbage proposal must not halt the chain")
+	}
+
+	for idx, ch := range chs {
+		if idx == attackIdx {
+			continue // the attacker's chain is not part of the committee's truth
+		}
+		if _, err := ch.BlockAt(1); err == nil && ch.Height() >= 1 {
+			blk, err := ch.BlockAt(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if blk.ID() == attackID {
+				t.Fatalf("validator %d committed the ATTACK block: the polka reached a lock on a garbage-root block", idx)
+			}
+		}
+		if rec, ok := ch.LockAt(1); ok && rec.BlockID == attackID {
+			t.Fatalf("validator %d has a DURABLE lock naming the attack block %x: the halt now survives restarts, which is the finding's exact claim", idx, attackID[:8])
+		}
+	}
+
+	// Evidence the refusal spoke: every honest validator emitted exactly one
+	// NIL prevote at the attack round (1, 0), and no honest validator emitted
+	// a non-nil prevote for the attack block at that round.
+	for idx, rec := range recs {
+		if idx == attackIdx {
+			continue
+		}
+		nils, forAttack := 0, 0
+		for _, raw := range rec.broadcasts {
+			v, err := DecodeVote(raw)
+			if err != nil || v.Type != MsgPrevote || v.Height != 1 || v.Round != 0 {
+				continue
+			}
+			if v.IsNil() {
+				nils++
+			}
+			if v.BlockID == attackID {
+				forAttack++
+			}
+		}
+		if forAttack != 0 {
+			t.Fatalf("honest validator %d prevoted the garbage-root block %d time(s): the attack reached a prevote", idx, forAttack)
+		}
+		if nils != 1 {
+			t.Fatalf("honest validator %d emitted %d nil prevote(s) at the attack round, want exactly 1: the refusal must speak, not stay silent", idx, nils)
+		}
+	}
+
+	// And the recovered chain is one history: the committed height-1 block is
+	// identical at every honest validator.
+	_ = g // the fixture's searched genesis; the parent draw is what matters
+	ref, err := chs[0].BlockAt(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idx, ch := range chs {
+		if idx == attackIdx {
+			continue
+		}
+		blk, err := ch.BlockAt(1)
+		if err != nil {
+			continue // this validator may still be a height behind; agreement is asserted below through its shared heights
+		}
+		blkID, refID := blk.ID(), ref.ID()
+		if blkID != refID {
+			t.Fatalf("honest validators disagree at height 1: %x vs %x", blkID[:8], refID[:8])
+		}
+	}
+	_ = g
+}
+
+// THE C-2 SCENARIO, AT THE COMMITTEE: round 0's polka for block B reached
+// every validator (every one locked on B and precommitted it), but the wire
+// lost three OF THE FOUR PRECOMMITS, so no validator saw the quorum of three
+// and nobody committed. Every validator is therefore locked on B at round 0
+// with B's bytes.
+//
+// Pre-fix behaviour (the audit's exact claim): every later round's proposer -
+// locked - proposed a FRESH block (a different block: its own key is the
+// header's proposer), which it then nil-prevoted itself; every other locked
+// validator nil-prevoted it too; no polka ever formed again; nobody ever
+// unlocked; the height stalled while the timeouts grew without bound.
+//
+// Post-fix: the very next round's proposer re-proposes B - the locked block,
+// with the round-0 polka as its justification - every locked validator
+// prevotes it (it is their own promise), the polka re-forms, the precommit
+// quorum completes, and B commits.
+//
+// The genesis's Time is chosen by the fixture so the round-1 proposer is NOT
+// the block's original builder: a reverted (pre-fix) re-proposal shows itself
+// as a fresh, different block the moment the locked non-builder proposes - the
+// mutant's first proposal is on the wire and dies on the assertion below.
+func TestALostPrecommitQuorumRecoversThroughTheLockedReProposal(t *testing.T) {
+	// The fixture guarantees the height-1 round-1 proposer is NOT the round-0
+	// proposer's builder (it searched genesis times for that) - the
+	// mutant-kill condition the wire assertions below lean on.
+	ds, chs, recs, net, cfg, _, _ := fourValidatorFixture(t)
+	defer func() {
+		for _, ch := range chs {
+			_ = ch.Close()
+		}
+	}()
+
+	// The loss: validators 1, 2 and 3 each lose their FIRST precommit cast at
+	// (height 1, round 0). With three of four precommits gone, the tallies are
+	// {v0's + own} = 2 at v1/v2/v3 and {own} = 1 at v0: the quorum of 3 is
+	// unreachable, at every validator, in round 0. The PREVOTES fly untouched,
+	// so the round-0 polka completes at every validator and every one of them
+	// LOCKS on the round-0 block - the exact mid-height state the audit names.
+	for idx := 1; idx < 4; idx++ {
+		wrapped := &dropFirstTP{Transport: net.TransportFor(fmt.Sprintf("v%d", idx))}
+		wrapped.pred = func(raw []byte) bool {
+			v, err := DecodeVote(raw)
+			return err == nil && v.Type == MsgPrecommit && v.Height == 1 && v.Round == 0
+		}
+		recs[idx].Transport = wrapped
+	}
+	// The wrappers must be installed over the drivers' transports: the driver
+	// was built over the recordingTransport, so re-point the recording layer's
+	// inner transport at the dropping wrapper. (recordingTransport forwards to
+	// its Transport - now the wrapper - and keeps recording what reached it;
+	// dropped frames do NOT appear in its log, which the fixture guards use.)
+
+	// Drive all four: round 0 commits for nobody (the loss), then the locked
+	// re-proposal must commit in a later round.
+	committedAt := -1
+	for i := 0; i < 600 && committedAt < 0; i++ {
+		now := int64(i) * driveStep
+		for _, d := range ds {
+			d.Tick(now)
+		}
+		net.Advance(netStep)
+		for _, d := range ds {
+			d.Tick(now + driveStep/2)
+		}
+		all := true
+		for _, ch := range chs {
+			if ch.Height() < 1 {
+				all = false
+			}
+		}
+		if all {
+			committedAt = i
+		}
+	}
+	if committedAt < 0 {
+		t.Fatalf("a committee locked on B with a lost round-0 precommit quorum never recovered: no height committed in 600 ticks - the locked proposer did not re-propose, or the justification does not travel")
+	}
+
+	// The committed height-1 block is the ONE everyone locked on: the
+	// round-0 block's ID must be on every chain, one history.
+	var bID [32]byte
+	for idx, ch := range chs {
+		blk, err := ch.BlockAt(1)
+		if err != nil {
+			t.Fatalf("validator %d committed past height 1 without the height-1 block in place: %v", idx, err)
+		}
+		if idx == 0 {
+			bID = blk.ID()
+			continue
+		}
+		if blkID := blk.ID(); blkID != bID {
+			t.Fatalf("validator %d holds a different height-1 block: %x vs %x", idx, blkID[:8], bID[:8])
+		}
+	}
+
+	// The C-2 property on the wire: EVERY proposal ever broadcast at height 1
+	// carried the locked block B - never a fresh conflicting one. (Round 0's
+	// proposer proposed B first; every later round's proposer re-proposed the
+	// locked B with its justification.) A reverted re-proposal proposes the
+	// proposer's own fresh build - an immediately different block - and this
+	// assertion fails on the mutant's first such proposal.
+	for idx, rec := range recs {
+		for _, raw := range rec.broadcasts {
+			p, err := DecodeProposal(raw)
+			if err != nil || p.Height != 1 {
+				continue
+			}
+			pid := p.Block.ID()
+			if pid != bID {
+				t.Fatalf("validator %d (locked, drawn as proposer) proposed %x at height 1; it is locked on %x and must re-propose THAT", idx, pid[:8], bID[:8])
+			}
+		}
+	}
+
+	// The round-1 re-proposal must have been ACCEPTED by a peer: at least one
+	// validator emitted a non-nil prevote for B at (1, round 1). This is what
+	// kills the "envelope validator must equal the block header's proposer"
+	// mutant: the locked proposer at round 1 re-proposes B built by a
+	// DIFFERENT validator, so a rule demanding the two keys match drops the
+	// re-proposal at every peer, no (1,1) prevote exists, and the recovery
+	// waits for the original builder's redraw instead.
+	pvR1 := 0
+	for _, rec := range recs {
+		for _, raw := range rec.broadcasts {
+			v, err := DecodeVote(raw)
+			if err == nil && v.Type == MsgPrevote && v.Height == 1 && v.Round == 1 && !v.IsNil() && v.BlockID == bID {
+				pvR1++
+			}
+		}
+	}
+	// At least TWO: the re-proposer's own prevote always exists (it self-tallies
+	// before shipping), so one alone would pass even if every PEER dropped the
+	// re-proposal - the acceptance this asserts is a peer's, not a formality.
+	if pvR1 < 2 {
+		t.Fatal("only the re-proposer itself prevoted B at (1, round 1); a peer's acceptance is what this recovery runs on")
+	}
+
+	// The proof-of-lock must be present from round 1 on: at least one re-proposal
+	// in a later round carries a justification that decodes to a verified quorum
+	// of prevotes for B at the claimed round.
+	var polkaSeen bool
+	for _, rec := range recs {
+		for _, raw := range rec.broadcasts {
+			p, err := DecodeProposal(raw)
+			if err != nil || p.Height != 1 || p.Round == 0 {
+				continue
+			}
+			if len(p.Justification) == 0 || p.ValidRound < 0 {
+				continue
+			}
+			vs := NewVoteSet(cfg, 1, uint32(p.ValidRound), MsgPrevote)
+			for _, vraw := range decodeVotes(p.Justification) {
+				v, err := DecodeVote(vraw)
+				if err != nil {
+					break
+				}
+				if _, err := vs.Add(v); err != nil {
+					break
+				}
+			}
+			pid := p.Block.ID()
+			if vs.HasQuorum(pid) {
+				polkaSeen = true
+			}
+		}
+	}
+	if !polkaSeen {
+		t.Fatal("no re-proposal ever carried a verified proof-of-lock: the recovery ran on something other than the retained polka")
+	}
+
+	// And the height-1 commit came AFTER round 0 (the loss was real): the
+	// round that committed is at least round 1. The precommits of the
+	// deciding round fly at that round; v0's round-0 precommit was the only
+	// one to leave - the record shows the recovery, not an instant round-0
+	// commit.
+	if committedAt == 0 {
+		t.Fatal("the height committed in round 0: the fixture's lost precommits did not actually prevent the round-0 commit")
+	}
+}
+
+// The round ladder must be CAPPED (audit C-2): an undecided height's rounds
+// end on the ladder, and an uncapped ladder makes every succeeding round
+// linearly slower forever - recovery latency grows without bound. With the
+// cap the ladder saturates: every round past maxRoundEscalation runs at the
+// same fixed cadence.
+//
+// The fixture is the blocked-quorum pair (quorum 2, one live validator): the
+// height can never commit, so the ladder rides out to the cap on its own. The
+// ghost never votes, so no future-round evidence ever accumulates and the raw
+// ladder is what this measures.
+func TestRoundTimeoutsAreCapped(t *testing.T) {
+	d, _, _, _, _, _ := blockedQuorumFixture(t)
+
+	now := int64(5) // below the first deadline: arms the ladder at +TimeoutBase
+	maxDelta := int64(0)
+	for r := uint32(0); r < maxRoundEscalation+8; r++ {
+		d.Tick(now)
+		if d.eng.Round() != r {
+			t.Fatalf("fixture: the engine is at round %d, want %d", d.eng.Round(), r)
+		}
+		delta := d.timeoutAt - d.now
+		want := roundBase + int64(minInt64(r, maxRoundEscalation))*roundStep
+		if delta != want {
+			t.Fatalf("round %d's deadline is TimeoutBase+%d*TimeoutStep = %d, want %d: the ladder %s",
+				r, minInt64(r, maxRoundEscalation), delta, want,
+				func() string {
+					if delta > want {
+						return "grew past its cap"
+					}
+					return "fell short of the ladder"
+				}())
+		}
+		if delta > maxDelta {
+			maxDelta = delta
+		}
+		now = d.timeoutAt
+	}
+	// Saturation is real, not asserted: the sampled deltas stopped growing and
+	// the maximum sits exactly at the capped cadence.
+	if maxDelta != roundBase+int64(maxRoundEscalation)*roundStep {
+		t.Fatalf("the ladder's maximum delta %d != the capped TimeoutBase+%d*TimeoutStep: the cap would not have bound", maxDelta, maxRoundEscalation)
+	}
+}
+
+func minInt64(a, b uint32) int64 {
+	if int64(b) < int64(a) {
+		return int64(b)
+	}
+	return int64(a)
+}
+
+// A timeout must JUMP the ladder when members holding more than one third of
+// the committee's total power signed prevotes at rounds ahead of the current
+// one (the minimal round-resync the capped ladder needs): the committee is
+// that far ahead, and a +1 step would keep this validator permanently one
+// round behind, dropping every proposal as wrong-round in both directions.
+//
+// On four equal-power validators the power bar is total/3+1 = 2 members - on
+// an EQUAL committee the same number the old seat gate gave, which is why
+// equal-power behaviour is unchanged. The engine holds no future evidence for
+// the first two firings (one attesting member is below the bar of 2) and the
+// ladder escalates by one each time; the third firing has two members' future
+// prevotes and jumps straight to the attested round.
+func TestTimeoutJumpsOnFutureRoundEvidence(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+	if e.step != StepPropose || e.proposal != nil {
+		t.Fatal("fixture: the engine must start unproposing at round 0")
+	}
+
+	// One attesting member: below the power bar of 2. The ladder escalates by one.
+	v0 := voteFrom(t, cfg, 0, MsgPrevote, h, 3, crypto.HashParts([]byte("some-later-block")))
+	if err := e.OnMessage(EncodeVote(v0)); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 1 {
+		t.Fatalf("one future-round vote must not move the ladder bar: engine at round %d, want 1", e.Round())
+	}
+
+	// A second attesting member at a further round: power 2 of 4, the bar. The
+	// next timeout jumps to the round where the evidence's bulk is first
+	// completed - the smallest round whose accumulated power reaches the bar,
+	// here 3, the 2nd largest of rounds {5, 3}.
+	v2 := voteFrom(t, cfg, 2, MsgPrevote, h, 5, crypto.HashParts([]byte("some-later-block")))
+	if err := e.OnMessage(EncodeVote(v2)); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 3 {
+		t.Fatalf("the power bar's future rounds must jump the ladder: engine at round %d, want 3 (the bar-completing round of attestations 5, 3)", e.Round())
+	}
+	if p := e.future[2]; p == nil || p.Round != 5 {
+		t.Fatal("fixture: the recorded future evidence is wrong")
+	}
+
+	// The jump lands the honest way: a NEW round at StepPropose waiting for
+	// that round's proposal, the (none-here) lock and the future evidence
+	// intact.
+	if e.Step() != StepPropose {
+		t.Fatalf("after the jump the engine is at step %s, want propose", e.Step())
+	}
+	// The evidence survives the round change and a further member attests
+	// round 9: the bar-completing round is then 5 (power 2 attesting at 5 or
+	// above), so the next timeout advances only to 5. The engine rides the
+	// evidence's bulk forward, not any single member's furthest claim.
+	v1 := voteFrom(t, cfg, 1, MsgPrevote, h, 9, crypto.HashParts([]byte("some-later-block")))
+	if err := e.OnMessage(EncodeVote(v1)); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 5 {
+		t.Fatalf("the jump target is the bar-completing round, not the furthest attested: engine at round %d, want 5", e.Round())
+	}
+}
+
+// The jump's gate is a third of the POWER, not one member's claim: a single
+// signed future-round vote must never move the ladder. A committee that
+// jumped on any single attestation would follow one Byzantine member into
+// rounds nobody else is in - and never come back, because the votes its
+// laggards see are all past-rounds relative to the jumped validator.
+//
+// For four equal validators the power bar is 2: attesting twice from the SAME
+// member (its highest wins) still counts as one member's power. The jump
+// fires only when a second, distinct member attests.
+func TestTimeoutJumpNeedsDistinctMembersNotOneByzantine(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+
+	// One member, repeatedly attesting absurd rounds: still one entry.
+	for _, r := range []uint32{4, 100, 1 << 30} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 0, MsgPrevote, h, r, crypto.HashParts([]byte("some-later-block"))))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(e.future) != 1 || e.future[0].Round != 1<<30 {
+		t.Fatalf("fixture: one member must hold exactly one (its highest) entry, got %d entries", len(e.future))
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 1 {
+		t.Fatalf("a single member's future rounds must not jump the ladder (want +1 step, engine at round %d)", e.Round())
+	}
+}
+
+// The jump gate counts POWER, not SEATS (round-3 F1): the committee file
+// carries a per-entry power, so on a weighted genesis the Byzantine budget is
+// a fraction of total power, while the previous round's gate counted
+// floor(n/3)+1 COMMITTEE SEATS - and a coalition holding strictly UNDER one
+// third of the power can occupy exactly that many seats.
+//
+// The weighted committee is the reviewer's: n=7, powers {1,1,1,2,2,2,2},
+// total 11. The seat gate is 7/3+1 = 3 members; the power bar (the same
+// integers TotalPower feeds the quorum) is 11/3+1 = 4. Three power-1 seats
+// hold 3/11 = 0.273 of the power - strictly under a third - and exactly fill
+// the seat gate; the power gate must refuse them. Conversely a coalition that
+// genuinely exceeds one third of power in FEWER seats (two power-2 members:
+// 4/11 = 0.364 at two seats, below the seat gate of 3) must still be able to
+// move the round, so the gate is not simply dead: both directions below.
+func TestJumpGateCountsPowerNotSeats(t *testing.T) {
+	cfg := weightedCommittee(t, 1, 1, 1, 2, 2, 2, 2)
+	parent := crypto.HashParts([]byte("parent"))
+	someID := crypto.HashParts([]byte("some-later-block"))
+	// The engine's seat is the last one (power 2): it is not one of the
+	// attesting attackers below, and the fixture anchor asserts that.
+	idx := 6
+	h := round0ProposerHeight(t, cfg, idx, false, parent)
+
+	if total := cfg.TotalPower(); total != 11 {
+		t.Fatalf("fixture: total power %d, want 11 for powers {1,1,1,2,2,2,2}", total)
+	}
+	if bar := cfg.TotalPower()/3 + 1; bar != 4 {
+		t.Fatalf("fixture: the power bar is %d, want 4 (strictly more than a third of 11)", bar)
+	}
+
+	// Direction 1 (the attack): three seats holding 3/11 of the power attest
+	// round 9. They fill the SEAT gate (3 = floor(7/3)+1) exactly, so the
+	// member-count version of this gate jumped the engine to their claimed
+	// round; the power gate must not move it.
+	e := newTestEngine(t, cfg, idx, h, parent)
+	for _, seat := range []int{0, 1, 2} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, 9, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 1 {
+		t.Fatalf("a coalition with 3/11 = 0.273 of the power in 3 seats moved the round to %d: 3 of 11 is strictly under one third and must not reach the power gate (want round 1)", e.Round())
+	}
+
+	// A SINGLE Byzantine validator must never move the round either - the
+	// property round 2 established, kept on a weighted committee: the
+	// heaviest member holds 2/11, under the bar of 4.
+	e = newTestEngine(t, cfg, idx, h, parent)
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 0, MsgPrevote, h, 9, someID))); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 1 {
+		t.Fatalf("one member holding 2/11 of the power moved the round to %d: a single validator must not reach the gate at all", e.Round())
+	}
+
+	// Direction 2a (the gate is alive): two power-2 seats at round 9 hold
+	// 4/11 = 0.364 of the power, above the bar in TWO seats - fewer than the
+	// old seat gate of 3. The round must move, to the round the bulk attests.
+	e = newTestEngine(t, cfg, idx, h, parent)
+	for _, seat := range []int{3, 4} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, 9, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 9 {
+		t.Fatalf("a coalition holding 4/11 of the power in 2 seats did not move the round (at %d, want 9): the power gate must stay live", e.Round())
+	}
+
+	// Direction 2b (the target never follows a sub-third coalition's claim):
+	// the same three sub-third seats attest round 9 and ONE honest member -
+	// without whose power the gate would refuse - attests round 5. The
+	// crossing happens where the power reaches the bar, so the jump goes to
+	// the honest member's round 5, not the attackers' claimed 9.
+	e = newTestEngine(t, cfg, idx, h, parent)
+	for _, seat := range []int{0, 1, 2} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, 9, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 3, MsgPrevote, h, 5, someID))); err != nil {
+		t.Fatal(err)
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 5 {
+		t.Fatalf("the jump went to round %d, want 5: with power 3 at claimed round 9 and power 2 attested at round 5, the bar of 4 is first reached at the honest member's round 5 - the target must not follow the sub-third coalition's furthest claim", e.Round())
+	}
+}
+
+// The jump target is CAPPED (round-3 F1): a power-gated jump bounds WHO can
+// name the target, not the number they name - a coalition that legitimately
+// exceeds one third of power (and, equally, one buggy honest validator) can
+// attest math.MaxUint32, and a jump there parks OnTimeout's wrap guard, which
+// returns silently: the validator would be permanently ejected from the
+// height, its votes and every proposal wrong-round in both directions. So the
+// jump never leaves the current round by more than maxRoundEscalation - the
+// same stride the timeout ladder uses - and a genuinely further committee is
+// caught by repetition on later timeouts instead of one unbounded step.
+func TestJumpNeverTravelsFurtherThanABoundedStride(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1) // total 4: the bar is 4/3+1 = 2 power
+	parent := crypto.HashParts([]byte("parent"))
+	someID := crypto.HashParts([]byte("some-later-block"))
+	idx := 2
+	h := round0ProposerHeight(t, cfg, idx, false, parent)
+	e := newTestEngine(t, cfg, idx, h, parent)
+
+	// Two members attest math.MaxUint32: the power gate is genuinely
+	// satisfied (2 of 4), and the crossing - the round the old code would
+	// have jumped TO - is MaxUint32 itself, where OnTimeout silently returns
+	// forever after. The engine must jump to the BOUND instead.
+	for _, seat := range []int{0, 1} {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, seat, MsgPrevote, h, math.MaxUint32, someID))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != maxRoundEscalation {
+		t.Fatalf("a MaxUint32-evidenced jump landed at round %d, want the bounded stride %d (an unbounded jump would strand the engine at OnTimeout's wrap guard and eject it from the height)", e.Round(), maxRoundEscalation)
+	}
+	if e.Step() != StepPropose {
+		t.Fatalf("after the bounded jump the engine is at step %s, want propose: it must stay live", e.Step())
+	}
+
+	// The bound is per jump, not per height: the same evidence, still ahead,
+	// moves the engine another bounded stride on the next timeout - a gap
+	// wider than the stride is closed by repetition, and no jump ever reaches
+	// the wrap guard's round.
+	e.OnTimeout(TimeoutEvent{Height: h, Round: e.Round()})
+	if e.Round() != 2*maxRoundEscalation {
+		t.Fatalf("the second timeout did not carry another bounded stride (at round %d, want %d): the bound must not dead-end resync", e.Round(), 2*maxRoundEscalation)
+	}
+}
+
+// NewDriver refuses a signing key that is not a committee seat (audit C-11):
+// the engine's own vote could never be tallied, so the validator must fail to
+// start rather than panic on its first timeout. The state is CONSTRUCTED (a
+// known committee and a freshly generated stranger key), never provoked
+// through a buffer or a timing race.
+func TestNewDriverRefusesAKeyOutsideTheCommittee(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	g := genesis.Devnet()
+	g.Validators = cfg.Committee
+	g.Params.CommitteeSize = len(cfg.Committee)
+	ch, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ch.Close()
+
+	_, stranger, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := NewDriver(cfg, ch, stranger, &recordingTransport{Transport: silentInner{}}, nil)
+	if !errors.Is(err, ErrNotValidator) {
+		t.Fatalf("NewDriver with a stranger key = %v, want ErrNotValidator", err)
+	}
+	if d != nil {
+		t.Fatal("NewDriver handed back a driver for the key it refused")
+	}
+
+	// Non-vacuity control: the committee's own seat key is accepted, so the
+	// gate refuses the stranger, not every construction.
+	if d := mustDriver(t, cfg, ch, testCommitteeKey(0), &recordingTransport{Transport: silentInner{}}, nil); d == nil {
+		t.Fatal("NewDriver refused a committee seat")
+	}
 }

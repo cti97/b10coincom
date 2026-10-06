@@ -40,13 +40,15 @@ func TestAddressHasPrefixAndIsLowercase(t *testing.T) {
 
 func TestAddressIsDeterministic(t *testing.T) {
 	pub := randomPub(t)
-	if AddressFromPub(pub) != AddressFromPub(pub) {
+	a, b := AddressFromPub(pub), AddressFromPub(pub)
+	if a != b {
 		t.Fatal("AddressFromPub is not deterministic")
 	}
 }
 
 func TestAddressDiffersForDifferentKeys(t *testing.T) {
-	if AddressFromPub(randomPub(t)) == AddressFromPub(randomPub(t)) {
+	a, b := AddressFromPub(randomPub(t)), AddressFromPub(randomPub(t))
+	if a == b {
 		t.Fatal("two distinct keys produced the same address")
 	}
 }
@@ -73,6 +75,56 @@ func TestParseAddressRejectsTamperedChecksum(t *testing.T) {
 
 	if _, err := ParseAddress(tampered); !errors.Is(err, ErrBadAddress) {
 		t.Fatalf("expected ErrBadAddress for tampered checksum, got %v", err)
+	}
+}
+
+// addressAlphabet is the lowercase base32 alphabet String() renders, in
+// symbol-index order. It is duplicated in the test so a change to the
+// production alphabet cannot silently make these cases vacuous.
+const addressAlphabet = "abcdefghijklmnopqrstuvwxyz234567"
+
+// TestParseAddressAcceptsOnlyTheCanonicalSpelling (audit S-11) pins the two
+// classes of non-canonical spelling the decoder used to accept. Both decode
+// to the SAME [20]byte address as the canonical string - that is the point -
+// so only the a.String() == s check can refuse them.
+func TestParseAddressAcceptsOnlyTheCanonicalSpelling(t *testing.T) {
+	a := AddressFromPub(randomPub(t))
+	canonical := a.String()
+	got, err := ParseAddress(canonical)
+	if err != nil {
+		t.Fatalf("the canonical spelling %q must parse: %v", canonical, err)
+	}
+	if got != a {
+		t.Fatalf("canonical spelling parsed to %v, want %v", got, a)
+	}
+
+	// Mixed case in the BODY only: the prefix stays lowercase, so the refusal
+	// is the canonical check, not the case-sensitive prefix check.
+	body := canonical[len(AddressPrefix):]
+	upperBody := strings.ToUpper(body)
+	if upperBody == body {
+		t.Fatalf("test address body %q has no letters to change case", body)
+	}
+	mixed := AddressPrefix + upperBody
+	if _, err := ParseAddress(mixed); !errors.Is(err, ErrBadAddress) {
+		t.Fatalf("ParseAddress(%q) = %v, want ErrBadAddress (non-canonical mixed case)", mixed, err)
+	}
+
+	// A different final character with the SAME top two data bits: only the
+	// three padding bits differ, so it decodes to the same 24-byte payload and
+	// the same checksum. Before the fix it parsed to a identical.
+	last := body[len(body)-1]
+	idx := strings.IndexByte(addressAlphabet, last)
+	if idx < 0 {
+		t.Fatalf("last body character %q is not in the base32 alphabet", last)
+	}
+	alt := byte(addressAlphabet[(idx&0b11000)|((idx+1)&0b111)])
+	padded := AddressPrefix + body[:len(body)-1] + string(alt)
+	if padded == canonical {
+		t.Fatal("constructed padding variant equals the canonical spelling")
+	}
+	if _, err := ParseAddress(padded); !errors.Is(err, ErrBadAddress) {
+		t.Fatalf("ParseAddress(%q) = %v, want ErrBadAddress (padding-bit variant)", padded, err)
 	}
 }
 

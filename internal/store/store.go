@@ -1,30 +1,44 @@
-// Package store persists blocks as append-only segment files and a
-// per-height lock log, both over opaque payloads.
+// Package store persists blocks as append-only segment files, a per-height
+// lock log, a per-height round log and a per-height commit-certificate log,
+// all over opaque payloads.
 //
-// Record layout: uvarint(len(payload)) || payload || uint32be(crc32c(payload)).
+// Record layout, shared by every log here:
 //
-// Open scans the final segment and truncates any partial trailing record:
-// that is what makes a crash mid-write survivable. The node restarts,
-// re-syncs from the last good block, and loses nothing already committed. A
-// structurally complete record whose checksum fails is indexed but never
-// trusted: Read reports it as ErrCorruptRecord instead of silently dropping
-// committed heights. A damaged record in any non-final segment is genuine
-// corruption and fails Open.
+//	uint64be(len(payload)) || uint32be(crc32c(len)) || payload || uint32be(crc32c(len || payload))
+//
+// The header is FIXED WIDTH and checksummed so that the length prefix is
+// trustworthy BEFORE it is used to find the record's end. That is the fix
+// audit S-2 asks for. Before it, the checksum covered only the payload, so a
+// single flipped bit in a length prefix was indistinguishable from a crash:
+// the scanner would read the corrupt length, conclude the record ran past
+// EOF, and "repair" by truncating the file - silently deleting committed
+// blocks and reporting Open success. Here a corrupt length fails its own
+// checksum and Open FAILS loudly without touching a byte.
+//
+// The scan STOPS at the first corruption, in the final segment too: a
+// complete record whose record checksum fails is corruption, not a torn
+// tail, and the bytes after it cannot be framed (the corrupt record's own
+// length is what would say where they start). Truncating there would delete
+// exactly what a repair must preserve, so every log here refuses instead.
+// Truncation is confined to what only a crash can produce: the file ends inside
+// a record - an incomplete header, or a complete, VALID header whose record
+// runs past EOF. A crash cannot invent a different length, because a written
+// record's header checksum travels with the length it describes.
 //
 // The lock log (separate file, same framing) holds one validator's own
-// lockedRound/lockedBlock per height. Its records have a FIXED payload
-// (see lockPayloadLen), so a frame's length prefix can only ever be one
-// exact byte - and it is checked against the constant instead of trusted.
-// That closes a hole a length-prefix repair would leave: without the check,
-// a single flipped bit in an intact record's length byte is indistinguishable
-// from a crash for the scanner, and "repairing" it truncates the log and the
-// promise with it - degrading a validator to unlocked, the exact unsafe
-// direction the lock exists to refuse. So here the truncate is confined to
-// what only a crash can produce: a complete length prefix whose record runs
-// past EOF. Everything else is corruption and FAILS Open. Blocks are judged
-// content-based through their state roots, so a bad block can only stall a
-// Read; a lock's whole value is its mere existence, and a missing one reads
-// as unlocked.
+// lockedRound/lockedBlock per height. Its records have a FIXED payload (see
+// lockPayloadLen), so a valid header claiming any other length is corruption
+// by construction and is refused on top of the framing checks - the same
+// guarantee as the block log, without having to trust a length at all. A
+// lock's whole value is its mere existence, and a missing one reads as
+// unlocked, so its error policy is as strict as the framing allows: the node
+// staying down is the honest failure.
+//
+// The round log (roundLogName) records the consensus round a validator had
+// reached at a height (audit C-3), under the lock log's fixed-width framing;
+// the certificate log (certLogName, audit C-7) indexes one opaque certificate
+// per committed height and reads records back on demand rather than holding
+// them in memory.
 package store
 
 import (
@@ -33,23 +47,67 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 )
 
 // BlocksPerSegment is how many blocks share one segment file.
 const BlocksPerSegment = 1000
+
+// maxOpenReaders bounds the per-segment read-handle cache. Reads walk arbitrary
+// non-head heights, so a long chain has far more segments than a process may
+// hold descriptors for; the cache keeps reads on the hot segments (replay
+// walks them in order) without an unbounded descriptor count.
+const maxOpenReaders = 8
 
 // lockLogName holds the lock log. The name deliberately does not end in
 // ".seg": scan would otherwise index lock records as block heights and
 // renumber the chain.
 const lockLogName = "locks.log"
 
+// certLogName holds the commit-certificate log (audit C-7). Like the lock log
+// its name avoids the ".seg" suffix for the same reason.
+const certLogName = "certs.log"
+
+// roundLogName holds the consensus-round log (audit C-3). Like the lock and
+// certificate logs its name avoids the ".seg" suffix for the same reason.
+const roundLogName = "rounds.log"
+
+// genesisFileName holds the data directory's genesis identity: the 32-byte
+// genesis hash this chain was first opened with (audit O-5). It has no ".seg"
+// suffix so scan never indexes it as a block, and it is written once, on the
+// first Open, then compared on every later one. Without it a wrong genesis is
+// only discovered after replay has already diverged, as an opaque
+// "replay diverged" error; with it the first Open that names a different
+// genesis is told exactly that, before a block is replayed.
+const genesisFileName = "genesis.hash"
+
+// RecordHeaderLen and RecordTrailerLen are the on-disk framing's fixed sizes:
+// an 8-byte big-endian payload length plus the 4-byte CRC32C of those 8 bytes,
+// and a 4-byte CRC32C of the header and the payload. They are exported because
+// they are part of the file format, and a tool that walks a segment (or a test
+// that rewrites one) must be able to frame records exactly as Open does.
+const (
+	RecordHeaderLen  = 8 + 4
+	RecordTrailerLen = 4
+	lengthFieldLen   = 8
+)
+
 var (
 	ErrNotFound      = errors.New("store: height not found")
 	ErrBadHeight     = errors.New("store: heights must be appended sequentially")
 	ErrCorruptRecord = errors.New("store: record checksum mismatch")
+	// ErrWrongGenesis reports a data directory whose recorded genesis hash
+	// differs from the genesis the caller is opening it with (audit O-5).
+	ErrWrongGenesis = errors.New("store: data directory belongs to a different genesis")
+	// errTornRecord reports a record the file ends inside. It is not
+	// corruption: it is the one shape a crash mid-write can leave, and it is
+	// the only shape Open may truncate. It is unexported because callers
+	// outside this package must treat it as ErrCorruptRecord.
+	errTornRecord = errors.New("store: record is incomplete")
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
@@ -79,6 +137,26 @@ type LockRecord struct {
 	BlockID [32]byte
 }
 
+// roundPayloadLen is the fixed payload size of one round record: 8 bytes of
+// big-endian height followed by 4 bytes of big-endian round. The width is a
+// constant of the CODE, not data the file states, for exactly the reason the
+// lock record's is (see lockPayloadLen): scanRounds compares the framing's
+// length prefix against this constant and refuses any disagreement, so no
+// corruption can shape one record into a torn tail that gets "repaired" by
+// truncation.
+const roundPayloadLen = 8 + 4
+
+// RoundRecord is the persisted form of a validator's position at a height:
+// it had entered Round at Height when it last advanced. It is not a safety
+// promise - unlike a lock, losing it can only re-enter an earlier round, and
+// the lock still refuses every conflicting vote - so its value is liveness:
+// a validator that advanced through several timed-out rounds does not start
+// the whole capped ladder over from round 0 after a restart.
+type RoundRecord struct {
+	Height uint64
+	Round  uint32
+}
+
 // Store is an append-only block log over opaque payloads.
 type Store struct {
 	dir   string
@@ -87,12 +165,48 @@ type Store struct {
 	have  bool
 	index map[uint64]int64 // height -> record offset within its segment
 
+	// lock is the exclusive data-directory lock, held from Open until Close.
+	// See dirlock.go: it keeps a second process (or a second open Store in
+	// this process) from interleaving writes into these files.
+	lock *dirLock
+
 	// lockFile is the append handle on the lock log; locks maps a height to
 	// the NEWEST lock record for it. A height may legitimately carry a lock
 	// and no block: the lock points at head+1, the height being judged, so
 	// lock heights are deliberately NOT required to be appended heights.
-	lockFile *os.File
-	locks    map[uint64]LockRecord
+	//
+	// lockRecords is how many framed records the log PHYSICALLY holds, one per
+	// PutLock ever, while locks holds one entry per height. The difference is
+	// the stale growth audit C-13 names; PruneLocks deletes the below-head
+	// entries and rewrites the log when enough of them have accumulated.
+	lockFile    *os.File
+	locks       map[uint64]LockRecord
+	lockRecords int
+
+	// roundFile is the append handle on the round log; rounds maps a height
+	// to the NEWEST round recorded for it (audit C-3). Like a lock, a round
+	// is recorded for a height that has not been appended yet.
+	roundFile *os.File
+	rounds    map[uint64]uint32
+
+	// certFile is the append-and-read handle on the commit-certificate log
+	// (audit C-7); certIndex maps a height to the offset of its record in
+	// that file. The certificate BYTES are not held in memory: one record
+	// per committed height would grow without bound over a long run, and the
+	// log exists precisely so a restarted node can serve history it no
+	// longer remembers. CertAt reads one record back through this handle.
+	certFile  *os.File
+	certIndex map[uint64]int64
+
+	// readMu guards the per-segment read-handle cache below (audit S-7).
+	// Store.Read is reached CONCURRENTLY by RPC readers under the chain's read
+	// lock, so the cache is shared mutable state and must be serialised. The
+	// handle is held for the whole Read, so a cache eviction can never close a
+	// handle another reader is mid-read on; the alternative - reading the whole
+	// segment into memory per call - is the allocation this cache removes.
+	readMu    sync.Mutex
+	readers   map[string]*os.File // segment name -> read handle
+	readerLRU []string            // most-recently-used last, bounded by maxOpenReaders
 }
 
 // segmentName maps a height to the segment file holding it. Names are
@@ -104,26 +218,77 @@ func segmentName(height uint64) string {
 }
 
 // Open prepares dir for use, rebuilds the in-memory height and lock indexes,
-// and discards any partial trailing record.
+// and discards any partial trailing record. It takes the directory's
+// exclusive single-writer lock first and holds it until Close; a directory
+// already owned by a live process (or by another open Store in this process)
+// is refused with ErrDataDirInUse before any file is scanned or truncated.
 func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, index: make(map[uint64]int64), locks: make(map[uint64]LockRecord)}
+	lock, err := acquireDirLock(dir)
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{
+		dir:       dir,
+		index:     make(map[uint64]int64),
+		locks:     make(map[uint64]LockRecord),
+		rounds:    make(map[uint64]uint32),
+		certIndex: make(map[uint64]int64),
+		readers:   make(map[string]*os.File),
+		lock:      lock,
+	}
 	if err := s.scan(); err != nil {
+		lock.release()
 		return nil, err
 	}
 	f, err := os.OpenFile(s.segmentPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
+		lock.release()
 		return nil, err
 	}
 	lf, err := os.OpenFile(filepath.Join(dir, lockLogName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		_ = f.Close()
+		lock.release()
+		return nil, err
+	}
+	rf, err := os.OpenFile(filepath.Join(dir, roundLogName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		_ = f.Close()
+		_ = lf.Close()
+		lock.release()
+		return nil, err
+	}
+	// O_RDWR, unlike the append-only handles above: serving an adopted
+	// height's certificate reads the record back with ReadAt.
+	cf, err := os.OpenFile(filepath.Join(dir, certLogName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	if err != nil {
+		_ = f.Close()
+		_ = lf.Close()
+		_ = rf.Close()
+		lock.release()
 		return nil, err
 	}
 	s.file = f
 	s.lockFile = lf
+	s.roundFile = rf
+	s.certFile = cf
+	// Make the directory entries for any file just created durable (audit
+	// S-15). Each file's own contents are fsynced as they are written; without
+	// this, a crash can lose the freshly created directory entry even though
+	// the data blocks were flushed, leaving a directory that replays shorter
+	// than the last acknowledged block. Best-effort: see syncDir.
+	syncDir(dir)
+	// Compact a lock log an earlier build (or a long run between restarts) grew
+	// one frame per height (audit C-13). scanLocks already pruned the map; this
+	// bounds the FILE too. The error is deliberately ignored: the old log is
+	// intact and complete, so a failed maintenance rewrite must not stop a node
+	// from opening its own data directory.
+	if s.have {
+		_ = s.PruneLocks(s.last)
+	}
 	return s, nil
 }
 
@@ -132,6 +297,80 @@ func (s *Store) segmentPath() string {
 		return filepath.Join(s.dir, segmentName(s.last))
 	}
 	return filepath.Join(s.dir, segmentName(0))
+}
+
+// syncDir best-effort fsyncs a directory so a newly created or renamed entry
+// survives a power loss (audit S-15). Directory fsync is not portable - some
+// platforms and filesystems reject it - so the error is deliberately dropped:
+// on a platform that supports it the entry is made durable, and on one that
+// does not there is nothing further this layer can do. It is called after
+// creating a new segment, creating the logs, compacting the lock log, and
+// recording the genesis marker.
+func syncDir(dir string) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = f.Sync()
+	_ = f.Close()
+}
+
+// CheckGenesis records h as this data directory's genesis identity on the
+// first call, and refuses every later call with a different hash (audit O-5).
+// It is called by chain.Open while the store holds the directory's exclusive
+// lock, so the read-then-write is single-writer. The marker is written
+// atomically (temp, fsync, rename, dir fsync) and is NOT part of the block
+// framing: a missing marker (a directory written by a build older than this
+// one) is recorded on first sight, so no existing directory is invalidated.
+func (s *Store) CheckGenesis(h [32]byte) error {
+	path := filepath.Join(s.dir, genesisFileName)
+	raw, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if len(raw) != len(h) {
+			return fmt.Errorf("store: %s is %d bytes, want the %d-byte genesis hash; the data directory is damaged", path, len(raw), len(h))
+		}
+		var got [32]byte
+		copy(got[:], raw)
+		if got != h {
+			return fmt.Errorf("%w: %s records genesis %x, but the node was started with genesis %x; use a different --dir or the matching genesis",
+				ErrWrongGenesis, path, got[:8], h[:8])
+		}
+		return nil
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	}
+	tmp, err := os.CreateTemp(s.dir, genesisFileName+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(h[:]); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	syncDir(s.dir)
+	return nil
 }
 
 // scan rebuilds the index from disk and repairs the final segment's tail.
@@ -156,45 +395,163 @@ func (s *Store) scan() error {
 	// The lock log is scanned with the blocks: a lock that survived the crash
 	// must be loaded in the same pass as the blocks it promises about, or a
 	// restarted validator would re-open unlocked.
-	return s.scanLocks()
+	if err := s.scanLocks(); err != nil {
+		return err
+	}
+	// The round log (audit C-3), scanned under the same policy as the lock
+	// log: the newest record per height stands, and a torn tail is the only
+	// shape Open may cut. It is read back in the same Open that replays the
+	// blocks, so the round a crashed validator had reached is available to
+	// the engine built over that replay.
+	if err := s.scanRounds(); err != nil {
+		return err
+	}
+	// Certificate records are indexed but their payloads are NOT loaded: a
+	// cert log carries one record per committed height, so keeping it all in
+	// memory is the unbounded archive audit C-7 names. CertAt reads the one
+	// record it needs.
+	return s.scanCerts()
+}
+
+// frame validates the fixed-width header of the record starting at off in raw
+// and returns the payload length and the offset of the record's end.
+//
+// It separates the two things a record can be: errTornRecord means the file
+// ends inside the record (an incomplete header, or a header that is complete
+// and VALID but whose payload and trailer do not all fit) - the only shape a
+// crash can leave. Any other error means the bytes disagree with themselves,
+// which corruption alone produces. The order matters and is the whole fix: the
+// header's checksum is verified BEFORE its length is used, so a corrupt length
+// can never be mistaken for a torn tail and truncated away.
+//
+// A non-negative exact demands that length: for a log whose records all carry
+// the same fixed payload, a header that checks out but names any other length
+// is corruption by construction, not a tear, and must be refused before the
+// overrun test can call it one.
+func frame(raw []byte, off int64, exact int64) (int64, int64, error) {
+	rem := int64(len(raw)) - off
+	if rem < int64(RecordHeaderLen) {
+		return 0, 0, errTornRecord
+	}
+	return frameHeader(raw[off:off+RecordHeaderLen], off, rem, exact)
+}
+
+// frameHeader is the whole framing policy, applied to a header that is already
+// in memory. frame and readRecordAt share it so an in-memory record and a
+// streamed one can never be framed by two slightly different rules.
+func frameHeader(header []byte, off, rem, exact int64) (int64, int64, error) {
+	if crc32.Checksum(header[:lengthFieldLen], crcTable) != binary.BigEndian.Uint32(header[lengthFieldLen:]) {
+		return 0, 0, errors.New("length-prefix checksum mismatch (the length is not trustworthy)")
+	}
+	n := binary.BigEndian.Uint64(header[:lengthFieldLen])
+	if exact >= 0 && n != uint64(exact) {
+		return 0, 0, fmt.Errorf("length prefix names %d bytes, but this record format writes only the constant %d", n, exact)
+	}
+	// The header is trustworthy, so its length needs no further validation
+	// beyond keeping the arithmetic below in range: bound it by what is left.
+	if n > uint64(rem) {
+		return 0, 0, errTornRecord
+	}
+	payStart := off + RecordHeaderLen
+	recEnd := payStart + int64(n) + RecordTrailerLen
+	if recEnd > off+rem {
+		return 0, 0, errTornRecord
+	}
+	return int64(n), recEnd, nil
+}
+
+// readRecordAt frames one record read straight from r at off, using size as the
+// file's end. It does not read the payload, only the fixed-width header, so
+// framing a record costs one 12-byte read instead of the whole segment (audit
+// S-7). A ReadAt failure is reported as itself, not as a torn record: a real
+// I/O error is not the crash shape truncation may repair.
+func readRecordAt(r io.ReaderAt, size, off, exact int64) (int64, int64, error) {
+	rem := size - off
+	if rem < int64(RecordHeaderLen) {
+		return 0, 0, errTornRecord
+	}
+	var header [RecordHeaderLen]byte
+	if _, err := r.ReadAt(header[:], off); err != nil {
+		return 0, 0, err
+	}
+	return frameHeader(header[:], off, rem, exact)
+}
+
+// repairHint is appended to a corruption error so the operator is told the
+// ONE recovery path this format has (audit O-5). Automatic repair cannot be
+// offered: a COMPLETE record whose checksum fails is bit rot, not the torn
+// tail a crash leaves, and its length prefix may itself be the damaged bytes,
+// so the scan cannot frame what follows it and truncating there deletes
+// committed data. The hint names the file and the offset at which an operator
+// (after backing up, or with a replica to compare) can truncate, which
+// discards the damaged record and everything after it and is the only way
+// back to an openable directory. For a non-final segment even that is unsafe:
+// later segments are numbered from this one's record count, so truncating it
+// would renumber them, and only restoring the segment itself is a repair.
+func repairHint(final bool, path string, off int64) string {
+	if !final {
+		return fmt.Sprintf(" (a non-final segment cannot be repaired by truncation: later segments are numbered from its records; restore %s from a replica)", path)
+	}
+	return fmt.Sprintf(" (a COMPLETE record whose checksum fails is bit rot, not a crash, so it is not truncated automatically: back up %s, then truncate it at offset %d to recover everything before the damage, or restore it from a replica)", path, off)
 }
 
 // scanSegment walks one segment record by record. Earlier segments are
 // closed, so a damaged record there is real corruption and fails Open; the
-// final segment is the only place a crash could have cut a record, so its
-// tail is repaired instead: a partial trailing record is truncated away, and
-// a complete record with a bad checksum keeps its index slot for Read to
-// reject.
+// final segment is the only place a crash could have cut a record, so a torn
+// tail there is truncated away. A COMPLETE record whose checksum fails is
+// corruption in either case, and the scan STOPS there (audit S-2): its length
+// cannot be trusted to find the next record's start, so indexing past it would
+// invent heights, and truncating there would delete the very bytes a repair
+// must preserve.
+//
+// The scan STREAMS the file (audit S-7): it reads a 12-byte header, then the
+// one record it frames, never the whole segment. Before this, Open read each
+// segment into memory once per record in it - a chain with N blocks paid
+// O(N x segment bytes) of allocation just to start.
 func (s *Store) scanSegment(name string, final bool) error {
 	path := filepath.Join(s.dir, name)
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := fi.Size()
 	off := int64(0)
-	for off < int64(len(raw)) {
-		n, m := binary.Uvarint(raw[off:])
-		// A length prefix beyond the file cannot be a valid record and
-		// would overflow the arithmetic below.
-		if m <= 0 || n > uint64(len(raw)) {
-			if final {
+	// buf is reused across records; it grows to the largest record and no more.
+	var buf []byte
+	for off < size {
+		n, recEnd, err := readRecordAt(f, size, off, -1)
+		if err != nil {
+			if final && errors.Is(err, errTornRecord) {
+				// Close before truncating: Windows refuses os.Truncate while a
+				// handle is open. The deferred Close then no-ops.
+				_ = f.Close()
 				return s.truncateTail(path, off)
 			}
-			return fmt.Errorf("%w: bad length prefix in %s at offset %d", ErrCorruptRecord, name, off)
+			return fmt.Errorf("%w: %s in %s at offset %d%s", ErrCorruptRecord, err, name, off, repairHint(final, path, off))
 		}
-		recEnd := off + int64(m) + int64(n) + 4
-		if recEnd > int64(len(raw)) {
-			if final {
-				return s.truncateTail(path, off)
-			}
-			return fmt.Errorf("%w: truncated record in %s at offset %d", ErrCorruptRecord, name, off)
+		need := RecordHeaderLen + int(n)
+		if cap(buf) < need {
+			buf = make([]byte, need)
+		} else {
+			buf = buf[:need]
 		}
-		payStart := off + int64(m)
-		payload := raw[payStart : payStart+int64(n) : payStart+int64(n)]
-		want := binary.BigEndian.Uint32(raw[payStart+int64(n) : recEnd])
-		corrupt := crc32.Checksum(payload, crcTable) != want
-		if corrupt && !final {
-			return fmt.Errorf("%w: checksum mismatch in %s at offset %d", ErrCorruptRecord, name, off)
+		if _, err := f.ReadAt(buf, off); err != nil {
+			return fmt.Errorf("%w: cannot read record at offset %d of %s: %v", ErrCorruptRecord, off, name, err)
+		}
+		var trailer [RecordTrailerLen]byte
+		if _, err := f.ReadAt(trailer[:], off+RecordHeaderLen+int64(n)); err != nil {
+			return fmt.Errorf("%w: cannot read trailer at offset %d of %s: %v", ErrCorruptRecord, off, name, err)
+		}
+		// The checksum covers the length prefix AND the payload: a length
+		// that disagrees with the bytes it frames cannot pass, whether or not
+		// the header's own checksum already caught it.
+		if crc32.Checksum(buf, crcTable) != binary.BigEndian.Uint32(trailer[:]) {
+			return fmt.Errorf("%w: checksum mismatch in %s at offset %d%s", ErrCorruptRecord, name, off, repairHint(final, path, off))
 		}
 		h := s.last + 1
 		s.index[h] = off
@@ -205,12 +562,9 @@ func (s *Store) scanSegment(name string, final bool) error {
 	return nil
 }
 
-// truncateTail cuts a partial trailing record off the file. It deliberately
-// does NOT rewind s.last or drop index slots: every indexed record starts
-// BEFORE size (the partial record was never indexed), so a complete-but-corrupt
-// record keeps its height and Read reports ErrCorruptRecord for it. Rewinding
-// here would leave that record's bytes on disk while claiming a lower height,
-// and the next reopen would re-read them and renumber every height after.
+// truncateTail cuts a torn trailing record off the file. It is reached only
+// for errTornRecord - the file ending inside a record - so nothing a crash did
+// not cut can be lost here.
 func (s *Store) truncateTail(path string, size int64) error {
 	return os.Truncate(path, size)
 }
@@ -242,6 +596,10 @@ func (s *Store) Append(height uint64, payload []byte) error {
 		}
 		old := s.file
 		s.file = f
+		// Make the new segment's directory entry durable before the write
+		// below (audit S-15): the record is fsynced, so the entry must be too,
+		// or a crash could leave data on disk with nothing naming it.
+		syncDir(s.dir)
 		if err := old.Close(); err != nil {
 			return err
 		}
@@ -263,14 +621,24 @@ func (s *Store) Append(height uint64, payload []byte) error {
 	return nil
 }
 
+// writeRecord renders one framed record and appends it durably.
+//
+// The fixed-width header (a big-endian length plus the CRC32C of that length)
+// comes first so the scanner can decide whether the length is trustworthy
+// BEFORE it uses it. The trailing checksum then covers the header AND the
+// payload. A single write(2) of the whole buffer keeps a crash from leaving
+// any shape other than a prefix of it.
 func writeRecord(f *os.File, payload []byte) error {
-	var hdr [binary.MaxVarintLen64]byte
-	m := binary.PutUvarint(hdr[:], uint64(len(payload)))
-	rec := make([]byte, 0, m+len(payload)+4)
-	rec = append(rec, hdr[:m]...)
+	rec := make([]byte, 0, RecordHeaderLen+len(payload)+RecordTrailerLen)
+	var lenbuf [lengthFieldLen]byte
+	binary.BigEndian.PutUint64(lenbuf[:], uint64(len(payload)))
+	rec = append(rec, lenbuf[:]...)
+	var hsum [RecordTrailerLen]byte
+	binary.BigEndian.PutUint32(hsum[:], crc32.Checksum(rec, crcTable))
+	rec = append(rec, hsum[:]...)
 	rec = append(rec, payload...)
-	var sum [4]byte
-	binary.BigEndian.PutUint32(sum[:], crc32.Checksum(payload, crcTable))
+	var sum [RecordTrailerLen]byte
+	binary.BigEndian.PutUint32(sum[:], crc32.Checksum(rec, crcTable))
 	rec = append(rec, sum[:]...)
 	if _, err := f.Write(rec); err != nil {
 		return err
@@ -281,46 +649,97 @@ func writeRecord(f *os.File, payload []byte) error {
 }
 
 // Read returns a copy of the payload stored at height.
+//
+// It reads ONLY the one record (audit S-7): a per-segment read handle plus
+// ReadAt, not os.ReadFile over the whole segment. A historical GET /block/{h}
+// used to allocate the entire segment (up to a gibibyte in the theoretical
+// worst case) to return one block; the cost is now the record's own size.
 func (s *Store) Read(height uint64) ([]byte, error) {
 	off, ok := s.index[height]
 	if !ok {
 		return nil, fmt.Errorf("%w: %d", ErrNotFound, height)
 	}
-	path := filepath.Join(s.dir, segmentName(height))
-	raw, err := os.ReadFile(path)
+	name := segmentName(height)
+	// Hold readMu for the whole read: it serialises the cache and keeps the
+	// handle open against a concurrent reader's eviction (the chain's read lock
+	// lets several RPC reads run at once).
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	f, err := s.readerLocked(name)
+	if err != nil {
+		return nil, err
+	}
+	size, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return nil, err
 	}
 	// The index offsets come from the store's own scan, but the segment file
 	// can be rewritten underneath an open store: nothing here may panic on
-	// those bytes.
-	if int64(len(raw)) <= off {
-		return nil, fmt.Errorf("%w: index offset %d is past the end of %s", ErrCorruptRecord, off, segmentName(height))
+	// those bytes. readRecordAt re-validates the framing - the length prefix
+	// AND its checksum - before any offset arithmetic, exactly as scanSegment
+	// does before indexing; a torn or corrupt record is reported, never
+	// trusted.
+	if off < 0 || off >= size {
+		return nil, fmt.Errorf("%w: index offset %d is past the end of %s", ErrCorruptRecord, off, name)
 	}
-	n, m := binary.Uvarint(raw[off:])
-	// A length prefix is stored data, not a trusted size: Uvarint legally
-	// yields up to 2^64-1, and int(n) overflows for anything above MaxInt64
-	// (end would wrap negative, so the truncation guard below would pass).
-	// Bound BEFORE any offset arithmetic, exactly as scanSegment does before
-	// indexing.
-	if m <= 0 || n > uint64(len(raw)) {
-		return nil, fmt.Errorf("%w: bad length at %d", ErrCorruptRecord, off)
+	n, _, err := readRecordAt(f, size, off, -1)
+	if err != nil {
+		return nil, fmt.Errorf("%w: at height %d: %v", ErrCorruptRecord, height, err)
 	}
-	start := int(off) + m
-	end := start + int(n)
-	// Defensive: end may not fall below start, and the record's trailing
-	// checksum must still lie inside the segment.
-	if end < start || end+4 > len(raw) {
-		return nil, fmt.Errorf("%w: truncated record at %d", ErrCorruptRecord, off)
+	// One buffer holds the header and the payload, so the checksum covers
+	// exactly the bytes the framing describes.
+	buf := make([]byte, RecordHeaderLen+int(n))
+	if _, err := f.ReadAt(buf, off); err != nil {
+		return nil, fmt.Errorf("%w: at height %d: cannot read record: %v", ErrCorruptRecord, height, err)
 	}
-	payload := raw[start:end]
-	want := binary.BigEndian.Uint32(raw[end : end+4])
-	if crc32.Checksum(payload, crcTable) != want {
+	var trailer [RecordTrailerLen]byte
+	if _, err := f.ReadAt(trailer[:], off+RecordHeaderLen+int64(n)); err != nil {
+		return nil, fmt.Errorf("%w: at height %d: cannot read trailer: %v", ErrCorruptRecord, height, err)
+	}
+	if crc32.Checksum(buf, crcTable) != binary.BigEndian.Uint32(trailer[:]) {
 		return nil, fmt.Errorf("%w: at height %d", ErrCorruptRecord, height)
 	}
-	out := make([]byte, len(payload))
-	copy(out, payload)
+	out := make([]byte, n)
+	copy(out, buf[RecordHeaderLen:])
 	return out, nil
+}
+
+// readerLocked returns an open read handle on the named segment, opening and
+// caching it if needed, and refreshes its LRU position. The caller must hold
+// readMu for the whole lifetime of the returned handle: an eviction closes the
+// least-recently-used handle, and closing one a reader is mid-ReadAt on would
+// turn a concurrent read into a spurious error.
+func (s *Store) readerLocked(name string) (*os.File, error) {
+	if f, ok := s.readers[name]; ok {
+		s.touchReaderLocked(name)
+		return f, nil
+	}
+	f, err := os.Open(filepath.Join(s.dir, name))
+	if err != nil {
+		return nil, err
+	}
+	if len(s.readerLRU) >= maxOpenReaders {
+		oldest := s.readerLRU[0]
+		s.readerLRU = s.readerLRU[1:]
+		if of := s.readers[oldest]; of != nil {
+			_ = of.Close()
+		}
+		delete(s.readers, oldest)
+	}
+	s.readers[name] = f
+	s.readerLRU = append(s.readerLRU, name)
+	return f, nil
+}
+
+// touchReaderLocked moves name to the most-recently-used end of the LRU.
+func (s *Store) touchReaderLocked(name string) {
+	for i, n := range s.readerLRU {
+		if n == name {
+			s.readerLRU = append(s.readerLRU[:i], s.readerLRU[i+1:]...)
+			break
+		}
+	}
+	s.readerLRU = append(s.readerLRU, name)
 }
 
 // Height returns the highest stored height.
@@ -329,20 +748,24 @@ func (s *Store) Height() (uint64, bool) { return s.last, s.have }
 // scanLocks rebuilds the lock index from the lock log.
 //
 // The error policy is deliberately asymmetric with the block segments' and
-// is the whole point of the log. What may be truncated is ONLY the one
-// signature a crash mid-write can leave here: a complete, correct length
-// prefix whose record runs past EOF. Everything else fails Open loudly,
-// never truncates:
+// is the whole point of the log. What may be truncated is ONLY what a crash
+// mid-write can leave here: the file ending inside a record - an incomplete
+// header, or a complete and VALID header whose record runs past EOF.
+// Everything else fails Open loudly, never truncates:
 //
-//   - A length prefix that is not exactly the record's constant size is
-//     corruption. A write of this record format can emit one byte - the
-//     constant - and nothing else, so a torn tail cannot produce a different
-//     one, while a single flipped bit in an intact record's length byte can.
-//     Truncating it would be how a corrupt log "repairs" itself into
-//     unlocked: the destroyed record is replaced by silence, and silence
-//     here is a validator free to prevote the very conflicting block its
-//     lock exists to refuse. The evidence is also preserved - the file is
-//     not rewritten, so what bit rot happened stays readable afterwards.
+//   - A header whose checksum does not match its length is corruption, not a
+//     torn tail: a written header's checksum travels with the length it
+//     describes, so a flipped bit in either makes the two disagree, while a
+//     crash can only fail to write them at all. Truncating it would be how a
+//     corrupt log "repairs" itself into unlocked: the destroyed record is
+//     replaced by silence, and silence here is a validator free to prevote
+//     the very conflicting block its lock exists to refuse. The evidence is
+//     also preserved - the file is not rewritten, so what bit rot happened
+//     stays readable afterwards.
+//   - A VALID header naming any length other than the constant this record
+//     format always writes is corruption too, for the same reason: a torn
+//     tail cannot produce a different length, and a corrupt one no longer
+//     escapes the framing check that catches it before it is read.
 //   - A COMPLETE record whose checksum fails means the bytes on disk changed
 //     under us or were written badly: again loud, for the same reason.
 //   - Decode is strict on top (a fixed-width payload that is not exactly
@@ -362,40 +785,228 @@ func (s *Store) scanLocks() error {
 	}
 	off := int64(0)
 	for off < int64(len(raw)) {
-		n, m := binary.Uvarint(raw[off:])
-		// A length prefix this record format cannot have written - because
-		// it always writes exactly the one-byte constant - is corruption,
-		// not a torn tail: fail loudly, never truncate here. Both parts of
-		// the check matter: one flipped bit can turn the constant prefix
-		// into either a different single byte (m stays 1) or a multi-byte
-		// varint whose DECODED value happens to equal the constant again
-		// (m becomes 2) - so a value check alone is not enough; the varint
-		// must be exactly as wide as the constant is.
-		if m != 1 || n != lockPayloadLen {
-			return fmt.Errorf("%w: lock record length prefix at offset %d of %s is not the constant %d (corruption, not a torn tail); got length %d, %d varint bytes", ErrCorruptRecord, off, lockLogName, lockPayloadLen, n, m)
+		n, recEnd, err := frame(raw, off, lockPayloadLen)
+		if err != nil {
+			if errors.Is(err, errTornRecord) {
+				// The tail a crash actually cuts: the file ends inside the
+				// record. Nothing from this offset on is intact.
+				return s.truncateTail(path, off)
+			}
+			return fmt.Errorf("%w: lock record at offset %d of %s: %v", ErrCorruptRecord, off, lockLogName, err)
 		}
-		recEnd := off + int64(m) + int64(n) + 4
-		if recEnd > int64(len(raw)) {
-			// The tail a crash actually cuts: the framing byte completed,
-			// the record never did. Nothing from this offset on is intact.
-			return s.truncateTail(path, off)
-		}
-		payStart := off + int64(m)
-		payload := raw[payStart : payStart+int64(n) : payStart+int64(n)]
-		want := binary.BigEndian.Uint32(raw[payStart+int64(n) : recEnd])
-		if crc32.Checksum(payload, crcTable) != want {
+		payStart := off + RecordHeaderLen
+		framed := raw[off : payStart+n : payStart+n]
+		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
+		if crc32.Checksum(framed, crcTable) != want {
 			return fmt.Errorf("%w: lock record checksum mismatch at offset %d of %s", ErrCorruptRecord, off, lockLogName)
 		}
-		rec, err := decodeLockRecord(payload)
+		rec, err := decodeLockRecord(raw[payStart : payStart+n])
 		if err != nil {
 			return fmt.Errorf("%w: lock record at offset %d of %s: %v", ErrCorruptRecord, off, lockLogName, err)
 		}
 		// Newest wins: a height whose lock moved appears once per move, and
 		// only the last frame carries the promise that stands.
 		s.locks[rec.Height] = rec
+		s.lockRecords++
+		off = recEnd
+	}
+	// Prune what a previous life of the chain has already left behind (audit
+	// C-13), IN MEMORY here: the file cannot be compacted until Open's append
+	// handle exists, so this bounds the map's load on a log that grew before
+	// this fix. Heights strictly below the committed head are never judged
+	// again (the driver only ever restores a lock for head+1), and the head's
+	// own record is deliberately kept - the conservative superset, and what
+	// chain_lock_test asserts survives a reopen.
+	if s.have {
+		s.pruneLockMap(s.last)
+	}
+	return nil
+}
+
+// pruneLockMap deletes every in-memory promise for a height strictly below the
+// committed head. The chain has left those heights for good: Append only
+// extends head+1, there is no reorg, and Driver.newEngine restores the lock for
+// head+1 alone. Keeping the head's own record (h == below) is deliberate
+// headroom, not a need - it is one record against the unbounded growth.
+func (s *Store) pruneLockMap(below uint64) {
+	for h := range s.locks {
+		if h < below {
+			delete(s.locks, h)
+		}
+	}
+}
+
+// scanRounds rebuilds the round index from the round log (audit C-3).
+//
+// The error policy is the lock log's, record for record: a torn tail (the
+// file ending inside a record, or a valid header whose record runs past EOF)
+// is the one shape a crash mid-write leaves and is truncated; a header whose
+// length checksum fails, a valid header naming any length other than the
+// fixed roundPayloadLen this format always writes, or a complete record whose
+// checksum fails, is corruption and fails Open loudly. The round is not a
+// safety promise, so the strictness is a choice rather than a necessity: the
+// bytes after a corrupt record cannot be framed, and a log that cannot be
+// framed cannot be trusted to say which round stands. A NEWEST record per
+// height wins, so a height whose round advanced several times reads back the
+// furthest round that reached disk.
+func (s *Store) scanRounds() error {
+	path := filepath.Join(s.dir, roundLogName)
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // no round was ever recorded
+	}
+	if err != nil {
+		return err
+	}
+	off := int64(0)
+	for off < int64(len(raw)) {
+		n, recEnd, err := frame(raw, off, roundPayloadLen)
+		if err != nil {
+			if errors.Is(err, errTornRecord) {
+				// The tail a crash actually cuts: the file ends inside the
+				// record. Nothing from this offset on is intact.
+				return s.truncateTail(path, off)
+			}
+			return fmt.Errorf("%w: round record at offset %d of %s: %v", ErrCorruptRecord, off, roundLogName, err)
+		}
+		payStart := off + RecordHeaderLen
+		framed := raw[off : payStart+n : payStart+n]
+		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
+		if crc32.Checksum(framed, crcTable) != want {
+			return fmt.Errorf("%w: round record checksum mismatch at offset %d of %s", ErrCorruptRecord, off, roundLogName)
+		}
+		rec, err := decodeRoundRecord(raw[payStart : payStart+n])
+		if err != nil {
+			return fmt.Errorf("%w: round record at offset %d of %s: %v", ErrCorruptRecord, off, roundLogName, err)
+		}
+		// Newest wins: the round only ever advances at a height, so the last
+		// frame is the position that stands.
+		s.rounds[rec.Height] = rec.Round
 		off = recEnd
 	}
 	return nil
+}
+
+// scanCerts indexes the commit-certificate log (audit C-7): a height to the
+// offset of its record. The payloads are NOT kept in memory - see the Store
+// doc - so this pass rebuilds an index, not an archive.
+//
+// The error policy is the block log's, not the lock log's: what a torn tail
+// can destroy here is archival evidence for one height, never a safety
+// promise. A certificate that never completed means this node cannot serve
+// that height until it re-adopts it, which is exactly the state persistence
+// exists to narrow; the node must not refuse to start over it. Corruption in a
+// complete record still stops the scan and fails Open, because the bytes after
+// a record whose length cannot be trusted cannot be framed at all.
+func (s *Store) scanCerts() error {
+	path := filepath.Join(s.dir, certLogName)
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // no certificate was ever recorded
+	}
+	if err != nil {
+		return err
+	}
+	off := int64(0)
+	for off < int64(len(raw)) {
+		n, recEnd, err := frame(raw, off, -1)
+		if err != nil {
+			if errors.Is(err, errTornRecord) {
+				return s.truncateTail(path, off)
+			}
+			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, certLogName, err)
+		}
+		if n < certHeightLen {
+			return fmt.Errorf("%w: certificate record at offset %d of %s carries %d bytes, too few for its height", ErrCorruptRecord, off, certLogName, n)
+		}
+		payStart := off + RecordHeaderLen
+		framed := raw[off : payStart+n : payStart+n]
+		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
+		if crc32.Checksum(framed, crcTable) != want {
+			return fmt.Errorf("%w: certificate record checksum mismatch at offset %d of %s", ErrCorruptRecord, off, certLogName)
+		}
+		height := binary.BigEndian.Uint64(raw[payStart : payStart+certHeightLen])
+		// Newest wins: a height is certified once, and the store's PutCert
+		// refuses to append a second record for it, so only a hand-written
+		// file can present two.
+		s.certIndex[height] = off
+		off = recEnd
+	}
+	return nil
+}
+
+// certHeightLen is the key the certificate log frames its payload with: the
+// height the certificate commits, big-endian, fixed width. The store does not
+// interpret the rest of the payload - the consensus package owns that
+// encoding - it only needs to find a height's record again.
+const certHeightLen = 8
+
+// PutCert appends an opaque certificate payload for height. An entry already
+// recorded for that height is kept: a committed height never changes its
+// block, so the first certificate this node proved and persisted for it is the
+// one that stands, and re-recording would only grow the log.
+func (s *Store) PutCert(height uint64, payload []byte) error {
+	if _, have := s.certIndex[height]; have {
+		return nil
+	}
+	rec := make([]byte, 0, certHeightLen+len(payload))
+	var key [certHeightLen]byte
+	binary.BigEndian.PutUint64(key[:], height)
+	rec = append(rec, key[:]...)
+	rec = append(rec, payload...)
+	off, err := s.certFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if err := writeRecord(s.certFile, rec); err != nil {
+		// Cut a partial record back off so later appends start clean; the
+		// next Open also self-heals if this truncate fails.
+		_ = s.certFile.Truncate(off)
+		return err
+	}
+	s.certIndex[height] = off
+	return nil
+}
+
+// CertAt returns a copy of the certificate payload recorded for height, and
+// whether one exists. It reads the one record, so the cert log costs memory
+// only for the record being served, however long the chain runs.
+func (s *Store) CertAt(height uint64) ([]byte, bool) {
+	off, ok := s.certIndex[height]
+	if !ok {
+		return nil, false
+	}
+	// The record was framed by scanCerts/PutCert, but the file lives on disk:
+	// re-validate rather than trusting the offset, and report absence (never
+	// a panic, never a short read) if it no longer holds.
+	header := make([]byte, RecordHeaderLen)
+	if _, err := s.certFile.ReadAt(header, off); err != nil {
+		return nil, false
+	}
+	if crc32.Checksum(header[:lengthFieldLen], crcTable) != binary.BigEndian.Uint32(header[lengthFieldLen:]) {
+		return nil, false
+	}
+	n := binary.BigEndian.Uint64(header[:lengthFieldLen])
+	if n < certHeightLen || n > uint64(math.MaxInt) {
+		return nil, false
+	}
+	body := make([]byte, n)
+	if _, err := s.certFile.ReadAt(body, off+RecordHeaderLen); err != nil {
+		return nil, false
+	}
+	framed := make([]byte, 0, RecordHeaderLen+int(n))
+	framed = append(framed, header...)
+	framed = append(framed, body...)
+	var trailer [RecordTrailerLen]byte
+	if _, err := s.certFile.ReadAt(trailer[:], off+RecordHeaderLen+int64(n)); err != nil {
+		return nil, false
+	}
+	if crc32.Checksum(framed, crcTable) != binary.BigEndian.Uint32(trailer[:]) {
+		return nil, false
+	}
+	out := make([]byte, n-certHeightLen)
+	copy(out, body[certHeightLen:])
+	return out, true
 }
 
 // encodeLockRecord renders a lock as its fixed-size payload: 8 bytes of
@@ -449,6 +1060,130 @@ func (s *Store) PutLock(rec LockRecord) error {
 		return err
 	}
 	s.locks[rec.Height] = rec
+	s.lockRecords++
+	return nil
+}
+
+// lockCompactThreshold is how many records the lock log may hold beyond the
+// promises that still stand before PruneLocks rewrites it (audit C-13). A
+// rewrite costs a file create, a full re-encode, two fsyncs and a rename, so it
+// is batched rather than paid per commit; the steady state is the live promises
+// (head and head+1) plus at most this many stale frames, instead of one frame
+// per height forever.
+const lockCompactThreshold = 256
+
+// PruneLocks drops the lock-log records for every height strictly below the
+// committed head (audit C-13): the in-memory promises always, and the on-disk
+// log once enough stale frames have accumulated to be worth a rewrite.
+//
+// SAFETY, stated because the lock is a promise and this DELETES promises. A
+// lock record for height h is read in exactly one place - Driver.newEngine's
+// restoreLock - and only for the height the engine is about to judge, which is
+// always head+1. Once Append has made head >= h durable, no engine will ever
+// be built for h again: the chain has no reorg, Append only extends head+1, and
+// the validator's promise at h could only matter on a path that re-judged h.
+// So a record below the head is unreachable by construction, and dropping it
+// cannot turn a locked validator into an unlocked one. The records that CAN be
+// read - head (needlessly kept) and head+1 (the promise that matters, never
+// below the head) - are kept. Compaction is atomic in the only way that
+// matters: the kept set is written to a temporary file, fsynced and renamed
+// over the log, so a crash leaves either the old log (a superset) or the new
+// one, and both contain every promise head+1 could need. A failure is returned
+// but is not a safety event: the old file still holds every record, and the
+// caller (Chain.Append) deliberately ignores it so a storage-maintenance
+// failure cannot park consensus.
+func (s *Store) PruneLocks(below uint64) error {
+	s.pruneLockMap(below)
+	// Compact when stale frames - records that are not the newest for their
+	// height, or whose height was just dropped - have piled up. In the common
+	// case the map holds the head and head+1 records and the log holds a
+	// handful more, so this is a no-op.
+	if s.lockRecords <= len(s.locks)+lockCompactThreshold {
+		return nil
+	}
+	return s.compactLocks()
+}
+
+// compactLocks rewrites the lock log to exactly the promises currently in
+// s.locks (one newest record per live height), atomically. The temporary file
+// becomes the store's append handle after the rename, so there is no window in
+// which the renamed log has no valid handle; see PruneLocks for the safety
+// argument.
+func (s *Store) compactLocks() error {
+	kept := make([]LockRecord, 0, len(s.locks))
+	for _, rec := range s.locks {
+		kept = append(kept, rec)
+	}
+	// Ascending height, for a deterministic file: the newest-per-height map
+	// has one record per height, so order cannot change which promise wins,
+	// but a stable order keeps a rewritten log byte-reproducible.
+	slices.SortFunc(kept, func(a, b LockRecord) int {
+		switch {
+		case a.Height < b.Height:
+			return -1
+		case a.Height > b.Height:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	// A crash between CreateTemp and Rename can leave a temporary file behind.
+	// Open ignores it (it is neither locks.log nor a .seg), but it would
+	// accumulate one per interrupted compaction, so reclaim any leftovers
+	// before writing a new one. Compaction is serialised by the chain's write
+	// lock, so no other live writer owns one of these names.
+	if stale, _ := filepath.Glob(filepath.Join(s.dir, lockLogName+".compact-*")); len(stale) > 0 {
+		for _, p := range stale {
+			_ = os.Remove(p)
+		}
+	}
+
+	tmp, err := os.CreateTemp(s.dir, lockLogName+".compact-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// CreateTemp makes the file 0600; the log has always been 0644, so keep
+	// that mode across the rewrite.
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	for _, rec := range kept {
+		if err := writeRecord(tmp, encodeLockRecord(rec)); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+			return err
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+
+	old := s.lockFile
+	oldRecords := s.lockRecords
+	s.lockFile = tmp
+	s.lockRecords = len(kept)
+	if err := os.Rename(tmpName, filepath.Join(s.dir, lockLogName)); err != nil {
+		// Nothing was renamed: restore the handle and record count, and drop
+		// the temporary file. The old log is untouched and complete.
+		s.lockFile = old
+		s.lockRecords = oldRecords
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// The rename committed. Make it durable (audit S-15): without the
+	// directory fsync a crash could leave the old log's entry in place even
+	// though the new one was renamed over it.
+	syncDir(s.dir)
+	// The old handle still names the unlinked inode; a Close failure there
+	// cannot affect the new log, so it is not reported.
+	_ = old.Close()
 	return nil
 }
 
@@ -461,14 +1196,72 @@ func (s *Store) LockAt(height uint64) (LockRecord, bool) {
 	return rec, ok
 }
 
-// Close releases both handles - the block segment and the lock log - and
-// reports BOTH failures: an early return on the first error would leak the
-// other open descriptor every time one close fails. The fields are cleared
-// unconditionally (a close error can fire after the descriptor is really
-// gone - see Append's rollover), so a repeated Close cannot spin on the
-// same handle.
+// encodeRoundRecord renders a round as its fixed-size payload: 8 bytes of
+// big-endian height followed by 4 bytes of big-endian round - exactly
+// roundPayloadLen bytes, the payload the store's CRC framing wraps. The width
+// is fixed so scanRounds can compare the prefix against this constant, as the
+// lock log does.
+func encodeRoundRecord(rec RoundRecord) []byte {
+	out := make([]byte, roundPayloadLen)
+	binary.BigEndian.PutUint64(out[0:8], rec.Height)
+	binary.BigEndian.PutUint32(out[8:12], rec.Round)
+	return out
+}
+
+// decodeRoundRecord reads encodeRoundRecord's payload back. It is strict for
+// the same reason decodeLockRecord is: a payload that is not exactly the
+// fixed-width layout is corruption, and a misframed reading must never decode
+// into a round the validator never entered.
+func decodeRoundRecord(payload []byte) (RoundRecord, error) {
+	var rec RoundRecord
+	if len(payload) != roundPayloadLen {
+		return rec, fmt.Errorf("round record payload is %d bytes, want the fixed %d", len(payload), roundPayloadLen)
+	}
+	rec.Height = binary.BigEndian.Uint64(payload[0:8])
+	rec.Round = binary.BigEndian.Uint32(payload[8:12])
+	return rec, nil
+}
+
+// PutRound records that the validator entered rec.Round at rec.Height, and
+// appends it durably before returning. Like the lock log it is append-only
+// with the newest frame per height winning, so a crash mid-advance leaves the
+// previous round intact and a restart resumes from the furthest round whose
+// record reached disk. Round heights are NOT required to be appended block
+// heights: the round belongs to the height being judged, head+1.
+func (s *Store) PutRound(rec RoundRecord) error {
+	payload := encodeRoundRecord(rec)
+	off, err := s.roundFile.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	if err := writeRecord(s.roundFile, payload); err != nil {
+		// Cut a partial record back off so later appends start clean; the
+		// next Open also self-heals if this truncate fails.
+		_ = s.roundFile.Truncate(off)
+		return err
+	}
+	s.rounds[rec.Height] = rec.Round
+	return nil
+}
+
+// RoundAt returns the newest round recorded for height, and whether one
+// exists. Absence - a height whose engine never advanced past round 0 - is
+// the legitimate zero value, not an error; corruption of the underlying log
+// already fails Open loudly, so absence can never hide a torn record.
+func (s *Store) RoundAt(height uint64) (uint32, bool) {
+	r, ok := s.rounds[height]
+	return r, ok
+}
+
+// Close releases every handle - the block segment, the lock log, the round log
+// and the certificate log - and reports ALL failures: an early return on the
+// first error would leak the other open descriptors every time one close
+// fails. The fields are cleared unconditionally (a close error can fire after
+// the descriptor is really gone - see Append's rollover), so a repeated Close
+// cannot spin on the same handle. The data-directory lock is released last, so
+// the directory admits a new writer only once this store's files are closed.
 func (s *Store) Close() error {
-	var fileErr, lockErr error
+	var fileErr, lockErr, roundErr, certErr error
 	if s.file != nil {
 		fileErr = s.file.Close()
 		s.file = nil
@@ -477,5 +1270,26 @@ func (s *Store) Close() error {
 		lockErr = s.lockFile.Close()
 		s.lockFile = nil
 	}
-	return errors.Join(fileErr, lockErr)
+	if s.roundFile != nil {
+		roundErr = s.roundFile.Close()
+		s.roundFile = nil
+	}
+	if s.certFile != nil {
+		certErr = s.certFile.Close()
+		s.certFile = nil
+	}
+	// Close the cached per-segment read handles (audit S-7) while still holding
+	// readMu, and clear the map so a repeated Close cannot close them twice.
+	s.readMu.Lock()
+	for name, f := range s.readers {
+		_ = f.Close()
+		delete(s.readers, name)
+	}
+	s.readerLRU = nil
+	s.readMu.Unlock()
+	if s.lock != nil {
+		s.lock.release()
+		s.lock = nil
+	}
+	return errors.Join(fileErr, lockErr, roundErr, certErr)
 }

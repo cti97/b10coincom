@@ -1,5 +1,24 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # The audit's B-1 also asked that govulncheck see the LIVE vulnerability
+  # database periodically, not only on pushes: a newly published advisory
+  # about a pinned dependency should fail the gate in days, not when someone
+  # next pushes. A twice-a-week schedule (and the lint job below runs ALL its
+  # checks on it - cheap) re-checks this tree against vuln.go.dev on every
+  # pass, without anyone touching the repository.
+  schedule:
+    - cron: '23 5 * * 2,5'
+
+# The workflow's token can do nothing but read: neither vet, test, release nor
+# lint needs write access to the repository. Scoping the token is the audit's
+# B-1 ask alongside SHA pins: a compromised workflow cannot do more than its
+# own steps allow with the identity those steps run under. The release job
+# publishes dist/ through actions/upload-artifact (audit B-2), which writes
+# with the workflow's own runtime token and needs no extra permission.
+permissions:
+  contents: read
 
 # Bash everywhere: the linux/darwin cross entries and the windows entries run
 # the SAME `GOOS=... GOARCH=...` env-prefixed lines, and windows-latest
@@ -12,15 +31,32 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Both actions are SHA-pinned, not tag-pinned (the audit's B-1): a tag
+      # is mutable — `uses: actions/checkout@v4` runs whatever that tag points
+      # at when the job starts, carrying this workflow's token. A commit SHA
+      # never moves; Dependabot's github-actions ecosystem opens the update
+      # PRs from one pin to the next after each upstream release. The tag
+      # each SHA matches is named in the comment beside it.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.23'
+          # The version comes from go.mod (its `go` floor and `toolchain`
+          # minimum), so the CI Go version and the module's demand cannot
+          # drift apart (the audit's B-1: '1.23' was end-of-life).
+          go-version-file: go.mod
       # -count=1 forces real test execution: without it cached results make a
-      # flaky test report green from a previous run.
+      # flaky test report green from a previous run. -timeout is the audit's
+      # T-3 ask: internal/devnet's poll loops carry wall-clock ceilings, so a
+      # slow-but-progressing run can outlive go test's default 10-minute
+      # package timeout and die with a goroutine dump — a failure that says
+      # nothing about the code. The audit's "roughly 940 s" is the tcp_test.go
+      # subset; re-measured, the package's poll ceilings now total ~1770 s
+      # (all second-literals, ~2340 s), so 20 m would still be short. 40 m
+      # clears the whole package's ceilings and is far above the measured
+      # healthy pass (~24 s), which is the only run that should ever finish.
       - run: go vet ./...
-      - run: go test -count=1 ./...
-      - run: go test -race -count=1 ./...
+      - run: go test -timeout 40m -count=1 ./...
+      - run: go test -race -timeout 40m -count=1 ./...
       - run: go build ./...
       # The milestone acceptance commands must keep printing OK with exit 0.
       # The first is the default run — its --claims default makes it pay one
@@ -33,6 +69,59 @@ jobs:
       - run: go run ./cmd/b10coin devnet --blocks 100
       - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1
       - run: go run ./cmd/b10coin devnet --validators 4 --blocks 100
+
+  # The supply-chain/lint gate (the audit's B-1): formatting, module hygiene,
+  # staticcheck and govulncheck. The two external tools are pinned by exact
+  # version and run through `go run tool@version`, which keeps them OUT of
+  # go.mod (they are developer tooling, not dependencies of this code) while
+  # making the gate reproducible: the finding set is a function of the
+  # checked-in version, not of whatever ships that week.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      # gofmt is enforced on the module's OWN source trees (`cmd`, `internal`),
+      # the only directories holding checked-in Go. The README claims the tree
+      # is gofmt-clean; this makes the claim a gate.
+      - name: gofmt -l reports nothing
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          test -z "$unformatted" || { echo "not gofmt-clean:"; echo "$unformatted"; exit 1; }
+      # shellcheck over every shell script in the tree (audit N-16): the deploy
+      # harness, the release/build scripts and the plan guard are operator-facing
+      # code that no Go test runs. The gate is `--severity=warning` so it fails
+      # on real defects (warnings and errors) without turning pre-existing
+      # info/style notes into a red CI; acceptance.sh and check-plan.sh are
+      # clean at the default severity too. shellcheck ships on GitHub's
+      # ubuntu-latest runner, but a MISSING shellcheck must never look like a
+      # clean lint: this step fails loudly rather than passing silently.
+      - name: shellcheck the scripts
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::error::shellcheck is not installed; install it (apt-get install shellcheck). This gate must not pass silently."
+            exit 1
+          fi
+          shellcheck --version
+          git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
+      # `go mod tidy` must be a no-op on a committed tree: a graph tidy wants
+      # to change means go.mod/go.sum lie about the build. The diff pins both.
+      - name: go mod tidy leaves no diff
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      # staticcheck 2026.2.1 (module honnef.co/go/tools v0.8.1), the release
+      # that matches the toolchain go.mod demands. Findings fail the job: the
+      # tree today is clean, so a new finding must be fixed or — with a
+      # written reason — excluded, never ignored silently.
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+      # govulncheck v1.8.0 (golang.org/x/vuln/cmd/govulncheck) checks
+      # call-reachable vulnerabilities against the live vuln DB at
+      # https://vuln.go.dev — module-level advisories the code never calls do
+      # not fail the gate, which is exactly the signal worth gating on.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
   # The portability matrix: every supported target is COMPILED and, crucially,
   # go-VETTED for that GOOS/GOARCH. Vet, not build, is what caught the real
@@ -55,10 +144,10 @@ jobs:
           - { os: windows-latest, goos: windows, goarch: amd64 }
           - { os: windows-latest, goos: windows, goarch: arm64 }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
       - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
       - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go vet ./...
 
@@ -69,17 +158,36 @@ jobs:
   # simply runs the one build story — replacing the single linux/arm64 job
   # this workflow carried since the Pi task. A regression that silently
   # produced only the host platform's binaries, or dropped one of the pair,
-  # fails HERE and not on a Pi flashed hours later.
+  # fails HERE and not on a Pi flashed hours later. The job then UPLOADS the
+  # whole dist/ (audit B-2: it verified and threw the bytes away): a run's
+  # artifacts are retrievable instead of rebuilt, and BUILD-INFO names the
+  # toolchain and the reproducible flags that produced them.
+  #
+  # SIGNING BOUNDARY: SHA256SUMS is signed only if B10COIN_RELEASE_SIGN_KEY
+  # points at a minisign secret key. Add a repository secret holding the key
+  # file's bytes, write it to a runner temp file in a step here, and export the
+  # path; nothing signs without it and no key belongs in this repository.
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
       - run: make release
       - run: file dist/*
-      # Belt over the script's internal assertion: 12 artifacts for 6 targets
-      # plus the checksum file, and every artifact line present in SHA256SUMS.
-      - run: test "$(ls dist | grep -vc SHA256SUMS)" -eq 12
+      # Belt over the script's internal assertion: exactly 12 b10coin-*
+      # artifacts for 6 targets (BUILD-INFO is metadata, not a binary), and
+      # every artifact line present in SHA256SUMS.
+      - run: test "$(ls dist/b10coin-* | wc -l)" -eq 12
       - run: test "$(wc -l < dist/SHA256SUMS)" -eq 12
+      # The toolchain record must exist and be non-empty (audit B-2).
+      - run: grep -q '^toolchain go' dist/BUILD-INFO
+      - run: grep -q '^flags -trimpath -buildvcs=false$' dist/BUILD-INFO
+      # Publish the artifacts (audit B-2). Pinned by commit SHA, like every
+      # other action here; the comment names the tag it matches.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: b10coin-release
+          path: dist/
+          if-no-files-found: error

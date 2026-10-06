@@ -47,14 +47,25 @@ func (a Address) String() string {
 	return AddressPrefix + strings.ToLower(b32.EncodeToString(payload))
 }
 
-// ParseAddress validates the prefix, base32 body and checksum of s.
+// ParseAddress validates the prefix, base32 body and checksum of s, and
+// accepts ONE canonical spelling of each address only (audit S-11).
 //
-// Case policy is deliberate: the "b10" PREFIX check is case-sensitive, so
-// "B10…" is rejected, while the base32 BODY is upper-cased before decoding,
-// so a lowercase body is accepted. This asymmetry is not a malleability
-// risk: an Address compares as its raw [20]byte value and String() always
-// re-renders it in lowercase, so every accepted spelling of an address
-// denotes exactly the same account.
+// Case policy: the "b10" PREFIX check is case-sensitive, so "B10…" is
+// rejected, and the base32 BODY is upper-cased before decoding. Decoding is
+// therefore case-insensitive, which by itself would accept 2^39 spellings of
+// one address, and the 24-byte payload's final base32 character carries three
+// padding bits, multiplying that by 8 more. Every one of them denotes the
+// same account (an Address compares as its raw [20]byte value), so this was
+// never a consensus or signature risk - but it IS an interop hazard: two
+// nodes, an explorer and a wallet can disagree on whether two spellings name
+// the same account, and a copy-pasted address that a peer re-renders
+// differently looks like a different account.
+//
+// The decoder still upper-cases (so the base32 alphabet is decoded in one
+// place), but the result is accepted ONLY when it re-renders to the input:
+// a.String() == s. Because String() is the single canonical form, a caller
+// that stored or displayed an address's String() can always parse it back,
+// and any other spelling is refused with ErrBadAddress.
 func ParseAddress(s string) (Address, error) {
 	var a Address
 	if !strings.HasPrefix(s, AddressPrefix) {
@@ -75,6 +86,9 @@ func ParseAddress(s string) (Address, error) {
 	sum := crypto.HashParts([]byte("b10coin-checksum"), a[:])
 	if !bytes.Equal(sum[:addressChecksumSize], raw[AddressSize:]) {
 		return a, fmt.Errorf("%w: checksum mismatch", ErrBadAddress)
+	}
+	if canonical := a.String(); canonical != s {
+		return a, fmt.Errorf("%w: non-canonical spelling (want %q)", ErrBadAddress, canonical)
 	}
 	return a, nil
 }

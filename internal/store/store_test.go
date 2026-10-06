@@ -1,8 +1,12 @@
 package store
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -92,7 +96,9 @@ func TestAppendRejectsNonSequentialHeight(t *testing.T) {
 }
 
 // A crash mid-write leaves a truncated trailing record. Open must discard
-// it rather than failing, so the node can restart and re-sync.
+// it rather than failing, so the node can restart and re-sync. The tail here
+// is the shape a crash really leaves: a COMPLETE, VALID header whose payload
+// and trailer never arrived.
 func TestTruncatedTailIsDiscardedOnOpen(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(dir)
@@ -112,8 +118,12 @@ func TestTruncatedTailIsDiscardedOnOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Length prefix claims 64 bytes, but only 3 follow.
-	if _, err := f.Write([]byte{64, 1, 2, 3}); err != nil {
+	// A valid header claiming 64 bytes, then only 3 of them: the file ends
+	// inside the record, which is the one thing only a crash can produce.
+	var header [RecordHeaderLen]byte
+	binary.BigEndian.PutUint64(header[:8], 64)
+	binary.BigEndian.PutUint32(header[8:], crc32.Checksum(header[:8], crcTable))
+	if _, err := f.Write(append(header[:], 1, 2, 3)); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
@@ -142,11 +152,56 @@ func TestTruncatedTailIsDiscardedOnOpen(t *testing.T) {
 	}
 }
 
-// A corrupted payload must be detected by the checksum.
-func TestCorruptPayloadIsDetected(t *testing.T) {
+// A header of fewer than RecordHeaderLen bytes is the other shape a crash
+// leaves: the write stopped inside the framing header itself. It is torn, not
+// corrupt, because corruption changes bytes rather than removing them.
+func TestPartialHeaderIsTreatedAsATornTail(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(dir)
+	if err := s.Append(1, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+	good, err := os.Stat(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(seg, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte{0, 0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("a partial header must be truncated, not fail Open: %v", err)
+	}
+	defer s2.Close()
+	if h, ok := s2.Height(); !ok || h != 1 {
+		t.Fatalf("Height = %d, %v; want 1, true", h, ok)
+	}
+	if st, err := os.Stat(seg); err != nil || st.Size() != good.Size() {
+		t.Fatalf("the partial header was not cut: size = %d, want %d (%v)", st.Size(), good.Size(), err)
+	}
+}
+
+// A corrupted payload must be detected by the checksum, and the scan must STOP
+// there: the record's own length is what would say where the next one starts,
+// so indexing past a record whose checksum failed would invent heights, and
+// truncating there would delete committed blocks. Open refuses, and the file
+// is left exactly as it was found.
+func TestCorruptPayloadStopsTheScanAndFailsOpen(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := Open(dir)
 	if err := s.Append(1, []byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(2, []byte("ghijkl")); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
@@ -156,18 +211,91 @@ func TestCorruptPayloadIsDetected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[2] ^= 0xFF // flip a payload byte; the length stays intact, so only the checksum can catch this
+	raw[RecordHeaderLen+2] ^= 0xFF // a payload byte of record 1; the framing stays valid
+	before := append([]byte(nil), raw...)
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(dir)
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("a corrupt payload must fail Open with ErrCorruptRecord, got %v", err)
+	}
+	after, err := os.ReadFile(seg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s2.Close()
-	if _, err := s2.Read(1); !errors.Is(err, ErrCorruptRecord) {
-		t.Fatalf("expected ErrCorruptRecord, got %v", err)
+	if !bytes.Equal(before, after) {
+		t.Fatal("Open rewrote the segment: corruption must fail loudly, never be repaired away")
+	}
+}
+
+// S-2's own case: a single flipped bit in a record's LENGTH PREFIX. The fixed
+// width header checksums the length, so the corrupt length fails its own check
+// BEFORE it is used to find the record's end - Open refuses rather than
+// "repairing" the log by truncating everything from there, which is what
+// silently deleted committed blocks before the fix.
+//
+// Two shapes are exercised: a middle record whose corrupt length would still
+// frame inside the file, and the FINAL record's corrupt length, which used to
+// overrun EOF and be deleted as if it were a torn tail.
+func TestCorruptLengthPrefixIsRefusedNotTrusted(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		flips func(raw []byte) int
+	}{
+		{
+			name: "middle record",
+			// The length field of record 2 (after record 1's "aaa").
+			flips: func(raw []byte) int { return RecordHeaderLen + 3 + RecordTrailerLen },
+		},
+		{
+			name: "final record overrunning EOF",
+			// The length field of the last record: flipping a high bit used
+			// to make the record appear to run past EOF and be truncated away.
+			flips: func(raw []byte) int {
+				rec := RecordHeaderLen + 3 + RecordTrailerLen
+				rec += RecordHeaderLen + 3 + RecordTrailerLen
+				return rec
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for h := uint64(1); h <= 3; h++ {
+				if err := s.Append(h, []byte("aaa")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			seg := filepath.Join(dir, fmt.Sprintf("%08d.seg", 0))
+			raw, err := os.ReadFile(seg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw[tc.flips(raw)] ^= 0x80 // one bit of the big-endian length
+			before := append([]byte(nil), raw...)
+			if err := os.WriteFile(seg, raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := Open(dir); !errors.Is(err, ErrCorruptRecord) {
+				t.Fatalf("a corrupt length prefix must fail Open with ErrCorruptRecord, got %v", err)
+			}
+			after, err := os.ReadFile(seg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("Open truncated the segment: a corrupt length was trusted as a torn tail")
+			}
+		})
 	}
 }
 
@@ -216,7 +344,7 @@ func TestCorruptRecordInEarlierSegmentFailsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[1] ^= 0xFF // corrupt the first record's payload byte, keeping the length valid
+	raw[RecordHeaderLen+1] ^= 0xFF // corrupt the first record's payload byte, keeping the framing valid
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -227,11 +355,14 @@ func TestCorruptRecordInEarlierSegmentFailsOpen(t *testing.T) {
 }
 
 // A complete record with a bad checksum followed by a partial trailing record
-// is the layout that exposed a height-renumbering bug in recovery: the corrupt
-// record's bytes must NOT survive while the in-memory height is rewound. The
-// repair must keep the corrupt record at its own height, so that appending on
-// top and reopening yields the same heights.
-func TestCorruptCompleteRecordThenPartialTailKeepsHeights(t *testing.T) {
+// is the layout that once exposed a height-renumbering bug: the old repair kept
+// the corrupt record at its height, truncated the partial tail, and appending
+// on top then renumbered everything. The scan now STOPS at the corrupt record,
+// so that repair cannot run at all: the store refuses to open, the corrupt
+// bytes stay exactly where they are for a human to inspect, and no height is
+// ever invented or renumbered. Recovery is an operator's deliberate act
+// (restore a backup, or cut the file by hand), not an automatic silence.
+func TestCorruptCompleteRecordThenPartialTailFailsOpen(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)
 	if err != nil {
@@ -250,42 +381,29 @@ func TestCorruptCompleteRecordThenPartialTailKeepsHeights(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Record 1 occupies bytes 0..7 (varint len + payload + crc32), so record 2
-	// starts at 8 and its payload begins at 9.
-	raw[9] ^= 0xFF
-	// Append a truncated trailing record: a length prefix claiming 64 bytes
+	// Corrupt record 2's payload: record 1 is header(12)+3+trailer(4), so
+	// record 2's payload starts 12 bytes into it.
+	raw[RecordHeaderLen+3+RecordTrailerLen+RecordHeaderLen+1] ^= 0xFF
+	// Then append a torn trailing record: a valid header claiming 64 bytes
 	// with only 3 following.
-	raw = append(raw, 64, 1, 2, 3)
+	var header [RecordHeaderLen]byte
+	binary.BigEndian.PutUint64(header[:8], 64)
+	binary.BigEndian.PutUint32(header[8:], crc32.Checksum(header[:8], crcTable))
+	raw = append(raw, append(header[:], 1, 2, 3)...)
+	before := append([]byte(nil), raw...)
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(dir)
-	if err != nil {
-		t.Fatalf("Open after repair must succeed: %v", err)
+	if _, err := Open(dir); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("a corrupt complete record must fail Open, got %v", err)
 	}
-	h, _ := s2.Height()
-	if h != 2 {
-		t.Fatalf("repaired Height() = %d, want 2 - the corrupt complete record keeps its own height", h)
-	}
-	if _, err := s2.Read(2); !errors.Is(err, ErrCorruptRecord) {
-		t.Fatalf("Read(2) = %v, want ErrCorruptRecord", err)
-	}
-	if err := s2.Append(3, []byte("three")); err != nil {
-		t.Fatal(err)
-	}
-	s2.Close()
-
-	s3, err := Open(dir)
+	after, err := os.ReadFile(seg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s3.Close()
-	if h3, _ := s3.Height(); h3 != 3 {
-		t.Fatalf("reopened Height() = %d, want 3 - heights were renumbered", h3)
-	}
-	if b, err := s3.Read(3); err != nil || string(b) != "three" {
-		t.Fatalf("Read(3) = %q, %v; want \"three\", nil", b, err)
+	if !bytes.Equal(before, after) {
+		t.Fatal("Open repaired the file instead of refusing: the scan did not stop at the first corruption")
 	}
 }
 
@@ -355,14 +473,12 @@ func TestZeroLengthPayloadRoundTrips(t *testing.T) {
 	}
 }
 
-// A length prefix is stored data, and binary.Uvarint legally decodes up to
-// 2^64-1. Read must bound it BEFORE any offset arithmetic — int(n) overflows
-// for lengths above MaxInt64, so end := start + int(n) wraps negative and the
-// old truncation guard (end+4 > len(raw)) passed, crashing Read with a slice
-// bug ([10:9]) instead of reporting corruption. scanSegment never had this
-// hole: it rejects n > len(raw) before doing arithmetic. The file must hold
-// more than 13 bytes for the old truncated-record guard to be reached with a
-// negative end at all, hence three records.
+// A length prefix is stored data. With the fixed-width header the length is
+// checksummed, so a lying length has to be given a matching header checksum to
+// reach the offset arithmetic at all - which is exactly the hand-crafted
+// attack this test builds. Read must bound it BEFORE slicing: a length near
+// 2^64 makes the record's end wrap negative, and the guard must still report
+// corruption rather than panic.
 func TestReadRejectsOverflowingLengthPrefixInsteadOfPanicking(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)
@@ -370,7 +486,7 @@ func TestReadRejectsOverflowingLengthPrefixInsteadOfPanicking(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The store is deliberately left OPEN while its file is rewritten
-	// underneath it: a reopen would repair the tail and hide the bug.
+	// underneath it: a reopen would refuse the file and hide the bug.
 	defer s.Close()
 	for h := uint64(1); h <= 3; h++ {
 		if err := s.Append(h, []byte(fmt.Sprintf("payload-%d", h))); err != nil {
@@ -383,13 +499,14 @@ func TestReadRejectsOverflowingLengthPrefixInsteadOfPanicking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) < 13 {
+	if len(raw) < RecordHeaderLen+RecordTrailerLen {
 		t.Fatalf("segment is %d bytes; the corrupt-prefix layout needs more", len(raw))
 	}
-	// Overwrite the FIRST record's length prefix with the 10-byte varint
-	// encoding of 2^64-1 (nine 0xFF continuations plus a final 0x01).
-	giant := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}
-	copy(raw, giant)
+	// Claim 2^64-1 payload bytes and re-checksum the header, so the length is
+	// "trustworthy" as far as the framing check goes and the arithmetic is
+	// really reached.
+	binary.BigEndian.PutUint64(raw[0:8], math.MaxUint64)
+	binary.BigEndian.PutUint32(raw[8:RecordHeaderLen], crc32.Checksum(raw[0:8], crcTable))
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -397,5 +514,141 @@ func TestReadRejectsOverflowingLengthPrefixInsteadOfPanicking(t *testing.T) {
 	// Must report corruption, not panic.
 	if _, err := s.Read(1); !errors.Is(err, ErrCorruptRecord) {
 		t.Fatalf("Read(1) = %v, want an error wrapping ErrCorruptRecord (and no panic)", err)
+	}
+}
+
+// The certificate log (audit C-7) is keyed by height and survives a reopen:
+// the bytes a node served for a block it holds must outlive the process that
+// adopted it, which is what lets a restarted validator answer for history
+// committed before it restarted. First record for a height wins - a committed
+// height never changes its block - and an unknown height is an absence, not an
+// error or a panic.
+func TestCertLogSurvivesReopenAndKeepsTheFirstRecordPerHeight(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCert(1, []byte("certificate-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCert(2, []byte("certificate-two")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCert(1, []byte("a second claim for the same height")); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.CertAt(1); !ok || string(got) != "certificate-one" {
+		t.Fatalf("CertAt(1) = %q, %v; want the first record for that height", got, ok)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen with a certificate log: %v", err)
+	}
+	defer s2.Close()
+	for h, want := range map[uint64]string{1: "certificate-one", 2: "certificate-two"} {
+		got, ok := s2.CertAt(h)
+		if !ok || string(got) != want {
+			t.Fatalf("CertAt(%d) after reopen = %q, %v; want %q", h, got, ok, want)
+		}
+	}
+	if _, ok := s2.CertAt(3); ok {
+		t.Fatal("CertAt on a height with no certificate reported one")
+	}
+	// The returned slice is a copy: mutating it must not change what is served.
+	got, _ := s2.CertAt(1)
+	got[0] = 'Z'
+	if again, _ := s2.CertAt(1); string(again) != "certificate-one" {
+		t.Fatalf("mutating a returned certificate changed the log: %q", again)
+	}
+}
+
+// A crash mid-append leaves the certificate log with a torn tail. The tear is
+// the one shape only a crash can leave, so Open truncates it and every earlier
+// certificate survives: losing one height's evidence costs that height's
+// service, never the node's ability to start. Corruption in a COMPLETE record
+// is a different thing and still stops the scan.
+func TestTornCertificateTailIsTruncatedAndEarlierRecordsSurvive(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutCert(1, []byte("certificate-one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(dir, certLogName)
+	intact, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A complete, valid header for a record that never finished arriving.
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header [RecordHeaderLen]byte
+	binary.BigEndian.PutUint64(header[:8], 40)
+	binary.BigEndian.PutUint32(header[8:], crc32.Checksum(header[:8], crcTable))
+	if _, err := f.Write(append(header[:], 1, 2, 3)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("a torn certificate tail must be truncated, not fail Open: %v", err)
+	}
+	defer s2.Close()
+	if got, ok := s2.CertAt(1); !ok || string(got) != "certificate-one" {
+		t.Fatalf("the certificate before the tear was lost: %q, %v", got, ok)
+	}
+	if st, err := os.Stat(logPath); err != nil || st.Size() != intact.Size() {
+		t.Fatalf("the torn certificate tail was not cut: size = %d, want %d (%v)", st.Size(), intact.Size(), err)
+	}
+}
+
+// Audit O-5: the genesis identity is recorded once and compared on every
+// later check, so a mismatched genesis is named for what it is rather than
+// surfacing after replay as a divergence.
+func TestCheckGenesisRecordsOnceAndRefusesAMismatch(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a, b [32]byte
+	a[0], b[0] = 0xA1, 0xB2
+	if err := s.CheckGenesis(a); err != nil {
+		t.Fatalf("recording the genesis: %v", err)
+	}
+	if err := s.CheckGenesis(a); err != nil {
+		t.Fatalf("the same genesis must be accepted again: %v", err)
+	}
+	if err := s.CheckGenesis(b); !errors.Is(err, ErrWrongGenesis) {
+		t.Fatalf("a different genesis gave %v, want ErrWrongGenesis", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if err := s2.CheckGenesis(b); !errors.Is(err, ErrWrongGenesis) {
+		t.Fatalf("the recorded genesis did not survive reopen: %v, want ErrWrongGenesis", err)
+	}
+	if err := s2.CheckGenesis(a); err != nil {
+		t.Fatalf("the recorded genesis was not accepted after reopen: %v", err)
 	}
 }

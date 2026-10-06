@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -121,17 +122,17 @@ func TestOpenFailsOnCorruptLockRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Flip a byte inside the record's payload - the length stays intact, so
-	// only the checksum can catch this.
+	// Flip a byte inside the record's payload - the framing stays intact, so
+	// only the record checksum can catch this.
 	logPath := filepath.Join(dir, lockLogName)
 	raw, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != 1+lockPayloadLen+4 {
-		t.Fatalf("lock log is %d bytes; expected the 1-byte length prefix, the fixed %d-byte payload (8-byte height, 4-byte round, 32-byte ID) and 4-byte CRC", len(raw), lockPayloadLen)
+	if len(raw) != RecordHeaderLen+lockPayloadLen+RecordTrailerLen {
+		t.Fatalf("lock log is %d bytes; expected the %d-byte framed header, the fixed %d-byte payload (8-byte height, 4-byte round, 32-byte ID) and the %d-byte CRC", len(raw), RecordHeaderLen, lockPayloadLen, RecordTrailerLen)
 	}
-	raw[3] ^= 0xFF // a byte inside the record's fixed-width height field
+	raw[RecordHeaderLen+3] ^= 0xFF // a byte inside the record's fixed-width height field
 	if err := os.WriteFile(logPath, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -158,17 +159,34 @@ func TestOpenFailsOnCorruptLockRecord(t *testing.T) {
 // could not tell a crashed-half-written tail from bit rot in the length byte,
 // so a flipped bit led it to destroy the intact record - Open returned nil,
 // the log went to 0 bytes on disk, and a validator that had precommitted came
-// back UNLOCKED, the exact unsafe direction. The framing's length prefix is
-// now checked against the record's constant size, so any other value is
-// corruption and fails Open; the destructive truncate is gone, the bytes
-// (the evidence) stay on disk.
+// back UNLOCKED, the exact unsafe direction. Two independent guards now stand
+// in the way, and each is exercised by its own case:
+//
+//   - the fixed-width header's checksum covers the length, so a flipped bit
+//     anywhere in it is caught before the length is used; and
+//   - a header that DOES check out must still name the one constant this
+//     record format writes, so even a hand-consistent wrong length (the shape
+//     a writer bug would produce) is refused rather than read as a torn tail
+//     and truncated.
 func TestOpenFailsOnCorruptLengthPrefixLoudly(t *testing.T) {
-	// bit 7 turns the single-byte constant prefix into a MULTI-BYTE varint
-	// (the scanner reads the next payload byte as continuation data); bit 0
-	// leaves it single-byte but with a different value. Both are exactly the
-	// one flipped bit the review demands cannot degrade a validator to
-	// unlocked, and they exercise both bad-prefix shapes.
-	for name, mask := range map[string]byte{"bit7": 0x80, "bit0": 0x01} {
+	cases := map[string]func(raw []byte){
+		"flipped-bit-overruns-EOF": func(raw []byte) {
+			// The most significant byte of the length: the record now
+			// appears to run past EOF - the exact shape that used to be
+			// truncated away as a torn tail.
+			raw[0] ^= 0x80
+		},
+		"valid-header-wrong-constant": func(raw []byte) {
+			// A length one byte too long, with the header checksum recomputed
+			// so the framing check agrees with it. Only the constant rule can
+			// tell this apart from a crash - and without it the record would
+			// be truncated away as torn.
+			binary.BigEndian.PutUint64(raw[:lengthFieldLen], lockPayloadLen+1)
+			binary.BigEndian.PutUint32(raw[lengthFieldLen:RecordHeaderLen],
+				crc32.Checksum(raw[:lengthFieldLen], crcTable))
+		},
+	}
+	for name, corrupt := range cases {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			s, err := Open(dir)
@@ -188,17 +206,17 @@ func TestOpenFailsOnCorruptLengthPrefixLoudly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(raw) != 1+lockPayloadLen+4 {
-				t.Fatalf("lock log is %d bytes, want one whole 49-byte record", len(raw))
+			if len(raw) != RecordHeaderLen+lockPayloadLen+RecordTrailerLen {
+				t.Fatalf("lock log is %d bytes, want one whole %d-byte record", len(raw), RecordHeaderLen+lockPayloadLen+RecordTrailerLen)
 			}
 			sizeBefore, err := fileSize(logPath)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if raw[0] != byte(lockPayloadLen) {
-				t.Fatalf("the length prefix is %#x, want the constant %#x the writer emits", raw[0], byte(lockPayloadLen))
+			if got := binary.BigEndian.Uint64(raw[:lengthFieldLen]); got != lockPayloadLen {
+				t.Fatalf("the length field is %d, want the constant %d the writer emits", got, lockPayloadLen)
 			}
-			raw[0] ^= mask // corrupt ONLY the length prefix
+			corrupt(raw)
 			if err := os.WriteFile(logPath, raw, 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -247,11 +265,12 @@ func TestTornLockTailIsTruncatedNotReadAsALock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate a crash inside the next record: the framing byte (the ONLY
-	// byte this format's length prefix can be), then the start of a payload
-	// for height 6 round 1 - and no checksum, because the write never
-	// completed. A tail of this shape is what a crash actually costs, and
-	// truncating it is what the repair is for.
+	// Simulate a crash inside the next record: a COMPLETE, VALID framing
+	// header, then the start of a payload for height 6 round 1 - and no
+	// checksum, because the write never completed. A tail of this shape is
+	// what a crash actually costs, and truncating it is what the repair is
+	// for. (The checksummed header is what tells the scanner the record was
+	// cut rather than corrupted: a corrupt length would fail its own check.)
 	logPath := filepath.Join(dir, lockLogName)
 	intactLen, err := fileSize(logPath)
 	if err != nil {
@@ -261,8 +280,13 @@ func TestTornLockTailIsTruncatedNotReadAsALock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tear := make([]byte, 0, 1+8+4+2)
-	tear = append(tear, byte(lockPayloadLen))
+	tear := make([]byte, 0, RecordHeaderLen+8+4+2)
+	var lb [lengthFieldLen]byte
+	binary.BigEndian.PutUint64(lb[:], lockPayloadLen)
+	tear = append(tear, lb[:]...)
+	var hc [RecordTrailerLen]byte
+	binary.BigEndian.PutUint32(hc[:], crc32.Checksum(tear[:lengthFieldLen], crcTable))
+	tear = append(tear, hc[:]...)
 	var hb [8]byte
 	binary.BigEndian.PutUint64(hb[:], 6)
 	var rb [4]byte
@@ -416,5 +440,134 @@ func TestLockAtReportsTheLiveStore(t *testing.T) {
 	}
 	if got, ok := s.LockAt(1); !ok || got != rec {
 		t.Fatalf("LockAt(1) immediately after PutLock = %+v,%v; want %+v", got, ok, rec)
+	}
+}
+
+// countLockFrames reads locks.log back through the store's own framing and
+// counts its records, so a prune test can assert the FILE really shrank rather
+// than only the map.
+func countLockFrames(t *testing.T, dir string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, lockLogName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, off := 0, int64(0)
+	for off < int64(len(raw)) {
+		_, recEnd, err := frame(raw, off, lockPayloadLen)
+		if err != nil {
+			t.Fatalf("framing locks.log at offset %d: %v", off, err)
+		}
+		n++
+		off = recEnd
+	}
+	return n
+}
+
+// PruneLocks drops every promise strictly below the committed head and keeps
+// the two that can still be read - the head's own record (conservative
+// headroom) and the head+1 promise a restart restores - across both the live
+// store and a reopen (audit C-13).
+func TestPruneLocksDropsBelowTheCommittedHead(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The chain has committed through height 5, so the store knows its head on
+	// reopen.
+	for h := uint64(1); h <= 5; h++ {
+		if err := s.Append(h, []byte("block")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for h := uint64(1); h <= 6; h++ {
+		if err := s.PutLock(LockRecord{Height: h, Round: 1, BlockID: idOf(byte(h))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.PruneLocks(5); err != nil {
+		t.Fatal(err)
+	}
+	for h := uint64(1); h < 5; h++ {
+		if _, ok := s.LockAt(h); ok {
+			t.Fatalf("LockAt(%d) survived a prune below the committed head 5", h)
+		}
+	}
+	if _, ok := s.LockAt(5); !ok {
+		t.Fatal("the head's own lock was pruned; the fix deliberately keeps it")
+	}
+	if _, ok := s.LockAt(6); !ok {
+		t.Fatal("the head+1 promise was pruned: that record is the lock a restart reads, and dropping it reopens the M3 lock-persistence finding")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reopen prunes below its committed head too, so the same promises
+	// stand and the same heights are absent.
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	for h := uint64(1); h < 5; h++ {
+		if _, ok := s2.LockAt(h); ok {
+			t.Fatalf("after reopen LockAt(%d) is present for a height below the committed head", h)
+		}
+	}
+	if _, ok := s2.LockAt(5); !ok {
+		t.Fatal("the head's own lock did not survive the reopen")
+	}
+	if _, ok := s2.LockAt(6); !ok {
+		t.Fatal("the head+1 promise did not survive the reopen")
+	}
+}
+
+// A log of repeated relocks at one height grows one frame per move; once
+// enough stale frames have accumulated, PruneLocks rewrites the file to the
+// promises that stand, and the rewrite replays identically (audit C-13).
+func TestPruneLocksCompactsTheLog(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const moves = lockCompactThreshold + 2
+	newest := LockRecord{}
+	for i := 0; i < moves; i++ {
+		newest = LockRecord{Height: 9, Round: uint32(i), BlockID: idOf(byte(i))}
+		if err := s.PutLock(newest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if before := countLockFrames(t, dir); before != moves {
+		t.Fatalf("fixture: locks.log holds %d frames before the prune, want %d", before, moves)
+	}
+
+	if err := s.PruneLocks(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := countLockFrames(t, dir); got != 1 {
+		t.Fatalf("the compacted log holds %d frames, want the single newest promise", got)
+	}
+	if got, ok := s.LockAt(9); !ok || got != newest {
+		t.Fatalf("after compaction LockAt(9) = %+v,%v; want the newest %+v", got, ok, newest)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if got, ok := s2.LockAt(9); !ok || got != newest {
+		t.Fatalf("across the reopen the compacted log reads %+v,%v; want the newest %+v", got, ok, newest)
+	}
+	if _, ok := s2.LockAt(8); ok {
+		t.Fatal("a height that was never locked appeared after compaction")
 	}
 }

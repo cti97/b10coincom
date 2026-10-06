@@ -83,8 +83,6 @@ func TestRestoreLockKeepsTheStrongerPromise(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	parent := crypto.HashParts([]byte("parent"))
 	h := round0ProposerHeight(t, cfg, 0, true, parent)
-	e := newTestEngine(t, cfg, 0, h, parent)
-
 	older := testProposer(t, cfg, h, 0, parent)
 	newer := conflictingBlock(t, cfg, h, 1, parent, 0xC1)
 
@@ -92,7 +90,7 @@ func TestRestoreLockKeepsTheStrongerPromise(t *testing.T) {
 	// from an earlier life of this same height that was WEAKER (round 0): the
 	// engine must keep the promise it already had, not regress to the
 	// restored one.
-	e = newTestEngine(t, cfg, 0, h, parent)
+	e := newTestEngine(t, cfg, 0, h, parent)
 	e.restoreLock(1, newer.ID())
 	e.restoreLock(0, older.ID()) // an older record arrives late (disk order aside, it happens)
 	if got := e.lk.round(); got != 1 {

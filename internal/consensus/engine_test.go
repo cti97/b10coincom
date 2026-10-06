@@ -5,7 +5,9 @@ import (
 	"math"
 	"testing"
 
+	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
+	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -53,12 +55,23 @@ func conflictingBlock(t *testing.T, cfg Config, height uint64, round uint32, par
 
 // newTestEngine builds an engine for committee index idx, starting at height 1
 // with an all-zero parent and no lock.
+//
+// Since round 3 (F3), NewEngine installs a refusing default validation seam -
+// a driver-less engine never prevotes FOR an unjudged block. The consensus
+// tests here model the consensus logic on a block whose chain validity is
+// not under test (the chain's seam has its own tests, and the driver wiring
+// is exercised by the driver and committee tests), so the fixture DELIBERATELY
+// replaces the refusal with an accepting validator - a visible assignment,
+// the exact act the F3 design requires, never an absence of wiring. Tests of
+// the refusal itself build their engine directly with NewEngine and keep the
+// default.
 func newTestEngine(t *testing.T, cfg Config, idx int, height uint64, parent [32]byte) *Engine {
 	t.Helper()
 	priv := testCommitteeKey(idx)
 	e := NewEngine(cfg, height, parent, priv, func(h uint64, r uint32, p [32]byte) (types.Block, error) {
 		return testProposer(t, cfg, h, r, p), nil
 	})
+	e.SetValidate(func(*types.Block) error { return nil }) // accept: chain validity is not this file's subject
 	if e.Locked() {
 		t.Fatal("a fresh engine must not be locked: the lock's zero value is round 0, which is a real round")
 	}
@@ -308,7 +321,7 @@ func TestNonProposerEmitsANilPrevoteWhenNoProposalArrives(t *testing.T) {
 	h := round0ProposerHeight(t, cfg, 1, false, parent)
 	e := newTestEngine(t, cfg, 1, h, parent)
 
-	e.OnTimeout(TimeoutEvent{Height: h, Round: 0, Step: StepPrevote})
+	e.OnTimeout(TimeoutEvent{Height: h, Round: 0})
 	outs := e.Drain()
 
 	found := false
@@ -342,7 +355,7 @@ func TestThreeTimeoutsAdvanceTheRoundOneNilPrevoteEach(t *testing.T) {
 			t.Fatalf("fixture: the engine is at round %d, want %d", e.Round(), ended)
 		}
 		// The driver's shape: fire the timer for the round the engine is in.
-		e.OnTimeout(TimeoutEvent{Height: e.Height(), Round: e.Round(), Step: e.Step()})
+		e.OnTimeout(TimeoutEvent{Height: e.Height(), Round: e.Round()})
 		outs := e.Drain()
 		if len(outs) != 1 {
 			t.Fatalf("round %d: the timeout must emit exactly the owed nil prevote, got %d message(s)",
@@ -368,9 +381,9 @@ func TestThreeTimeoutsAdvanceTheRoundOneNilPrevoteEach(t *testing.T) {
 	// and an event for another height are all ignored: only the current round
 	// can run out of time, and only the driver knows which one that is.
 	for _, stale := range []TimeoutEvent{
-		{Height: h, Round: 0, Step: StepPrevote},     // a round already left
-		{Height: h, Round: 99, Step: StepPropose},    // a round never entered
-		{Height: h + 1, Round: 3, Step: StepPropose}, // another height
+		{Height: h, Round: 0},     // a round already left
+		{Height: h, Round: 99},    // a round never entered
+		{Height: h + 1, Round: 3}, // another height
 	} {
 		e.OnTimeout(stale)
 		if e.Round() != 3 {
@@ -400,7 +413,7 @@ func TestTimeoutIntoTheNextRoundKeepsTheLock(t *testing.T) {
 	}
 	e.Drain() // clear the precommit the lock emitted
 
-	e.OnTimeout(TimeoutEvent{Height: e.Height(), Round: e.Round(), Step: e.Step()})
+	e.OnTimeout(TimeoutEvent{Height: e.Height(), Round: e.Round()})
 
 	if e.Round() != 1 {
 		t.Fatalf("the timeout did not advance the round, still at %d", e.Round())
@@ -591,6 +604,10 @@ func TestUnjustifiedProposalIsNotPrevoted(t *testing.T) {
 // proposal above prevotes a conflicting block the moment its justification
 // checks out - three quorum prevotes for that block at the claimed round. Unlock
 // on evidence is liveness; without this half the gate would be a permanent stop.
+//
+// The proposal is offered at round 2 with a polka formed at round 1 (audit C-9
+// requires ValidRound < Round): the lock is at round 0, the polka is strictly
+// newer, and the proposing round is newer still.
 func TestJustifiedProposalUnlocksALockedValidator(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	parent := crypto.HashParts([]byte("parent"))
@@ -598,12 +615,13 @@ func TestJustifiedProposalUnlocksALockedValidator(t *testing.T) {
 	blkA := testProposer(t, cfg, h, 0, parent)
 	lockedID := blkA.ID()
 	e := lockedEngineAtRound1(t, cfg, 1, h, parent, lockedID)
+	e.enterRound(2) // the polka below formed in round 1; the proposal is offered in round 2
 
 	blkB := conflictingBlock(t, cfg, h, 1, parent, 0xB7)
 	idB := blkB.ID()
-	p1 := cfg.Proposer(h, 1, parent)
+	p1 := cfg.Proposer(h, 2, parent)
 	propB := &Proposal{
-		Height: h, Round: 1, Block: blkB, ValidRound: 1, Validator: p1,
+		Height: h, Round: 2, Block: blkB, ValidRound: 1, Validator: p1,
 		Justification: encodeJustification([]*Vote{
 			voteFrom(t, cfg, 0, MsgPrevote, h, 1, idB),
 			voteFrom(t, cfg, 1, MsgPrevote, h, 1, idB),
@@ -741,10 +759,8 @@ func TestJustificationMustProveQuorumForTheProposalsOwnBlock(t *testing.T) {
 // A ValidRound that does not fit the VoteSet's uint32 round must be REJECTED
 // outright, never truncated: uint32(MaxUint32+1) is 0, so a silent truncation
 // would tally the carried evidence for round 0 and grant an unlock at a round
-// the proposal never claimed. The boundary is pinned from BOTH sides: the
-// evidence below is genuine quorum prevotes, so anything other than the range
-// guard would let the too-large claim through, while exactly MaxUint32 - where
-// no truncation occurs - must still verify.
+// the proposal never claimed. The evidence below is a genuine quorum, so only
+// the range guard can be what refuses the too-large claim.
 func TestValidRoundAboveUint32IsRejected(t *testing.T) {
 	cfg := evenCommittee(t, 4, 1)
 	parent := crypto.HashParts([]byte("parent"))
@@ -779,20 +795,814 @@ func TestValidRoundAboveUint32IsRejected(t *testing.T) {
 		t.Fatalf("a proposal whose ValidRound cannot fit a uint32 round must not be prevoted, got %d message(s)", len(left))
 	}
 
-	// The other side of the boundary: exactly MaxUint32 FITS, so with evidence
-	// genuinely from that round the justification verifies.
+	// The other side of the boundary is now the C-9 rule: no uint32 proposing
+	// round is strictly GREATER than MaxUint32, so the largest ValidRound that
+	// can ever verify is MaxUint32-1, offered at Round MaxUint32.
 	justAtMax := encodeJustification([]*Vote{
-		voteFrom(t, cfg, 0, MsgPrevote, h, math.MaxUint32, blk.ID()),
-		voteFrom(t, cfg, 1, MsgPrevote, h, math.MaxUint32, blk.ID()),
-		voteFrom(t, cfg, 2, MsgPrevote, h, math.MaxUint32, blk.ID()),
+		voteFrom(t, cfg, 0, MsgPrevote, h, math.MaxUint32-1, blk.ID()),
+		voteFrom(t, cfg, 1, MsgPrevote, h, math.MaxUint32-1, blk.ID()),
+		voteFrom(t, cfg, 2, MsgPrevote, h, math.MaxUint32-1, blk.ID()),
 	})
 	pMax := &Proposal{
-		Height: h, Round: 0, Block: blk, ValidRound: math.MaxUint32,
+		Height: h, Round: math.MaxUint32, Block: blk, ValidRound: math.MaxUint32 - 1,
 		Justification: justAtMax, Validator: p0,
 	}
 	pMax.Sig = signProposal(t, cfg, pMax)
 	got, err := e.verifyJustification(pMax)
-	if err != nil || got != math.MaxUint32 {
-		t.Fatalf("a ValidRound of exactly MaxUint32 fits a uint32 and must verify, got round %d, err %v", got, err)
+	if err != nil || got != math.MaxUint32-1 {
+		t.Fatalf("a ValidRound of MaxUint32-1 at Round MaxUint32 must verify, got round %d, err %v", got, err)
+	}
+}
+
+// C-9's boundary, from BOTH sides, each with a GENUINE quorum as the carried
+// evidence - so the proposal-round comparison, and nothing else, is what
+// refuses or admits the claim. At the boundary a proposal offered at round 1
+// may not claim a polka at round 1: the block would be quoting a quorum that
+// could not have formed before its own proposal went out. One round lower is a
+// real earlier polka and verifies.
+func TestValidRoundAtTheProposalRoundIsRejected(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	idx := 1
+	// A height where THIS engine is the round-1 proposer, so the proposal
+	// passes the proposer check and the boundary rule is what refuses it.
+	h := roundProposerHeight(t, cfg, idx, 1, parent)
+	e := newTestEngine(t, cfg, idx, h, parent)
+	blk := testProposer(t, cfg, h, 1, parent)
+
+	just := encodeJustification([]*Vote{
+		voteFrom(t, cfg, 0, MsgPrevote, h, 1, blk.ID()),
+		voteFrom(t, cfg, 1, MsgPrevote, h, 1, blk.ID()),
+		voteFrom(t, cfg, 2, MsgPrevote, h, 1, blk.ID()),
+	})
+	p := &Proposal{
+		Height: h, Round: 1, Block: blk, ValidRound: 1,
+		Justification: just, Validator: cfg.Proposer(h, 1, parent),
+	}
+	p.Sig = signProposal(t, cfg, p)
+
+	if _, err := e.verifyJustification(p); !errors.Is(err, ErrBadJustification) {
+		t.Fatalf("ValidRound == Round must be refused with ErrBadJustification, got %v", err)
+	}
+	// Behaviourally: no vote may rest on it, and the step must not move.
+	if err := e.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatalf("OnMessage returned %v; want silent refusal", err)
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("a proposal claiming a polka at its own round was prevoted (%d message(s))", len(left))
+	}
+	if e.Step() != StepPropose {
+		t.Fatalf("the boundary proposal moved the step to %s", e.Step())
+	}
+}
+
+// The other side of C-9's boundary: ValidRound == Round-1 is a genuinely
+// earlier polka and verifies when its evidence is a real quorum.
+func TestValidRoundOneBelowTheProposalRoundVerifies(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, true, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+	blk := testProposer(t, cfg, h, 0, parent)
+
+	just := encodeJustification([]*Vote{
+		voteFrom(t, cfg, 0, MsgPrevote, h, 0, blk.ID()),
+		voteFrom(t, cfg, 1, MsgPrevote, h, 0, blk.ID()),
+		voteFrom(t, cfg, 2, MsgPrevote, h, 0, blk.ID()),
+	})
+	p := &Proposal{
+		Height: h, Round: 1, Block: blk, ValidRound: 0,
+		Justification: just, Validator: cfg.Proposer(h, 1, parent),
+	}
+	p.Sig = signProposal(t, cfg, p)
+
+	got, err := e.verifyJustification(p)
+	if err != nil || got != 0 {
+		t.Fatalf("ValidRound == Round-1 with a real quorum must verify at round 0, got %d, err %v", got, err)
+	}
+}
+
+// The validation seam is ENFORCED, not conventional (round-3 F3). After the
+// C-2 fix removed the envelope-vs-header-proposer equality (necessarily: a
+// locked re-proposal offers another validator's block), a block's header
+// proposer key and signature are checked ONLY by the seam - so a driver-less
+// engine built through the EXPORTED NewEngine used to prevote bytes nobody
+// ever verified. The constructor now installs a default seam that refuses
+// every block, and only a visible replacement (SetValidate, or the driver's
+// direct wiring) can enable a FOR prevote - a prevotable engine cannot arise
+// from forgetting to wire something.
+func TestEngineWithoutAValidationSeamNeverPrevotesForABlockItDidNotJudge(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 0, true, parent)
+
+	// The mechanism, asserted where it lives: the exported constructor's
+	// default seam is installed (never nil) and refuses with its named error.
+	// Checked AFTER the behavioural verdicts below, so a mutant removing the
+	// installation fails on the behaviour the finding is about, not only on
+	// the fixture check.
+	p0 := NewEngine(cfg, h, parent, testCommitteeKey(0), func(hh uint64, rr uint32, pp [32]byte) (types.Block, error) {
+		return testProposer(t, cfg, hh, rr, pp), nil
+	})
+
+	// Proposer side: the seam-less engine IS this round's proposer. It still
+	// proposes (refusing to propose is not the fix - rounds must stay
+	// leavable) but must NIL-prevote its own emission: the block was never
+	// judged, and FOR would stake a vote on bytes nobody authenticated.
+	if err := p0.StartProposing(); err != nil {
+		t.Fatal(err)
+	}
+	sawProposal, sawFor, sawNil := false, false, false
+	for _, o := range p0.Drain() {
+		if p := tryProposal(o.Data); p != nil {
+			sawProposal = true
+		}
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote {
+			if v.IsNil() {
+				sawNil = true
+			} else {
+				sawFor = true
+			}
+		}
+	}
+	if !sawProposal {
+		t.Fatal("fixture: the proposer emitted no proposal; the fixture must exercise the prevote")
+	}
+	if sawFor {
+		t.Fatal("a driver-less engine PREVOTED FOR its own proposal: the header proposer's key and signature were never checked by anyone - the driver-less prevote hole F3 closes")
+	}
+	if !sawNil {
+		t.Fatal("the seam-less engine was silent instead of nil-prevoting: a validator that casts nothing leaves its weight out of the nil tally and stalls the round")
+	}
+
+	// Follower side: a perfectly signed, well-formed proposal from the real
+	// round proposer arrives at a seam-less engine. Same verdict: the refusal
+	// is about the missing judge, not the bytes, so the verdict is nil - once.
+	p1 := NewEngine(cfg, h, parent, testCommitteeKey(1), func(hh uint64, rr uint32, pp [32]byte) (types.Block, error) {
+		return testProposer(t, cfg, hh, rr, pp), nil
+	})
+	blk := testProposer(t, cfg, h, 0, parent)
+	p := &Proposal{Height: h, Round: 0, Block: blk, ValidRound: -1, Validator: cfg.Proposer(h, 0, parent)}
+	p.Sig = signProposal(t, cfg, p)
+	if err := p1.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatalf("the seam-less engine must still accept the signed proposal as round data, got %v", err)
+	}
+	outs := p1.Drain()
+	if len(outs) != 1 {
+		t.Fatalf("the seam-less follower emitted %d message(s) for one unusable proposal, want exactly the nil prevote", len(outs))
+	}
+	v, err := DecodeVote(outs[0].Data)
+	if err != nil || v.Type != MsgPrevote || !v.IsNil() {
+		t.Fatal("the seam-less follower's only emission was not a nil prevote: either it prevoted FOR unjudged bytes or it emitted nothing at all")
+	}
+	if p1.Locked() {
+		t.Fatal("the seam-less engine locked a block its refusal itself named unusable")
+	}
+
+	// The mechanism, now that the behaviour is pinned: the exported
+	// constructor's default seam is installed (never nil) and refuses with
+	// its named error - the detail that makes the refusal hold for every
+	// exported construction, not just this fixture's two engines.
+	if p0.validate == nil {
+		t.Fatal("NewEngine must install a default validation seam; a nil field is the bypass this fix closed")
+	}
+	if err := p0.validate(nil); !errors.Is(err, errNoValidationSeam) {
+		t.Fatalf("NewEngine's default seam returned %v, want the named refusal errNoValidationSeam", err)
+	}
+
+	// And the nil-proof wiring: SetValidate(nil) - the assignment that would
+	// restore the hole through the exported API - cannot be made at all.
+	defer func() {
+		if recover() == nil {
+			t.Fatal("SetValidate(nil) did not panic: the exported API can silently disable the validation seam again")
+		}
+	}()
+	p1.SetValidate(nil)
+}
+
+// A future-round vote is membership-checked BEFORE any signature verification
+// (round-3 F2, the audit's C-8 discipline): IndexOf is a linear scan the
+// engine pays anyway, an Ed25519 verification is not, and the old order let
+// any peer force one verification per frame with a self-signed future-round
+// vote. The instrument is crypto.VerifyHook - an observation point that
+// counts exactly the Ed25519 evaluations; production never sets it.
+func TestAFutureRoundVoteFromANonMemberCostsNoSignatureVerification(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	someID := crypto.HashParts([]byte("some-later-block"))
+	h := round0ProposerHeight(t, cfg, 0, false, parent)
+	e := newTestEngine(t, cfg, 0, h, parent)
+
+	strangerPub, strangerPriv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifications := 0
+	crypto.VerifyHook = func() { verifications++ }
+	defer func() { crypto.VerifyHook = nil }()
+
+	// Eight self-signed future-round votes from a key NOT in the committee:
+	// per frame, the old order paid one Ed25519 verification (each vote's
+	// signature is genuinely valid - the peer is just not a member), the new
+	// order pays none. Rounds 1..4 are also inside the C-3 future buffer, so
+	// they reach the round's VoteSet and are refused there as ErrNotValidator;
+	// rounds 5..8 fall outside it and are refused by the out-of-window path's
+	// own membership check. Either way the frame is REFUSED - the error is the
+	// engine saying so, not a fatal condition - and neither verification nor
+	// evidence may move.
+	for r := uint32(1); r <= 8; r++ {
+		v := &Vote{Type: MsgPrevote, Height: h, Round: r, BlockID: someID, Validator: strangerPub}
+		hash := v.SigningHash()
+		v.Sig = crypto.Sign(strangerPriv, hash[:])
+		if err := e.OnMessage(EncodeVote(v)); err != nil && !errors.Is(err, ErrNotValidator) {
+			t.Fatal(err)
+		}
+	}
+	if verifications != 0 {
+		t.Fatalf("%d non-member frame(s) each forced an Ed25519 verification before the membership check: the free check must run first (want 0 verifications)", verifications)
+	}
+	if len(e.future) != 0 {
+		t.Fatalf("non-member future-round votes left %d recorded entr(y/ies): a stranger's vote must also be refused for recording", len(e.future))
+	}
+
+	// Non-vacuity control 1: the branch DOES verify a member's vote - exactly
+	// one verification for the member's valid future vote, which is then
+	// recorded. A hook that never fires cannot pass this test, and the
+	// reorder cannot have silenced the evidence path.
+	if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, 1, MsgPrevote, h, 5, someID))); err != nil {
+		t.Fatal(err)
+	}
+	if verifications != 1 {
+		t.Fatalf("a member's valid future-round vote reached %d verification(s), want exactly 1: the reorder must keep authentication", verifications)
+	}
+	if p := e.future[1]; p == nil || p.Round != 5 {
+		t.Fatal("the member's valid future-round vote was not recorded: the branch under test never ran")
+	}
+
+	// Non-vacuity control 2: membership first does not mean trust members -
+	// a member's vote with a corrupted signature is verified (the free pass
+	// would be the next hole) and recorded nowhere.
+	bad := voteFrom(t, cfg, 2, MsgPrevote, h, 7, someID)
+	bad.Sig[0] ^= 0xff
+	if err := e.OnMessage(EncodeVote(bad)); err != nil {
+		t.Fatal(err)
+	}
+	if verifications != 2 {
+		t.Fatalf("a member's corrupted future-round vote reached %d verification(s), want 2: membership first must not skip the member's own verification", verifications)
+	}
+	if _, seen := e.future[2]; seen {
+		t.Fatal("a member's badly signed future-round vote was recorded: the reorder dropped the signature gate")
+	}
+}
+
+// sealedChainFixture opens a REAL chain under cfg's committee so an engine can
+// carry the driver's validation seam: the seam's judgement is the chain's own
+// ValidateNext - the same policy Append runs - against a chain whose head the
+// engine actually judges. The returned parent is the engine's parent (the
+// chain's genesis head) and the height is head+1.
+func sealedChainFixture(t *testing.T, cfg Config) (*chain.Chain, uint64, [32]byte) {
+	t.Helper()
+	g := genesis.Devnet()
+	g.Validators = cfg.Committee
+	g.Params.CommitteeSize = len(cfg.Committee)
+	ch, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ch.Close() })
+	parent := ch.Head().ID()
+	return ch, ch.Head().Header.Height + 1, parent
+}
+
+// attackProposalForStateRoot builds the audit C-1 attack at (height, round):
+// an envelope whose every authenticity check is honest - the real round
+// proposer's key signed it, the header height matches the envelope, the
+// parent matches the engine's - carrying a block whose StateRoot is garbage.
+// The proposer in the attack "builds a normal block, overwrites Header.
+// StateRoot with garbage, re-signs": the re-sign means the ENVELOPE'S
+// signature is a perfectly valid one. What cannot be honest is the root.
+func attackProposalForStateRoot(t *testing.T, cfg Config, height uint64, round uint32, parent [32]byte) (*Proposal, [32]byte) {
+	t.Helper()
+	pPub := cfg.Proposer(height, round, parent)
+	b := types.Block{Header: types.Header{
+		Height:     height,
+		ParentHash: parent,
+		StateRoot:  [32]byte{0xde, 0xad, 0xbe, 0xef},
+		TxRoot:     types.ComputeTxRoot(nil),
+		Timestamp:  int64(1_700_000_000 + height),
+		Proposer:   pPub,
+	}}
+	if err := b.ValidateStructure(); err != nil {
+		t.Fatalf("fixture: the attack block must be structurally valid: %v", err)
+	}
+	p := &Proposal{Height: height, Round: round, Block: b, ValidRound: -1, Validator: pPub}
+	p.Sig = signProposal(t, cfg, p)
+	return p, b.ID()
+}
+
+// The audit C-1 attack, at the engine level: a fresh validator receives a
+// correctly signed proposal from the round's proposer whose block claims a
+// garbage state root. Before the seam existed, this proposal was prevoted,
+// the polka formed, the lock was taken - and the chain then refused the
+// block, parking the node forever. Now the seam judges the block BEFORE any
+// vote: the engine prevotes NIL and never locks.
+//
+// Non-vacuity is structural: maybePrevote only runs when the engine ACCEPTED
+// the proposal (stored it), so the emitted nil prevote itself proves the
+// attack travelled past the envelope and proposer checks. The refusal is
+// therefore attributable to the block content alone.
+func TestGarbageStateRootProposalIsNilPrevotedAndNeverLocked(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	ch, height, parent := sealedChainFixture(t, cfg)
+	e := newTestEngine(t, cfg, 1, height, parent)
+	e.SetValidate(ch.ValidateNext)
+
+	attack, attackID := attackProposalForStateRoot(t, cfg, height, 0, parent)
+	if err := e.OnMessage(EncodeProposal(attack)); err != nil {
+		t.Fatalf("the attack proposal must pass the envelope checks as protocol data, got %v", err)
+	}
+
+	// The refusal must SPEAK: exactly one nil prevote, so the round can end
+	// and the committee can move to a later round's honest proposal.
+	outs := e.Drain()
+	if got := drainTypes(outs); got[MsgPrevote] != 1 {
+		t.Fatalf("the garbage-root proposal produced %v prevote emission(s); want exactly one (the nil prevote)", got)
+	}
+	for _, o := range outs {
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote {
+			if !v.IsNil() {
+				t.Fatalf("the engine prevoted %x for a block whose state root it cannot accept; want nil", v.BlockID[:8])
+			}
+			if v.Height != height || v.Round != 0 {
+				t.Fatalf("the refusal prevote sits at (h=%d, r=%d), want (h=%d, r=0)", v.Height, v.Round, height)
+			}
+		}
+	}
+	// And the lock must never have been taken on the garbage block - the
+	// persisted promise the old behaviour wrote was what made every restart
+	// re-pin the halt.
+	if e.Locked() {
+		locked := e.lk.blockID()
+		if locked == attackID {
+			t.Fatalf("the engine locked on %x: a garbage-root proposal must not reach a lock", locked[:8])
+		}
+		t.Fatalf("the engine locked (on %x) without a usable evidence path", locked[:8])
+	}
+}
+
+// The positive control over the C-1 seam, from the SAME fixture shape: a
+// legitimately valid proposal - block built by the round's proposer through
+// the chain's own Build, real state root included - MUST still be prevoted.
+// This kills the failure mode where the fix refuses everything: a seam that
+// rejects a block Chain.Build signed would show nothing here but a stalled
+// committee.
+func TestAValidBlockIsStillPrevotedThroughTheSeam(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	ch, height, parent := sealedChainFixture(t, cfg)
+	e := newTestEngine(t, cfg, 1, height, parent)
+	e.SetValidate(ch.ValidateNext)
+
+	pPub := cfg.Proposer(height, 0, parent)
+	b, err := ch.Build(testCommitteeKey(cfg.IndexOf(pPub)), nil, ch.Head().Header.Timestamp+1)
+	if err != nil {
+		t.Fatalf("fixture: chain.Build must produce the valid proposal block: %v", err)
+	}
+	p := &Proposal{Height: height, Round: 0, Block: *b, ValidRound: -1, Validator: pPub}
+	p.Sig = signProposal(t, cfg, p)
+	if err := e.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatal(err)
+	}
+
+	outs := e.Drain()
+	prevoted := false
+	for _, o := range outs {
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote && v.BlockID == b.ID() {
+			prevoted = true
+		}
+	}
+	if !prevoted {
+		t.Fatal("a valid proposal was not prevoted through the seam: the engine must not refuse blocks its own chain policy accepts")
+	}
+	if e.Locked() {
+		// Only the engine's own prevote is tallied so far (1 of the quorum
+		// of 3): the lock must NOT have formed. This pins that the control
+		// case ends in the same mid-round state the attack case refused
+		// from, and that prevoting did not itself take a lock.
+		locked := e.lk.blockID()
+		t.Fatalf("the control engine locked without a polka (on %x): the fixture drifted from one self prevote", locked[:8])
+	}
+}
+
+// The envelope/header height disagreement is a PROTOCOL ERROR refused at the
+// proposal's face (audit C-1): the block a polka would carry must be the
+// block at the height being decided. The proposal is not stored, nothing is
+// prevoted, and no lock forms.
+func TestProposalHeaderHeightMismatchIsAProtocolError(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, true, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+
+	blk := testProposer(t, cfg, h, 0, parent)
+	// The block claims the NEXT height while the envelope names the round's
+	// own: exactly the shape a commit-would-fail-forever proposal has if it
+	// were allowed past the face checks.
+	blk.Header.Height = h + 1
+	p := &Proposal{Height: h, Round: 0, Block: blk, ValidRound: -1, Validator: cfg.Proposer(h, 0, parent)}
+	p.Sig = signProposal(t, cfg, p)
+
+	err := e.OnMessage(EncodeProposal(p))
+	if !errors.Is(err, ErrBadProposalHeight) {
+		t.Fatalf("a header-height mismatch must be refused as a protocol error, got %v", err)
+	}
+	if e.proposal != nil {
+		t.Fatal("the mismatched proposal was stored as this round's proposal")
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("a refused proposal must not be prevoted, got %d message(s)", len(left))
+	}
+	if e.lk.locked() {
+		locked := e.lk.blockID()
+		zero := [32]byte{}
+		if locked != zero {
+			t.Fatal("the lock moved without any evidence")
+		}
+	}
+}
+
+// roundProposerHeight returns the first height in 1..99 at which wantIdx's key
+// is the proposer at the given ROUND (round0ProposerHeight is the round-0
+// special case).
+func roundProposerHeight(t *testing.T, cfg Config, wantIdx int, round uint32, parent [32]byte) uint64 {
+	t.Helper()
+	for h := uint64(1); h < 100; h++ {
+		if string(cfg.Proposer(h, round, parent)) == string(cfg.Committee[wantIdx].PubKey) {
+			return h
+		}
+	}
+	t.Fatalf("fixture: no height in 1..99 has validator %d proposer at round %d", wantIdx, round)
+	return 0 // unreachable
+}
+
+// engineLockedAtRoundN is a proposal-receiving engine (idx idx, NOT the round-0
+// proposer at the returned height) locked on blkA.ID() in round 0 - via a
+// proposal it received and a quorum of prevotes it tallied - and then parked in
+// the round the proposer will be drawn for. The propose function is caller
+// supplied so the locked-proposing tests can record whether a fresh block was
+// ever built at all.
+func engineLockedAtRound0(t *testing.T, cfg Config, idx int, height uint64, parent [32]byte, blkA types.Block, propose ProposeFn) *Engine {
+	t.Helper()
+	e := NewEngine(cfg, height, parent, testCommitteeKey(idx), propose)
+	// The polka below is the fixture's premise, so chain validity is granted
+	// explicitly (round 3, F3): NewEngine's default seam refuses every block,
+	// and an engine leaving that refusal in place can never be locked by it.
+	e.SetValidate(func(*types.Block) error { return nil })
+	if e.Locked() {
+		t.Fatal("fixture: a fresh engine must not be locked")
+	}
+	p := &Proposal{Height: height, Round: 0, Block: blkA, ValidRound: -1, Validator: cfg.Proposer(height, 0, parent)}
+	p.Sig = signProposal(t, cfg, p)
+	if err := e.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < len(cfg.Committee) && cfg.Quorum() > uint64(i); i++ {
+		if i == idx {
+			continue // the engine's own prevote already sits in its tally
+		}
+		if uint64(i) >= cfg.Quorum() && !e.Locked() {
+			break
+		}
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, i, MsgPrevote, height, 0, blkA.ID()))); err != nil {
+			t.Fatal(err)
+		}
+		if e.Locked() {
+			break
+		}
+	}
+	if !e.Locked() || e.lk.round() != 0 || e.lk.blockID() != blkA.ID() {
+		t.Fatalf("fixture: the engine must be locked on the polka'd block at round 0 (locked=%v round=%d)",
+			e.Locked(), e.lk.round())
+	}
+	if out := e.Drain(); len(out) == 0 {
+		t.Fatal("fixture: locking should have produced output; the outbox must be drained here")
+	}
+	if e.lockedBlock == nil || e.lockedBlock.ID() != blkA.ID() {
+		t.Fatal("fixture: the lock must retain the locked block's bytes for the re-proposal")
+	}
+	return e
+}
+
+// A validator locked on block B and later drawn as proposer must propose B -
+// with the polka that locked it as the justification - and must NOT build a
+// fresh block (audit C-2). A fresh block would be nil-prevoted by the proposer
+// itself, which is exactly why the pre-fix rounds never ended once a third of
+// power had locked.
+func TestLockedProposerReProposesItsLockedBlock(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	idx := 1
+	h := roundProposerHeight(t, cfg, idx, 1, parent)
+	blkA := testProposer(t, cfg, h, 0, parent)
+
+	built := false
+	propose := func(hh uint64, r uint32, p [32]byte) (types.Block, error) {
+		built = true
+		return testProposer(t, cfg, hh, r, p), nil
+	}
+	e := engineLockedAtRound0(t, cfg, idx, h, parent, blkA, propose)
+	e.enterRound(1)
+
+	if err := e.StartProposing(); err != nil {
+		t.Fatalf("the locked proposer must re-propose, got error: %v", err)
+	}
+	if built {
+		t.Fatal("the locked proposer built a FRESH block: it must re-propose its locked one")
+	}
+
+	// Exactly one proposal was emitted (plus the proposer's own prevote of
+	// it): scan ONE drained batch - Drain clears, so a second drain here
+	// would find nothing that the first one already took.
+	var prop *Proposal
+	prevoted := false
+	for _, o := range e.Drain() {
+		if p := tryProposal(o.Data); p != nil {
+			if prop != nil {
+				t.Fatal("more than one proposal was emitted")
+			}
+			prop = p
+		}
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote && !v.IsNil() && v.BlockID == blkA.ID() {
+			prevoted = true
+		}
+	}
+	if prop == nil {
+		t.Fatal("no proposal was emitted")
+	}
+	proposedID := prop.Block.ID()
+	lockedID := blkA.ID()
+	if proposedID != lockedID {
+		t.Fatalf("the proposer proposed %x; it is locked on %x and must propose that", proposedID[:8], lockedID[:8])
+	}
+	if prop.ValidRound != 0 {
+		t.Fatalf("the re-proposal claims ValidRound %d; the locked polka was formed at round 0", prop.ValidRound)
+	}
+	// The carried justification must be the polka itself: a quorum of real
+	// prevotes for the locked block at the claimed round, re-tallied through
+	// the same gate a peer runs.
+	if len(prop.Justification) == 0 {
+		t.Fatal("the re-proposal carries no justification - no proof-of-lock")
+	}
+	vs := NewVoteSet(cfg, h, uint32(prop.ValidRound), MsgPrevote)
+	for _, raw := range decodeVotes(prop.Justification) {
+		v, err := DecodeVote(raw)
+		if err != nil {
+			t.Fatalf("the carried justification holds an undecodable vote: %v", err)
+		}
+		if _, err := vs.Add(v); err != nil {
+			t.Fatalf("the carried justification holds a vote that fails verification: %v", err)
+		}
+	}
+	if !vs.HasQuorum(blkA.ID()) {
+		t.Fatal("the carried justification does not reach quorum for the locked block")
+	}
+
+	// The proposer must also prevote its own re-proposal - nil-prevoting its
+	// own proposal was the other half of the C-2 defect.
+	if !prevoted {
+		t.Fatal("the proposer did not prevote its own re-proposal")
+	}
+
+	// And the proof must WORK on a peer: a validator that never saw this
+	// proposal before - unlocked, holding nothing - prevotes the locked block
+	// on the carried evidence alone. This is the justification doing its job:
+	// what the proposer asserts, an honest peer can check.
+	// A peer judges the re-proposal in the round it names: like every honest
+	// validator it has moved through the timeout into round 1 (the round the
+	// re-proposal is proposed in), so the round-match onProposal requires
+	// holds.
+	peer := newTestEngine(t, cfg, 2, h, parent)
+	peer.enterRound(1)
+	if err := peer.OnMessage(EncodeProposal(prop)); err != nil {
+		t.Fatal(err)
+	}
+	peerPrevoted := false
+	for _, o := range peer.Drain() {
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote && v.BlockID == blkA.ID() {
+			peerPrevoted = true
+		}
+	}
+	if !peerPrevoted {
+		t.Fatal("a peer refused the justified re-proposal: the proof-of-lock does not unlock or convince")
+	}
+	if peer.Locked() {
+		t.Fatal("the peer's PREVOTE must not take a lock on its own")
+	}
+}
+
+// The inverse half of the locked-proposer rule: a locked proposer holding NO
+// bytes for its locked ID - the lock restored from the store as an ID alone,
+// or taken over prevotes whose proposal never arrived - has nothing to
+// re-propose. It falls through to the fresh build, and its own lock then
+// judges the result: it must nil-prevote its own fresh proposal (a differing
+// block is refused), and the fresh build must go out through the propose seam.
+// What it must never do is prevote a block its lock does not name.
+func TestLockedProposerWithoutBytesFallsThroughToARefusedFreshBuild(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	idx := 1
+	h := round0ProposerHeight(t, cfg, idx, true, parent)
+
+	built := false
+	propose := func(hh uint64, r uint32, p [32]byte) (types.Block, error) {
+		built = true
+		return conflictingBlock(t, cfg, hh, r, p, 0x5E), nil
+	}
+	e := NewEngine(cfg, h, parent, testCommitteeKey(idx), propose)
+	// The restart shape: the promise comes back from the store as (round, ID)
+	// alone - no block bytes, no votes.
+	e.restoreLock(0, crypto.HashParts([]byte("locked-block-id")))
+	if !e.Locked() || e.lockedBlock != nil || len(e.lockedVotes) != 0 {
+		t.Fatalf("fixture: the restored lock must exist and carry no bytes")
+	}
+
+	if err := e.StartProposing(); err != nil {
+		t.Fatalf("a byte-less locked proposer falls through to its fresh build, got error: %v", err)
+	}
+	if !built {
+		t.Fatal("the fresh build never ran through the propose seam")
+	}
+	// Exactly one proposal; and its own prevote of it MUST BE NIL - the lock
+	// refuses a block it does not name, and the proposer is as bound by that
+	// as any peer.
+	var prop *Proposal
+	selfPrevoteNil := false
+	for _, o := range e.Drain() {
+		if p := tryProposal(o.Data); p != nil {
+			if prop != nil {
+				t.Fatal("more than one proposal was emitted")
+			}
+			prop = p
+		}
+		if v, err := DecodeVote(o.Data); err == nil && v.Type == MsgPrevote {
+			if v.IsNil() {
+				selfPrevoteNil = true
+			} else {
+				vID := v.BlockID
+				t.Fatalf("the byte-less locked proposer PREVOTED its own fresh block %x: its lock must refuse it", vID[:8])
+			}
+		}
+	}
+	if prop == nil {
+		t.Fatal("no proposal was emitted")
+	}
+	if prop.Block.ID() == crypto.HashParts([]byte("locked-block-id")) {
+		t.Fatal("the emitted proposal is the locked block: the fixture must hold no bytes for it")
+	}
+	if !selfPrevoteNil {
+		t.Fatal("the proposer did not nil-prevote its own fresh proposal through the lock rule")
+	}
+	if e.proposalEn == nil || e.proposalEn.ValidRound != -1 {
+		t.Fatalf("the fallback fresh proposal must claim no polka, got vr %d", func() int64 {
+			if e.proposalEn != nil {
+				return e.proposalEn.ValidRound
+			}
+			return -999
+		}())
+	}
+}
+
+// A signing key outside the committee is refused with an ERROR, never a panic
+// (audit C-11). The engine used to sign the vote, deliver it to its own tally,
+// and panic when the tally refused it as ErrNotValidator; emitVote now checks
+// membership FIRST and returns the error, and CheckMembership is the same check
+// a driver calls before it drives the engine (see
+// TestNewDriverRefusesAKeyOutsideTheCommittee). The state is CONSTRUCTED here -
+// a stranger key at a known height - not provoked through a buffer or a race.
+func TestANonMemberEngineReturnsAnErrorInsteadOfPanicking(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+
+	_, stranger, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewEngine(cfg, h, parent, stranger, nil)
+
+	if err := e.CheckMembership(); !errors.Is(err, ErrNotValidator) {
+		t.Fatalf("CheckMembership for a stranger key = %v, want ErrNotValidator", err)
+	}
+	// A timeout owes a nil prevote; for a non-member that emission must come
+	// back as an error naming the real reason, not crash the process.
+	if err := e.OnTimeout(TimeoutEvent{Height: h, Round: 0}); !errors.Is(err, ErrNotValidator) {
+		t.Fatalf("a non-member engine's timeout = %v, want ErrNotValidator (the panic is gone)", err)
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("a non-member engine emitted %d message(s); it must sign nothing at all", len(left))
+	}
+}
+
+// C-12's decision, pinned: nil prevotes are tallied but have NO protocol
+// effect. A whole committee's nil prevotes at the current round do not
+// precommit, lock, commit, or advance the round; only OnTimeout leaves it. The
+// engine's comments now say exactly this. A future nil-polka fast round change
+// would replace this test, and that change is what would need a new safety
+// argument.
+func TestNilPrevotesDoNotLeaveTheRound(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+	e := newTestEngine(t, cfg, 1, h, parent)
+	e.Drain()
+
+	for i := 0; i < len(cfg.Committee); i++ {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, i, MsgPrevote, h, 0, [32]byte{}))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if e.Round() != 0 {
+		t.Fatalf("nil prevotes moved the engine to round %d; only a timeout may leave a round (audit C-12)", e.Round())
+	}
+	if e.Step() == StepPrecommit || e.Step() == StepCommit {
+		t.Fatalf("nil prevote weight moved the engine to step %s; it must have no protocol effect", e.Step())
+	}
+	if e.Locked() {
+		t.Fatal("nil prevotes locked the engine, though there is no block to promise about")
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("nil prevotes produced %d emission(s)", len(left))
+	}
+	// The tally DID observe the weight, so a future nil-polka rule has it even
+	// though nothing decides on it today.
+	if got := e.prevotes.NilPower(); got != 4 {
+		t.Fatalf("nil weight tallied as %d, want the committee's 4", got)
+	}
+}
+
+// solePrevote requires exactly one outbound message and returns it decoded as
+// a prevote.
+func solePrevote(t *testing.T, outs []Outbound) *Vote {
+	t.Helper()
+	if len(outs) != 1 {
+		t.Fatalf("the engine emitted %d message(s), want exactly one prevote", len(outs))
+	}
+	v, err := DecodeVote(outs[0].Data)
+	if err != nil || v.Type != MsgPrevote {
+		t.Fatalf("the single emission is not a decodable prevote (err %v, type %d)", err, v.Type)
+	}
+	return v
+}
+
+// C-10's documented gap, pinned: the lock and the round are durable, the
+// prevote is not. A validator that prevotes FOR a block, crashes and restarts
+// at the same (height, round) casts a SECOND, independently signed prevote at
+// that round - here a NIL one, because the protocol does not retransmit the
+// proposal it prevoted. This is the evidence M5 slashing must punish, not a
+// safety hole: the lock is persisted before the precommit, and one validator's
+// capped weight cannot supply the one-third intersection two conflicting
+// quorums would need (see Driver.persistRound's C-10 note).
+func TestARestartDoesNotRememberAPrevote(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("parent"))
+	idx := 1
+	h := round0ProposerHeight(t, cfg, idx, false, parent)
+	blkA := testProposer(t, cfg, h, 0, parent)
+	accept := func(*types.Block) error { return nil }
+
+	// First life: the round-0 proposal arrives and this validator prevotes FOR.
+	first := NewEngine(cfg, h, parent, testCommitteeKey(idx), nil)
+	first.SetValidate(accept)
+	p := &Proposal{Height: h, Round: 0, Block: blkA, ValidRound: -1, Validator: cfg.Proposer(h, 0, parent)}
+	p.Sig = signProposal(t, cfg, p)
+	if err := first.OnMessage(EncodeProposal(p)); err != nil {
+		t.Fatal(err)
+	}
+	firstVote := solePrevote(t, first.Drain())
+	if firstVote.IsNil() || firstVote.BlockID != blkA.ID() {
+		t.Fatal("fixture: the first life must prevote FOR the round-0 block")
+	}
+
+	// Restart: a fresh engine at the same height and round, same key. The
+	// round is restored; the prevote is not, by design (audit C-10).
+	second := NewEngine(cfg, h, parent, testCommitteeKey(idx), nil)
+	second.SetValidate(accept)
+	second.restoreRound(0)
+	if err := second.OnTimeout(TimeoutEvent{Height: h, Round: 0}); err != nil {
+		t.Fatalf("the restarted engine's timeout: %v", err)
+	}
+	secondVote := solePrevote(t, second.Drain())
+	if !secondVote.IsNil() {
+		t.Fatalf("the restarted engine prevoted %x; the no-proposal timeout must prevote NIL", secondVote.BlockID[:8])
+	}
+	if secondVote.Height != h || secondVote.Round != 0 {
+		t.Fatalf("the second prevote is for (%d,%d), want (%d,0)", secondVote.Height, secondVote.Round, h)
+	}
+	// Two prevotes, one (height, round), one key, different block IDs: the
+	// equivocation the persisted lock cannot prevent and M5 slashing must.
+	if string(firstVote.Validator) != string(secondVote.Validator) {
+		t.Fatal("fixture: both lives must sign with the same validator key")
+	}
+	if firstVote.BlockID == secondVote.BlockID {
+		t.Fatal("fixture: the two prevotes must disagree for this test to say anything")
 	}
 }
