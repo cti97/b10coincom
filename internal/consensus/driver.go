@@ -91,14 +91,20 @@ type Driver struct {
 	appendRefused bool
 }
 
-// maxRoundEscalation caps the timeout ladder (audit C-2): a round's deadline
-// is TimeoutBase + min(round, maxRoundEscalation)*TimeoutStep from the clock
-// reading, so an undecided height settles into a FIXED round cadence instead
-// of growing its timeouts without bound. The escalation exists to let slow
-// committees converge; past this many rounds it has done all the good it can
-// and only makes recovery after a stall linearly slower. With the shipped
-// defaults (200ms base, 100ms step) rounds top out at 1.8s; a testnet keeps
-// proposing steadily instead of crawling to multi-second rounds.
+// maxRoundEscalation is the STRIDE of one round-resync jump: jumpTarget
+// (engine.go) never leaves the engine's current round by more than this many
+// rounds on a single timeout, so one member's claim cannot park the engine at
+// a round it would take an unbounded number of timeouts to reach.
+//
+// It is NOT a cap on the timeout ladder, and it has not been one since the
+// round-divergence review. It used to be: Tick re-armed each round at
+// TimeoutBase + min(round, maxRoundEscalation)*TimeoutStep, on audit C-2's
+// reasoning that "past this many rounds escalation has done all the good it
+// can". That reasoning was wrong, and its error was not a matter of degree: a
+// ladder that SATURATES is a ladder that cannot close a round divergence at
+// all, because a flat cadence makes a round gap an INVARIANT (see Tick's re-arm
+// below, which carries the whole argument and the test that pins it). The
+// escalation's reach grows without bound again, exactly as it did before C-2.
 const maxRoundEscalation = uint32(16)
 
 // NewDriver starts a driver that will extend ch from its current head.
@@ -438,20 +444,51 @@ func (d *Driver) Tick(nowMillis int64) {
 		// construction, which is where CheckMembership now puts it.
 		_ = d.eng.OnTimeout(TimeoutEvent{Height: d.eng.Height(), Round: d.eng.Round()})
 		// The round the engine is in NOW, after OnTimeout advanced it, gets
-		// the base timeout plus its own step - CAPPED at maxRoundEscalation
-		// steps (audit C-2): each round therefore runs longer than the one
-		// before it until the cap, after which every round runs the same
-		// fixed cadence. A height that cannot decide must not grow its
-		// timeouts without bound: unbounded growth made every later round
-		// linearly slower forever, so a committee that recovered late would
-		// still crawl. A new round's propose phase still runs before the
-		// next timer can fire: the deadline is at least TimeoutBase from a
-		// clock reading taken this tick.
-		escalation := d.eng.Round()
-		if escalation > maxRoundEscalation {
-			escalation = maxRoundEscalation
-		}
-		d.timeoutAt = d.now + d.cfg.TimeoutBase + int64(escalation)*d.cfg.TimeoutStep
+		// the base timeout plus its own step - and the ladder escalates by one
+		// step per round WITHOUT BOUND: escalation == round, no saturation
+		// (audit C-2's cap is removed; see maxRoundEscalation).
+		//
+		// WHY THERE IS NO SATURATING CAP. This deadline is doing two jobs, and
+		// the second one is the only round-resynchronizer the protocol has:
+		//
+		//  1. Backoff: a round that cannot decide is given more time than the
+		//     one before it.
+		//  2. Catch-up: the deadline is STRICTLY INCREASING in the round, so of
+		//     two engines the one holding the SMALLER round fires SOONER and
+		//     gains on the other, round after round. A quorum needs three
+		//     votes IN ONE ROUND and an engine votes only in the round it is
+		//     in, so a divergence of live rounds has to reach 0 for the height
+		//     to decide; job 2 is what drives it there.
+		//
+		// A cap that SATURATES the ladder (the C-2 form, min(round, K) steps)
+		// destroys job 2 from round K on: every round past K runs the SAME
+		// cadence, so every engine leaves exactly one round per timeout and the
+		// gap between them is INVARIANT. That is not "recovery that is merely
+		// slower"; it is an absorbing state, reached permanently in one step.
+		// The other closer, jumpTarget (engine.go), deliberately requires
+		// TotalPower - Quorum + 1 of the power and so cannot help the shape
+		// that matters most: a committee whose live set is EXACTLY quorum, with
+		// one live seat ahead of the rest. Three live seats of a four-seat
+		// committee is that shape - three Raspberry Pis with one restarted or
+		// briefly delayed - and there one live seat holds 1 of the bar's 2, so
+		// the laggards step +1 forever and the height never decides.
+		//
+		// Nor can the cap be SOFTENED rather than removed. The escalation is an
+		// integer, so a schedule that is strictly increasing in the round must
+		// grow by at least one step per round - i.e. it must be at least this
+		// ladder. Any cap-shaped schedule (a smaller step past K, a logarithm,
+		// any sub-linear growth) has rounds r, r+1 with the SAME deadline, and
+		// that one flat step is the same absorbing state at that one round
+		// pair: engines sitting at r and r+1 would step in lockstep forever.
+		// Demanding that no round pair can be trapped therefore forces the
+		// ladder to be linear, and the choice is forced rather than tuned.
+		//
+		// The cost is stated honestly rather than hidden: an undecided height
+		// now grows its rounds' cost without bound. But a height that CANNOT
+		// decide is not helped by a fixed cadence - it still never decides, at
+		// any cadence - while a height that CAN decide is exactly the one this
+		// asymmetry carries to a commit. That is the trade C-2 got backwards.
+		d.timeoutAt = d.now + d.cfg.TimeoutBase + int64(d.eng.Round())*d.cfg.TimeoutStep
 	}
 	d.flush()
 }

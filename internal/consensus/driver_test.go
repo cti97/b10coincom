@@ -2092,56 +2092,15 @@ func TestALostPrecommitQuorumRecoversThroughTheLockedReProposal(t *testing.T) {
 	}
 }
 
-// The round ladder must be CAPPED (audit C-2): an undecided height's rounds
-// end on the ladder, and an uncapped ladder makes every succeeding round
-// linearly slower forever - recovery latency grows without bound. With the
-// cap the ladder saturates: every round past maxRoundEscalation runs at the
-// same fixed cadence.
-//
-// The fixture is the blocked-quorum pair (quorum 2, one live validator): the
-// height can never commit, so the ladder rides out to the cap on its own. The
-// ghost never votes, so no future-round evidence ever accumulates and the raw
-// ladder is what this measures.
-func TestRoundTimeoutsAreCapped(t *testing.T) {
-	d, _, _, _, _, _ := blockedQuorumFixture(t)
-
-	now := int64(5) // below the first deadline: arms the ladder at +TimeoutBase
-	maxDelta := int64(0)
-	for r := uint32(0); r < maxRoundEscalation+8; r++ {
-		d.Tick(now)
-		if d.eng.Round() != r {
-			t.Fatalf("fixture: the engine is at round %d, want %d", d.eng.Round(), r)
-		}
-		delta := d.timeoutAt - d.now
-		want := roundBase + int64(minInt64(r, maxRoundEscalation))*roundStep
-		if delta != want {
-			t.Fatalf("round %d's deadline is TimeoutBase+%d*TimeoutStep = %d, want %d: the ladder %s",
-				r, minInt64(r, maxRoundEscalation), delta, want,
-				func() string {
-					if delta > want {
-						return "grew past its cap"
-					}
-					return "fell short of the ladder"
-				}())
-		}
-		if delta > maxDelta {
-			maxDelta = delta
-		}
-		now = d.timeoutAt
-	}
-	// Saturation is real, not asserted: the sampled deltas stopped growing and
-	// the maximum sits exactly at the capped cadence.
-	if maxDelta != roundBase+int64(maxRoundEscalation)*roundStep {
-		t.Fatalf("the ladder's maximum delta %d != the capped TimeoutBase+%d*TimeoutStep: the cap would not have bound", maxDelta, maxRoundEscalation)
-	}
-}
-
-func minInt64(a, b uint32) int64 {
-	if int64(b) < int64(a) {
-		return int64(b)
-	}
-	return int64(a)
-}
+// The round ladder's cadence is pinned by
+// TestRoundTimeoutsNeverSaturateSoTheLadderAlwaysClosesAGap
+// (internal/consensus/round_divergence_test.go). The test that used to live
+// here, TestRoundTimeoutsAreCapped, asserted the OPPOSITE: that from round
+// maxRoundEscalation on every round ran the same fixed deadline. That
+// saturation was the defect - a flat cadence makes a round gap an invariant, so
+// a committee whose live set is exactly quorum and whose seats have drifted
+// could never decide - and it is exactly what the replaced test was measuring,
+// so it is gone rather than weakened.
 
 // A timeout must JUMP the ladder when members holding more than one third of
 // the committee's total power signed prevotes at rounds ahead of the current

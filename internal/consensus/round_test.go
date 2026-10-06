@@ -2,12 +2,15 @@ package consensus
 
 // Audit C-3's own pins: the per-height multi-round vote buffer, the
 // commit-from-any-round rule and the persisted (height, round). The already
-// shipped halves of C-3 - the capped TimeoutStep ladder and the power-gated,
-// stride-bounded round jump - have their existing tests in driver_test.go
-// (TestRoundTimeoutsAreCapped, TestTimeoutJumpsOnFutureRoundEvidence,
+// shipped halves of C-3 - the escalating TimeoutStep ladder and the
+// power-gated, stride-bounded round jump - have their existing tests in
+// driver_test.go (TestTimeoutJumpsOnFutureRoundEvidence,
 // TestTimeoutJumpNeedsDistinctMembersNotOneByzantine,
 // TestJumpGateCountsPowerNotSeats, TestJumpNeverTravelsFurtherThanABoundedStride)
-// and are deliberately untouched here.
+// and are deliberately untouched here. The ladder's escalation is pinned by
+// TestRoundTimeoutsNeverSaturateSoTheLadderAlwaysClosesAGap in
+// round_divergence_test.go: its C-2 saturation was removed, because a flat
+// cadence makes a round gap an absorbing state.
 
 import (
 	"testing"
