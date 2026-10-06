@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/cti97/b10coincom/internal/relay"
+	"github.com/cti97/b10coincom/internal/wire"
 )
 
 const helpText = `b10coin-relay — the forwarder validators dial outbound to
@@ -137,15 +138,26 @@ enforce any of it)
 
   --access-token-file (default unset) enables the relay's own access control
   (audit N-8). When set, the file's bytes (a trailing newline is trimmed) are
-  the PRE-SHARED FIRST FRAME: every connection must send exactly those bytes
-  as its first frame or it is closed and counted unauthorized. The relay
+  the PRE-SHARED TOKEN, and at least 16 bytes are required: a shorter one is
+  brute-forced by dialling it (one byte falls in 256 attempts), so a relay
+  that would advertise a gate it cannot defend refuses to start instead. The
+  exchange is three FIXED frames and no decoding anywhere: the relay writes
+  the gate greeting as a connection's first frame, the connection must then
+  send exactly the token bytes or be closed and counted unauthorized, and the
+  relay confirms with a fixed accepted frame - which is how a node tells a
+  refusal from a dead socket. A node that does not see the greeting refuses to
+  send its token at all, so a relay started WITHOUT --access-token-file can no
+  longer be handed the secret only to forward it to every peer. The relay
   compares length and bytes only - it still decodes nothing, so this is not a
   second implementation of any wire semantics. This is the defence that works
   where an IP allowlist cannot (home validators behind CGNAT, rotating
   outbound addresses): the token is a secret both ends hold, not an address.
   The token frame is consumed, never forwarded, and an unauthenticated
-  connection is never registered, so it receives nothing. With no token the
-  relay behaves exactly as before.
+  connection is never registered, so it receives nothing. The token travels in
+  PLAINTEXT over TCP and is REPLAYABLE (a constant compared once per
+  connection, never challenged or expired): run it over a trusted path such as
+  a VPN, and treat its disclosure as a connection someone else can make. With
+  no token the relay sends no greeting and behaves exactly as before.
 
 Operation: run one instance per validator star, behind the VPS firewall
 allowlisting the validator IPs where that is practical - and with
@@ -284,7 +296,7 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 	writeTimeout := fs.Int("write-timeout", int(relay.DefaultWriteTimeout/time.Second), "seconds a connection's write queue may stay backed up before it is closed and its queued bytes and slot released; the queue must drain to empty within it")
 	readTimeout := fs.Int("read-timeout", int(relay.DefaultReadTimeout/time.Second), "seconds one frame may take to arrive; expiry closes that connection and releases its slot")
 	keepAlive := fs.Int("keepalive", int(relay.DefaultKeepAlive/time.Second), "TCP keepalive probe period in seconds; half-open connections are reaped by the kernel after unanswered probes")
-	accessTokenFile := fs.String("access-token-file", "", "path to a file whose bytes are the pre-shared first-frame access token (audit N-8); each connection must send exactly those bytes first or be closed. Compared by length and equality; the relay decodes nothing")
+	accessTokenFile := fs.String("access-token-file", "", "path to a file whose bytes are the pre-shared access token (audit N-8; at least 16 bytes). The relay announces the gate with a fixed first frame, each connection must then send exactly those bytes or be closed and counted unauthorized, and the relay confirms with a second fixed frame. Compared by length and equality, decoded by nothing; the token is plaintext over TCP and replayable, so run it over a trusted path")
 
 	err := fs.Parse(args)
 	switch {
@@ -313,6 +325,16 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 		if len(token) == 0 {
 			fmt.Fprintln(stderr, "the access-token file is empty; remove the flag or give it at least one byte")
 			return "", relay.Options{}, fmt.Errorf("access-token file %q is empty", *accessTokenFile)
+		}
+		// The token is the only credential this relay has, checked once per
+		// dial, and it is sent in plaintext. A short one is brute-forced at
+		// network speed (a 1-byte token falls in 256 dials), so the floor is
+		// enforced HERE, before a listener exists, and on the node side too
+		// (tcp.New) - a length limit on one end only is a limit an operator
+		// can miss.
+		if len(token) < wire.MinRelayAccessTokenBytes {
+			fmt.Fprintf(stderr, "the access token is %d bytes; at least %d are required, or it is brute-forced by dialling\n", len(token), wire.MinRelayAccessTokenBytes)
+			return "", relay.Options{}, fmt.Errorf("access-token file %q is %d bytes; at least %d are required", *accessTokenFile, len(token), wire.MinRelayAccessTokenBytes)
 		}
 	}
 	return *addr, relay.Options{

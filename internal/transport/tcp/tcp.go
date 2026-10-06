@@ -26,7 +26,11 @@
 // validator's handshake saw - including the validator's own name, whose
 // refusal (below) used to be permanent, because the maintainer did not
 // redial. A relay connection is therefore registered under the fixed name
-// "relay:<addr>" and its handshake WRITES the local ID and reads nothing.
+// "relay:<addr>" and its handshake WRITES the local ID and reads nothing -
+// unless a relay access token is configured, in which case it reads exactly
+// the relay's two fixed gate frames and writes the token between them
+// (adoptRelay), so that the secret is never offered to a relay that has not
+// announced it gates.
 // This is a transport-level name, NOT authentication - through a relay,
 // every frame arrives under the one relay name, and verifying who is behind
 // it is the wire layer's signed HELLO plus the membership checks of the node
@@ -51,11 +55,13 @@
 // handle (audit N-1, whose first fix introduced exactly that):
 //
 //   - the relay:<addr> name is RESERVED for this transport's own outbound
-//     relay registration. No ACCEPTED connection may claim it
-//     (ErrReservedPeerName): the name is produced only by RelayPeerName on
-//     the dialling side, an inbound peer never legitimately presents it, and
-//     the deterministic form would otherwise let any stranger who can reach
-//     the listener claim the relay link's identity for free.
+//     relay registration. No DIRECT connection - accepted or dialled - may
+//     claim it (ErrReservedPeerName): the name is produced only by
+//     RelayPeerName on the dialling side of an adoptRelay, no other peer
+//     legitimately presents it, and the deterministic form would otherwise
+//     let any peer the operator dials (or a stranger who can reach the
+//     listener, or a plaintext-TCP MITM at a dialed address) claim the relay
+//     link's identity for free.
 //
 //   - an outbound maintainer NEVER retires because its connection was
 //     superseded. It backs off and redials (see maintain): the rank's winner
@@ -67,9 +73,11 @@
 package tcp
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"sort"
@@ -229,15 +237,17 @@ var (
 	// mid-stream with no identity), and the connection ends. The maintainer
 	// redials like any other failure.
 	ErrHandshakeIDTooLarge = errors.New("tcp: handshake identity frame exceeds the identity bound")
-	// ErrReservedPeerName is returned when an ACCEPTED (inbound) connection
-	// announces a name this transport reserves for its own outbound
-	// registrations - the relay:<addr> form. The name is deterministic and
-	// public (RelayPeerName), so allowing an inbound claim would hand any
-	// stranger who can reach the listener the relay link's identity for
-	// free; a legitimate relay connection is dialled out in relay mode and
-	// is never the accepted side (audit N-1). The connection is closed and
-	// the real relay maintainer is untouched.
-	ErrReservedPeerName = errors.New("tcp: accepted connection announced a reserved outbound name")
+	// ErrReservedPeerName is returned when a DIRECT connection - accepted or
+	// dialled - announces a name this transport reserves for its own outbound
+	// relay registrations, the relay:<addr> form. The name is deterministic
+	// and public (RelayPeerName), so allowing a claim would hand a peer the
+	// relay link's identity for free: a stranger who can reach the listener,
+	// anyone the operator dials, or a plaintext-TCP MITM at a dialed address.
+	// A legitimate relay connection is the one adoptRelay dialled in relay
+	// mode; install refuses this prefix on every direct connection (audit
+	// N-1, dial direction closed in the fourth review round). The connection
+	// is closed and the real relay maintainer is untouched.
+	ErrReservedPeerName = errors.New("tcp: a direct connection announced a reserved outbound name")
 )
 
 // Options configures a TCP transport. Every duration and bound has a default;
@@ -294,12 +304,22 @@ type Options struct {
 	// the socket-free tests and non-consensus users want. Dialled
 	// connections are never gated: they are addresses the operator chose.
 	Admit func(frame []byte) bool
-	// RelayAccessToken, when non-empty, is sent as the first frame of every
-	// RELAY-mode dial (audit N-8): the pre-shared credential a relay with
+	// RelayAccessToken, when non-empty, is the pre-shared credential sent on
+	// every RELAY-mode dial (audit N-8): the first-frame secret a relay with
 	// Options.AccessToken requires before it registers the connection. It is
-	// sent INSTEAD of the (unused) ID announcement, so the relay consumes one
-	// frame and the node injects no junk into the forwarding path. Empty
-	// keeps the previous behaviour. It has no effect on direct connections.
+	// NOT sent first: this end waits for the relay's fixed gate greeting (see
+	// adoptRelay), so a relay that does not gate - one started without a token,
+	// which would forward whatever it received to every peer - never sees the
+	// secret at all. It has no effect on direct connections. At least
+	// wire.MinRelayAccessTokenBytes bytes are required; New refuses less.
+	//
+	// TWO LIMITS an operator must know, neither of which this layer can fix:
+	// the token travels in PLAINTEXT over TCP, so any passive observer of the
+	// link reads it; and it is REPLAYABLE, because it is a constant the relay
+	// compares per connection and neither end challenges or expires it. It
+	// authenticates a connection, not a peer: use it over a trusted path (a
+	// VPN), or a token whose compromise you can absorb. It is documented in
+	// the README's relay section.
 	RelayAccessToken []byte
 	// Rand is the source of the reconnection jitter. An explicitly seeded
 	// *rand.Rand makes the delay sequence a function of that seed, so a test
@@ -357,14 +377,20 @@ func (o Options) withDefaults() Options {
 // transport-side bound on how many frames one connection may push through the
 // single dispatch callback. dispatch serialises every reader (the consensus
 // engine is single-threaded), so without it one flooder delays honest vote
-// dispatch for the whole transport - and over a relay every member shares one
-// connection, so a stranger's frames contend with all of them.
+// dispatch for the whole transport. That argument holds for a DIRECT
+// connection, where the connection IS the peer; it does NOT hold for a
+// relay-mode connection, where one socket carries every member's traffic and
+// the sender is unknown to this layer (conn.relayMode, and internal/relay's
+// per-sender share). The bucket is therefore armed for direct connections and
+// bypassed for relay ones.
 //
 // It is deliberately a DROP, not a disconnect: a frame is cheap to lose
 // (gossip is redundant and the driver ignores Broadcast errors), while a
-// severed honest peer is a liveness loss. The clock is a field so a test can
-// drive refill by a constructed instant instead of sleeping (the project rule:
-// never provoke state through a timing race).
+// severed honest peer is a liveness loss.
+//
+// The clock is a field so a test can drive refill by a constructed instant
+// instead of sleeping (the project rule: never provoke state through a timing
+// race).
 type rateLimiter struct {
 	mu     sync.Mutex
 	perSec float64
@@ -461,8 +487,37 @@ type conn struct {
 	// release the accept-time slot it holds against MaxConns. Outbound
 	// connections are not capped and release nothing.
 	inbound bool
-	// rl is the per-connection frame-rate bucket (audit N-6).
+	// rl is the per-connection frame-rate bucket (audit N-6). It is NOT armed
+	// on a relay-mode connection: see relayMode below.
 	rl *rateLimiter
+	// relayMode marks a connection this transport dialled to a relay with
+	// RelayPeerName(addr) (adoptRelay), and it EXEMPTS the connection from rl.
+	// It is DIAL INTENT, set by adoptRelay alone - never inferred from the
+	// identity a peer announced. Deriving it from the name was the fourth
+	// review round's hole: a dialed direct peer (or a plaintext-TCP MITM at a
+	// dialed address) announcing "relay:..." exempted its DIRECT link from
+	// the bucket. install takes relay explicitly and refuses the reserved
+	// prefix on every direct connection, dialed or accepted.
+	//
+	// The bucket is a per-CONNECTION bound, and on the relay link the
+	// connection is no longer the sender: every honest member's traffic
+	// arrives on this one socket, so the bucket cannot tell a stranger's flood
+	// from a validator's vote and drops whatever frame is next. Charging it
+	// here made one flooder at the relay cost every validator its honest
+	// votes and proposals - a MEDIUM regression the audit-verification report
+	// named (new issue 1): before the bucket existed, a flood only DELAYED
+	// dispatch; with it, honest frames were DISCARDED.
+	//
+	// The per-sender bound belongs where the sender is known, and the relay
+	// already owns it: internal/relay gives every registered connection a byte
+	// share of the receiver's queue and closes a sender whose backlog will not
+	// drain (relay.go's per-sender share and receiverStalled). For a relay
+	// connection this bucket is therefore both redundant - the sender is
+	// bounded one layer down, per sender - and harmful, because it is charged
+	// to the wrong party. On a DIRECT connection the connection IS the sender,
+	// so the bucket stays exactly as it was and still stops one flooder from
+	// monopolising the single dispatch callback. See reader.
+	relayMode bool
 	// gated counts frames dropped because the connection was not yet
 	// admitted; rateLimited counts frames dropped by rl. Observables for the
 	// tests, and the numbers an operator would want if a listener is being
@@ -586,6 +641,15 @@ func New(opts Options) (*TcpTransport, error) {
 		// Refuse it here rather than at connect time: an empty LocalID is a
 		// construction bug, and every connection it would open is doomed.
 		return nil, fmt.Errorf("tcp: LocalID must be non-empty")
+	}
+	if n := len(opts.RelayAccessToken); n > 0 && n < wire.MinRelayAccessTokenBytes {
+		// Enforced at construction, not at dial time: a short token is a
+		// configuration error the operator must fix before this node runs,
+		// and the relay refuses the same length, so a node that started
+		// anyway could only redial a handshake the relay will not complete.
+		// See wire.MinRelayAccessTokenBytes for why 16 bytes.
+		return nil, fmt.Errorf("tcp: relay access token is %d bytes; at least %d are required (a short token is brute-forced by dialling)",
+			n, wire.MinRelayAccessTokenBytes)
 	}
 	o := opts.withDefaults()
 	return &TcpTransport{
@@ -921,6 +985,8 @@ func (t *TcpTransport) forgetOutbound(ob *outbound) {
 // dialled says whether THIS end is the side that opened the connection (the
 // maintainer's dial) or the side that accepted it; it feeds the duplicate
 // rank, which needs the direction to stay decidable identically at both ends.
+// It does NOT select relay mode: a DIRECT connection is never relay mode,
+// whatever name the peer announces (see install).
 func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled bool) (*conn, error) {
 	if err := t.writeHello(nc, addr); err != nil {
 		return nil, err
@@ -929,7 +995,7 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled bool) (*conn, err
 	if err != nil {
 		return nil, err
 	}
-	return t.install(nc, addr, dialled, id)
+	return t.install(nc, addr, dialled, false, id)
 }
 
 // writeHello sends the local ID under the handshake write deadline - the
@@ -995,46 +1061,131 @@ func (t *TcpTransport) readHello(nc net.Conn, addr string) (transport.PeerID, er
 }
 
 // adoptRelay installs a RELAY-mode connection: the local ID is written (an
-// announcement, read by nobody here), NOTHING is read back, and the
-// connection is registered under the fixed name relay:<addr>. The name is
-// not derived from any frame, so nothing a stranger writes through the relay
-// can put this connection into the self-connection or duplicate branches -
-// the exact defect that let a stranger park a validator's maintainer for
-// good (audit N-1). dialled is true: this end opened the socket, and the
-// duplicate rank needs the direction to stay decidable.
+// announcement, read by nobody here) or, with a configured access token, the
+// gate handshake below runs; the connection is registered under the fixed name
+// relay:<addr>. The name is not derived from any frame, so nothing a stranger
+// writes through the relay can put this connection into the self-connection or
+// duplicate branches - the exact defect that let a stranger park a validator's
+// maintainer for good (audit N-1). dialled is true: this end opened the socket,
+// and the duplicate rank needs the direction to stay decidable.
 //
-// When Options.RelayAccessToken is set, it is sent as the FIRST frame and the
-// ID announcement is omitted: the relay's access gate (audit N-8) consumes
-// exactly one frame and compares it by length and equality, so sending the
-// token in place of the junk ID frame is both the credential and one fewer
-// unknown frame forwarded to every peer. Without a token the ID announcement
-// is unchanged, so every existing relay deployment is untouched.
+// When Options.RelayAccessToken is set, the token is NOT written first: this
+// end waits for the relay to present wire.RelayGateGreeting, sends the token
+// only to a relay that has announced it gates, and then waits for
+// wire.RelayGateAccepted before installing the connection (review, audit fix
+// round 4). The ID announcement is omitted on this path. Without a token the
+// ID announcement is unchanged, so every relay deployment that configures no
+// token behaves exactly as before.
+//
+// The order is the fix, not a detail. The previous shape wrote the token
+// unconditionally, and a relay started without --access-token-file consumes no
+// token frame at all: it forwarded the operator's secret to EVERY registered
+// connection as ordinary payload. A token-configured node therefore refuses to
+// send the secret to a relay that has not announced gating, which is the only
+// rule that works when the remote end is misconfigured, rolled back, or older
+// than the greeting. The price is that a token-configured node requires a
+// token-configured relay of at least this vintage; a relay with no token is
+// refused loudly and repeatedly rather than trusted with the secret. Every
+// refusal here is logged (relayHandshakeFailed) - before this, a node with a
+// wrong token redialled forever in silence and the failure was visible only in
+// the relay's unauthorized counter.
 func (t *TcpTransport) adoptRelay(nc net.Conn, addr string) (*conn, error) {
 	if len(t.opts.RelayAccessToken) > 0 {
+		if err := t.readGateFrame(nc, addr, wire.RelayGateGreeting,
+			"the relay did not announce the access-token gate, so the token was NOT sent (a relay without a token would forward it to every peer)"); err != nil {
+			return nil, err
+		}
 		if err := t.writeHandshakeFrame(nc, addr, t.opts.RelayAccessToken); err != nil {
+			return nil, err
+		}
+		if err := t.readGateFrame(nc, addr, wire.RelayGateAccepted,
+			"the relay closed the socket instead of accepting the token (a wrong or mismatched token, or a relay that predates the gate handshake)"); err != nil {
 			return nil, err
 		}
 	} else if err := t.writeHello(nc, addr); err != nil {
 		return nil, err
 	}
-	return t.install(nc, addr, true, RelayPeerName(addr))
+	return t.install(nc, addr, true, true, RelayPeerName(addr))
+}
+
+// readGateFrame reads exactly one relay-gate frame under the handshake
+// deadline, verifies it is byte-for-byte the FIXED frame the relay sends
+// (length and bytes, via wire.RelayGateGreeting/RelayGateAccepted), clears the
+// deadline, and logs-and-errors on anything else. The failure text is composed
+// from why the node stopped, never from the bytes it read, so a stranger's
+// frame content cannot reach the log through this path.
+//
+// The read is bounded by the wanted frame's own length: anything longer is not
+// this fixed frame, and refusing it before allocating is the same bound the
+// direct handshake's readHello applies.
+func (t *TcpTransport) readGateFrame(nc net.Conn, addr string, want []byte, why string) error {
+	if err := nc.SetReadDeadline(time.Now().Add(t.opts.HandshakeTimeout)); err != nil {
+		relayHandshakeFailed(addr, err)
+		_ = nc.Close()
+		return err
+	}
+	frame, err := wire.ReadFrame(nc, len(want))
+	if err == nil && !bytes.Equal(frame, want) {
+		err = errors.New("the frame is not the fixed announcement this build expects")
+	}
+	if err != nil {
+		relayHandshakeFailed(addr, fmt.Errorf("%s: %w", why, err))
+		_ = nc.Close()
+		return fmt.Errorf("tcp: relay handshake with %s: %s: %w", addr, why, err)
+	}
+	if err := nc.SetReadDeadline(time.Time{}); err != nil {
+		relayHandshakeFailed(addr, err)
+		_ = nc.Close()
+		return err
+	}
+	return nil
+}
+
+// relayHandshakeFailed is the node-side log line a relay handshake death
+// needs. It exists because the failure mode it names is otherwise invisible:
+// the maintainer treats every refusal as an ordinary failure and redials with
+// backoff (audit N-1), so a relay that refuses the token - or one that never
+// gates - produced no output anywhere in this process, and an operator saw only
+// a relay's unauthorized counter climbing. It goes to the standard library
+// logger, the same place internal/devnet's node layer writes its
+// operator-facing lines, so a deployment that captures stderr captures it.
+func relayHandshakeFailed(addr string, err error) {
+	log.Printf("b10coin: relay %s: %v", addr, err)
 }
 
 // install runs the registry acceptance an adopt or adoptRelay has already
-// negotiated: refusal of the useless IDs (self; a duplicate that outranks
-// the newcomer), the identical-rank replacement otherwise, and the reader
-// and writer goroutines. On refusal the socket is closed and the error is
-// the sentinel the maintainer's backoff path treats as every other failure.
-func (t *TcpTransport) install(nc net.Conn, addr string, dialled bool, id transport.PeerID) (*conn, error) {
+// negotiated: refusal of the useless IDs (self; the reserved relay:<addr>
+// form; a duplicate that outranks the newcomer), the identical-rank
+// replacement otherwise, and the reader and writer goroutines. On refusal the
+// socket is closed and the error is the sentinel the maintainer's backoff
+// path treats as every other failure.
+//
+// relay is DIAL INTENT, not a fact about the peer: it is true only on the
+// connection adoptRelay installed because this end opened it with
+// DialRelay/AddRelay. It sets relayMode (the rate-bucket exemption) and it is
+// the ONLY key that does. The fourth review round found the hole in deriving
+// relayMode from the id instead: relayMode used to be
+// `dialled && strings.HasPrefix(id, relayPeerIDPrefix)`, so a peer this node
+// DIALED - or a plaintext-TCP MITM at a dialed address - could announce
+// "relay:<anything>" and exempt its DIRECT connection from the rate bucket,
+// the very exemption item 1 added to protect a shared relay link. The
+// reserved name is refused on every DIRECT connection here, dialed or
+// accepted, for the companion reason: the relay:<addr> name is deterministic
+// and public (RelayPeerName), so a name a peer chooses must not be able to
+// claim the transport's own relay registration (which is dialled too, so the
+// old `!dialled` guard left the dial direction wide open to the same free
+// handle).
+func (t *TcpTransport) install(nc net.Conn, addr string, dialled, relay bool, id transport.PeerID) (*conn, error) {
 	c := &conn{
-		remote:  id,
-		nc:      nc,
-		tq:      make(chan []byte, t.opts.WriteQueueSize),
-		dead:    make(chan struct{}),
-		addr:    addr,
-		dialled: dialled,
-		inbound: !dialled,
-		rl:      newRateLimiter(t.opts.RateLimitPerSec, t.opts.RateLimitBurst),
+		remote:    id,
+		nc:        nc,
+		tq:        make(chan []byte, t.opts.WriteQueueSize),
+		dead:      make(chan struct{}),
+		addr:      addr,
+		dialled:   dialled,
+		inbound:   !dialled,
+		relayMode: relay,
+		rl:        newRateLimiter(t.opts.RateLimitPerSec, t.opts.RateLimitBurst),
 	}
 	// Admission (audit N-3): an INBOUND connection is a peer only after the
 	// node's Admit callback has accepted a frame from it. A dialled
@@ -1055,14 +1206,18 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled bool, id transp
 		nc.Close()
 		return nil, fmt.Errorf("%w (%q on %s)", ErrSelfConnection, id, addr)
 	}
-	if !dialled && strings.HasPrefix(string(id), relayPeerIDPrefix) {
+	if !relay && strings.HasPrefix(string(id), relayPeerIDPrefix) {
 		// A name this transport reserves for its OWN outbound relay
-		// registration, claimed by an ACCEPTED connection. relay:<addr> is
-		// deterministic and public, so an inbound claim is always a stranger
-		// reaching the listener: refuse it before it can enter the registry
-		// and evict the real relay link (audit N-1's free handle). A genuine
-		// relay connection is dialled in relay mode (adoptRelay, dialled
-		// true), so this branch never touches it.
+		// registration, claimed by a DIRECT connection - accepted OR dialed.
+		// relay:<addr> is deterministic and public, so a claim is always a
+		// peer reaching this node (through the listener, or at an address the
+		// operator dials, or a plaintext-TCP MITM at one) and never a genuine
+		// relay link: the only legitimate holder is adoptRelay, which passes
+		// relay=true and the name it computed itself. Refuse it before it can
+		// enter the registry and evict the real relay link (audit N-1's free
+		// handle, dial direction included - fourth review round). The old
+		// guard tested !dialled, so a dialed peer announcing this name
+		// installed directly into relayMode and skipped the rate bucket.
 		t.mu.Unlock()
 		nc.Close()
 		return nil, fmt.Errorf("%w (%q on %s)", ErrReservedPeerName, id, addr)
@@ -1174,7 +1329,13 @@ func newcomerWins(local transport.PeerID, existing, newcomer *conn) bool {
 //     forever with four bytes;
 //   - the RATE LIMIT (audit N-6) drops a frame over the per-connection token
 //     bucket, so no single connection can monopolise the one dispatch
-//     callback that serialises every reader;
+//     callback that serialises every reader. It is applied to DIRECT
+//     connections only: on a relay connection the connection is the shared
+//     link, not the sender, so the bucket would discard honest members' votes
+//     for a stranger's flood. relayMode is DIAL INTENT - set only by
+//     adoptRelay, never by the name a peer announces, and the reserved relay
+//     name is refused on every direct connection (install) - and the relay's
+//     own per-sender share is the bound that replaces the bucket there;
 //   - the ADMISSION GATE (audit N-3/N-7) holds an inbound connection out of
 //     Peers() and Broadcast until Options.Admit accepts a frame.
 func (t *TcpTransport) reader(c *conn) {
@@ -1198,7 +1359,7 @@ func (t *TcpTransport) reader(c *conn) {
 			// through its maintainer; the consensus layer tolerates the loss.
 			break
 		}
-		if !c.rl.allow() {
+		if !c.relayMode && !c.rl.allow() {
 			c.rateLimited.Add(1)
 			continue // the frame is consumed, so framing stays intact
 		}

@@ -2103,3 +2103,36 @@ func TestAwaitReplyHonoursTheInjectedWait(t *testing.T) {
 		t.Fatalf("a zero ReplyWait reached the seam as %v, want DefaultReplyWait %v", gotWait, DefaultReplyWait)
 	}
 }
+
+// TestAReplayedSyncRequestDoesNotSpendTheMembersBudget pins the second half of
+// the fourth review round's new issue 3 (3b): Answer charged the per-requester
+// rate bucket BEFORE the replay check, so a captured signed request replayed to
+// a node drained that member's whole catch-up budget while doing no work for
+// it. The member's own next pull then saw ErrSyncRateLimited - a member denied
+// catch-up by an attacker who paid nothing but the bytes of one frame it had
+// already observed.
+//
+// The scenario is constructed, not timed: the limit is 2 and the window is a
+// minute, so one served request leaves exactly one token. Fifty replays are
+// FREE (the seen set refuses them and charges nothing); the member's next
+// honest request must still be inside the budget. On the pre-fix order the
+// second replay drains the bucket and the honest request is refused.
+func TestAReplayedSyncRequestDoesNotSpendTheMembersBudget(t *testing.T) {
+	f := newCertServeFixture(t, 2)
+	f.server.RateLimit = 2
+	f.server.RateWindow = time.Minute // never resets mid-test
+
+	captured := syncSignReq(t, f.pullerKey, 1, 1)
+	if _, err := f.server.Answer(captured); err != nil {
+		t.Fatalf("the member's first request was refused: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		if _, err := f.server.Answer(captured); !errors.Is(err, ErrSyncReplayed) {
+			t.Fatalf("replay %d of a captured request gave %v, want ErrSyncReplayed", i, err)
+		}
+	}
+	honest := syncSignReq(t, f.pullerKey, 1, 1)
+	if _, err := f.server.Answer(honest); err != nil {
+		t.Fatalf("the member's own next request was refused after 50 replays of a captured frame: %v", err)
+	}
+}

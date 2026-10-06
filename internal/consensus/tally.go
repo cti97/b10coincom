@@ -77,6 +77,24 @@ func NewVoteSet(cfg Config, height uint64, round uint32, typ MsgType) *VoteSet {
 // a corrupted signature now reports ErrNotValidator rather than
 // ErrBadVoteSignature; the vote is refused either way, and no caller's
 // behaviour depends on which of two true reasons is named.
+//
+// THE DUPLICATE CHECK ALSO RUNS BEFORE Verify() (review, audit fix round 4),
+// for the same reason membership does: an Ed25519 verification must not be
+// purchasable by a frame that has already been paid for once. A Byzantine
+// proposer packs one captured member vote thousands of times into a 1 MiB
+// justification; verifyJustification tallies the copies through this method,
+// and every copy that reaches Verify is one Ed25519 verification spent under
+// the driver lock, once per round the proposer proposes. The seen set is the
+// cheap way to refuse the repeats: a validator already recorded here has
+// already had its ONE vote counted, so a further frame claiming it can change
+// nothing whether or not its signature is intact.
+//
+// POISONING IS NOT INTRODUCED by checking seen first. Only a vote that passed
+// membership, Verify() and the height/round guard is written into seen (below),
+// so a forged frame claiming an unseen validator cannot mark that validator
+// seen and swallow its honest vote later: it still reaches Verify() and is
+// refused by it. The check is a read of a map keyed by the validator bytes
+// already in hand; recording stays where it was.
 func (vs *VoteSet) Add(v *Vote) (bool, error) {
 	if v == nil {
 		return false, ErrNilVote
@@ -91,15 +109,19 @@ func (vs *VoteSet) Add(v *Vote) (bool, error) {
 	if idx < 0 {
 		return false, ErrNotValidator
 	}
+	if _, dup := vs.seen[string(v.Validator)]; dup {
+		// Already counted once. Refusing here, before Verify(), is what makes
+		// a justification packed with copies of one vote cost one signature
+		// check rather than thousands; nothing is recorded on this path, so
+		// the poisoning argument in the doc above holds.
+		return false, nil
+	}
 	if err := v.Verify(); err != nil {
 		return false, err
 	}
 	if v.Height != vs.height || v.Round != vs.round {
 		return false, fmt.Errorf("%w: vote for (%d,%d) in a set for (%d,%d)",
 			ErrWrongHeightRound, v.Height, v.Round, vs.height, vs.round)
-	}
-	if _, dup := vs.seen[string(v.Validator)]; dup {
-		return false, nil
 	}
 	vs.seen[string(v.Validator)] = idx
 	vs.votes = append(vs.votes, v)

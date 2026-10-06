@@ -408,13 +408,17 @@ func TestOpenRejectsRenumberedStoredChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Skip record 1 entirely: framed header (length || its checksum), payload,
-	// trailer checksum.
-	recLen := binary.BigEndian.Uint64(raw)
-	span := store.RecordHeaderLen + int(recLen) + store.RecordTrailerLen
+	// trailer checksum. The segment header is NOT part of the record and stays
+	// (it is the format marker, and without it Open would refuse the file as an
+	// unrecognised format instead of reaching the replay that this test is
+	// about).
+	recLen := binary.BigEndian.Uint64(raw[store.SegmentHeaderLen:])
+	span := store.SegmentHeaderLen + store.RecordHeaderLen + int(recLen) + store.RecordTrailerLen
 	if len(raw) < span {
 		t.Fatalf("malformed first record in %s; cannot drop it", seg)
 	}
-	if err := os.WriteFile(seg, raw[span:], 0o644); err != nil {
+	kept := append(append([]byte(nil), raw[:store.SegmentHeaderLen]...), raw[span:]...)
+	if err := os.WriteFile(seg, kept, 0o644); err != nil {
 		t.Fatal(err)
 	}
 

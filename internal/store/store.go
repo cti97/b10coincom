@@ -2,7 +2,19 @@
 // lock log, a per-height round log and a per-height commit-certificate log,
 // all over opaque payloads.
 //
-// Record layout, shared by every log here:
+// Every one of those files begins with a SEGMENT HEADER (review, audit fix
+// round 4): the magic SegmentMagic and a big-endian uint32
+// SegmentFormatVersion, SegmentHeaderLen bytes in all. It is the format
+// identifying itself, and it is checked before a single record is framed. A
+// directory written before the header existed (`4b1f36c`) is refused with
+// ErrUnrecognisedFormat, whose hint tells the operator the directory cannot be
+// read by this build and must NOT be truncated; before this, such files failed
+// as a record checksum mismatch and the repair hint advised truncating at
+// offset 0, which deletes the chain. The magic and the version are constants of
+// the CODE: nothing in a file can make a damaged file look like a valid other
+// version.
+//
+// Record layout, shared by every log here, AFTER the header:
 //
 //	uint64be(len(payload)) || uint32be(crc32c(len)) || payload || uint32be(crc32c(len || payload))
 //
@@ -42,6 +54,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -96,10 +109,46 @@ const (
 	lengthFieldLen   = 8
 )
 
+// The segment header (review, audit fix round 4). EVERY log file this package
+// writes begins with it, before the first record:
+//
+//	SegmentMagic (11 bytes) || uint32be(SegmentFormatVersion)
+//
+// The framing below is self-checking per record, but it was not
+// self-IDENTIFYING: a directory written before the checksummed length prefix
+// (`4b1f36c`) holds records in an older layout, and Open read the first old
+// record header's length field as a new record's length, failed the length
+// CRC, and reported the result as bit rot - with a repair hint telling the
+// operator to truncate the file at offset 0 and "recover everything before the
+// damage". Following it deleted the chain. The hint was not wrong about the
+// bytes it could see; the format was wrong about which bytes they were.
+//
+// The header fixes that by making the format state itself. A file that does
+// not begin with these bytes is not this format at all, and is refused with
+// ErrUnrecognisedFormat and a hint that says so, before a single record is
+// framed. The version is checked, not merely recorded, so a future layout
+// change is refused as loudly as an older one rather than misparsed.
+const (
+	// SegmentMagic is the fixed 11-byte tag at offset 0 of every log file.
+	SegmentMagic = "b10coin-seg"
+	// SegmentFormatVersion is the layout version this build writes and reads.
+	SegmentFormatVersion = 1
+	// SegmentHeaderLen is the size of the magic and version together.
+	SegmentHeaderLen = len(SegmentMagic) + 4
+)
+
 var (
 	ErrNotFound      = errors.New("store: height not found")
 	ErrBadHeight     = errors.New("store: heights must be appended sequentially")
 	ErrCorruptRecord = errors.New("store: record checksum mismatch")
+	// ErrUnrecognisedFormat reports a data directory whose files are not in
+	// this build's format - almost always a directory last written by a build
+	// that predates the segment header (review, audit fix round 4). It is
+	// deliberately distinct from ErrCorruptRecord: the bytes are not DAMAGED,
+	// they are a different layout, and the repair the corruption path suggests
+	// (truncate at the failure offset) would destroy a chain that is intact in
+	// its own format. The two must never be reported as each other.
+	ErrUnrecognisedFormat = errors.New("store: unrecognised data-directory format")
 	// ErrWrongGenesis reports a data directory whose recorded genesis hash
 	// differs from the genesis the caller is opening it with (audit O-5).
 	ErrWrongGenesis = errors.New("store: data directory belongs to a different genesis")
@@ -284,6 +333,20 @@ func Open(dir string) (*Store, error) {
 	s.lockFile = lf
 	s.roundFile = rf
 	s.certFile = cf
+	// Every log this process will write begins with the segment header. The
+	// scan has already classified any header that existed; these calls write
+	// the one a fresh (or torn-header) file is missing, so the FIRST record
+	// ever appended always lands after a header. See ensureSegmentHeader.
+	for _, hf := range []*os.File{s.file, s.lockFile, s.roundFile, s.certFile} {
+		if err := ensureSegmentHeader(hf); err != nil {
+			_ = f.Close()
+			_ = lf.Close()
+			_ = rf.Close()
+			_ = cf.Close()
+			lock.release()
+			return nil, err
+		}
+	}
 	// Make the directory entries for any file just created durable (audit
 	// S-15). Each file's own contents are fsynced as they are written; without
 	// this, a crash can lose the freshly created directory entry even though
@@ -491,6 +554,93 @@ func readRecordAt(r io.ReaderAt, size, off, exact int64) (int64, int64, error) {
 	return frameHeader(header[:], off, rem, exact)
 }
 
+// segmentHeaderBytes renders the canonical segment header. It is a constant
+// function of the code, never of the file, so every check of it is a check
+// against a value a corrupt file cannot influence.
+func segmentHeaderBytes() []byte {
+	out := make([]byte, 0, SegmentHeaderLen)
+	out = append(out, SegmentMagic...)
+	var v [4]byte
+	binary.BigEndian.PutUint32(v[:], SegmentFormatVersion)
+	return append(out, v[:]...)
+}
+
+// classifySegmentHeader decides what a log file's first bytes are, given the
+// prefix head that was read from it (head is the first min(size,
+// SegmentHeaderLen) bytes). Three outcomes:
+//
+//   - nil: the canonical header is present and current;
+//   - errTornRecord: head is EMPTY, or a PREFIX of the canonical header, which
+//     is the one shape a crash during the header write can leave. It is not
+//     corruption and it is not an older format - it is this format, cut short,
+//     with no record after it (a whole record is longer than the header, so a
+//     file this short holds none) - and the caller may repair it by rewriting
+//     the header from offset 0. Nothing committed can be lost;
+//   - anything else, wrapped ErrUnrecognisedFormat: these are not this
+//     format's bytes. The caller must NOT truncate: the file may be a
+//     perfectly intact chain in an older layout, and the repair for that is a
+//     fresh directory or a resync, not data loss.
+func classifySegmentHeader(head []byte) error {
+	want := segmentHeaderBytes()
+	if len(head) <= len(want) && bytes.HasPrefix(want, head) {
+		// Note the empty case: HasPrefix(want, nil) is true, so a zero-length
+		// file (one a previous Open created and never appended to) and a
+		// partially written header both land here.
+		if len(head) == len(want) {
+			return nil
+		}
+		return errTornRecord
+	}
+	return fmt.Errorf("%w: the file begins with %q, not the %q magic of version %d",
+		ErrUnrecognisedFormat, head, SegmentMagic, SegmentFormatVersion)
+}
+
+// formatHint is the operator's instruction for a directory that is not in this
+// format. It is the CORRUPTION hint's opposite: there is nothing to truncate
+// and nothing to repair, because the bytes are not damaged. An older build's
+// directory is intact in its own layout, and cutting it at any offset would
+// destroy a chain that this build simply cannot read.
+func formatHint(path string) string {
+	return fmt.Sprintf(" (%s is not in this build's format version %d: a data directory written before the segment header was introduced cannot be read by this build. Point --dir at a new directory and re-sync from a peer, or restore the matching older build. Do NOT truncate it: the file is not damaged, and truncating deletes an intact chain)", path, SegmentFormatVersion)
+}
+
+// writeSegmentHeader writes the canonical header to f, which the caller has
+// positioned (or opened for append) at offset 0 of an empty file.
+func writeSegmentHeader(f *os.File) error {
+	_, err := f.Write(segmentHeaderBytes())
+	return err
+}
+
+// ensureSegmentHeader writes the canonical header into f when f does not have
+// one yet, and does nothing when it does. It is called on every handle Open
+// creates or reopens for appending, and on a segment the store rolls onto, so
+// no writable log can exist in this process without a header.
+//
+// It never READS f, because three of the four handles are open write-only
+// (O_APPEND|O_WRONLY); classification is the scan's job and has already run on
+// every file that existed when this Open began. The size test against
+// SegmentHeaderLen is the only check needed to tell "the scan saw a header" (a
+// file at least that long) from "the scan saw an empty file or a torn header,
+// which it deliberately left for this function to rewrite" (anything shorter).
+// A torn header is cut from offset 0 rather than appended over, so the header
+// always precedes the bytes it describes.
+func ensureSegmentHeader(f *os.File) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Size() >= int64(SegmentHeaderLen) {
+		return nil
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return writeSegmentHeader(f)
+}
+
 // repairHint is appended to a corruption error so the operator is told the
 // ONE recovery path this format has (audit O-5). Automatic repair cannot be
 // offered: a COMPLETE record whose checksum fails is bit rot, not the torn
@@ -534,7 +684,37 @@ func (s *Store) scanSegment(name string, final bool) error {
 		return err
 	}
 	size := fi.Size()
-	off := int64(0)
+	// The segment header comes first, and nothing in the file may be framed
+	// before it is understood. An empty or torn header is this format cut
+	// short: no record can fit in fewer bytes than the header, so the final
+	// segment may be cut back to zero and rewritten (the same crash shape the
+	// torn-record path below repairs); a NON-final segment cannot be, because
+	// a later segment exists only after this one's records were written. Any
+	// other prefix is a different layout and is refused as such - never with
+	// the truncation hint.
+	headLen := min(size, int64(SegmentHeaderLen))
+	var head [SegmentHeaderLen]byte
+	if headLen > 0 {
+		if _, err := f.ReadAt(head[:headLen], 0); err != nil {
+			return err
+		}
+	}
+	switch err := classifySegmentHeader(head[:headLen]); {
+	case err == nil:
+	case errors.Is(err, errTornRecord) && final:
+		// A crash cut the header, and nothing follows it: cut it back to zero
+		// and let Open write the header again.
+		_ = f.Close()
+		return s.truncateTail(path, 0)
+	case errors.Is(err, errTornRecord):
+		// A header-less segment with a LATER segment after it is not a shape a
+		// crash can leave - the later one exists only after this one was
+		// written - so these are this format's own bytes, damaged.
+		return fmt.Errorf("%w: segment header is incomplete in %s%s", ErrCorruptRecord, name, repairHint(final, path, 0))
+	default:
+		return fmt.Errorf("%w%s", err, formatHint(path))
+	}
+	off := int64(SegmentHeaderLen)
 	// buf is reused across records; it grows to the largest record and no more.
 	var buf []byte
 	for off < size {
@@ -606,6 +786,15 @@ func (s *Store) Append(height uint64, payload []byte) error {
 		f, err := os.OpenFile(filepath.Join(s.dir, segmentName(height)),
 			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
+			return err
+		}
+		// A new segment starts with the format header, before its first record.
+		// It is an empty file here (the scan would have found any records), so
+		// this writes the header; the error must be returned, not ignored: a
+		// segment whose header never reached disk would be refused as an
+		// unrecognised format on the next Open.
+		if err := ensureSegmentHeader(f); err != nil {
+			_ = f.Close()
 			return err
 		}
 		old := s.file
@@ -797,7 +986,22 @@ func (s *Store) scanLocks() error {
 	if err != nil {
 		return err
 	}
-	off := int64(0)
+	// The lock log carries the same segment header as every other log, and it
+	// is classified BEFORE a record is framed: a log in an older layout must be
+	// refused as an unrecognised format, not read as a corrupt record and
+	// "repaired" by truncating a validator's promise away. An empty or torn
+	// header (only a crash can leave one, and it precedes every record) is cut
+	// back to zero: a log with no complete record holds no promise, which is
+	// the same state as a missing log.
+	headLen := min(int64(len(raw)), int64(SegmentHeaderLen))
+	switch err := classifySegmentHeader(raw[:headLen]); {
+	case err == nil:
+	case errors.Is(err, errTornRecord):
+		return s.truncateTail(path, 0)
+	default:
+		return fmt.Errorf("%w%s", err, formatHint(path))
+	}
+	off := int64(SegmentHeaderLen)
 	for off < int64(len(raw)) {
 		n, recEnd, err := frame(raw, off, lockPayloadLen)
 		if err != nil {
@@ -872,7 +1076,18 @@ func (s *Store) scanRounds() error {
 	if err != nil {
 		return err
 	}
-	off := int64(0)
+	// The segment header, exactly as scanLocks classifies it, and for the same
+	// reason: an older layout is refused as a format, never truncated as a
+	// corrupt record.
+	headLen := min(int64(len(raw)), int64(SegmentHeaderLen))
+	switch err := classifySegmentHeader(raw[:headLen]); {
+	case err == nil:
+	case errors.Is(err, errTornRecord):
+		return s.truncateTail(path, 0)
+	default:
+		return fmt.Errorf("%w%s", err, formatHint(path))
+	}
+	off := int64(SegmentHeaderLen)
 	for off < int64(len(raw)) {
 		n, recEnd, err := frame(raw, off, roundPayloadLen)
 		if err != nil {
@@ -922,7 +1137,19 @@ func (s *Store) scanCerts() error {
 	if err != nil {
 		return err
 	}
-	off := int64(0)
+	// The segment header, as in the two logs above. A pre-header certificate
+	// log is refused as an unrecognised format rather than truncated: the
+	// archive is not a safety promise, but a truncated log would silently
+	// renumber the heights it indexes, which is worse than refusing to read it.
+	headLen := min(int64(len(raw)), int64(SegmentHeaderLen))
+	switch err := classifySegmentHeader(raw[:headLen]); {
+	case err == nil:
+	case errors.Is(err, errTornRecord):
+		return s.truncateTail(path, 0)
+	default:
+		return fmt.Errorf("%w%s", err, formatHint(path))
+	}
+	off := int64(SegmentHeaderLen)
 	for off < int64(len(raw)) {
 		n, recEnd, err := frame(raw, off, -1)
 		if err != nil {
@@ -1166,6 +1393,14 @@ func (s *Store) compactLocks() error {
 		_ = os.Remove(tmpName)
 		return err
 	}
+	// The rewritten log is the same format as the one it replaces, header and
+	// all: a compaction that dropped the header would produce a directory this
+	// build refuses to open.
+	if err := writeSegmentHeader(tmp); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
 	for _, rec := range kept {
 		if err := writeRecord(tmp, encodeLockRecord(rec)); err != nil {
 			_ = tmp.Close()
@@ -1373,6 +1608,13 @@ func (s *Store) compactRounds() error {
 	// CreateTemp makes the file 0600; the log has always been 0644, so keep
 	// that mode across the rewrite.
 	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// Header first, exactly as compactLocks writes one: a rewritten log that
+	// dropped the header would be refused by the next Open.
+	if err := writeSegmentHeader(tmp); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
 		return err

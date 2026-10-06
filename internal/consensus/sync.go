@@ -767,13 +767,19 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 	if err := verifySyncReq(req, s.chain.Genesis().Validators); err != nil {
 		return nil, err
 	}
-	// The resource gates come before any allocation or disk read. The rate
-	// bucket is charged first so even a replay flood is bounded by it.
-	if !s.allowRequest(req) {
-		return nil, fmt.Errorf("%w: %s", ErrSyncRateLimited, requesterLabel(req.Requester))
-	}
+	// The resource gates come before any allocation or disk read. The REPLAY
+	// check runs first (review, audit fix round 4): a captured signed request
+	// replayed to this node is refused by the seen set, and charging the rate
+	// bucket for it first let a passive observer drain a member's whole
+	// catch-up budget for free - the member's own honest pulls then saw
+	// ErrSyncRateLimited, and the attacker paid nothing but the bytes of one
+	// captured frame. A replay is no work, so it costs no token. The order of
+	// the remaining gates is unchanged.
 	if !s.noteRequest(req) {
 		return nil, fmt.Errorf("%w: nonce %d was already served", ErrSyncReplayed, req.Nonce)
+	}
+	if !s.allowRequest(req) {
+		return nil, fmt.Errorf("%w: %s", ErrSyncRateLimited, requesterLabel(req.Requester))
 	}
 	// Refusals come before the first make(): nothing is allocated for a
 	// request this syncer has already decided not to answer. The comparison

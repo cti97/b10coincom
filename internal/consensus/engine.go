@@ -453,13 +453,17 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) error {
 // they name: a coalition that legitimately exceeds one third can still
 // attest an absurd round - and so can one buggy honest validator - and
 // jumping to math.MaxUint32 would park the engine in OnTimeout's wrap guard,
-// ejecting it from the height silently. The jump exists to resync a follower
-// onto a live committee; that never needs more than one bounded stride per
-// timeout (larger gaps close by repetition on later timeouts, at the capped
-// ladder's cadence), and the cap keeps round numbers reachable only by round
-// COUNTS of timeouts, never by one jump. With maxRoundEscalation the bound is
-// deliberately the same number the timeout ladder uses: past that many
-// rounds, escalation adds nothing, and a jump that far needs no extra reach.
+// ejecting it from the height silently. One bounded stride per timeout is all
+// a resync onto a live committee needs, and the cap keeps round numbers
+// reachable only by round COUNTS of timeouts, never by one jump.
+//
+// The cap is a bound on the JUMP, never on the ladder, and the division of
+// labour matters: this gate needs more than a third of the power to attest, so
+// it cannot fire at all when the live set is exactly quorum and one live seat
+// is ahead (three of four seats: one seat against a bar of two). That shape is
+// closed by the DRIVER's timeout ladder instead, which is strictly increasing
+// in the round: the engine behind fires sooner and gains a round at a time,
+// with no reference to any claim. See Driver.Tick.
 func (e *Engine) jumpTarget() uint32 {
 	if len(e.future) == 0 {
 		return 0

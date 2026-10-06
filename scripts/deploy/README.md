@@ -353,8 +353,14 @@ puts on that) — allowlisting the validators is what keeps strangers off.
 
 An IP allowlist is not always usable: a home validator behind CGNAT shares a
 pool address that rotates, and the allowlist has to be edited every time it
-does. The relay therefore ALSO supports a **pre-shared first frame** — a
-token both ends hold, compared by length and equality, with no decoding:
+does. The relay therefore ALSO supports a **pre-shared token** — a token both
+ends hold, compared by length and equality, with no decoding. The relay
+announces the gate with a fixed first frame, the node answers with the token,
+and the relay confirms with a second fixed frame; a node that does not see the
+greeting REFUSES to send the token (a relay started without
+`--access-token-file` would forward it to every peer) and logs the refusal, as
+does a node whose token the relay rejects. Generate at least 16 bytes: a
+shorter token is brute-forced by dialling:
 
 ```sh
 # on the VPS, once; readable only by the service user
@@ -367,18 +373,26 @@ sudo -u b10coin /opt/b10coin/b10coin-relay --addr :7001 \
 ```
 
 Every connection must send exactly those bytes (a trailing newline is
-trimmed) as its first frame or it is closed and counted `unauthorized`. The
-token frame is consumed, never forwarded, and an unauthenticated connection
-is never registered, so it receives nothing. Copy the SAME token file to
-every Pi (`scp`, mode 0600) and give each node `--relay-access-token-file`
-(§5, §6); each node sends it in place of the relay's unused ID frame.
+trimmed) as the frame after the greeting or it is closed and counted
+`unauthorized`. The token frame is consumed, never forwarded, and an
+unauthenticated connection is never registered, so it receives nothing. Copy
+the SAME token file to every Pi (`scp`, mode 0600) and give each node
+`--relay-access-token-file` (§5, §6).
 
-This keeps the relay's "parses nothing" property exactly: the check is a
-length comparison and a byte comparison of raw frame bytes. There is no
+**Two limits of this layer, stated because nothing else states them:** the
+token travels in **plaintext** over TCP, so anyone who can observe the link
+reads it; and it is **replayable**, because it is a constant compared once per
+connection that neither end challenges or expires. It authenticates a
+connection, not a peer — run it over a trusted path (a VPN), and treat its
+disclosure as a connection someone else can make.
+
+This keeps the relay's "parses nothing" property exactly: the relay reads one
+frame, compares raw bytes, and writes two constant frames. There is no
 decoder, no tag check and no consensus concept anywhere in the path — the
 token is opaque to the relay. Use BOTH layers where you can: the allowlist is
 the cheap outer filter, and the token is the one that survives a rotating
-CGNAT address. With no token the relay behaves exactly as before.
+CGNAT address. With no token the relay sends no greeting and behaves exactly
+as before.
 
 The relay binds everything a stranger controls (frame size, connection
 count, per-connection buffers, stalled-read timeout) and authenticates
@@ -550,23 +564,26 @@ hashes below, never from reachability).
    scripts/deploy/acceptance.sh --pis 192.0.2.11,192.0.2.12,192.0.2.13 --relay example.com
    ```
 
-## 8. When it does not work: the four failures
+## 8. When it does not work: the five failures
 
 Failures 1–3 all look alike from the outside — a quiet node at height 0 —
 so judge them by these signatures, in this order. Failure 4 never gets that
 far: the binary itself refuses to run, so it announces itself the moment
-you start it.
+you start it. Failure 5 also announces itself, by naming the data
+directory's format.
 
 | # | Failure | Signature (how you tell) | Fix |
 |---|---|---|---|
 | 1 | **Committee-file / binary mismatch** — one node runs a different (or hand-edited) `committee.json`, or an older binary | `journalctl -u b10coin \| grep listening` — the `chain …` part of the banner **differs** between Pis (the chain ID comes from the shared file §3.2; an older binary that cannot read `--genesis` exits before any banner). Nodes on different chains never object; they just ignore each other forever | Stop the odd node; start it from the **same binary build** with the same **committee.json bytes** the others run (§3.2). No other remedy exists — a changed committee file is a different chain |
 | 2 | **Relay unreachable** — relay not running, VPS address wrong, port 7001 closed in the cloud firewall, or this Pi's source IP missing from the ufw allowlist | All chain IDs **match**, but from a Pi: `timeout 3 bash -c '</dev/tcp/example.com/7001' && echo open` prints nothing. On the VPS: `systemctl status b10coin-relay` and `ss -tlnp \| grep 7001` tell you whether it listens at all; `sudo ufw status numbered` tells you whose access was refused | Start the relay (`systemctl enable --now b10coin-relay`), open TCP 7001 in the security group, and add the **allowlist line for this Pi's current IP** (§4 — a bare open port is the audit finding, never the remedy). Nodes redial with backoff; nothing to restart on the Pis |
 | 3 | **One identity, two machines** — the same key file on two Pis, so both act as the same seat | Chain IDs all match, relay reachable, yet heights stall. `journalctl -u b10coin \| grep consensus` shows **the same `seat N` on two Pis** — with genesis-file mode the seat is derived from the key, so two machines sharing `b10coin.key` share every signature they make. A related loud case: a node whose key is NOT in the committee file **exits at startup** with `refusing to start … not listed` | `b10coin keygen` on the offending Pi (its old key file must be renamed away first — keygen refuses to overwrite), add the NEW public key to the committee file and redistribute it — remembering a committee-file edit changes the chain identity, so this is for bring-up, not for a chain history that already exists |
+| 5 | **A data directory written before the `b10coin-seg` format marker** — the node was upgraded over a chain written by an older build | The node exits at startup naming the directory: `unrecognised data-directory format … Do NOT truncate it`. Nothing is corrupt; the files are intact in the older layout, which this build cannot read | Point `--dir` at a **new, empty** directory and let the node catch up from a peer, or keep running the older binary. Do **not** truncate the files the message names — before this marker existed the same failure printed a hint that said to truncate at offset 0, which deletes the chain |
 | 4 | **Wrong-architecture binary** — e.g. the ARM64 relay copied onto a standard amd64 (x86_64) VPS, or either binary onto a 32-bit OS | The binary refuses to start at all: running it directly prints `Exec format error` / `cannot execute binary file`, and systemd's log (`journalctl -u b10coin-relay`) shows the same with exit `status=203/EXEC`. Confirm with `file /opt/b10coin/b10coin-relay` — the architecture it names must match what `uname -m` prints on that machine | Rebuild for the machine's own architecture (§2's `uname -m` step: the VPS almost always wants `b10coin-relay-linux-amd64`, from `scripts/deploy/build.sh linux/amd64`), reinstall with `install -m 0755`, and nothing on the Pis changes |
 
 Quick disambiguation: the binary will not start (`Exec format error`) → 4;
-chain IDs differ → 1; chain IDs match and the relay port test fails → 2;
-chain IDs match, relay reachable, a `seat` repeats → 3. And a non-fault: Pis
+startup names an `unrecognised data-directory format` → 5; chain IDs differ
+→ 1; chain IDs match and the relay port test fails → 2; chain IDs match, relay
+reachable, a `seat` repeats → 3. And a non-fault: Pis
 at slightly different heights whose fixed-height block hashes agree (§7.3)
 are healthy — do not chase it.
 If the table and logs genuinely cannot place the fault, reproduce the

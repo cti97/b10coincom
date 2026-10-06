@@ -542,6 +542,32 @@ func (v *Validator) Addr() string {
 // Height reports this validator's chain height (committed blocks only).
 func (v *Validator) Height() uint64 { return v.ch.Height() }
 
+// Round reports the round this validator's current consensus engine is in,
+// read under the driver mutex so a poller in another goroutine sees the engine
+// the driver is actually using. See consensus.Driver.Round for why a stalled
+// run needs it: the committed height alone cannot distinguish a parked node
+// (AppendRefused, a round that stopped) from one churning its round ladder past
+// the committee's.
+func (v *Validator) Round() uint32 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return 0
+	}
+	return v.drv.Round()
+}
+
+// AppendRefused reports whether this validator's driver has parked: its engine
+// committed a block the chain refused, so it has stopped offering that height
+// and will not advance past it (Design Decision 8). A false here on a node that
+// is not advancing is the other half of the diagnosis - the height is
+// undecidable, not refused.
+func (v *Validator) AppendRefused() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.drv != nil && v.drv.AppendRefused()
+}
+
 // Seat reports this validator's committee index (genesis-file mode derives it
 // from the key's position; fixture mode stores it).
 func (v *Validator) Seat() int { return v.cfg.Index }

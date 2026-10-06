@@ -161,11 +161,14 @@ func TestRunBadAddrExitsOne(t *testing.T) {
 // TestParseArgsReadsTheAccessTokenFile pins audit N-8's CLI wiring: the token
 // is read from a FILE (not argv, where ps would show it), a trailing newline
 // from an editor is trimmed, and an empty or missing file is a bad invocation
-// rather than a silently disabled gate.
+// rather than a silently disabled gate. The length floor is part of it (review,
+// audit fix round 4): a token shorter than wire.MinRelayAccessTokenBytes is
+// brute-forced by dialling, so the CLI refuses it before the relay can listen.
 func TestParseArgsReadsTheAccessTokenFile(t *testing.T) {
 	dir := t.TempDir()
+	const goodToken = "shared-secret-enough"
 	tokenPath := filepath.Join(dir, "token")
-	if err := os.WriteFile(tokenPath, []byte("shared-secret\n"), 0o600); err != nil {
+	if err := os.WriteFile(tokenPath, []byte(goodToken+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
@@ -173,8 +176,18 @@ func TestParseArgsReadsTheAccessTokenFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs with a token file: %v", err)
 	}
-	if string(opts.AccessToken) != "shared-secret" {
-		t.Fatalf("AccessToken = %q, want %q (with the trailing newline trimmed)", opts.AccessToken, "shared-secret")
+	if string(opts.AccessToken) != goodToken {
+		t.Fatalf("AccessToken = %q, want %q (with the trailing newline trimmed)", opts.AccessToken, goodToken)
+	}
+	// One byte under the floor is refused, and the message names the floor.
+	shortPath := filepath.Join(dir, "short")
+	if err := os.WriteFile(shortPath, []byte("too-short-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := parseArgs([]string{"--access-token-file", shortPath}, &stderr); err == nil {
+		t.Fatal("a 15-byte access token was accepted; it is brute-forced by dialling")
+	} else if !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("the short-token refusal reads %q; it must name the minimum", err)
 	}
 
 	// A missing file is an error, not an open relay.

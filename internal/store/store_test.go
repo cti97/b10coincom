@@ -211,7 +211,7 @@ func TestCorruptPayloadStopsTheScanAndFailsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[RecordHeaderLen+2] ^= 0xFF // a payload byte of record 1; the framing stays valid
+	raw[SegmentHeaderLen+RecordHeaderLen+2] ^= 0xFF // a payload byte of record 1; the framing stays valid
 	before := append([]byte(nil), raw...)
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
@@ -246,14 +246,14 @@ func TestCorruptLengthPrefixIsRefusedNotTrusted(t *testing.T) {
 		{
 			name: "middle record",
 			// The length field of record 2 (after record 1's "aaa").
-			flips: func(raw []byte) int { return RecordHeaderLen + 3 + RecordTrailerLen },
+			flips: func(raw []byte) int { return SegmentHeaderLen + RecordHeaderLen + 3 + RecordTrailerLen },
 		},
 		{
 			name: "final record overrunning EOF",
 			// The length field of the last record: flipping a high bit used
 			// to make the record appear to run past EOF and be truncated away.
 			flips: func(raw []byte) int {
-				rec := RecordHeaderLen + 3 + RecordTrailerLen
+				rec := SegmentHeaderLen + RecordHeaderLen + 3 + RecordTrailerLen
 				rec += RecordHeaderLen + 3 + RecordTrailerLen
 				return rec
 			},
@@ -344,7 +344,7 @@ func TestCorruptRecordInEarlierSegmentFailsOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[RecordHeaderLen+1] ^= 0xFF // corrupt the first record's payload byte, keeping the framing valid
+	raw[SegmentHeaderLen+RecordHeaderLen+1] ^= 0xFF // corrupt the first record's payload byte, keeping the framing valid
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestCorruptCompleteRecordThenPartialTailFailsOpen(t *testing.T) {
 	}
 	// Corrupt record 2's payload: record 1 is header(12)+3+trailer(4), so
 	// record 2's payload starts 12 bytes into it.
-	raw[RecordHeaderLen+3+RecordTrailerLen+RecordHeaderLen+1] ^= 0xFF
+	raw[SegmentHeaderLen+RecordHeaderLen+3+RecordTrailerLen+RecordHeaderLen+1] ^= 0xFF
 	// Then append a torn trailing record: a valid header claiming 64 bytes
 	// with only 3 following.
 	var header [RecordHeaderLen]byte
@@ -499,14 +499,14 @@ func TestReadRejectsOverflowingLengthPrefixInsteadOfPanicking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) < RecordHeaderLen+RecordTrailerLen {
+	if len(raw) < SegmentHeaderLen+RecordHeaderLen+RecordTrailerLen {
 		t.Fatalf("segment is %d bytes; the corrupt-prefix layout needs more", len(raw))
 	}
 	// Claim 2^64-1 payload bytes and re-checksum the header, so the length is
 	// "trustworthy" as far as the framing check goes and the arithmetic is
 	// really reached.
-	binary.BigEndian.PutUint64(raw[0:8], math.MaxUint64)
-	binary.BigEndian.PutUint32(raw[8:RecordHeaderLen], crc32.Checksum(raw[0:8], crcTable))
+	binary.BigEndian.PutUint64(raw[SegmentHeaderLen:SegmentHeaderLen+8], math.MaxUint64)
+	binary.BigEndian.PutUint32(raw[SegmentHeaderLen+8:SegmentHeaderLen+RecordHeaderLen], crc32.Checksum(raw[SegmentHeaderLen:SegmentHeaderLen+8], crcTable))
 	if err := os.WriteFile(seg, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}

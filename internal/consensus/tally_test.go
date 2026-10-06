@@ -234,3 +234,91 @@ func TestAnyQuorumReturnsFirstSeenQuorumBlockEvenWhenSeveralHaveQuorum(t *testin
 		}
 	}
 }
+
+// TestTallyDuplicateCheckPrecedesSignatureVerification pins the ordering fix of
+// the fourth review round (audit-verification new issue 3a).
+//
+// A justification a Byzantine proposer packs is tallied through VoteSet.Add,
+// and the set is built for ONE (height, round): the attack is one captured,
+// validly signed vote from validator 0 for exactly that place, repeated
+// thousands of times. Every repeat that reaches Verify() is one Ed25519
+// verification spent under the driver lock, once per round the proposer
+// proposes.
+//
+// The measurement is EXACT and needs no clock and no counter: the copies carry
+// a DESTROYED signature, which Verify() would reject. Everything the duplicate
+// check reads (type, key, height, round) is identical to the recorded vote, so
+//
+//   - with the seen check BEFORE Verify, each copy returns (false, nil) - the
+//     duplicate result - and no signature is checked: 0 verifications;
+//   - with the check after Verify, each copy returns ErrBadVoteSignature: one
+//     verification each. The error count IS the verification count.
+//
+// So this test fails, with the count in the message, on the pre-fix order and
+// on any mutant that moves the duplicate check back below the signature.
+//
+// It also pins the property that makes moving the check SAFE: an unseen
+// validator's forged frame must still reach Verify() (nothing was recorded for
+// it), so it cannot be used to mark an honest validator seen and swallow its
+// real vote.
+func TestTallyDuplicateCheckPrecedesSignatureVerification(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	var id [32]byte
+	id[0] = 1
+	vs := NewVoteSet(cfg, 1, 0, MsgPrevote)
+
+	// One captured vote from validator 0, recorded: the vote the proposer
+	// copies.
+	captured := voteFrom(t, cfg, 0, MsgPrevote, 1, 0, id)
+	if added, err := vs.Add(captured); err != nil || !added {
+		t.Fatalf("the captured vote was not recorded: added=%v err=%v", added, err)
+	}
+
+	// 50,000 copies of it, each with a destroyed signature. Nothing else about
+	// a copy changes.
+	const copies = 50000
+	verifications := 0
+	for i := 0; i < copies; i++ {
+		dup := *captured
+		dup.Sig = append([]byte(nil), captured.Sig...)
+		dup.Sig[0] ^= 0xFF
+		added, err := vs.Add(&dup)
+		if errors.Is(err, ErrBadVoteSignature) {
+			verifications++
+			continue
+		}
+		if err != nil {
+			t.Fatalf("copy %d of a recorded vote: err=%v; want the duplicate result (added=false, err=nil)", i, err)
+		}
+		if added {
+			t.Fatalf("copy %d was counted as a second vote for validator 0", i)
+		}
+	}
+	if verifications != 0 {
+		t.Fatalf("%d of %d copies of ONE captured vote reached Verify(): the duplicate check runs after the signature check, so a 1 MiB justification costs that many Ed25519 verifications under the driver lock", verifications, copies)
+	}
+	if got := vs.PowerFor(id); got != 1 {
+		t.Fatalf("power for the block = %d after %d duplicates, want 1", got, copies)
+	}
+	if n := len(vs.Votes()); n != 1 {
+		t.Fatalf("the set holds %d votes after %d duplicates, want 1", n, copies)
+	}
+
+	// POISONING CONTROL. Validator 1 is NOT in the set. A forged vote claiming
+	// it must reach - and fail - Verify(), which proves the duplicate check
+	// recorded nothing for a vote that did not verify; and the honest vote that
+	// follows must still be accepted.
+	forged := voteFrom(t, cfg, 1, MsgPrevote, 1, 0, id)
+	forged.Sig = append([]byte(nil), forged.Sig...)
+	forged.Sig[0] ^= 0xFF
+	if _, err := vs.Add(forged); !errors.Is(err, ErrBadVoteSignature) {
+		t.Fatalf("a forged vote from an UNSEEN validator gave %v; want ErrBadVoteSignature - a failed verification must never mark a validator seen", err)
+	}
+	honest := voteFrom(t, cfg, 1, MsgPrevote, 1, 0, id)
+	if added, err := vs.Add(honest); err != nil || !added {
+		t.Fatalf("validator 1's honest vote was refused after a forged one claimed it: added=%v err=%v", added, err)
+	}
+	if got := vs.PowerFor(id); got != 2 {
+		t.Fatalf("power = %d after validator 1's honest vote, want 2", got)
+	}
+}
