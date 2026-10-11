@@ -116,7 +116,18 @@ jobs:
       # that matches the toolchain go.mod demands. Findings fail the job: the
       # tree today is clean, so a new finding must be fixed or — with a
       # written reason — excluded, never ignored silently.
-      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+      # GOTOOLCHAIN is pinned here on purpose, and NOT to the module's toolchain.
+      # Go 1.27.2 raised the compiler's export-data version to 5; staticcheck
+      # 2026.2.1 / v0.8.1 is the newest release that exists and its golang.org/x/tools
+      # reads up to version 4, so under 1.27.2 it fails with
+      #   internal error in importing "internal/byteorder" (... version 5 is greater
+      #   than maximum supported version 4)
+      # which is an upstream limitation, not a finding about this code. The 2026-10-08
+      # net/http advisories are fixed in BOTH 1.26.9 and 1.27.2, so linting under
+      # 1.26.9 keeps the vulnerability gate and the lint gate simultaneously. It also
+      # matches the module's `go 1.26.0` language floor, which is what staticcheck
+      # should judge the source against. Revisit when a staticcheck release reads v5.
+      - run: GOTOOLCHAIN=go1.26.9 go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
       # govulncheck v1.8.0 (golang.org/x/vuln/cmd/govulncheck) checks
       # call-reachable vulnerabilities against the live vuln DB at
       # https://vuln.go.dev — module-level advisories the code never calls do

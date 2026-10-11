@@ -61,3 +61,24 @@ advisory is yours unless you prefer otherwise.
 Only the default branch's HEAD is supported. This project has no long-term
 release branches; a fix lands on the default branch and ships in the next
 release build.
+## A scheduled govulncheck failure is usually a Go patch release
+
+`go.mod` pins an exact `toolchain` line on purpose (audit finding B-1), so the
+version a binary reports and the version CI scans are one source of truth.
+Dependabot does not manage the `toolchain` directive, so **every Go patch
+release re-creates the failure until someone edits that line**.
+
+If the scheduled `lint` run fails and the findings are all in the **standard
+library** (`net/http`, `crypto/...`, `net/url`, ...) with no third-party module
+named, the fix is one line:
+
+    toolchain go1.27.2      # was go1.27.1
+
+Then verify, per the CI gates:
+
+    go mod tidy && git diff --exit-code go.mod go.sum
+    go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+The second command must print no findings. Push on a branch so the
+`pull_request` run exercises the full matrix and the release job's
+`BUILD-INFO` toolchain assertion.
