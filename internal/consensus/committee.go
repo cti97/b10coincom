@@ -35,6 +35,22 @@ var (
 type Config struct {
 	Committee []genesis.Validator
 
+	// CommitteeFor, when non-nil, is the PER-HEIGHT committee source: the
+	// chain's epoch-boundary derivation (Chain.CommitteeAt). Committee is
+	// then only the chain's base set - the genesis committee, which a node
+	// needs before any state has been derived and which is what a driver's
+	// membership gate checks - and every consumer that has a height must use
+	// CommitteeAt instead of reading Committee directly.
+	//
+	// Nil keeps the static behaviour: Committee is the set at every height.
+	// That is the M3/M4 shape and the shape a unit test builds. The seam
+	// exists so a committee CAN change at an epoch boundary without any
+	// reader caching it across the boundary: the driver rebuilds its Config
+	// for each height it judges (Driver.configFor), and the router, the
+	// certificate gate and BLOCK_SYNC membership ask by the height of the
+	// frame or block they are judging.
+	CommitteeFor func(h uint64) ([]genesis.Validator, error)
+
 	// TimeoutBase is the round-0 timeout and TimeoutStep the extra time added per
 	// further round. Timeouts must grow, or a slow network would thrash through
 	// rounds faster than messages can arrive; Validate rejects a non-positive
@@ -163,21 +179,50 @@ func quorumFor(total uint64) uint64 {
 }
 
 // CommitteeAt returns the committee that validates a height. Validator-set
-// changes take effect at epoch boundaries in M5 (staking); until then this is the
-// genesis set at every height, and the seam exists so M5 has somewhere to plug in
-// without touching the engine.
+// changes take effect at epoch boundaries (M5): the answer is the epoch's set,
+// fixed for the whole epoch, and nothing else may change it mid-epoch.
 //
-// It has NO READER yet (audit C-17), and that is a recorded decision rather than
-// an oversight: every current reader uses cfg.Committee directly, because with
-// one fixed committee a height-taking accessor is a no-op no test could
-// distinguish from the field read. The seam is a signature M5 fills in, not a
-// working indirection. When epoch-bound set changes arrive, the readers that
-// must vary by height - Proposer, VoteSet.Add's membership and power lookup,
-// IndexOf - take the height and call THIS method, and that change is reviewable
-// as the behavioural change it is. Routing those readers through this method
-// today would create call sites that pass a height the method ignores: the
-// appearance of a seam without a single changed decision.
-func (c Config) CommitteeAt(height uint64) []genesis.Validator { return c.Committee }
+// Every reader that judges a frame, a proposal or a block HAS A HEIGHT and must
+// call this method rather than read Config.Committee: the driver rebuilds its
+// Config per height, the vote router checks membership at the frame's height,
+// the certificate gate re-tallies with the block's height's set, and HELLO /
+// BLOCK_SYNC admission ask at the height they are judging. A reader that reads
+// Committee directly is pinned to the base (genesis) set - the M3/M4 shape -
+// and is exactly the bug TestTheRouter... / TestTheCertificateGateUsesTheBlocksEpoch
+// catch when the set rotates.
+//
+// It does not cache: Config is a value, and CommitteeFor is a pure function of
+// committed state (Chain.CommitteeAt memoises per EPOCH, never across a
+// boundary). Returning a Config whose Committee was filled for one height and
+// reusing it at another is what "nothing caches a committee across a boundary"
+// forbids.
+func (c Config) CommitteeAt(h uint64) ([]genesis.Validator, error) {
+	if c.CommitteeFor != nil {
+		return c.CommitteeFor(h)
+	}
+	return c.Committee, nil
+}
+
+// powerCapMinSeats is the smallest committee the spec's 1/4 cap can bind on.
+// Below four seats the largest holder necessarily holds at least a third, so
+// no ratio below 1/3 can hold and the cap is not applied. state's derivation
+// carries the same threshold (state.powerCapMinSeats); TestPowerCapFor pins
+// that this function and the derivation agree.
+const powerCapMinSeats = 4
+
+// PowerCapFor is the power-cap ratio a committee of n seats carries: the
+// spec's 1/4 at four or more, and 1/1 below. It exists so a config built for a
+// DERIVED committee (whose seat count can differ from genesis after a
+// rotation) carries a cap that committee can satisfy: 1/4 over three seats is
+// unsatisfiable (three equal seats are 1/3 each), so keeping 1/4 there would
+// make Config.Validate refuse the boundary's committee and halt the chain -
+// the defect the 1/1 escape already documents in Validate.
+func PowerCapFor(n int) (num, den uint64) {
+	if n >= powerCapMinSeats {
+		return 1, 4
+	}
+	return 1, 1
+}
 
 // IndexOf returns the committee index of a public key, or -1.
 func (c Config) IndexOf(pub []byte) int {

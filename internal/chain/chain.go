@@ -39,6 +39,13 @@ var (
 	// proposer set any positive value, including one behind its parent, and
 	// made the timestamp a free grinding input for the next proposer draw.
 	ErrBadTimestamp = errors.New("chain: block timestamp is not valid for its parent")
+	// ErrNoCommittee reports a height whose committee epoch has not been
+	// decided yet: the block at that epoch's deciding height (e*E-1, or the
+	// genesis state for epoch 0) is not committed. It is an error rather than
+	// a derivation from the current head state because deriving from the head
+	// is precisely the bug epoch-boundary rotation exists to prevent - a bond
+	// changing inside an epoch would move that epoch's seats.
+	ErrNoCommittee = errors.New("chain: the committee for that height is not determined")
 )
 
 // Chain is a validated, durably-stored block sequence. It is safe for
@@ -62,6 +69,26 @@ type Chain struct {
 	// derived from the genesis hash (so no private key exists for it). Set
 	// once in Open; advanceLocked uses it rather than recomputing per block.
 	faucet types.Address
+
+	// committees memoises, per committee epoch, the seat set derived from the
+	// state committed at the last height BEFORE that epoch. It is DERIVED
+	// STATE, never written to the store: chain.Open replays every stored block
+	// through applyValidatedLocked, so a restart rebuilds every epoch from the
+	// same states and derives the same seats (TestTheBoundaryCommitteeSurvivesReplay).
+	//
+	// It is not a cache that can go stale, and it must never be recomputed
+	// from the head. An entry is written exactly once, at the moment the state
+	// that DECIDES that epoch is committed (height e*E-1 for epoch e; the
+	// genesis state for epoch 0), and is a pure function of that state - see
+	// state.Committee. Deriving on demand from whatever the head is now would
+	// let a bond changing inside an epoch move that epoch's seats mid-epoch,
+	// which is the safety bug rotation-at-boundaries exists to prevent.
+	//
+	// Guarded by mu: Append writes under the write lock, CommitteeAt reads
+	// under the read lock. A lookup MISS is not derived on demand - the state
+	// a future epoch needs does not exist yet, and inventing one from the head
+	// would be the very bug above. It is an error naming the missing height.
+	committees map[uint64][]genesis.Validator
 }
 
 // genesisState builds the state that block 1 builds upon. It applies the
@@ -167,7 +194,21 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 			_ = s.Close()
 		}
 	}()
-	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st), faucet: g.FaucetAddress()}
+	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st), faucet: g.FaucetAddress(),
+		committees: make(map[uint64][]genesis.Validator)}
+	// Epoch 0's committee is the one derived from the GENESIS state (height
+	// -1 does not exist; the genesis state is its stand-in). It is recorded
+	// here for the same reason every later epoch is recorded at its deciding
+	// height: the seats epoch 0 validates with must not move when a bond
+	// changes inside the epoch.
+	//
+	// A derivation failure (no bonded candidate, CommitteeSize zero) is NOT an
+	// Open failure. Genesis permits an empty validator set - the testnet
+	// genesis is defined before keys exist - and such a chain simply cannot
+	// judge a height; CommitteeAt reports that, and consensus refuses to act.
+	if vals, err := st.Committee(); err == nil {
+		c.committees[0] = vals
+	}
 
 	// Compare the genesis BEFORE replaying a single block (audit O-5). A data
 	// directory belongs to one chain; opening it with a different genesis
@@ -236,6 +277,59 @@ func (c *Chain) Height() uint64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.head.Header.Height
+}
+
+// CommitteeAt returns the seats that validate height h: the committee of
+// epoch h/EpochBlocks (0-based; the faucet claim epoch is h/E+1 and is a
+// different number), derived from the state committed at the last height of
+// the preceding epoch - e*E-1 - or from the genesis state for epoch 0.
+//
+// This is the ONE per-height source of committee truth. Consensus for h reads
+// it (driver configFor, the vote router's membership check, the certificate
+// gate, HELLO admission, BLOCK_SYNC membership), so a validator's seat ends
+// exactly at the boundary and begins exactly there: h = E-1 is the last height
+// of epoch 0 and h = E the first of epoch 1.
+//
+// A height mid-epoch therefore sees exactly the set its first block saw. The
+// entry is written when the deciding state is committed, never recomputed: a
+// bond that changes inside epoch e cannot move epoch e's seats, because the
+// function of that state was already taken. The set that committed the
+// boundary's parent is the set that judges the boundary.
+//
+// The returned slice - and every validator key in it - is a COPY: the memo is
+// derived state that a caller must not be able to mutate through.
+func (c *Chain) CommitteeAt(h uint64) ([]genesis.Validator, error) {
+	blocks := c.gen.Params.EpochBlocks
+	if blocks == 0 {
+		// genesis.Validate refuses this, so it is unreachable from a real
+		// chain; a hand-built one must not divide by zero.
+		return nil, fmt.Errorf("%w: EpochBlocks is zero", ErrNoCommittee)
+	}
+	epoch := h / blocks
+	c.mu.RLock()
+	vals, ok := c.committees[epoch]
+	var head uint64
+	if !ok {
+		head = c.head.Header.Height
+	}
+	c.mu.RUnlock()
+	if !ok {
+		switch {
+		case epoch == 0:
+			return nil, fmt.Errorf("%w: epoch 0's committee is derived from the genesis state, which seats none", ErrNoCommittee)
+		case head < epoch*blocks-1:
+			return nil, fmt.Errorf("%w: epoch %d (height %d) is decided by the state at height %d, which is not committed yet (head %d)",
+				ErrNoCommittee, epoch, h, epoch*blocks-1, head)
+		default:
+			return nil, fmt.Errorf("%w: epoch %d (height %d) was decided by the state at height %d, which seats no committee",
+				ErrNoCommittee, epoch, h, epoch*blocks-1)
+		}
+	}
+	out := make([]genesis.Validator, len(vals))
+	for i := range vals {
+		out[i] = genesis.Validator{PubKey: append([]byte(nil), vals[i].PubKey...), Power: vals[i].Power}
+	}
+	return out, nil
 }
 
 // Head returns the current head block. Append retains the caller's
@@ -476,7 +570,36 @@ func (c *Chain) applyValidatedLocked(b *types.Block) error {
 	}
 	c.state = next
 	c.head = b
+	c.memoCommitteeLocked(next, b.Header.Height)
 	return nil
+}
+
+// memoCommitteeLocked records the committee epoch whose deciding state was
+// just committed. Epoch e is decided by the state at height e*E-1 (epoch 0 by
+// the genesis state), so exactly the block whose height+1 is a multiple of E
+// writes an entry - and it writes the entry for the epoch that BEGINS at
+// height+1, i.e. (height+1)/E. Writing at any other height, or keying the
+// entry by height/E, would shift every boundary by one block; both are pinned
+// by TestTheCommitteeChangesExactlyAtTheBoundary.
+//
+// A derivation failure is swallowed here on purpose: the block is valid, and
+// whether the NEXT epoch can be judged is a separate question that CommitteeAt
+// reports when someone asks. Refusing an otherwise-valid block because the
+// following epoch has no candidates would halt a chain one block early for a
+// reason the block itself does not carry. The caller holds mu.
+func (c *Chain) memoCommitteeLocked(st *state.State, height uint64) {
+	blocks := c.gen.Params.EpochBlocks
+	if blocks == 0 {
+		return
+	}
+	next := height + 1 // a wrap to 0 fails the next check, so the last uint64 height is inert
+	if next < blocks || next%blocks != 0 {
+		return
+	}
+	epoch := next / blocks
+	if vals, err := st.Committee(); err == nil {
+		c.committees[epoch] = vals
+	}
 }
 
 // validateLocked runs every check Append runs for a block over the chain's
@@ -646,6 +769,10 @@ func (c *Chain) Append(b *types.Block) error {
 	}
 	c.state = next
 	c.head = b
+	// The height just committed may be the boundary that DECIDES the next
+	// epoch. Record that epoch's seats from the state now committed - the same
+	// place replay records them - before any later height can observe it.
+	c.memoCommitteeLocked(next, b.Header.Height)
 	// The height just committed is behind every engine this node will build
 	// from now on (Driver.newEngine judges head+1, and there is no reorg), so
 	// its persisted lock - and every older one - can never be read again.

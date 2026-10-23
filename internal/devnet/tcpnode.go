@@ -52,7 +52,6 @@ package devnet
 //     forever at a height nobody is at; the rebuild is the rejoin.
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"fmt"
 	"log"
@@ -378,11 +377,10 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 
 	// The committee's power cap: the spec's 1/4 for four or more members,
 	// 1/1 below (small fixtures cannot satisfy 1/4). Sized by the committee
-	// that actually runs, whatever named it.
-	capNum, capDen := uint64(1), uint64(4)
-	if n < 4 {
-		capNum, capDen = 1, 1
-	}
+	// that actually runs, whatever named it. The DRIVER recomputes it for the
+	// per-height committee (a rotation can change the seat count); this is the
+	// startup sanity check on the GENESIS set, and both use the one rule.
+	capNum, capDen := consensus.PowerCapFor(n)
 	ccfg := consensus.Config{
 		Committee:   g.Validators,
 		TimeoutBase: consensusTimeoutBaseMS,
@@ -397,6 +395,13 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The per-height committee source (M5 Task 3): every engine this driver
+	// builds asks the chain for the epoch's seats, and every other reader
+	// (router membership, certificate gate, HELLO admission, BLOCK_SYNC) asks
+	// the same chain. Committee above stays the genesis set - the base a
+	// driver's membership gate checks - and is never the set used to judge a
+	// height once this seam is wired.
+	ccfg.CommitteeFor = ch.CommitteeAt
 	// admitHello is the transport's admission policy (audit N-3/N-7): an
 	// INBOUND socket becomes a peer only once it has delivered a HELLO signed
 	// by a member of THIS chain's committee. Before that it is absent from
@@ -405,6 +410,13 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// transport name cannot make this validator copy every frame for it. The
 	// policy lives here, not in the transport, because it needs the committee
 	// and the chain id; the transport only calls it.
+	//
+	// Membership is per the committee of the HEIGHT THE HELLO ANNOUNCES (M5
+	// rotation), widened by committeeMemberAt to the genesis and head sets so
+	// the rotation does not lock out the peers it creates. Admission is a DoS
+	// bound, never a safety gate: every admitted frame still faces the
+	// router's per-height membership, and every adopted block the certificate
+	// gate.
 	admitHello := func(frame []byte) bool {
 		h, err := wire.DecodeHello(frame)
 		if err != nil {
@@ -413,7 +425,7 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		if h.ChainID != g.ChainID {
 			return false
 		}
-		if genesis.SeatOfPubKey(g.Validators, h.Validator) < 0 {
+		if !committeeMemberAt(ch, g, h.Validator, h.Height) {
 			return false
 		}
 		hh := helloHash(h)
@@ -693,6 +705,42 @@ func helloHash(h *wire.Hello) [32]byte {
 	return crypto.HashParts([]byte("b10coin-hello"), e.Bytes())
 }
 
+// committeeMemberAt reports whether pub may participate in this node's
+// peer-to-peer traffic: it holds a seat in the committee that judges height,
+// OR it held a genesis seat, OR it holds one at our current head.
+//
+// THE UNION IS FOR THE ROTATION ITSELF, and it is deliberately not a single
+// height's set. Admission bounds who may send this node frames, and the
+// rotation creates two peers a single-height check would lock out:
+//
+//   - a validator whose seat ENDED at the boundary is absent from the new
+//     epoch's committee, so a strict check refuses its HELLO and it can never
+//     reconnect to follow the chain - the very node rotation produces;
+//   - a validator whose seat BEGAN after genesis is absent from the genesis
+//     set, so a peer still behind the boundary would refuse it;
+//   - a peer announcing a height whose deciding state we do not hold yet
+//     (ahead of an epoch boundary) cannot be checked at that height at all,
+//     and refusing it would refuse the pull that carries us across.
+//
+// The genesis and head sets cover all three. NOTHING HERE IS A SAFETY
+// DECISION: every frame still faces the router's per-height membership check,
+// and every block is adopted only through the certificate gate at its own
+// height. A peer admitted under the union cannot change this chain's state by
+// claiming a seat; it can at most waste bytes, which the transport's
+// per-connection admission and the BLOCK_SYNC rate limits bound.
+func committeeMemberAt(ch *chain.Chain, g *genesis.Genesis, pub []byte, height uint64) bool {
+	if genesis.SeatOfPubKey(g.Validators, pub) >= 0 {
+		return true
+	}
+	if vals, err := ch.CommitteeAt(height); err == nil && genesis.SeatOfPubKey(vals, pub) >= 0 {
+		return true
+	}
+	if vals, err := ch.CommitteeAt(ch.Height()); err == nil && genesis.SeatOfPubKey(vals, pub) >= 0 {
+		return true
+	}
+	return false
+}
+
 // observeHello records a peer's attested height, refusing announcements from
 // another committee, non-member signatures, and unvouched heights. The only
 // decision a hello may influence is WHICH peer to pull from, and adoption
@@ -700,18 +748,18 @@ func helloHash(h *wire.Hello) [32]byte {
 // heights" - was wrong on the code: a non-member is refused HERE, before
 // recordHeight, so the only actor who can inflate an entry is a signed
 // committee member. The rotation below (C-6) is what handles that member.
+//
+// Membership is per the height the HELLO announces (M5 rotation), through the
+// same committeeMemberAt the transport's admission uses: a rotated-in validator
+// becomes a pull target as soon as its epoch is derivable, and a rotated-out
+// genesis seat stays one (it still holds history, and it is the peer this node
+// may have to follow from). Without the per-height half the new epoch's seats
+// could never be selected.
 func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	if h.ChainID != v.g.ChainID {
 		return
 	}
-	member := false
-	for i := range v.g.Validators {
-		if bytes.Equal(v.g.Validators[i].PubKey, h.Validator) {
-			member = true
-			break
-		}
-	}
-	if !member {
+	if !committeeMemberAt(v.ch, v.g, h.Validator, h.Height) {
 		return
 	}
 	hh := helloHash(h)

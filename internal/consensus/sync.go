@@ -433,6 +433,55 @@ func syncReqHash(req *wire.BlockSyncReq) [32]byte {
 	return crypto.HashParts([]byte("b10coin-sync-req"), e.Bytes())
 }
 
+// syncSeatsAt returns the validator set a BLOCK_SYNC participant is authorised
+// against at height h: the committee that judges h, the genesis seats, and the
+// seats of this node's current head.
+//
+// WHY MORE THAN ONE SET. BLOCK_SYNC membership is an authorisation (a DoS
+// bound on who may spend this node's disk and CPU), never a safety decision:
+// every served unit is certificate-gated at its own height, and nothing a
+// requester sends can move this chain. Judged at ONE height, the rotation
+// itself would lock out exactly the participants it creates:
+//
+//   - a validator whose seat ENDED at the boundary is not in the committee at
+//     its head, so every peer would refuse the catch-up pull it needs to
+//     follow the chain it just left (this is the 6 -> 5 fixture's departing
+//     validator: without the genesis seats it freezes one block into the new
+//     epoch);
+//   - a validator whose seat BEGAN after genesis is not in the genesis set,
+//     so a restart at the boundary would be refused by peers that are still
+//     on its own epoch.
+//
+// Both are members of a set this node knows: genesis for the first, the
+// current head's committee for the second. A stranger is in neither and is
+// still refused, which is the property the relay-stranger tests pin.
+func (s *Syncer) syncSeatsAt(h uint64) []genesis.Validator {
+	genesisSeats := s.chain.Genesis().Validators
+	out := make([]genesis.Validator, len(genesisSeats))
+	copy(out, genesisSeats)
+	add := func(vals []genesis.Validator) {
+		for _, v := range vals {
+			member := false
+			for i := range out {
+				if bytes.Equal(out[i].PubKey, v.PubKey) {
+					member = true
+					break
+				}
+			}
+			if !member {
+				out = append(out, v)
+			}
+		}
+	}
+	if vals, err := s.chain.CommitteeAt(h); err == nil {
+		add(vals)
+	}
+	if vals, err := s.chain.CommitteeAt(s.chain.Height()); err == nil {
+		add(vals)
+	}
+	return out
+}
+
 // verifySyncReq authenticates a request the way consensus messages are
 // authenticated: a signature that verifies, bound to a key in the validator
 // set. It takes the validator list rather than a Config because the syncer is
@@ -625,10 +674,23 @@ func certVoteSet(vals []genesis.Validator, height uint64, round uint32) *VoteSet
 // certificate - a certificate that "seems right" would be an unverified claim
 // of a commit that may never have happened.
 func (s *Syncer) verifyCertificate(blk *types.Block, round uint32, votes []*Vote) error {
-	vals := s.chain.Genesis().Validators
+	// THE BLOCK'S HEIGHT'S COMMITTEE, not the genesis set (M5 rotation). An
+	// adopted block at height h must prove quorum among the seats that h
+	// validates under - the epoch h belongs to. A certificate signed by the
+	// previous epoch's seats is not evidence about a block of this one: at the
+	// boundary the two sets differ, and counting the old set would be
+	// re-tallying against a committee the chain no longer has. The set is a
+	// pure function of committed state, so every node checks one certificate
+	// against the same seats.
+	vals, err := s.chain.CommitteeAt(blk.Header.Height)
+	if err != nil {
+		// No derivable committee means this node cannot judge the block at
+		// all. A refused certificate, never a fallback to genesis.
+		return fmt.Errorf("%w: no committee for height %d: %w", ErrBadSyncCommit, blk.Header.Height, err)
+	}
 	// certVoteSet builds a bare Config (no timeouts), so Config.Validate is not
 	// run over it and Config.Quorum would silently use a WRAPPED total if this
-	// genesis's powers summed past 2^64 (audit C-17). The production node
+	// committee's powers summed past 2^64 (audit C-17). The production node
 	// validates the same committee at startup, but the certificate gate must
 	// not lean on a caller's earlier check: refuse the overflow here, as a
 	// refused certificate, so a wrapped quorum can never admit one.
@@ -655,8 +717,8 @@ func (s *Syncer) verifyCertificate(blk *types.Block, round uint32, votes []*Vote
 	return nil
 }
 
-// valsQuorum is the quorum threshold the genesis committee's powers imply, for
-// error messages.
+// valsQuorum is the quorum threshold the committee's powers imply, for error
+// messages.
 func valsQuorum(vals []genesis.Validator) uint64 { return Config{Committee: vals}.Quorum() }
 
 // RecordCommit files a commit certificate for a height. The driver's
@@ -764,7 +826,26 @@ func (s *Syncer) certificateAt(height uint64) (commitRecord, bool) {
 // and the served count below the window is how the requester learns the peer
 // has run out.
 func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
-	if err := verifySyncReq(req, s.chain.Genesis().Validators); err != nil {
+	// BLOCK_SYNC membership is PER HEIGHT, and it MUST NOT BE STRICTER THAN
+	// THE ROTATION ITSELF. The asker's head is the height just before the
+	// range it wants (From-1). Checking only that height refuses the pull a
+	// validator whose seat ENDED at From needs most: it is no longer a member
+	// at its head, so every peer would refuse its catch-up and the follower
+	// rotation creates would be frozen out of the chain it is trying to
+	// follow. syncSeatsAt widens the seat to the committee that judges the
+	// height, the genesis seats (a seat that has since ended still needs - and
+	// may serve - history) and this node's current head's seats (a seat that
+	// began after genesis). From 0 has no head below it; the genesis committee
+	// is then the right answer and CommitteeAt(0) gives it.
+	//
+	// This is an AUTHORISATION gate, not a safety gate: nothing a requester
+	// sends can move this chain. The safety is the certificate gate on every
+	// served unit, which the puller re-runs against each block's own epoch.
+	askerHead := req.From
+	if askerHead > 0 {
+		askerHead--
+	}
+	if err := verifySyncReq(req, s.syncSeatsAt(askerHead)); err != nil {
 		return nil, err
 	}
 	// The resource gates come before any allocation or disk read. The REPLAY
@@ -892,7 +973,20 @@ func (s *Syncer) Receive(from transport.PeerID, data []byte) {
 		// answer.
 		return
 	}
-	if verifySyncResp(w.req, resp, w.expect, s.chain.Genesis().Validators) != nil {
+	// The responder's committee is the one at the FIRST height it serves -
+	// the asker's head+1 = w.req.From, which this node can always derive
+	// (its state is committed) - or, for an empty answer, at the asker's own
+	// head. It is deliberately NOT the highest unit's height: that block is
+	// ahead of this node, its epoch's deciding state is not committed here,
+	// and asking for it is exactly the pull that crosses an epoch boundary.
+	// Checking at the highest unit would refuse the one pull catch-up needs
+	// after a rotation. Membership is an authorisation gate; every adopted
+	// unit is certificate-gated individually at its own height.
+	respHeight := w.req.From
+	if len(resp.Units) == 0 && respHeight > 0 {
+		respHeight--
+	}
+	if verifySyncResp(w.req, resp, w.expect, s.syncSeatsAt(respHeight)) != nil {
 		// The authentication check: an unsigned envelope, a non-member's, a
 		// different member's, or a signature that does not cover exactly this
 		// request and these bytes. Dropped, never filed.

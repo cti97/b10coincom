@@ -254,12 +254,23 @@ func (n *Net) newDriver(i int, tpOverride transport.Transport) (*consensus.Drive
 	if tpOverride != nil {
 		tp = tpOverride
 	}
-	d, err := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
+	d, err := consensus.NewDriver(n.driverConfig(i), n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
 	if err != nil {
 		return nil, err
 	}
 	d.CommitWitness = n.syncs[i].RecordCommit
 	return d, nil
+}
+
+// driverConfig is the configuration validator i's driver is built with: the
+// harness config plus the per-height committee seam (M5 rotation). The genesis
+// set in Committee stays the base a driver's membership gate checks, and every
+// height is judged with the epoch's derived seats - which for every current
+// scenario (EpochBlocks 1,000, runs far shorter) are the genesis seats.
+func (n *Net) driverConfig(i int) consensus.Config {
+	cfg := n.cfg
+	cfg.CommitteeFor = n.ch[i].CommitteeAt
+	return cfg
 }
 
 // newSyncer builds validator i's BLOCK_SYNC syncer over tp and installs the
@@ -970,7 +981,7 @@ func (n *Net) reseat(i int, c *chain.Chain) error {
 // restart scenario has always taken. The commit witness is re-wired so the
 // rebuilt driver keeps archiving certificates for the heights it commits.
 func (n *Net) rebuildDriver(i int) error {
-	d, err := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
+	d, err := consensus.NewDriver(n.driverConfig(i), n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
 	if err != nil {
 		return err
 	}

@@ -134,26 +134,48 @@ func NewMessageRouter(sync *Syncer) *MessageRouter {
 	return &MessageRouter{Sync: sync}
 }
 
-// committee returns the validator set membership is checked against.
-// Committee, when set explicitly, wins; otherwise it is the syncer's chain's
-// genesis committee. The returned slice is never mutated here.
-func (r *MessageRouter) committee() []genesis.Validator {
+// committee returns the validator set membership is checked against FOR A
+// HEIGHT, and whether a committee is known at all.
+//
+// Committee, when set explicitly, wins and is height-independent: that is the
+// unit-test shape (a fixed fixture set), never a node built through
+// NewMessageRouter with a live syncer.
+//
+// Otherwise the set is the syncer chain's committee at THAT height - the
+// epoch's set, not the genesis one. This is the whole point of the per-frame
+// height here: a vote signed by a validator whose seat ended at the boundary
+// must fail membership, and a vote signed by one whose seat began there must
+// pass it, in the same round. A genesis-wide check admits the first and
+// refuses the second, which is the cross-boundary failure
+// TestTheRouterRefusesTheOldEpochsVotes pins.
+//
+// A height the chain cannot answer for (a future epoch, a chain whose genesis
+// cannot seat a committee) is reported as KNOWN-but-empty rather than unknown:
+// the caller then refuses the frame. Falling back to an unknown committee
+// would skip the membership check entirely and let a self-signed stranger
+// through to the signature branch, which proves nothing about membership.
+// The returned slice is never mutated here.
+func (r *MessageRouter) committee(h uint64) ([]genesis.Validator, bool) {
 	if r.Committee != nil {
-		return r.Committee
+		return r.Committee, true
 	}
 	if r.Sync != nil && r.Sync.chain != nil {
-		return r.Sync.chain.Genesis().Validators
+		vals, err := r.Sync.chain.CommitteeAt(h)
+		if err != nil {
+			return nil, true
+		}
+		return vals, true
 	}
-	return nil
+	return nil, false
 }
 
-// isMember reports whether pub is a committee key, and whether a committee is
-// known at all. known=false (no syncer chain and no explicit Committee) means
-// the caller must fall back to the signature check alone: the unit-test shape,
-// never a node built through NewMessageRouter.
-func (r *MessageRouter) isMember(pub []byte) (member, known bool) {
-	vals := r.committee()
-	if len(vals) == 0 {
+// isMemberAt reports whether pub is a committee key at height h, and whether a
+// committee is known at all. known=false (no syncer chain and no explicit
+// Committee) means the caller must fall back to the signature check alone: the
+// unit-test shape, never a node built through NewMessageRouter.
+func (r *MessageRouter) isMemberAt(pub []byte, h uint64) (member, known bool) {
+	vals, known := r.committee(h)
+	if !known {
 		return false, false
 	}
 	for i := range vals {
@@ -225,7 +247,7 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 	// fails Verify must not record a key, or a stranger could poison the key
 	// of an honest vote it cannot sign and silence it.
 	if v, err := DecodeVote(m.Data); err == nil {
-		if member, known := r.isMember(v.Validator); known && !member {
+		if member, known := r.isMemberAt(v.Validator, v.Height); known && !member {
 			r.refused.Add(1)
 			return false
 		}
@@ -247,7 +269,7 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 		// signature, which is the expensive part of judging the decoded frame
 		// (audit C-8). A non-member's proposal costs one decode, never a
 		// verification, and never reaches the engine.
-		if member, known := r.isMember(p.Validator); known && !member {
+		if member, known := r.isMemberAt(p.Validator, p.Height); known && !member {
 			r.refused.Add(1)
 			return false
 		}

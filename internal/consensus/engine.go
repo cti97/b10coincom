@@ -394,6 +394,15 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) error {
 		// No usable proposal arrived before the round ran out: the one vote
 		// this round is owed is NIL. Emitted while e.round is still the round
 		// that is ending, so the vote is signed and tallied as that round's.
+		//
+		// An engine whose key has no seat returns ErrNotValidator HERE and does
+		// not enter the next round (audit C-11:
+		// TestANonMemberEngineReturnsAnErrorInsteadOfPanicking). That is the
+		// inert shape a rotated-out validator's driver runs: it tallies and it
+		// emits nothing. If it falls behind it is caught up by the node's pull,
+		// which rebuilds the engine at the adopted head - so the freeze costs a
+		// lag, never a stall of the chain. Do not swallow this error to make it
+		// advance rounds: the error IS the contract.
 		if err := e.emitVote(MsgPrevote, [32]byte{}); err != nil {
 			return err
 		}
