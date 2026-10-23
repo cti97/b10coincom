@@ -78,6 +78,12 @@ jobs:
   # checked-in version, not of whatever ships that week.
   lint:
     runs-on: ubuntu-latest
+    # contents: read is inherited from the top-level default; the ONLY extra grant
+    # is issues: write, for the scheduled toolchain-chore step below. No other job
+    # gains anything.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -132,8 +138,31 @@ jobs:
       # call-reachable vulnerabilities against the live vuln DB at
       # https://vuln.go.dev — module-level advisories the code never calls do
       # not fail the gate, which is exactly the signal worth gating on.
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
-
+      - name: govulncheck
+        run: |
+          set -o pipefail
+          go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./... 2>&1 | tee "$RUNNER_TEMP/govulncheck.out"
+      # The pinned `toolchain` line (audit B-1) means every Go patch release that
+      # fixes a standard-library advisory turns into a red `schedule` run while the
+      # code stands still. That is the gate working - but it is a chore nobody sees
+      # until they look at Actions, and it has now rotated twice (2026-10-08 ->
+      # go1.27.2, then GO-2026-6809 -> go1.27.3). This step files the issue so the
+      # chore becomes visible where work is tracked, instead of relying on someone
+      # noticing a red cron run.
+      #
+      # It only ever files on the SCHEDULE trigger: a push or PR that fails
+      # govulncheck is a normal failure its author sees immediately, and opening an
+      # issue for it would be noise. It is `failure()`-gated and no-ops unless THIS
+      # step's own output is on disk with advisory IDs in it, so an earlier lint
+      # gate failing (gofmt, shellcheck, tidy, staticcheck) files nothing.
+      # The reporter lives in scripts/ci/ so that the shellcheck gate above covers it -
+      # ~90 lines of inline YAML shell was logic the rest of this workflow does not have
+      # and nothing linted. See that script's header for what it files and why.
+      - name: file a toolchain-bump issue when the standard library is what regressed
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/ci/file-toolchain-issue.sh "$RUNNER_TEMP/govulncheck.out"
   # The portability matrix: every supported target is COMPILED and, crucially,
   # go-VETTED for that GOOS/GOARCH. Vet, not build, is what caught the real
   # cross-platform defect of this milestone — a Unix-only syscall in the
