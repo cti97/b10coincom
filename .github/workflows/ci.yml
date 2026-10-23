@@ -78,6 +78,12 @@ jobs:
   # checked-in version, not of whatever ships that week.
   lint:
     runs-on: ubuntu-latest
+    # contents: read is inherited from the top-level default; the ONLY extra grant
+    # is issues: write, for the scheduled toolchain-chore step below. No other job
+    # gains anything.
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -132,7 +138,118 @@ jobs:
       # call-reachable vulnerabilities against the live vuln DB at
       # https://vuln.go.dev — module-level advisories the code never calls do
       # not fail the gate, which is exactly the signal worth gating on.
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - name: govulncheck
+        run: |
+          set -o pipefail
+          go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./... 2>&1 | tee "$RUNNER_TEMP/govulncheck.out"
+      # The pinned `toolchain` line (audit B-1) means every Go patch release that
+      # fixes a standard-library advisory turns into a red `schedule` run while the
+      # code stands still. That is the gate working - but it is a chore nobody sees
+      # until they look at Actions, and it has now rotated twice (2026-10-08 ->
+      # go1.27.2, then GO-2026-6809 -> go1.27.3). This step files the issue so the
+      # chore becomes visible where work is tracked, instead of relying on someone
+      # noticing a red cron run.
+      #
+      # It only ever files on the SCHEDULE trigger: a push or PR that fails
+      # govulncheck is a normal failure its author sees immediately, and opening an
+      # issue for it would be noise. It is `failure()`-gated and no-ops unless THIS
+      # step's own output is on disk with advisory IDs in it, so an earlier lint
+      # gate failing (gofmt, shellcheck, tidy, staticcheck) files nothing.
+      - name: file a toolchain-bump issue when the standard library is what regressed
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/govulncheck.out"
+          if [ ! -s "$out" ] || ! grep -q 'GO-[0-9]\{4\}-' "$out"; then
+            echo "govulncheck produced no advisory findings; a different lint gate failed. Nothing to file."
+            exit 0
+          fi
+
+          stdlib=$(grep -c 'Standard library' "$out" || true)
+          modules=$(grep -cE '^[[:space:]]+Module:' "$out" || true)
+          # A module-level advisory the code never calls is not a finding: govulncheck
+          # reports those separately and they do not fail the gate. What fails the
+          # gate is a call-reachable finding, which is always either the standard
+          # library or a module we actually call.
+          if [ "${stdlib:-0}" -gt 0 ] && [ "${modules:-0}" -eq 0 ]; then
+            kind='stdlib'
+          else
+            kind='triage'
+          fi
+
+          # The version to bump to, taken from govulncheck's own "Fixed in:" lines.
+          fixed=$(grep -oE 'Fixed in: [^ ]+@go[0-9]+\.[0-9]+\.[0-9]+' "$out" \
+                    | grep -oE 'go[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
+
+          findings=$(grep -E 'Vulnerability #[0-9]+: GO-' "$out" | sed 's/^ *//' || true)
+          summary=$(grep -E 'Your code is affected by' "$out" | tail -1 || true)
+
+          if [ "$kind" = 'stdlib' ]; then
+            title='ci: Go toolchain bump needed (scheduled govulncheck, standard library only)'
+            target="${fixed:-the newest Go patch release}"
+            body=$(cat <<EOF
+          The scheduled \`lint\` run failed \`govulncheck\` with **call-reachable findings in the standard library only**. By the procedure in \`SECURITY.md\`, that means one line changed in \`go.mod\`:
+
+          \`\`\`text
+          toolchain ${target}
+          \`\`\`
+
+          Then verify locally — all four must pass:
+
+          \`\`\`bash
+          go mod tidy && git diff --exit-code go.mod go.sum
+          go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+          GOTOOLCHAIN=go1.26.9 go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+          go test -count=1 ./...
+          \`\`\`
+
+          Check the staticcheck line specifically: \`staticcheck@v0.8.1\` is the newest release that exists and its \`golang.org/x/tools\` reads export data up to version 4, so a toolchain bump can break it. That is why the CI step pins \`GOTOOLCHAIN=go1.26.9\`; if a future staticcheck reads v5, that pin can go.
+
+          ${summary}
+
+          Findings:
+          \`\`\`text
+          ${findings}
+          \`\`\`
+
+          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          )
+          else
+            title='ci: scheduled govulncheck failure needs triage (not standard library only)'
+            body=$(cat <<EOF
+          The scheduled \`lint\` run failed \`govulncheck\` with a call-reachable finding that is **not** explained by a Go toolchain bump. This one needs a human: either a dependency upgrade or a code change.
+
+          ${summary}
+
+          Findings:
+          \`\`\`text
+          ${findings}
+          \`\`\`
+
+          Full output:
+          \`\`\`text
+          $(cat "$out")
+          \`\`\`
+
+          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          )
+          fi
+
+          # One issue per kind, updated in place: a twice-weekly cron must not open a
+          # new issue every run.
+          existing=$(gh issue list --state open --search "in:title ${title}" \
+                       --json number,title --jq \
+                       "[.[] | select(.title == \"${title}\") | .number] | first // empty")
+          if [ -n "${existing:-}" ]; then
+            printf '%s\n\n---\n\n%s' "$body" "_Re-detected by run ${GITHUB_RUN_ID} on $(date -u +%Y-%m-%dT%H:%M:%SZ)._" \
+              | gh issue comment "$existing" --body-file -
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$title" --body "$body" --label dependencies
+          fi
 
   # The portability matrix: every supported target is COMPILED and, crucially,
   # go-VETTED for that GOOS/GOARCH. Vet, not build, is what caught the real
