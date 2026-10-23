@@ -88,12 +88,40 @@ func genesisState(g *genesis.Genesis) *state.State {
 		// same bytes differently - which is the point.
 		GenesisHash: g.Hash(),
 		MinFee:      g.Params.MinFeeSparks,
+		// The staking rules' parameters (M5 Task 1). MinStake is the floor a
+		// Bond's RESULT must clear, UnbondingEpochs is the cooldown in epochs
+		// (the release height is height + UnbondingEpochs*EpochBlocks, which
+		// reuses the EpochBlocks wired above), and CommitteeSize is what the
+		// committee derivation will fill. Wiring them here is what makes them
+		// consensus behaviour on a real chain rather than values that exist
+		// only in states tests construct by hand.
+		MinStake:        g.Params.MinStakeSparks,
+		UnbondingEpochs: g.Params.UnbondingEpochs,
+		CommitteeSize:   g.Params.CommitteeSize,
 	})
 	for _, d := range g.DevAccounts {
 		addr := types.AddressFromPub(d.PubKey)
 		acc := st.Get(addr)
 		acc.Balance += d.BalanceSparks
 		st.Set(addr, acc)
+	}
+	// GENESIS SEATS ARE BONDED, NOT BOUGHT. The genesis hash is what seats a
+	// validator, so height 0 holds bonded stake that no balance ever funded -
+	// this is the initial condition of the conservation invariant, not a double
+	// count of anything. It is also why the genesis state root (and therefore
+	// the acceptance root) moves in M5 Task 1: a bond is committed state, and
+	// before this task the state held no bonds at all.
+	//
+	// Amount is the genesis Validator.Power, unscaled: for a genesis seat the
+	// power IS its bond, and rescaling it would change every M3/M4 quorum and
+	// proposer draw for no milestone reason. Height 0 records that the stake
+	// predates the chain.
+	for _, v := range g.Validators {
+		st.SetBond(types.AddressFromPub(v.PubKey), state.Bond{
+			Validator: append([]byte(nil), v.PubKey...),
+			Amount:    v.Power,
+			Height:    0,
+		})
 	}
 	// The genesis mint the spec names. Reward is not special-cased at height 0,
 	// so this is the same formula every later block uses.

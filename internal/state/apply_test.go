@@ -486,19 +486,19 @@ func TestRootGoldenVectorFourAccounts(t *testing.T) {
 // execution reaches the type switch rather than failing the signature check
 // first.
 //
-// The three staking types are part of this table on purpose: M5 Task 0 makes
-// them encodable, and this is the test that keeps "encodable" from quietly
-// meaning "applicable". Task 1 adds the arms; until then a Bond is refused by
-// the same default branch as type 99.
+// The three staking types were part of this table between M5 Tasks 0 and 1, on
+// purpose: Task 0 made them encodable and this kept "encodable" from quietly
+// meaning "applicable". Task 1 gave them arms, so they moved to their own
+// tests (stake_test.go) and only the RESERVED values remain here - 0 and 6+ are
+// still not transactions, and the arm for them must stay the default branch.
 func TestApplyTxRejectsUnsupportedType(t *testing.T) {
 	cases := []struct {
 		name string
 		typ  types.TxType
 	}{
+		{"unreserved type 0", types.TxType(0)},
+		{"unreserved type 6", types.TxType(6)},
 		{"unreserved type 99", types.TxType(99)},
-		{"Bond", types.TxBond},
-		{"Unbond", types.TxUnbond},
-		{"Withdraw", types.TxWithdraw},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

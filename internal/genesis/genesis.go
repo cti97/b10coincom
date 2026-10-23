@@ -474,7 +474,13 @@ func sharedParams(chainID string, epochBlocks, claimAmountSparks uint64, committ
 		// set monetary policy. The level is a genesis parameter precisely so
 		// the level can be re-derived later without another fork; what is
 		// already fixed is that a zero-cost transfer is invalid.
-		MinFeeSparks:    1,
+		MinFeeSparks: 1,
+		// MIN_STAKE, derived rather than asserted: one b10 is SparksPerB10 =
+		// 10^8 sparks, so 1,000 b10 is 1,000 x 10^8 = 10^11 sparks. It is a
+		// genesis parameter (not a compiled-in constant) so the level can be
+		// re-derived later without another fork; what the encoding fixes is
+		// that it travels with the genesis. state.applyBond checks the RESULT
+		// of a Bond against it, so several bonds may accumulate to the floor.
 		MinStakeSparks:  1_000 * SparksPerB10,
 		EpochBlocks:     epochBlocks,
 		UnbondingEpochs: 2,
