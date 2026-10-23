@@ -1,12 +1,14 @@
 package state
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
 	"math/bits"
 	"slices"
 
+	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -411,4 +413,242 @@ func (s *State) applyWithdraw(tx *types.Tx) error {
 	from.Nonce++
 	s.Set(tx.From, from)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Committee derivation (M5 Task 2)
+// ---------------------------------------------------------------------------
+
+const (
+	// powerCapDivisor is §6.3's 1/4. It is a RATIO of the seated total, not a
+	// stake level, and it is the same ratio consensus.Config carries as
+	// PowerCapNum/PowerCapDen. Validate rejects only a share ABOVE it
+	// (power*den > total*num), so a seat holding exactly a quarter is legal -
+	// which is why the clamp below uses integer division and allows equality.
+	powerCapDivisor uint64 = 4
+
+	// powerCapMinSeats is the smallest committee the 1/4 cap can bind on. With
+	// fewer than four seats the largest holder necessarily holds at least a
+	// third - the largest is never below the average 1/n, and n < 4 - so 1/4
+	// is unsatisfiable there. Below this many seats the cap is not applied at
+	// all, which is exactly the escape consensus.Config expresses by
+	// configuring 1/1 for such a committee (Validate's per-validator
+	// comparison against 1/1 can never fail). There is no second rule: the
+	// derivation emits the raw stakes and the config layer says 1/1.
+	powerCapMinSeats = 4
+
+	// committeeMaxCapPasses bounds the fixed-point clamp. The bound is
+	// DERIVED, not guessed. A binding pass sets every power above T/4 to T/4;
+	// the slowest case is three seats pinned at one large value M with the
+	// rest tiny, where the gap g = M - min shrinks by three quarters a pass
+	// (g' = g - ceil(g/4)), so the pass count is
+	//
+	//	log_{4/3}(g) = log2(g) * ln2/ln(4/3) = 2.41 * log2(g).
+	//
+	// Over the whole uint64 domain log2(g) <= 64, so at most ~155 passes, and
+	// the measured worst case is 148 (three at 2^64-1, one at 1 spark). The
+	// plan said 64; that is NOT enough, and not only for adversarial inputs:
+	// three seats at 10^12 with one at 1 spark needs 94 passes, and three at
+	// 2^51 (the shipped 21,000,000 b10 supply cap is 2.1e15 = 2^50.9) with one
+	// at MIN_STAKE needs ~121, so 64 would refuse to seat a committee a real
+	// chain can reach - a liveness halt presented as an arithmetic error. 256
+	// is the next power of two above the proven bound, and the explicit
+	// non-convergence error stays as a guard on that analysis rather than as
+	// an approximation.
+	committeeMaxCapPasses = 256
+)
+
+var (
+	// ErrNoCandidates reports a state with no bond that can be seated. It is an
+	// error, not an empty slice: an empty committee reaching
+	// consensus.NewEngine fails there with ErrEmptyCommittee, a message about
+	// the engine when the fact is about the state.
+	ErrNoCandidates = errors.New("state: no bonded candidate can be seated")
+	// ErrZeroCommittee reports a state whose Params carry no CommitteeSize. A
+	// zero seat count would derive an empty committee for every height, which
+	// is the same failure one layer later and harder to read.
+	ErrZeroCommittee = errors.New("state: CommitteeSize is zero")
+	// ErrCommitteePowerOverflow reports a seated total that does not fit in a
+	// uint64. Every share and every clamp is computed from T, so a wrapped T
+	// would make every share wrong - it is refused, never emitted.
+	ErrCommitteePowerOverflow = errors.New("state: the seated voting power overflows uint64")
+	// ErrZeroPowerSeat reports a derivation that would emit a seat with no
+	// power. consensus.Config.Validate refuses such a committee
+	// (ErrZeroPower), so this is the same refusal one layer earlier with a
+	// message about the state. It is unreachable from a bond map whose
+	// candidates all hold at least one spark and that seats four or more: T is
+	// then at least 4 and T/4 at least 1, so no clamp can produce a zero. It
+	// stays as the check that the arithmetic still agrees with that argument.
+	ErrZeroPowerSeat = errors.New("state: the derivation would seat a validator with no voting power")
+	// ErrPowerCapNotConverged reports a clamp that did not reach a fixed point
+	// within committeeMaxCapPasses. The derivation returns the error rather
+	// than an approximation: a committee whose cap does not hold is one
+	// consensus.Config.Validate refuses, so approximating would move the
+	// failure somewhere with a worse message instead of removing it.
+	ErrPowerCapNotConverged = errors.New("state: the power cap did not reach a fixed point")
+)
+
+// committeeCandidate is one bond record as the derivation sees it: the map key
+// (the address), the key the seat would carry, and the locked amount.
+type committeeCandidate struct {
+	address types.Address
+	key     []byte
+	amount  uint64
+}
+
+// compareCandidates orders candidates by stake descending, then by public-key
+// BYTES ascending, then - for a total order only - by address bytes.
+//
+// The key tie-break is §6.3's and it is deliberately on the key, not on the
+// address: an address is a hash of the key, so its byte order is unrelated to
+// the key's, and a sort by address (or by the address STRING) would pick a
+// different winner among equal stakes. The address tie-break can only matter
+// for two bond records carrying the same key, which committed state cannot
+// hold - SetBond is keyed by address and a later Bond for one address keeps
+// the first-recorded key, so key and address are one-to-one through
+// AddressFromPub. A hand-built state can still hold the pair, and a sort with
+// equal keys and equal amounts would then hash an arbitrary map order, so the
+// address makes the order total and the derivation deterministic for every
+// state, not merely every reachable one.
+func compareCandidates(x, y committeeCandidate) int {
+	switch {
+	case x.amount > y.amount:
+		return -1
+	case x.amount < y.amount:
+		return 1
+	}
+	if c := bytes.Compare(x.key, y.key); c != 0 {
+		return c
+	}
+	return bytes.Compare(x.address[:], y.address[:])
+}
+
+// Committee returns the seats derived from THIS state: the top CommitteeSize
+// candidates by bonded stake (ties by public-key bytes, ascending), each power
+// capped at a quarter of the seated total. Which height this state is decides
+// which epoch's committee it is; the function itself knows nothing of heights.
+//
+// It is a PURE FUNCTION OF COMMITTED STATE and that is load-bearing, not
+// stylistic. It reads s.params (protocol configuration every node holding this
+// state already agrees on) and s.bonds (committed), and nothing else: no wall
+// clock, no network, no Peers(), no cache, no s.height. Two nodes with the same
+// committed state must derive the same committee, or they cannot agree on a
+// block - and the failure would look like a liveness bug, not a determinism
+// bug. In particular the bond map's iteration order is randomised by Go, so the
+// candidates are sorted before anything is selected, and the comparator is a
+// total order over the map's entries so the result does not depend on the order
+// the map yields them in.
+//
+// The cap is applied AFTER selecting, never instead of it: a validator that
+// ranks in the top CommitteeSize is seated even when its stake is far above a
+// quarter of the seated total, and its power is reduced to the cap. Excluding
+// over-cap holders instead would drop seats the stake ranking earned and would
+// make the seat set depend on the cap, not on the ranking. §6.3's table wants
+// the former: the cap "keeps one operator below the 1/3 threshold".
+//
+// Powers are the derivation's output; the cap ratio itself is the consensus
+// config's (1/4 at four or more seats, 1/1 below - see powerCapMinSeats).
+func (s *State) Committee() ([]genesis.Validator, error) {
+	if s.params.CommitteeSize <= 0 {
+		return nil, ErrZeroCommittee
+	}
+
+	// Candidates are bond records with a positive amount. An unbonding record
+	// is not in the bond map at all (applyUnbond deletes or decrements the
+	// bond and writes the record to s.unbonding), so coins in cooldown are
+	// not candidates and a fully withdrawn seat is gone - the cooldown's
+	// "neither spendable nor counted" half.
+	candidates := make([]committeeCandidate, 0, len(s.bonds))
+	for addr, b := range s.bonds {
+		if b.Amount == 0 {
+			continue
+		}
+		candidates = append(candidates, committeeCandidate{address: addr, key: b.Validator, amount: b.Amount})
+	}
+	if len(candidates) == 0 {
+		return nil, ErrNoCandidates
+	}
+
+	slices.SortFunc(candidates, compareCandidates)
+
+	seats := len(candidates)
+	if s.params.CommitteeSize < seats {
+		seats = s.params.CommitteeSize
+	}
+
+	powers := make([]uint64, seats)
+	for i := range powers {
+		powers[i] = candidates[i].amount
+	}
+	if seats >= powerCapMinSeats {
+		var err error
+		if powers, err = applyPowerCap(powers); err != nil {
+			return nil, err
+		}
+	}
+
+	committee := make([]genesis.Validator, seats)
+	for i := range committee {
+		// Clone the key: the returned committee must not alias committed
+		// state, or a caller could mutate a bond through it.
+		committee[i] = genesis.Validator{PubKey: slices.Clone(candidates[i].key), Power: powers[i]}
+	}
+	return committee, nil
+}
+
+// applyPowerCap is the fixed-point clamp: each pass takes T once and clamps
+// every member against that same T, repeating until a pass changes nothing.
+//
+// A single pass is not safe. The pass is measured against T, and clamping
+// changes T, so one pass leaves the residual holders over the ratio they were
+// just checked against: a holder of 99% of the stake, clamped once, ends at
+// 96% of the shrunken total and could still commit alone. Repeating the pass
+// against the recomputed total converges to the point where no member exceeds
+// T/4 - the property the cap exists to buy, and the one
+// consensus.Config.Validate checks.
+//
+// The pass structure is also what makes the result independent of the order the
+// validators are visited in: every clamp in a pass uses the same T, so a
+// permutation of the input yields a permutation of the output at every pass.
+func applyPowerCap(powers []uint64) ([]uint64, error) {
+	out := slices.Clone(powers)
+	for pass := 0; ; pass++ {
+		if pass == committeeMaxCapPasses {
+			return nil, fmt.Errorf("%w after %d passes", ErrPowerCapNotConverged, committeeMaxCapPasses)
+		}
+		total, ok := sumPowers(out)
+		if !ok {
+			return nil, ErrCommitteePowerOverflow
+		}
+		limit := total / powerCapDivisor
+		changed := false
+		for i := range out {
+			if out[i] > limit {
+				out[i] = limit
+				changed = true
+			}
+		}
+		if !changed {
+			for i := range out {
+				if out[i] == 0 {
+					return nil, fmt.Errorf("%w: seat %d has zero power", ErrZeroPowerSeat, i)
+				}
+			}
+			return out, nil
+		}
+	}
+}
+
+// sumPowers sums powers with a checked add, reporting whether the total fit in
+// a uint64. The clamp divides T, so a wrapped T would make every share wrong.
+func sumPowers(powers []uint64) (uint64, bool) {
+	var total uint64
+	for _, p := range powers {
+		next, carry := bits.Add64(total, p, 0)
+		if carry != 0 {
+			return 0, false
+		}
+		total = next
+	}
+	return total, true
 }
