@@ -18,9 +18,14 @@ var (
 	ErrAddressMismatch   = errors.New("types: pubkey does not match sender address")
 )
 
-// TxType discriminates the transaction union. TxTransfer (M1) and
-// TxFaucetClaim (M2) are implemented; TxBond, TxUnbond and TxWithdraw are
-// reserved so the encoding is stable.
+// TxType discriminates the transaction union. Every tag 1..5 is implemented:
+// TxTransfer (M1) and TxFaucetClaim (M2), then TxBond, TxUnbond and TxWithdraw
+// (M5), whose bodies were filled in behind tags reserved since M1.
+//
+// The VALUES are frozen. The reservation existed so the encoding could gain the
+// staking types without renumbering; changing a tag now would invalidate every
+// stored encoding and every signature over one, which is a larger hard fork
+// than M5 intends.
 type TxType uint8
 
 const (
@@ -61,12 +66,23 @@ type Tx struct {
 	Fee uint64
 
 	// TxTransfer only.
-	To     Address
+	To Address
+
+	// Amount is the sum moved, in sparks (never b10, never a float). It is
+	// carried by TxTransfer, TxBond and TxUnbond and by nothing else.
+	// TxWithdraw encodes NO body field at all: it asks for what the signer has
+	// already bonded to be released, and a release amount would be a second,
+	// redundant claim about state rather than a fact the chain derives from the
+	// bond record.
 	Amount uint64
 
 	// TxFaucetClaim only. The puzzle's parameters are genesis state, not carried
 	// on the wire: a claimant and a verifier must agree on them, and if they
-	// disagree the claim simply fails to verify.
+	// disagree the claim simply fails to verify. Epoch is the 1-BASED faucet
+	// claim epoch (h/EpochBlocks + 1); it is deliberately NOT on a staking
+	// transaction, whose committee epoch is 0-based and merely equal in period
+	// today. A bond carrying a claim epoch would couple two rules that only
+	// accidentally share a value.
 	Epoch    uint64
 	PowNonce uint64
 
@@ -74,7 +90,13 @@ type Tx struct {
 	Sig []byte
 }
 
-// encodeBody renders every field the signature covers.
+// encodeBody renders every field the signature covers: the common prefix, then
+// the body of this transaction type.
+//
+// The prefix - Type(1) | From(20) | len PubKey | Nonce(8) | Fee(8) - is
+// byte-identical for every type and MUST stay that way: every block on disk is
+// decoded on chain.Open and every stored signature covers these bytes, so a
+// prefix change invalidates every chain in every data directory.
 func (tx *Tx) encodeBody() []byte {
 	e := NewEncoder()
 	e.U8(uint8(tx.Type))
@@ -82,13 +104,20 @@ func (tx *Tx) encodeBody() []byte {
 	e.VarBytes(tx.PubKey)
 	e.U64(tx.Nonce)
 	e.U64(tx.Fee)
-	if tx.Type == TxTransfer {
+	switch tx.Type {
+	case TxTransfer:
 		e.Raw(tx.To[:])
 		e.U64(tx.Amount)
-	}
-	if tx.Type == TxFaucetClaim {
+	case TxFaucetClaim:
 		e.U64(tx.Epoch)
 		e.U64(tx.PowNonce)
+	case TxBond, TxUnbond:
+		// The validator a bond is for is From, the signer: no address is
+		// repeated in the body. Amount is 8 bytes, always, so the body has
+		// exactly one length here.
+		e.U64(tx.Amount)
+	case TxWithdraw:
+		// No body fields. The signer's bonded balance is state, not input.
 	}
 	return e.Bytes()
 }
@@ -126,12 +155,9 @@ func (tx *Tx) ID() [32]byte {
 	return crypto.HashParts([]byte("b10coin-txid"), tx.Encode())
 }
 
-// Encode returns the canonical wire encoding, signature included.
-//
-// Encoding is only meaningful for the implemented types (TxTransfer and
-// TxFaucetClaim): encodeBody emits a truncated body for a reserved type
-// (TxBond, TxUnbond, TxWithdraw), so DecodeTx(tx.Encode()) is not a round
-// trip for those — DecodeTx rejects reserved types outright.
+// Encode returns the canonical wire encoding, signature included. Every tag
+// 1..5 encodes its own body, so DecodeTx(tx.Encode()) round-trips for every
+// implemented type.
 func (tx *Tx) Encode() []byte {
 	e := NewEncoder()
 	e.Raw(tx.encodeBody())
@@ -159,8 +185,9 @@ func (tx *Tx) VerifySignature(genesisHash [32]byte) error {
 	return nil
 }
 
-// DecodeTx parses a canonical transaction encoding. It rejects unsupported
-// types, trailing bytes and any over-long field.
+// DecodeTx parses a canonical transaction encoding. It accepts the implemented
+// types 1..5 and rejects 0 and 6+ as ErrUnsupportedTxType, along with trailing
+// bytes and any over-long field.
 func DecodeTx(b []byte) (*Tx, error) {
 	d := NewDecoder(b)
 	rawType, err := d.U8()
@@ -168,7 +195,10 @@ func DecodeTx(b []byte) (*Tx, error) {
 		return nil, err
 	}
 	tx := &Tx{Type: TxType(rawType)}
-	if tx.Type != TxTransfer && tx.Type != TxFaucetClaim {
+	// The implemented tags are contiguous 1..5. Testing the range rather than
+	// listing the three new tags keeps a future reservation from silently
+	// becoming decodable: a reserved tag is still not a transaction.
+	if tx.Type < TxTransfer || tx.Type > TxWithdraw {
 		return nil, fmt.Errorf("%w: %d", ErrUnsupportedTxType, rawType)
 	}
 	if tx.From, err = d.Fixed20(); err != nil {
@@ -198,6 +228,15 @@ func DecodeTx(b []byte) (*Tx, error) {
 		if tx.PowNonce, err = d.U64(); err != nil {
 			return nil, err
 		}
+	case TxBond, TxUnbond:
+		// The body is exactly one fixed-width amount (8 bytes). There is no
+		// length prefix to misread: a missing byte is ErrShortBuffer and an
+		// extra one is ErrTrailingBytes.
+		if tx.Amount, err = d.U64(); err != nil {
+			return nil, err
+		}
+	case TxWithdraw:
+		// No body fields; Done() below is what makes one extra byte an error.
 	}
 	if tx.Sig, err = d.VarBytes(); err != nil {
 		return nil, err
