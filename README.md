@@ -793,8 +793,12 @@ Recovery depends on the round the divergence reaches, not only on the gap:
 measured on the constructed three-of-four state (one live seat ahead), a
 one-round gap starting at round 40 commits after about 13 s and a five-round
 gap after about 27 minutes, both slower than the same gaps starting near round
-16. So restart the members within one block time of each other, or expect the
-wait; [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
+16. The gap comes from the restart itself: a restarted node resumes at the
+round it had reached before it stopped, behind a committee that kept climbing,
+and the jump that would pull it forward needs 2 of the 4 seats ahead — if the
+next node is already stopping, only one is. So restart the members within one
+block time of each other, or one at a time **waiting for the chain to advance
+before stopping the next**, or expect the wait; [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
 has the operator's version. A node that has spent eight rounds at one height
 while the seats it can reach hold a quorum now says so, once per height:
 `b10coin: no block for 8 rounds at height H (round R, step S): quorum reachable
@@ -1235,8 +1239,11 @@ round gap closes. It is a liveness limit, not a safety one — see
 the three Pis within one block time of each other (back-to-back `systemctl
 restart`, or reboot them together), because a one-at-a-time restart leaves
 their rounds apart and can keep the chain at one head for minutes — the
-2026-10-30 Docker re-run measured 4 to 6.5 minutes. A node now logs the stall
-once per height (`b10coin: no block for 8 rounds at height …`), and
+2026-10-30 Docker re-run measured 4 to 6.5 minutes. If you must restart one
+at a time, wait for the chain to advance after each restart before stopping
+the next. A node now logs the stall once per height (`b10coin: no block for 8
+rounds at height …`) and, at startup, the round it resumes at (`consensus
+resuming height H at round R …`), and
 [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
 has the operator's procedure.
 

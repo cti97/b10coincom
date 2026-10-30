@@ -1068,6 +1068,21 @@ func TestStakeRefusesBelowMinStakeBeforeSubmitting(t *testing.T) {
 	}
 }
 
+// TestTheResumeLineNamesARestoredRound pins the startup note for the
+// rolling-restart trigger: silent at round 0 (a fresh height, the healthy
+// restart), and naming the height, the restored round and the advice otherwise.
+func TestTheResumeLineNamesARestoredRound(t *testing.T) {
+	if got := resumeLine(1081, 0); got != "" {
+		t.Fatalf("a node starting at round 0 printed a resume note: %q", got)
+	}
+	got := resumeLine(1081, 20)
+	for _, want := range []string{"height 1081", "round 20", "after the chain has advanced", "rolling restart"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the resume note does not say %q: %q", want, got)
+		}
+	}
+}
+
 // TestTheFundingHintAppearsOnlyWhenTheBalanceCannotReachMinStake is the M5
 // re-run's misleading-hint finding (2026-10-30): refusing a stake for a
 // two-spark FEE shortfall appended "no shipped genesis gives an operator's key

@@ -112,3 +112,21 @@ The network area was run again on its own at `6d54215`, which includes `88e70a8`
 2. Investigate the 3-seat stall, using that visibility, on a long-lived chain with mixed faults.
 3. Document the restart procedure in the deploy README: restart all nodes together, or wait for the chain to advance between restarts.
 4. Log PEER_EXCHANGE and relay reconnect events. Right now they are visible only through `ss`.
+
+## Follow-up: why a rolling restart stalls a 4-seat chain
+
+This was diagnosed with a debug build in Docker: 4 seats, 3 nodes, a chain warmed to height 1000, then a one-at-a-time restart with 15 s outages.
+- A restarted node resumes at **the round it had saved before it stopped**. The rest of the committee kept moving through rounds while it was down, so it comes back behind. In the reproduction, q1 came back at round 20 while q0 was at 26.
+- To catch up, it has to jump forward, and the jump rule needs 2 of the 4 seats to be ahead. In a fast rolling restart the next node is already stopping, so only one node is ahead, and the gap stays. After all three were back the nodes sat at rounds 33, 28 and 27, and each round's tally held only the node's own vote. Only the timeout ladder could close the gap, and it shrank from 5–6 rounds to 2 over 4 minutes.
+- Ruled out, with evidence: clock drift (every node's consensus clock ran at 1.0000× wall time); locks losing their evidence on restart (a deterministic simulation recovered within 10 ms, because the original proposer rebuilds the identical block); and the pure engine logic (an in-process rolling restart recovered within 1.6–15 s, because an in-process restart is instant and the node hears both peers before the next one stops).
+- Whether a no-wait restart stalls depends on timing: a second trial with the same procedure recovered within seconds.
+
+What changed:
+- Upstream's `0ccfce9` and `b213aad` added the stall line and the "restart together" advice.
+- This follow-up adds a startup line that names the restored round (`consensus    resuming height H at round R …`) and documents a safe one-at-a-time procedure: wait for the chain to advance after each restart before stopping the next node. Verified in Docker over 3 trials (9 restarts): the chain advanced 6–33 s after every restart and never stalled afterwards.
+
+Observed while verifying, not changed:
+- Upstream's stall line also fires once at height 0 on every fresh chain, while the nodes are still starting.
+- It also fires during a planned outage. A just-stopped peer still counts as reachable until its HELLO expires, so the line claims a quorum is reachable when it isn't.
+
+The 3-seat intermittent stall is still not diagnosed. Its committee jumps on 1 seat ahead, so this mechanism doesn't explain it.

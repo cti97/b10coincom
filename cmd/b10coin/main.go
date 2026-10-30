@@ -1161,6 +1161,25 @@ func cmdWithdraw(args []string) error {
 	return nil
 }
 
+// resumeLine is the startup note a validator prints when it comes back into an
+// undecided height at a round other than 0, and "" when it starts at round 0.
+//
+// It names the trigger of the rolling-restart stall (M5 network re-run at
+// 6d54215, 2026-10-30, diagnosed with a debug build): a restarted node resumes
+// at the round it had reached before it stopped, which is BEHIND a committee
+// that kept climbing rounds while it was down. It jumps forward only on
+// evidence from enough of the committee (2 of 4 seats on a four-seat
+// committee), so if the next node is stopped before this one has heard from
+// two peers it keeps the gap, and only the timeout ladder closes it. The stall
+// line (internal/devnet/stall.go) reports the symptom once the height is
+// stuck; this line is the cause, printed at the moment it is created.
+func resumeLine(height uint64, round uint32) string {
+	if round == 0 {
+		return ""
+	}
+	return fmt.Sprintf("consensus    resuming height %d at round %d, the round this node reached before it stopped; it catches up to a committee further ahead only once enough of the committee is heard from, so in a one-at-a-time restart stop the next node only after the chain has advanced (deploy README: rolling restart)", height, round)
+}
+
 func cmdNode(args []string) error {
 	fs := flag.NewFlagSet("node", flag.ExitOnError)
 	dir := fs.String("dir", "./b10coin-data", "data directory")
@@ -1538,6 +1557,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 		seatName = fmt.Sprintf("seat %d (%s)", seat, keyDesc)
 	}
 	fmt.Printf("consensus    committee of %d, %s, %s\n", committeeSize, seatName, dialDesc)
+	if line := resumeLine(v.Height()+1, v.Round()); line != "" {
+		fmt.Println(line)
+	}
 
 	serveErr := make(chan error, 1)
 	go func() {

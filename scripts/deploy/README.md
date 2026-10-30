@@ -648,6 +648,24 @@ same build**, for the §3 reason.
 > - **Do:** restart all three nodes within one block time (a few seconds of
 >   each other) — `sudo systemctl restart b10coin` back to back on the three
 >   machines, or reboot the Pis together.
+> - **If you must go one at a time** (an upgrade you want to watch Pi by
+>   Pi): restart one node, then **wait until the chain has advanced** —
+>   its `/status` height moves past where it stood — before you stop the
+>   next one. Why: a restarted node resumes at the round it had reached
+>   before it stopped, which is behind a committee that kept climbing
+>   rounds while it was down, and it jumps forward only once it hears 2 of
+>   the 4 seats ahead. Stop the next node too early and only one live seat
+>   is ahead of it, so it keeps the gap. With the wait, the 2026-10-30
+>   Docker check (4 seats, 3 nodes, 15 s down per restart, 3 trials, 9
+>   restarts) saw the chain advance 6 to 33 s after every restart and never
+>   stall afterwards. The node says when it resumes mid-height:
+>
+>   ```
+>   consensus    resuming height 1063 at round 17, the round this node reached before it stopped; ...
+>   ```
+>
+>   Round 0 prints nothing. A high round there right after a one-at-a-time
+>   restart is the gap forming.
 > - **Expect if you cannot:** safety is unaffected and no node diverges; the
 >   chain stops finalising until the ladder closes the gap, then resumes. A
 >   node now says so, once per stuck height, as soon as the stall is real, so
