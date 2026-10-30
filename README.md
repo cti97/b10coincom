@@ -792,7 +792,7 @@ restart — twice — and recovered only once the nodes were restarted together.
 Recovery depends on the round the divergence reaches, not only on the gap:
 measured on the constructed three-of-four state (one live seat ahead), a
 one-round gap starting at round 40 commits after about 13 s and a five-round
-gap after about 26 minutes, both slower than the same gaps starting near round
+gap after about 27 minutes, both slower than the same gaps starting near round
 16. So restart the members within one block time of each other, or expect the
 wait; [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
 has the operator's version. A node that has spent eight rounds at one height

@@ -636,7 +636,7 @@ same build**, for the §3 reason.
 > members' rounds apart — one Pi at a time, or one unit a few seconds before
 > the others — therefore hands the committee a round gap that only the ladder
 > can close, and **the wait grows with how far the rounds ran**: a one-round
-> gap at round 40 takes about 13 s, a five-round gap there about 25 minutes
+> gap at round 40 takes about 13 s, a five-round gap there about 27 minutes
 > (the arithmetic is in `internal/consensus/driver.go` and the main README's
 > [Consensus](../../README.md#consensus)). A four-seat committee with one
 > seat without a node is the slow shape: the round-resync jump needs 2 of the
