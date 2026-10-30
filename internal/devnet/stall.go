@@ -143,10 +143,6 @@ func (v *Validator) stallReportOnce() (string, bool) {
 	if v.drv == nil || v.closing.Load() {
 		return "", false
 	}
-	// Fold the engine's current state into the ring before reading it, exactly
-	// as DiagRounds does: a report must never name a round older than the
-	// engine it is looking at.
-	v.drv.Observe()
 	head, round := v.drv.Height(), v.drv.Round()
 	w := &v.stall
 	first := w.height != head || !w.observed
@@ -185,6 +181,14 @@ func (v *Validator) stallReportOnce() (string, bool) {
 		return "", false
 	}
 	v.stall.fired = true
+	// Fold the engine's current state into the ring before formatting the
+	// line, exactly as DiagRounds does: a report must never name a round older
+	// than the engine it is looking at. The fold is deliberately HERE and not
+	// at the top of this function: every return above reports nothing, so on a
+	// healthy tick this watcher costs one height/round read and a bool test,
+	// and the one ring fold the tick path pays is the tickLoop's own (RT-4).
+	// The harness poll needs no help - DiagRounds folds for itself.
+	v.drv.Observe()
 	return v.stallLine(head, round, power, total, quorum, peers), true
 }
 

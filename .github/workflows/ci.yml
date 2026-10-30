@@ -171,13 +171,15 @@ jobs:
       #
       # It only ever files on the SCHEDULE trigger: a push or PR that fails
       # govulncheck is a normal failure its author sees immediately, and opening an
-      # issue for it would be noise. It is `failure()`-gated and no-ops unless THIS
-      # step's own output is on disk with advisory IDs in it, so an earlier lint
-      # gate failing (gofmt, shellcheck, tidy, staticcheck) files nothing.
+      # issue for it would be noise. It is `failure()`-gated and classifies THIS
+      # job's failure: govulncheck's output on disk with advisory IDs -> the
+      # toolchain-bump or triage issue; anything else (gofmt, shellcheck, tidy,
+      # staticcheck, or govulncheck missing) -> a generic `lint` issue. A red cron
+      # must never be silent (audit CI-1).
       # The reporter lives in scripts/ci/ so that the shellcheck gate above covers it -
       # ~90 lines of inline YAML shell was logic the rest of this workflow does not have
       # and nothing linted. See that script's header for what it files and why.
-      - name: file a toolchain-bump issue when the standard library is what regressed
+      - name: file an issue when a scheduled lint fails
         if: failure() && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -250,3 +252,53 @@ jobs:
           name: b10coin-release
           path: dist/
           if-no-files-found: error
+
+  # CI-1's durable fix, not just its instance: a scheduled run that fails ANY
+  # job is reported, not only one that fails govulncheck. `main` failed its
+  # scheduled release on every run from 2026-10-27 and nobody was told, because
+  # the only reporter lived in `lint` and watched one step.
+  #
+  # This job exists instead of appending a reporter step to each job for two
+  # reasons. First, the token scope: only `lint` had `issues: write`, and that
+  # stays true - `test`, `release` and `cross` remain read-only. Second, `lint`
+  # reports itself in-job, where govulncheck's output file still exists; a
+  # separate job cannot read another job's $RUNNER_TEMP, so the toolchain-bump
+  # body (with "Fixed in:" and the four verify commands) would be lost. The two
+  # paths never overlap: `lint` is not in the loop below.
+  #
+  # `always()` so a failure upstream still reaches it; the event gate keeps it
+  # off pushes and PRs, where the author already sees the failure. The script
+  # dedups by exact title and exits 0 on every path, including a failed gh call.
+  report:
+    if: always() && github.event_name == 'schedule'
+    needs: [test, lint, release, cross]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: file an issue for every failed scheduled job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_RESULT: ${{ needs.test.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          CROSS_RESULT: ${{ needs.cross.result }}
+        run: |
+          set -u
+          # `lint` reports itself in-job (its govulncheck output is there); the
+          # other jobs have no vuln output to classify, so each gets a generic
+          # "scheduled <job> job failed" issue. Matrix legs of `cross` share one
+          # title on purpose: one broken platform should not open six issues,
+          # and later legs comment on the first one.
+          for job in test release cross; do
+            case "$job" in
+              test)    result=$TEST_RESULT ;;
+              release) result=$RELEASE_RESULT ;;
+              cross)   result=$CROSS_RESULT ;;
+            esac
+            if [ "$result" = failure ]; then
+              REPORT_JOB=$job ./scripts/ci/file-toolchain-issue.sh \
+                || echo "::warning::the scheduled-failure reporter failed for the $job job"
+            fi
+          done

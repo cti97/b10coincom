@@ -18,9 +18,16 @@ package consensus
 // branches (a vote for another height, a vote outside the round window, a
 // foreign or duplicate proposal) - no branch, no ordering and no state the
 // engine acts on is touched, and the counters are never read by a decision.
-// The per-round history itself is accumulated by Driver.Observe, which the
-// devnet harness calls after each driver operation; the consensus paths do not
-// call it, so production runs pay nothing for the ring.
+// The per-round history itself is accumulated by Driver.Observe. The NODE calls
+// it too: after every routed consensus frame (tcpnode.go route) and after every
+// tick (tcpnode.go tickLoop), inside the driver mutex. An earlier revision of
+// this header said "the consensus paths do not call it, so production runs pay
+// nothing for the ring"; that was false (RT-4) and is corrected here rather
+// than gated away, because the ring is what the stall line reads and the stall
+// line is an operator's only signal during a multi-minute stall (stall.go).
+// Both call sites already hold the mutex, so the ring buys no extra lock - only
+// a longer hold on the dispatch and tick paths. Its bounded cost is stated
+// beside Observe below.
 //
 // BOUNDED. Engine retention is already bounded (futureVoteRounds +
 // pastVoteRounds + 1 rounds). The driver keeps the most recent diagRingRounds
@@ -194,10 +201,19 @@ func (e *Engine) diagFillRound(round uint32, d *DiagRound) {
 		d.Step = e.step
 	}
 	d.HasProposal = s.proposal != nil
-	if s.proposal != nil {
-		d.ProposalID = s.proposal.ID()
-	} else {
+	switch {
+	case s.proposal == nil:
 		d.ProposalID = [32]byte{}
+	case d.ProposalID == ([32]byte{}):
+		// Hash the round's block ONCE per ring entry, not once per Observe. A
+		// round's proposal is immutable - the engine keeps the first one and
+		// counts the rest as duplicates - so the ID cannot change while this
+		// entry exists, and re-deriving it hashed a block header (Blake3 plus
+		// two encoder allocations) for every retained round on every routed
+		// frame. That was the real hot-path cost RT-4 found, and what made
+		// Observe's "allocates nothing on the steady path" false; the ring
+		// already carries the answer.
+		d.ProposalID = s.proposal.ID()
 	}
 	s.prevotes.diagFill(&d.Prevote, e.pub)
 	s.precommits.diagFill(&d.Precommit, e.pub)
@@ -239,11 +255,26 @@ const diagRingRounds = 24
 // same lock the driver itself takes), so a poll on a timeout can read a
 // history the engine has since pruned.
 //
-// It allocates nothing on the steady path (the round scratch is a stack array
-// and the only allocation is one-off growth of the ring slice up to
-// diagRingRounds), and it changes no consensus state. It is deliberately NOT
-// called from Tick or OnMessage: a production node pays nothing for an
-// instrument it cannot report.
+// It allocates nothing on the steady path. That was false before RT-4: the
+// round's block ID was re-hashed on every call (Blake3 plus two encoder
+// allocations per retained round with a proposal). A proposal is immutable once
+// accepted - the engine keeps the first and counts the rest as duplicates - so
+// the ID is now derived once per ring entry and reused. The round scratch stays
+// a stack array, and the only other allocation is one-off growth of the ring
+// slice up to diagRingRounds. It changes no consensus state.
+//
+// IT IS ON THE PRODUCTION HOT PATH (RT-4). The node calls it after every routed
+// consensus frame and after every tick, under the driver mutex; the devnet
+// harness calls it after each driver operation; the stall watcher folds once
+// more, but only when it is about to emit a line (see stallReportOnce). The
+// cost per call is bounded by the retention window: a map iteration and
+// scratch sort over at most futureVoteRounds + pastVoteRounds + 1 rounds, a
+// linear search of the diagRingRounds ring per round, and a fixed-array tally
+// copy per round (two DiagTally snapshots of at most diagMaxBlockIDs entries,
+// plus a linear scan of that round's votes). A proposer draw and the proposal's
+// block hash are paid only when a round first enters the ring. Nothing it
+// records is secret and no decision reads it; this is what the stall line
+// costs. BenchmarkHotPathObservers (internal/devnet) measures it.
 func (d *Driver) Observe() {
 	var scratch [futureVoteRounds + pastVoteRounds + 2]uint32
 	for _, round := range d.eng.diagRetainedRounds(scratch[:0]) {
