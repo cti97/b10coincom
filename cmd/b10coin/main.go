@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -48,6 +49,12 @@ func main() {
 		err = cmdNode(os.Args[2:])
 	case "claim":
 		err = cmdClaim(os.Args[2:])
+	case "stake":
+		err = cmdStake(os.Args[2:])
+	case "unstake":
+		err = cmdUnstake(os.Args[2:])
+	case "withdraw":
+		err = cmdWithdraw(os.Args[2:])
 	case "version":
 		fmt.Println(version.Version)
 	case "help", "-h", "--help":
@@ -75,6 +82,9 @@ Usage:
                  --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
+  b10coin stake  --node URL --key PATH --amount 1000    Bond b10 to this key's committee seat (signed tx)
+  b10coin unstake --node URL --key PATH [--amount 1000] Unbond all or part of the bond; cooldown, then withdraw
+  b10coin withdraw --node URL --key PATH                Release matured unbonding records to the spendable balance
   b10coin version
 
 A node with --peers/--relay/--listen runs the M4 consensus committee over real
@@ -103,6 +113,18 @@ stored: the key signs exactly this claim and is printed once so it can be
 reused for a follow-up transfer. Because stdout is captured by shells, CI
 logs and journalctl, --print-key=false withholds the key: safe when
 no follow-up transfer is planned, and the claimant address is still printed.
+
+The staking verbs are ORDINARY signed transactions, not a side channel: they
+read /status for the chain's genesis hash and stake parameters and
+/account/{address} for the nonce, balance and bond, then POST to /tx - the
+same signing, genesis-hash binding, fee rule and mempool admission as a
+transfer, and the state machine judges them at execution time. A bond needs
+MIN_STAKE (1,000 b10 = 10^11 sparks) and takes effect at the next epoch
+boundary. No shipped genesis funds a fresh key with MIN_STAKE: the faucet pays
+one claim per key per epoch (1 b10 on the devnet parameters, 100 b10 on the
+testnet parameters), and claim signs with an ephemeral key it never saves. See
+README "Staking" for the arithmetic and for the one pre-funded fixture account
+a local devnet ships.
 `)
 }
 
@@ -432,6 +454,341 @@ func postTxHex(url string, raw []byte) (string, error) {
 		return "", fmt.Errorf("%s: reply carried no txid", resp.Status)
 	}
 	return out.TxID, nil
+}
+
+// ---------------------------------------------------------------------------
+// The staking verbs (M5 Task 6)
+// ---------------------------------------------------------------------------
+//
+// These are CLIENTS, not a second transaction path. Each one reads the node's
+// /status for the chain's genesis hash and stake parameters and
+// /account/{address} for the nonce, balance and bond, then signs with the
+// operator's key file and POSTs the canonical bytes to /tx - the same endpoint,
+// the same signing hash and the same mempool admission a transfer uses. The
+// node's state machine judges the transaction at execution time, exactly as it
+// judges a transfer's balance, so nothing here needs (or is allowed) a bypass.
+//
+// The verbs do NOT wait for inclusion: a bond takes effect when a block applies
+// it and a SEAT changes only at the next epoch boundary, so "nothing happened
+// yet" is correct for up to an epoch. The txid is the receipt.
+
+// stakingStatus is the subset of GET /status the staking verbs need.
+type stakingStatus struct {
+	ChainID         string `json:"chain_id"`
+	Height          uint64 `json:"height"`
+	GenesisHash     string `json:"genesis_hash"`
+	MinFeeSparks    uint64 `json:"min_fee_sparks"`
+	MinStakeSparks  uint64 `json:"min_stake_sparks"`
+	EpochBlocks     uint64 `json:"epoch_blocks"`
+	UnbondingEpochs uint64 `json:"unbonding_epochs"`
+	CommitteeSize   int    `json:"committee_size"`
+}
+
+// stakingAccount is GET /account/{address}'s body.
+type stakingAccount struct {
+	Address   string                `json:"address"`
+	Balance   uint64                `json:"balance"`
+	Nonce     uint64                `json:"nonce"`
+	Bonded    uint64                `json:"bonded"`
+	Unbonding []stakingUnbondingRec `json:"unbonding"`
+}
+
+type stakingUnbondingRec struct {
+	Amount        uint64 `json:"amount"`
+	ReleaseHeight uint64 `json:"release_height"`
+}
+
+// stakingTarget is one node plus the key the verb signs with, already vetted:
+// the key file loaded, the node's chain identity parsed, and the account read
+// and checked to be the one this key signs as.
+type stakingTarget struct {
+	base    string
+	priv    ed25519.PrivateKey
+	pub     ed25519.PublicKey
+	addr    types.Address
+	status  stakingStatus
+	account stakingAccount
+	genesis [32]byte
+}
+
+// connectStakingNode loads the key file, reads the node's status and account,
+// and refuses anything that would make the signature meaningless: no key, an
+// unknown/malformed genesis hash (a node from before M5 cannot be signed for),
+// or an account the node names as somebody else's.
+func connectStakingNode(nodeURL, keyPath string) (*stakingTarget, error) {
+	if keyPath == "" {
+		return nil, fmt.Errorf("give --key PATH: a staking transaction is signed by a key file (b10coin keygen)")
+	}
+	priv, err := keystore.Load(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("key file %s holds no Ed25519 public key", keyPath)
+	}
+	addr := types.AddressFromPub(pub)
+	base := strings.TrimRight(nodeURL, "/")
+
+	var st stakingStatus
+	if err := getJSON(base+"/status", &st); err != nil {
+		return nil, fmt.Errorf("cannot read the node's status at %s: %w", base+"/status", err)
+	}
+	rawHash, err := hex.DecodeString(st.GenesisHash)
+	if err != nil || len(rawHash) != 32 {
+		return nil, fmt.Errorf("the node at %s reports genesis_hash %q; a staking transaction must be signed against the chain's 32-byte genesis hash (a node from before M5 does not report one, so it cannot be signed for)", nodeURL, st.GenesisHash)
+	}
+	var gh [32]byte
+	copy(gh[:], rawHash)
+
+	var acc stakingAccount
+	if err := getJSON(base+"/account/"+addr.String(), &acc); err != nil {
+		return nil, fmt.Errorf("cannot read the account for %s at %s: %w", addr, base+"/account/", err)
+	}
+	gotAddr, err := types.ParseAddress(acc.Address)
+	if err != nil || gotAddr != addr {
+		return nil, fmt.Errorf("the node reports account %q where this key signs as %s; refusing to sign for an account this key does not own", acc.Address, addr)
+	}
+	return &stakingTarget{base: base, priv: priv, pub: pub, addr: addr, status: st, account: acc, genesis: gh}, nil
+}
+
+// submit signs the transaction against the genesis hash the NODE reported and
+// posts the canonical encoding. This is the same chain binding and the same
+// encode/decode path a transfer uses: a transaction signed for another chain
+// fails the node's VerifySignature and is never admitted.
+func (t *stakingTarget) submit(tx *types.Tx) (string, error) {
+	hash := tx.SigningHash(t.genesis)
+	tx.Sig = crypto.Sign(t.priv, hash[:])
+	return postTxHex(t.base+"/tx", tx.Encode())
+}
+
+// stakingFundingNote is the honest answer to "where do I get MIN_STAKE?".
+// It is returned at the point a verb refuses for lack of funds or stake, so an
+// operator meets it with the command in hand rather than in a doc they have not
+// opened yet.
+const stakingFundingNote = "no shipped genesis funds an operator's key with MIN_STAKE: the faucet pays one claim per key per epoch and `b10coin claim` signs with an ephemeral key it does not save, so a fresh operator has no shipped path to this balance; see README \"Staking\" for the claim arithmetic"
+
+// checkSpendable refuses a bond the account cannot cover, before submitting:
+// the node would refuse it at execution, but the operator learns why here.
+func checkSpendable(balance, amount, fee uint64) error {
+	if fee > math.MaxUint64-amount {
+		return fmt.Errorf("the bond %d + fee %d overflows a uint64", amount, fee)
+	}
+	need := amount + fee
+	if balance < need {
+		return fmt.Errorf("the account holds %s b10 (%d sparks) but the bond plus the %d-spark fee needs %s b10 (%d sparks), short %d sparks; %s",
+			genesis.FormatB10(balance), balance, fee, genesis.FormatB10(need), need, need-balance, stakingFundingNote)
+	}
+	return nil
+}
+
+// cooldownBlocks is UnbondingEpochs x EpochBlocks with the overflow check the
+// state machine applies. ok=false means the product does not fit in a uint64
+// (unreachable on a validated genesis, but a node is not trusted input).
+func cooldownBlocks(st stakingStatus) (uint64, bool) {
+	if st.EpochBlocks == 0 || st.UnbondingEpochs > math.MaxUint64/st.EpochBlocks {
+		return 0, false
+	}
+	return st.UnbondingEpochs * st.EpochBlocks, true
+}
+
+func cmdStake(args []string) error {
+	fs := flag.NewFlagSet("stake", flag.ExitOnError)
+	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC")
+	keyPath := fs.String("key", "", "key file to sign with (b10coin keygen); the bond seats THIS key")
+	amountB10 := fs.String("amount", "", "amount to bond, in b10 as an exact decimal (at least MIN_STAKE, 1000 b10)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unknown argument %q", fs.Arg(0))
+	}
+	if *amountB10 == "" {
+		return fmt.Errorf("give --amount N in b10 (exact decimal; MIN_STAKE is 1000 b10 = 10^11 sparks)")
+	}
+	amount, err := genesis.ParseB10(*amountB10)
+	if err != nil {
+		return err
+	}
+	if amount == 0 {
+		return fmt.Errorf("--amount %q is zero sparks; a bond must be positive", *amountB10)
+	}
+	t, err := connectStakingNode(*nodeURL, *keyPath)
+	if err != nil {
+		return err
+	}
+	if t.status.MinStakeSparks == 0 {
+		return fmt.Errorf("the node reports min_stake_sparks 0: staking is not parameterised on that chain")
+	}
+	// The floor is on the RESULTING bond, not on this transaction
+	// (state.applyBond), so an existing bond may be topped up: 600 then 400 is
+	// legal against a 1,000 floor while either alone is not. Checking only
+	// --amount here would refuse a bond the chain accepts, which is exactly
+	// the verb/consensus disagreement this pre-check exists to prevent.
+	if t.account.Bonded > math.MaxUint64-amount {
+		return fmt.Errorf("the existing bond %d plus --amount %d overflows a uint64", t.account.Bonded, amount)
+	}
+	resulting := t.account.Bonded + amount
+	if resulting < t.status.MinStakeSparks {
+		return fmt.Errorf("--amount %s b10 (%d sparks) would leave the bond at %s b10 (%d sparks), below this chain's MIN_STAKE %s b10 (%d sparks); %s",
+			genesis.FormatB10(amount), amount, genesis.FormatB10(resulting), resulting,
+			genesis.FormatB10(t.status.MinStakeSparks), t.status.MinStakeSparks, stakingFundingNote)
+	}
+	if err := checkSpendable(t.account.Balance, amount, t.status.MinFeeSparks); err != nil {
+		return err
+	}
+
+	tx := &types.Tx{
+		Type:   types.TxBond,
+		From:   t.addr,
+		PubKey: t.pub,
+		Nonce:  t.account.Nonce,
+		Fee:    t.status.MinFeeSparks,
+		Amount: amount,
+	}
+	txid, err := t.submit(tx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("bond        %s b10 (%d sparks)\n", genesis.FormatB10(amount), amount)
+	fmt.Printf("from        %s\n", t.addr)
+	fmt.Printf("nonce       %d\n", t.account.Nonce)
+	fmt.Printf("fee         %d spark\n", t.status.MinFeeSparks)
+	fmt.Printf("txid        %s\n", txid)
+	if t.status.EpochBlocks > 0 {
+		fmt.Printf("the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every %d blocks), never mid-epoch.\n", t.status.EpochBlocks)
+	} else {
+		fmt.Println("the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary.")
+	}
+	return nil
+}
+
+func cmdUnstake(args []string) error {
+	fs := flag.NewFlagSet("unstake", flag.ExitOnError)
+	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC")
+	keyPath := fs.String("key", "", "key file that holds the bond (b10coin keygen)")
+	amountB10 := fs.String("amount", "", "amount to unbond, in b10 as an exact decimal (default: the whole bond)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unknown argument %q", fs.Arg(0))
+	}
+	t, err := connectStakingNode(*nodeURL, *keyPath)
+	if err != nil {
+		return err
+	}
+	if t.account.Bonded == 0 {
+		return fmt.Errorf("the account %s holds no bond; there is nothing to unbond (a bond is created by `b10coin stake`)", t.addr)
+	}
+	amount := t.account.Bonded
+	if *amountB10 != "" {
+		amount, err = genesis.ParseB10(*amountB10)
+		if err != nil {
+			return err
+		}
+		if amount == 0 {
+			return fmt.Errorf("--amount %q is zero sparks; omit --amount to unbond the whole bond", *amountB10)
+		}
+		if amount > t.account.Bonded {
+			return fmt.Errorf("--amount %s b10 (%d sparks) is more than the bonded %s b10 (%d sparks)",
+				genesis.FormatB10(amount), amount, genesis.FormatB10(t.account.Bonded), t.account.Bonded)
+		}
+	}
+
+	// Fee 0 is a CONSENSUS rule for an exit (state.applyUnbond), not a
+	// convenience: a validator may hold nothing spendable, and an exit that
+	// needed a coin would be one a zero-balance operator could never make.
+	tx := &types.Tx{
+		Type:   types.TxUnbond,
+		From:   t.addr,
+		PubKey: t.pub,
+		Nonce:  t.account.Nonce,
+		Fee:    0,
+		Amount: amount,
+	}
+	txid, err := t.submit(tx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("unbond      %s b10 (%d sparks)\n", genesis.FormatB10(amount), amount)
+	fmt.Printf("from        %s\n", t.addr)
+	fmt.Printf("nonce       %d\n", t.account.Nonce)
+	fmt.Printf("fee         0 sparks (an exit is free by consensus rule)\n")
+	fmt.Printf("txid        %s\n", txid)
+	if cooldown, ok := cooldownBlocks(t.status); ok && t.status.Height < math.MaxUint64 {
+		// The applying block is at least head+1, so this is the EARLIEST
+		// release height; the block that actually applies the unbond sets the
+		// exact one. Stated as an estimate rather than as a receipt.
+		fmt.Printf("release     height %d at the earliest (submitted at head %d; the cooldown is %d epochs x %d blocks = %d blocks)\n",
+			t.status.Height+1+cooldown, t.status.Height, t.status.UnbondingEpochs, t.status.EpochBlocks, cooldown)
+	}
+	fmt.Println("the coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then.")
+	return nil
+}
+
+func cmdWithdraw(args []string) error {
+	fs := flag.NewFlagSet("withdraw", flag.ExitOnError)
+	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC")
+	keyPath := fs.String("key", "", "key file that holds the unbonding records (b10coin keygen)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unknown argument %q", fs.Arg(0))
+	}
+	t, err := connectStakingNode(*nodeURL, *keyPath)
+	if err != nil {
+		return err
+	}
+	if len(t.account.Unbonding) == 0 {
+		return fmt.Errorf("the account %s has no unbonding record; there is nothing to withdraw (a record is created by `b10coin unstake`)", t.addr)
+	}
+	// A transaction submitted now applies at head+1 at the earliest, so a
+	// record releasing at head+1 is mature by the time it executes. Testing
+	// against head alone would refuse that record for one block.
+	next := t.status.Height + 1
+	if next == 0 { // head was MaxUint64; a wrapped "next" would let an unmatured record through
+		next = math.MaxUint64
+	}
+	var matured, total uint64
+	var earliest uint64
+	for _, rec := range t.account.Unbonding {
+		if rec.ReleaseHeight <= next {
+			if total > math.MaxUint64-rec.Amount {
+				return fmt.Errorf("the node reports unbonding records that overflow a uint64; refusing to sign")
+			}
+			total += rec.Amount
+			matured++
+			continue
+		}
+		if earliest == 0 || rec.ReleaseHeight < earliest {
+			earliest = rec.ReleaseHeight
+		}
+	}
+	if matured == 0 {
+		return fmt.Errorf("no unbonding record has matured at head %d: the next releases at height %d (%d block(s) to go); run withdraw again then",
+			t.status.Height, earliest, earliest-next)
+	}
+
+	tx := &types.Tx{
+		Type:   types.TxWithdraw,
+		From:   t.addr,
+		PubKey: t.pub,
+		Nonce:  t.account.Nonce,
+		Fee:    0,
+	}
+	txid, err := t.submit(tx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("withdraw    %d matured record(s), %s b10 (%d sparks), back to the spendable balance\n", matured, genesis.FormatB10(total), total)
+	fmt.Printf("from        %s\n", t.addr)
+	fmt.Printf("nonce       %d\n", t.account.Nonce)
+	fmt.Printf("fee         0 sparks (an exit is free by consensus rule)\n")
+	fmt.Printf("txid        %s\n", txid)
+	fmt.Println("withdraw releases EVERY record that is mature when the block applies; a second withdraw of the same record pays nothing.")
+	return nil
 }
 
 func cmdNode(args []string) error {

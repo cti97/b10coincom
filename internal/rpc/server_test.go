@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -166,11 +167,20 @@ func TestRPCReadsAreSafeDuringAppends(t *testing.T) {
 	defer ts.Close()
 	_, priv := genesis.DevValidatorKey()
 
+	// /account reads the same published state snapshot /status does; the
+	// concurrent arm covers both so a future lock-free read that is not
+	// actually safe fails under -race.
+	devPub, _ := genesis.DevAccountKey(0)
+	accountURL := ts.URL + "/account/" + types.AddressFromPub(devPub).String()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := 0; i < 80; i++ {
-			resp, err := http.Get(ts.URL + "/status")
+			url := ts.URL + "/status"
+			if i%2 == 0 {
+				url = accountURL
+			}
+			resp, err := http.Get(url)
 			if err == nil {
 				resp.Body.Close()
 			}
@@ -351,5 +361,190 @@ func TestTxEndpointRejectsAnOversizedBody(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("an oversized POST /tx = %d, want 413", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M5 Task 6: the node reads a staking client needs
+// ---------------------------------------------------------------------------
+
+// TestStatusReportsTheGenesisHashAndTheStakeParams pins the ADDITIVE contract:
+// every new field is present and equal to genesis.Devnet's value, and every
+// pre-M5 field is still present under its original name. The map decode is the
+// point - a renamed key (rather than an added one) would still satisfy a typed
+// struct decode, but not the key set.
+func TestStatusReportsTheGenesisHashAndTheStakeParams(t *testing.T) {
+	_, ts := testServer(t)
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	g := genesis.Devnet()
+	hash := g.Hash()
+	for _, key := range []string{"chain_id", "height", "head_hash", "state_root", "mempool",
+		"genesis_hash", "min_fee_sparks", "min_stake_sparks", "epoch_blocks", "unbonding_epochs", "committee_size"} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("/status is missing the %q field (add fields, rename none); body: %s", key, raw)
+		}
+	}
+
+	var got statusResponse
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.GenesisHash != hex.EncodeToString(hash[:]) {
+		t.Errorf("genesis_hash = %q, want %x", got.GenesisHash, hash)
+	}
+	if got.MinFeeSparks != g.Params.MinFeeSparks ||
+		got.MinStakeSparks != g.Params.MinStakeSparks ||
+		got.EpochBlocks != g.Params.EpochBlocks ||
+		got.UnbondingEpochs != g.Params.UnbondingEpochs ||
+		got.CommitteeSize != g.Params.CommitteeSize {
+		t.Errorf("stake params = (fee %d, stake %d, epoch %d, unbonding %d, committee %d), want genesis (%d, %d, %d, %d, %d)",
+			got.MinFeeSparks, got.MinStakeSparks, got.EpochBlocks, got.UnbondingEpochs, got.CommitteeSize,
+			g.Params.MinFeeSparks, g.Params.MinStakeSparks, g.Params.EpochBlocks, g.Params.UnbondingEpochs, g.Params.CommitteeSize)
+	}
+	if got.MinStakeSparks != 1_000*genesis.SparksPerB10 {
+		t.Errorf("min_stake_sparks = %d, want MIN_STAKE (10^11)", got.MinStakeSparks)
+	}
+}
+
+// appendBlock builds one block containing txs with the devnet proposer key and
+// appends it, failing the test on any error. It is how these tests construct a
+// REAL committed state (a bond, then an unbond) instead of mutating the live
+// state behind the chain's back.
+func appendBlock(t *testing.T, c *chain.Chain, txs []types.Tx, timestamp int64) {
+	t.Helper()
+	_, valPriv := genesis.DevValidatorKey()
+	blk, err := c.Build(valPriv, txs, timestamp)
+	if err != nil {
+		t.Fatalf("Build block at %d: %v", c.Height()+1, err)
+	}
+	if err := c.Append(blk); err != nil {
+		t.Fatalf("Append block at %d: %v", c.Height()+1, err)
+	}
+}
+
+// signTx signs a transaction with priv against the chain's genesis hash - the
+// same binding the node checks and the same one the staking verbs use.
+func signTx(t *testing.T, c *chain.Chain, tx *types.Tx, priv ed25519.PrivateKey) {
+	t.Helper()
+	hash := tx.SigningHash(c.Genesis().Hash())
+	tx.Sig = crypto.Sign(priv, hash[:])
+}
+
+// TestAccountReportsBondAndUnbonding constructs a real bond and a real
+// unbonding record through two committed blocks and reads them back from
+// /account. The release height is asserted as a HEIGHT derived from the chain's
+// own params (h + UnbondingEpochs*EpochBlocks), not as a duration.
+func TestAccountReportsBondAndUnbonding(t *testing.T) {
+	s, ts := testServer(t)
+	c := s.chain
+	g := c.Genesis()
+	devPub, devPriv := genesis.DevAccountKey(0)
+	addr := types.AddressFromPub(devPub)
+	const minStake = 1_000 * genesis.SparksPerB10
+
+	bond := &types.Tx{
+		Type: types.TxBond, From: addr, PubKey: devPub,
+		Nonce: 0, Fee: g.Params.MinFeeSparks, Amount: minStake,
+	}
+	signTx(t, c, bond, devPriv)
+	appendBlock(t, c, []types.Tx{*bond}, g.Time+1)
+	if c.Height() != 1 {
+		t.Fatalf("height = %d, want 1", c.Height())
+	}
+
+	unbond := &types.Tx{
+		Type: types.TxUnbond, From: addr, PubKey: devPub,
+		Nonce: 1, Fee: 0, Amount: 400 * genesis.SparksPerB10,
+	}
+	signTx(t, c, unbond, devPriv)
+	appendBlock(t, c, []types.Tx{*unbond}, g.Time+2)
+	if c.Height() != 2 {
+		t.Fatalf("height = %d, want 2", c.Height())
+	}
+
+	resp, err := http.Get(ts.URL + "/account/" + addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /account = %d, want 200", resp.StatusCode)
+	}
+	var got accountResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Address != addr.String() {
+		t.Errorf("address = %q, want %q", got.Address, addr.String())
+	}
+	wantBalance := 1_000_000*genesis.SparksPerB10 - minStake - g.Params.MinFeeSparks
+	if got.Balance != wantBalance {
+		t.Errorf("balance = %d, want %d", got.Balance, wantBalance)
+	}
+	if got.Nonce != 2 {
+		t.Errorf("nonce = %d, want 2", got.Nonce)
+	}
+	if want := uint64(minStake - 400*genesis.SparksPerB10); got.Bonded != want {
+		t.Errorf("bonded = %d, want %d", got.Bonded, want)
+	}
+	wantRelease := uint64(2) + g.Params.UnbondingEpochs*g.Params.EpochBlocks
+	if len(got.Unbonding) != 1 {
+		t.Fatalf("unbonding = %+v, want one record", got.Unbonding)
+	}
+	if got.Unbonding[0].Amount != 400*genesis.SparksPerB10 {
+		t.Errorf("unbonding amount = %d, want %d", got.Unbonding[0].Amount, 400*genesis.SparksPerB10)
+	}
+	if got.Unbonding[0].ReleaseHeight != wantRelease {
+		t.Errorf("release_height = %d, want %d (height 2 + %d epochs x %d blocks)",
+			got.Unbonding[0].ReleaseHeight, wantRelease, g.Params.UnbondingEpochs, g.Params.EpochBlocks)
+	}
+}
+
+// TestAccountForAFreshKeyIsZeroesNotEmpty404: the staking verbs read /account
+// for a key that may never have transacted, so "holds nothing" must be a
+// readable zero record - and the unbonding list must be [], not null.
+func TestAccountForAFreshKeyIsZeroesNotEmpty404(t *testing.T) {
+	_, ts := testServer(t)
+	pub, _ := genesis.DevAccountKey(1) // the zero-balance recipient fixture
+	addr := types.AddressFromPub(pub)
+	resp, err := http.Get(ts.URL + "/account/" + addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /account for a fresh key = %d, want 200", resp.StatusCode)
+	}
+	var got accountResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Balance != 0 || got.Nonce != 0 || got.Bonded != 0 || len(got.Unbonding) != 0 {
+		t.Errorf("fresh account = %+v, want all zero", got)
+	}
+	raw, _ := json.Marshal(got)
+	if !strings.Contains(string(raw), `"unbonding":[]`) {
+		t.Errorf("unbonding must encode as [] for a key with none: %s", raw)
+	}
+
+	bad, err := http.Get(ts.URL + "/account/not-an-address")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Errorf("GET /account with a malformed address = %d, want 400", bad.StatusCode)
 	}
 }

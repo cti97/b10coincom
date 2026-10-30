@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +22,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/cti97/b10coincom/internal/genesis"
+	"github.com/cti97/b10coincom/internal/keystore"
+	"github.com/cti97/b10coincom/internal/types"
 )
 
 // captureStdout runs fn with os.Stdout swapped for a pipe and returns what
@@ -758,5 +763,351 @@ func TestCmdNodeRefusesAShortRelayAccessToken(t *testing.T) {
 	// And no data directory was created: the refusal precedes the store.
 	if _, statErr := os.Stat(filepath.Join(dir, "data")); !os.IsNotExist(statErr) {
 		t.Fatalf("the refused invocation created its data directory (stat err = %v)", statErr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M5 Task 6: the staking verbs
+// ---------------------------------------------------------------------------
+
+// stakingStub is the smallest node a staking verb talks to: /status with the
+// chain's identity and stake parameters, /account/{address}, and /tx capturing
+// the posted canonical bytes. It is a STUB, not a chain, because the verb's
+// whole job is "read the node, sign, submit" - what the node then does with the
+// bytes is the state machine's test, not this one's.
+type stakingStub struct {
+	t           *testing.T
+	genesisHash [32]byte
+	account     stakingAccount
+	mu          sync.Mutex
+	posts       [][]byte
+	url         string
+	ts          *httptest.Server
+}
+
+func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *stakingStub {
+	t.Helper()
+	s := &stakingStub{t: t, genesisHash: genesisHash, account: acc}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"chain_id":         "stub-chain-1",
+			"height":           uint64(7),
+			"genesis_hash":     hex.EncodeToString(s.genesisHash[:]),
+			"min_fee_sparks":   uint64(1),
+			"min_stake_sparks": uint64(100_000_000_000),
+			"epoch_blocks":     uint64(1_000),
+			"unbonding_epochs": uint64(2),
+			"committee_size":   1,
+		})
+	})
+	mux.HandleFunc("/account/", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(s.account)
+	})
+	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading POST /tx: %v", err)
+		}
+		raw, err := hex.DecodeString(strings.TrimSpace(string(body)))
+		if err != nil {
+			t.Errorf("POST /tx body is not hex: %v", err)
+		}
+		s.mu.Lock()
+		s.posts = append(s.posts, raw)
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]string{"txid": strings.Repeat("ab", 32)})
+	})
+	s.ts = httptest.NewServer(mux)
+	t.Cleanup(s.ts.Close)
+	s.url = s.ts.URL
+	return s
+}
+
+// posted decodes the single transaction the verb submitted.
+func (s *stakingStub) posted() *types.Tx {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.posts) != 1 {
+		s.t.Fatalf("the verb posted %d transactions, want exactly 1", len(s.posts))
+	}
+	tx, err := types.DecodeTx(s.posts[0])
+	if err != nil {
+		s.t.Fatalf("the posted bytes do not decode: %v", err)
+	}
+	return tx
+}
+
+func stakingTestKey(t *testing.T) (string, ed25519.PublicKey, types.Address) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stake.key")
+	_, priv, err := keystore.Generate(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	return path, pub, types.AddressFromPub(pub)
+}
+
+// TestStakeVerbSubmitsABondWithTheRightFields: the stub reports a genesis hash
+// that is NOT the compiled-in devnet one. The verb must sign against the
+// REPORTED hash - the signature verifies there and fails against devnet's -
+// which is what makes a verb pointed at another chain produce a transaction
+// that chain can verify, and one pointed at a doctored node a useless
+// transaction rather than a dangerous one.
+func TestStakeVerbSubmitsABondWithTheRightFields(t *testing.T) {
+	keyPath, pub, addr := stakingTestKey(t)
+	var reported [32]byte
+	for i := range reported {
+		reported[i] = byte(0xa0 + i)
+	}
+	if reported == genesis.Devnet().Hash() {
+		t.Fatal("the test's reported hash must differ from the devnet genesis hash")
+	}
+	stub := newStakingStub(t, reported, stakingAccount{
+		Address: addr.String(),
+		Balance: 5_000 * genesis.SparksPerB10,
+		Nonce:   3,
+	})
+
+	if err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000"}); err != nil {
+		t.Fatalf("cmdStake: %v", err)
+	}
+	tx := stub.posted()
+	if tx.Type != types.TxBond {
+		t.Errorf("type = %d, want TxBond (%d)", tx.Type, types.TxBond)
+	}
+	if tx.From != addr {
+		t.Errorf("from = %s, want %s", tx.From, addr)
+	}
+	if !bytes.Equal(tx.PubKey, pub) {
+		t.Errorf("pubkey = %x, want %x", tx.PubKey, pub)
+	}
+	if tx.Nonce != 3 {
+		t.Errorf("nonce = %d, want the account nonce 3", tx.Nonce)
+	}
+	if tx.Fee != 1 {
+		t.Errorf("fee = %d, want the node's min_fee_sparks (1)", tx.Fee)
+	}
+	if want := uint64(100_000_000_000); tx.Amount != want {
+		t.Errorf("amount = %d sparks, want %d (1000 b10; a b10 value passed straight through would be 1000)", tx.Amount, want)
+	}
+	if err := tx.VerifySignature(reported); err != nil {
+		t.Errorf("the transaction does not verify against the genesis hash the stub reported: %v", err)
+	}
+	if err := tx.VerifySignature(genesis.Devnet().Hash()); err == nil {
+		t.Error("the transaction verifies against the compiled-in devnet genesis hash: the verb signed for the wrong chain")
+	}
+}
+
+// TestUnstakeWithNoAmountUnbondsTheWholeBond: omitting --amount means the whole
+// bond read from /account, and an exit carries fee 0.
+func TestUnstakeWithNoAmountUnbondsTheWholeBond(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(),
+		Balance: 1,
+		Nonce:   4,
+		Bonded:  750 * genesis.SparksPerB10,
+	})
+	if err := cmdUnstake([]string{"--node", stub.url, "--key", keyPath}); err != nil {
+		t.Fatalf("cmdUnstake: %v", err)
+	}
+	tx := stub.posted()
+	if tx.Type != types.TxUnbond {
+		t.Errorf("type = %d, want TxUnbond (%d)", tx.Type, types.TxUnbond)
+	}
+	if got, want := tx.Amount, uint64(750*genesis.SparksPerB10); got != want {
+		t.Errorf("amount = %d, want the whole bond %d", got, want)
+	}
+	if tx.Fee != 0 {
+		t.Errorf("fee = %d, want 0 (an unbond must not carry a fee)", tx.Fee)
+	}
+	if tx.Nonce != 4 {
+		t.Errorf("nonce = %d, want 4", tx.Nonce)
+	}
+}
+
+// TestUnstakePartialUsesTheGivenAmount is the other half of the amount rule:
+// with --amount the transaction carries exactly that, not the whole bond.
+func TestUnstakePartialUsesTheGivenAmount(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 0, Bonded: 1_000 * genesis.SparksPerB10,
+	})
+	if err := cmdUnstake([]string{"--node", stub.url, "--key", keyPath, "--amount", "250.5"}); err != nil {
+		t.Fatalf("cmdUnstake: %v", err)
+	}
+	if got, want := stub.posted().Amount, uint64(250*genesis.SparksPerB10+50_000_000); got != want {
+		t.Errorf("amount = %d, want %d (250.5 b10)", got, want)
+	}
+}
+
+// TestStakeRefusesBelowMinStakeBeforeSubmitting: the node's min_stake_sparks is
+// checked by the verb, so the operator gets the reason and the funding reality
+// instead of a node-side refusal. Nothing is posted.
+func TestStakeRefusesBelowMinStakeBeforeSubmitting(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 10_000 * genesis.SparksPerB10,
+	})
+	err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "999"})
+	if err == nil {
+		t.Fatal("stake below MIN_STAKE must be refused")
+	}
+	if !strings.Contains(err.Error(), "MIN_STAKE") {
+		t.Errorf("the refusal must name MIN_STAKE, got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+}
+
+// TestTheVerbRefusesAKeyThatDoesNotOwnTheAccount: the node names a different
+// account at the address this key signs as. Signing would be pointless at best
+// and misleading at worst, so the verb refuses before submitting.
+func TestTheVerbRefusesAKeyThatDoesNotOwnTheAccount(t *testing.T) {
+	keyPath, _, _ := stakingTestKey(t)
+	otherPub, _ := genesis.DevAccountKey(0)
+	other := types.AddressFromPub(otherPub)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: other.String(), Balance: 5_000 * genesis.SparksPerB10,
+	})
+	err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000"})
+	if err == nil {
+		t.Fatal("a key whose account the node names differently must be refused")
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+}
+
+// TestTheVerbsRefuseANodeWithoutAGenesisHash: a pre-M5 node has no
+// genesis_hash, and a staking signature bound to nothing the chain reports
+// would be the "compiled-in assumption" defect the reported hash exists to
+// prevent. The verb refuses instead of guessing.
+func TestTheVerbsRefuseANodeWithoutAGenesisHash(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"chain_id": "old-node-1", "height": uint64(1),
+			"min_fee_sparks": uint64(1), "min_stake_sparks": uint64(100_000_000_000),
+			"epoch_blocks": uint64(1_000), "unbonding_epochs": uint64(2),
+		})
+	})
+	mux.HandleFunc("/account/", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(stakingAccount{Address: addr.String(), Bonded: 1_000 * genesis.SparksPerB10})
+	})
+	// A /tx that ACCEPTS: if the verb fell through and signed against a
+	// zero genesis hash, this handler would take it and the assertion below
+	// would see a post. A stub that 404s would hide that by failing the POST
+	// for an unrelated reason.
+	var posted int
+	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
+		posted++
+		_ = json.NewEncoder(w).Encode(map[string]string{"txid": strings.Repeat("ab", 32)})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	if err := cmdUnstake([]string{"--node", ts.URL, "--key", keyPath}); err == nil {
+		t.Fatal("a node that reports no genesis_hash must be refused, not signed for")
+	}
+	if posted != 0 {
+		t.Errorf("the verb submitted %d transaction(s) to a node that reported no genesis_hash", posted)
+	}
+}
+
+// TestWithdrawVerbReleasesOnlyMaturedRecords: the withdraw verb submits one
+// TxWithdraw carrying no amount (the state machine derives the total from the
+// matured records), and it refuses before submitting when nothing has matured.
+func TestWithdrawVerbReleasesOnlyMaturedRecords(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	// Head 7, next 8. One record at 8 (mature by execution), one at 50.
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 9,
+		Unbonding: []stakingUnbondingRec{
+			{Amount: 400 * genesis.SparksPerB10, ReleaseHeight: 8},
+			{Amount: 600 * genesis.SparksPerB10, ReleaseHeight: 50},
+		},
+	})
+	if err := cmdWithdraw([]string{"--node", stub.url, "--key", keyPath}); err != nil {
+		t.Fatalf("cmdWithdraw: %v", err)
+	}
+	tx := stub.posted()
+	if tx.Type != types.TxWithdraw {
+		t.Errorf("type = %d, want TxWithdraw (%d)", tx.Type, types.TxWithdraw)
+	}
+	if tx.Amount != 0 {
+		t.Errorf("amount = %d, want 0 (withdraw carries no amount; applyWithdraw derives the total)", tx.Amount)
+	}
+	if tx.Fee != 0 {
+		t.Errorf("fee = %d, want 0", tx.Fee)
+	}
+	if tx.Nonce != 9 {
+		t.Errorf("nonce = %d, want 9", tx.Nonce)
+	}
+
+	// Nothing mature: refused, and the message names the next release height.
+	late := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 9,
+		Unbonding: []stakingUnbondingRec{{Amount: 1, ReleaseHeight: 50}},
+	})
+	err := cmdWithdraw([]string{"--node", late.url, "--key", keyPath})
+	if err == nil {
+		t.Fatal("withdraw with no matured record must be refused")
+	}
+	if !strings.Contains(err.Error(), "height 50") {
+		t.Errorf("the refusal should name the next release height, got: %v", err)
+	}
+	if len(late.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(late.posts))
+	}
+}
+
+// TestStakeRefusesABondTheAccountCannotCover: the balance check is the verb's
+// own, run before signing. Without it the operator learns "insufficient funds"
+// from the node instead of from the command that asked, and the funding note
+// (the honest answer to "where do I get MIN_STAKE?") is never shown.
+func TestStakeRefusesABondTheAccountCannotCover(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 500 * genesis.SparksPerB10, Nonce: 0,
+	})
+	err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000"})
+	if err == nil {
+		t.Fatal("a bond the account cannot cover must be refused by the verb")
+	}
+	if !strings.Contains(err.Error(), "short") {
+		t.Errorf("the refusal should name the shortfall, got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+}
+
+// TestStakeMayAccumulateToMinStake: the chain's floor is on the RESULTING bond
+// (state.applyBond), so an existing 600 b10 bond plus a 400 b10 bond is legal
+// even though 400 alone is not. A verb that checked only --amount would refuse
+// a transaction the chain accepts - and its own "the floor is on the result"
+// text would be false.
+func TestStakeMayAccumulateToMinStake(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(),
+		Balance: 5_000 * genesis.SparksPerB10,
+		Nonce:   2,
+		Bonded:  600 * genesis.SparksPerB10,
+	})
+	if err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "400"}); err != nil {
+		t.Fatalf("staking a 400 b10 top-up onto a 600 b10 bond must be accepted: %v", err)
+	}
+	tx := stub.posted()
+	if want := uint64(400 * genesis.SparksPerB10); tx.Amount != want {
+		t.Errorf("amount = %d, want %d (the top-up, not the resulting bond)", tx.Amount, want)
+	}
+	if tx.Nonce != 2 {
+		t.Errorf("nonce = %d, want 2", tx.Nonce)
 	}
 }

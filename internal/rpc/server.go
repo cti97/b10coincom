@@ -18,12 +18,47 @@ import (
 	"github.com/cti97/b10coincom/internal/types"
 )
 
+// statusResponse is ADDITIVE by contract (M5 Task 6): a client that ignores
+// unknown fields must keep working, so the M5 fields are appended and no
+// existing field is renamed or repurposed.
 type statusResponse struct {
 	ChainID   string `json:"chain_id"`
 	Height    uint64 `json:"height"`
 	HeadHash  string `json:"head_hash"`
 	StateRoot string `json:"state_root"`
 	Mempool   int    `json:"mempool"`
+
+	// M5: the chain identity a signature is bound to, and the stake
+	// parameters a client must know before it can build a valid staking
+	// transaction. GenesisHash is the SAME value tx.SigningHash takes; a
+	// client that signs against it produces a transaction this chain can
+	// verify, and one that signs against a compiled-in assumption produces a
+	// useless one.
+	GenesisHash     string `json:"genesis_hash"`
+	MinFeeSparks    uint64 `json:"min_fee_sparks"`
+	MinStakeSparks  uint64 `json:"min_stake_sparks"`
+	EpochBlocks     uint64 `json:"epoch_blocks"`
+	UnbondingEpochs uint64 `json:"unbonding_epochs"`
+	CommitteeSize   int    `json:"committee_size"`
+}
+
+// accountResponse is the /account/{address} view: the spendable account plus
+// the two locked-stake records the staking verbs must know about. Amounts are
+// sparks (uint64), never b10 and never a float.
+//
+// Unbonding is always a JSON list, never null: a client iterating it should
+// not have to special-case "no records".
+type accountResponse struct {
+	Address   string              `json:"address"`
+	Balance   uint64              `json:"balance"`
+	Nonce     uint64              `json:"nonce"`
+	Bonded    uint64              `json:"bonded"`
+	Unbonding []unbondingResponse `json:"unbonding"`
+}
+
+type unbondingResponse struct {
+	Amount        uint64 `json:"amount"`
+	ReleaseHeight uint64 `json:"release_height"`
 }
 
 type blockResponse struct {
@@ -162,6 +197,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/block/", s.handleBlock)
+	mux.HandleFunc("/account/", s.handleAccount)
 	mux.HandleFunc("/tx", s.handleTx)
 	return mux
 }
@@ -175,13 +211,61 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// separately let a commit in between pair the new height with the old
 	// head's hash and root. Genesis is immutable, so it needs no such care.
 	height, headID, stateRoot := s.chain.HeadSnapshot()
+	g := s.chain.Genesis()
+	genesisHash := g.Hash()
 	writeJSON(w, http.StatusOK, statusResponse{
-		ChainID:   s.chain.Genesis().ChainID,
+		ChainID:   g.ChainID,
 		Height:    height,
 		HeadHash:  hex.EncodeToString(headID[:]),
 		StateRoot: hex.EncodeToString(stateRoot[:]),
 		Mempool:   s.mempool.Len(),
+
+		GenesisHash:     hex.EncodeToString(genesisHash[:]),
+		MinFeeSparks:    g.Params.MinFeeSparks,
+		MinStakeSparks:  g.Params.MinStakeSparks,
+		EpochBlocks:     g.Params.EpochBlocks,
+		UnbondingEpochs: g.Params.UnbondingEpochs,
+		CommitteeSize:   g.Params.CommitteeSize,
 	})
+}
+
+// handleAccount reports the spendable account plus its bond and unbonding
+// records for one address.
+//
+// An unknown address is a 200 with zeroes, not a 404: "this key holds
+// nothing" is exactly what a staking client needs to know, and a 404 would
+// make a fresh key (every key, before its first claim) look like a broken
+// node. The address in the URL is echoed back so a client can check it is
+// reading the account it asked for.
+//
+// The read is served from the chain's published state snapshot, which is
+// immutable until the next Append replaces it: no lock is held across the
+// JSON encode and a commit cannot interleave a half-updated account.
+func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{"method not allowed"})
+		return
+	}
+	raw := strings.TrimPrefix(r.URL.Path, "/account/")
+	addr, err := types.ParseAddress(raw)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{"address must be a canonical b10 address"})
+		return
+	}
+	st := s.chain.State()
+	acc := st.Get(addr)
+	recs := st.UnbondingOf(addr)
+	out := accountResponse{
+		Address:   addr.String(),
+		Balance:   acc.Balance,
+		Nonce:     acc.Nonce,
+		Bonded:    st.Bonded(addr),
+		Unbonding: make([]unbondingResponse, 0, len(recs)),
+	}
+	for _, rec := range recs {
+		out.Unbonding = append(out.Unbonding, unbondingResponse{Amount: rec.Amount, ReleaseHeight: rec.ReleaseHeight})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
