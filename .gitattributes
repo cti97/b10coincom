@@ -1,0 +1,27 @@
+# Line endings are pinned here because this repository is built, tested and
+# shipped on macOS/Linux (CI, the release scripts, the Pi recipe) and is also
+# checked out on Windows. Git for Windows' installer defaults to
+# core.autocrlf=true, which rewrites text files to CRLF IN THE WORKING TREE:
+# the shell scripts then start with "#!/usr/bin/env bash\r" and fail in Linux
+# with exit 127 ("bad interpreter"), and gofmt -l flags nearly every .go file
+# because it sees a trailing CR on every line. The committed blobs are LF, so
+# the failure only appears on that checkout - which is exactly the kind of
+# machine-specific breakage a repository can pin away (audit L-1).
+#
+# `text=auto` still detects binary files and leaves their bytes alone; the
+# explicit `eol=lf` is what makes the CHECKOUT match the blob on every host,
+# whatever the host's own autocrlf setting is.
+* text=auto eol=lf
+
+# The scripts are executed directly (./scripts/...), so the shebang must carry
+# no trailing CR on any platform. Stated separately from the rule above because
+# it is the failure an operator actually hit, and a rule that names it is the
+# one a future contributor will find.
+*.sh text eol=lf
+
+# Nothing else needs pinning: every other tracked file is text (Go, Markdown,
+# Makefile, JSON genesis/committee files, workflow YAML), and there are no
+# tracked binaries - the one .exe in the tree is git-ignored build output, and
+# `dist/` artifacts are never committed. If a binary is ever checked in, give it
+# `binary` here before it is added, or text=auto's heuristic is all that
+# protects it.
