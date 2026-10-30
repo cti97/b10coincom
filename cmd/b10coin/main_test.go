@@ -1063,6 +1063,52 @@ func TestStakeRefusesBelowMinStakeBeforeSubmitting(t *testing.T) {
 	if len(stub.posts) != 0 {
 		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
 	}
+	if strings.Contains(err.Error(), "no shipped genesis") {
+		t.Errorf("a refusal on an account holding 10,000 b10 appended the no-funding-path hint: %v", err)
+	}
+}
+
+// TestTheFundingHintAppearsOnlyWhenTheBalanceCannotReachMinStake is the M5
+// re-run's misleading-hint finding (2026-10-30): refusing a stake for a
+// two-spark FEE shortfall appended "no shipped genesis gives an operator's key
+// MIN_STAKE" even though the account held a thousand times MIN_STAKE. The hint
+// is now conditional on the spendable balance being below MIN_STAKE, which is
+// the case it was written for. Both endings are asserted on constructed
+// balances, and the ST-1 refusal is checked through the real verb.
+func TestTheFundingHintAppearsOnlyWhenTheBalanceCannotReachMinStake(t *testing.T) {
+	const minStake = uint64(100_000_000_000)
+	// A thousand times MIN_STAKE, two sparks short of bond plus fee.
+	rich := 1000 * minStake
+	err := checkSpendable(rich, rich, 2, minStake)
+	if err == nil {
+		t.Fatal("a two-spark fee shortfall must still be refused")
+	}
+	if strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("an account holding 1000x MIN_STAKE was told it has no shipped path to MIN_STAKE: %v", err)
+	}
+	if !strings.Contains(err.Error(), "short 2 sparks") {
+		t.Fatalf("the refusal must still say how short it is: %v", err)
+	}
+	// An empty account: the hint is the honest answer and must stay.
+	err = checkSpendable(0, minStake, 1, minStake)
+	if err == nil {
+		t.Fatal("a bond the balance cannot cover must be refused")
+	}
+	if !strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("an account with no spendable funds was not told where MIN_STAKE comes from: %v", err)
+	}
+	// The same rule on the ST-1 refusal (the bond would end below MIN_STAKE):
+	// a funded account gets the arithmetic, not the funding lecture; a fresh
+	// account gets both.
+	keyPath, _, addr := stakingTestKey(t)
+	funded := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{Address: addr.String(), Balance: 10_000 * genesis.SparksPerB10})
+	if err := cmdStake([]string{"--node", funded.url, "--key", keyPath, "--amount", "999", "--yes"}); err == nil || strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("a funded account's ST-1 refusal carried the funding hint: %v", err)
+	}
+	empty := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{Address: addr.String(), Balance: 0})
+	if err := cmdStake([]string{"--node", empty.url, "--key", keyPath, "--amount", "999", "--yes"}); err == nil || !strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("a fresh account's ST-1 refusal dropped the funding hint: %v", err)
+	}
 }
 
 // TestTheVerbRefusesAKeyThatDoesNotOwnTheAccount: the node names a different

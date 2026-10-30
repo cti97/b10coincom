@@ -824,16 +824,33 @@ func (t *stakingTarget) submit(tx *types.Tx, o stakingTxOptions, prov txProvenan
 // opened yet.
 const stakingFundingNote = "no shipped genesis gives an operator's key MIN_STAKE in spendable funds: the faucet pays one claim per key per epoch and `b10coin claim` signs with an ephemeral key it does not save, so a fresh operator has no shipped path to this balance; see README \"Staking\" for the claim arithmetic"
 
+// fundingNote returns the MIN_STAKE hint, prefixed for appending to a refusal,
+// ONLY when the account's spendable balance is itself below MIN_STAKE.
+//
+// It used to be appended to every refusal, so an account holding a thousand
+// times MIN_STAKE that was two sparks short of the FEE was told that no shipped
+// genesis gives it MIN_STAKE at all (M5 Docker re-run, 2026-10-30: misleading,
+// cosmetic, and exactly the kind of hint that sends an operator looking for a
+// faucet they do not need). A balance at or above MIN_STAKE needs a correct
+// top-up or a smaller bond; the funding lecture is false there.
+func fundingNote(balance, minStake uint64) string {
+	if minStake > 0 && balance >= minStake {
+		return ""
+	}
+	return "; " + stakingFundingNote
+}
+
 // checkSpendable refuses a bond the account cannot cover, before submitting:
 // the node would refuse it at execution, but the operator learns why here.
-func checkSpendable(balance, amount, fee uint64) error {
+// minStake is the chain's MIN_STAKE, used only for the funding hint.
+func checkSpendable(balance, amount, fee, minStake uint64) error {
 	if fee > math.MaxUint64-amount {
 		return fmt.Errorf("the bond %d + fee %d overflows a uint64", amount, fee)
 	}
 	need := amount + fee
 	if balance < need {
-		return fmt.Errorf("the account holds %s b10 (%d sparks) but the bond plus the %d-spark fee needs %s b10 (%d sparks), short %d sparks; %s",
-			genesis.FormatB10(balance), balance, fee, genesis.FormatB10(need), need, need-balance, stakingFundingNote)
+		return fmt.Errorf("the account holds %s b10 (%d sparks) but the bond plus the %d-spark fee needs %s b10 (%d sparks), short %d sparks%s",
+			genesis.FormatB10(balance), balance, fee, genesis.FormatB10(need), need, need-balance, fundingNote(balance, minStake))
 	}
 	return nil
 }
@@ -942,11 +959,12 @@ func cmdStake(args []string) error {
 	}
 	resulting := t.account.Bonded + amount
 	if resulting < t.status.MinStakeSparks {
-		return fmt.Errorf("--amount %s b10 (%d sparks) would leave the bond at %s b10 (%d sparks), below this chain's MIN_STAKE %s b10 (%d sparks); %s",
+		return fmt.Errorf("--amount %s b10 (%d sparks) would leave the bond at %s b10 (%d sparks), below this chain's MIN_STAKE %s b10 (%d sparks)%s",
 			genesis.FormatB10(amount), amount, genesis.FormatB10(resulting), resulting,
-			genesis.FormatB10(t.status.MinStakeSparks), t.status.MinStakeSparks, stakingFundingNote)
+			genesis.FormatB10(t.status.MinStakeSparks), t.status.MinStakeSparks,
+			fundingNote(t.account.Balance, t.status.MinStakeSparks))
 	}
-	if err := checkSpendable(t.account.Balance, amount, t.status.MinFeeSparks); err != nil {
+	if err := checkSpendable(t.account.Balance, amount, t.status.MinFeeSparks, t.status.MinStakeSparks); err != nil {
 		return err
 	}
 

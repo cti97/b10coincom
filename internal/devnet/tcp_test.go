@@ -32,7 +32,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cti97/b10coincom/internal/consensus"
 	"github.com/cti97/b10coincom/internal/relay"
 )
 
@@ -100,37 +99,6 @@ func minMax(hs []uint64) (min, max uint64) {
 		}
 	}
 	return min, max
-}
-
-// diagTally renders one round's tally: how many validators the engine counted,
-// the power they carry against the quorum, the nil weight, and the per-block-ID
-// split. A tally short of quorum is the "votes arrived but did not add up"
-// distinction; the per-ID split says whether the committee was split across
-// two blocks or simply silent.
-func diagTally(name string, t consensus.DiagTally, quorum uint64) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s votes=%d power=%d quorum=%d", name, t.Votes, t.Total, quorum)
-	var nilPower uint64
-	for i := 0; i < t.N; i++ {
-		if t.IDs[i].BlockID == ([32]byte{}) {
-			nilPower = t.IDs[i].Power
-		}
-	}
-	fmt.Fprintf(&b, " nil=%d", nilPower)
-	if t.N > 0 {
-		b.WriteString(" ids=[")
-		for i := 0; i < t.N; i++ {
-			if i > 0 {
-				b.WriteString(",")
-			}
-			fmt.Fprintf(&b, "%x:%d", t.IDs[i].BlockID[:4], t.IDs[i].Votes)
-		}
-		b.WriteString("]")
-	}
-	if t.More > 0 {
-		fmt.Fprintf(&b, " +%d ids", t.More)
-	}
-	return b.String()
 }
 
 // stallReport names, per validator, WHY a networked run is not advancing. The
@@ -215,8 +183,8 @@ func stallReport(vs []*Validator) string {
 			}
 			fmt.Fprintf(&b, "\n\t  r%d h%d proposer=%s proposal=%s %s %s selfprevote=%s step=%s",
 				r.Round, r.Height, who, prop,
-				diagTally("prevote", r.Prevote, quorum),
-				diagTally("precommit", r.Precommit, quorum),
+				stallTally("prevote", r.Prevote, quorum),
+				stallTally("precommit", r.Precommit, quorum),
 				self, r.Step)
 		}
 	}

@@ -195,15 +195,28 @@ func waitClosed(t *testing.T, c net.Conn, what string) {
 	}
 }
 
+// waitForDeadline bounds every waitFor poll below. It used to be a hard-coded
+// 10 s, and on a heavily loaded `-race` host that was a coin flip: the
+// keepalive-sink test's `Dropped > 0` wait hit it once in a 565 s run, then
+// passed a full race re-run and 71 isolated runs (M5 Docker re-run,
+// 2026-10-30). Every condition these polls assert is an EVENTUALITY of a
+// healthy relay - a queue budget biting, a slot being reaped, a goroutine
+// exiting - so the deadline is a ceiling on pathological slowness, not a
+// latency expectation. 30 s triples the headroom a starved runner needs and
+// still fails a genuinely broken relay with a message instead of hanging the
+// job; it is deliberately bounded, because a test with no deadline is worse
+// than one with a long one.
+const waitForDeadline = 30 * time.Second
+
 // waitFor polls ok() until it holds, with one generous deadline: tests assert
 // outcomes, never sleeps - a poll loop degrades to a timeout failure, not to
 // a flake.
 func waitFor(t *testing.T, ok func() bool, what string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(waitForDeadline)
 	for !ok() {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s (waited 10s)", what)
+			t.Fatalf("%s (waited %s)", what, waitForDeadline)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

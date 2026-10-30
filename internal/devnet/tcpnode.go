@@ -315,6 +315,11 @@ type Validator struct {
 	// this bug's - the fix is to stop dispatching before closing).
 	closing atomic.Bool
 
+	// stall is the once-per-height stall reporter's memory (stall.go): the
+	// height it last reported and whether it has reported there. Guarded by mu,
+	// the same lock the driver it describes runs under.
+	stall stallWatch
+
 	// stop ends the loops; once closed, Close idempotence follows.
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -886,6 +891,13 @@ func (v *Validator) tickLoop() {
 			v.drv.Tick(now)
 			v.drv.Observe()
 			v.mu.Unlock()
+			// After the driver work, and outside the lock it just released:
+			// a node that has spent stallReportRounds rounds at one height
+			// with a reachable quorum says so once (stall.go). Logging is the
+			// only thing this does, and a blocked stderr must not hold mu.
+			if line, ok := v.stallReportOnce(); ok {
+				log.Print(line)
+			}
 		}
 	}
 }
