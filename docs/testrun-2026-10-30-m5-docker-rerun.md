@@ -15,6 +15,9 @@
 | Multi-container network | **partial** | **H-1 and H-2 are fixed on live nodes.** M-1 is still open. The M-2 re-check was not run. |
 | Staking end to end | **partial** | All verbs and the new ST-1/ST-3/ST-4 rules behave as documented. M-3 is still open. A rolling-restart stall was found; it is consensus behaviour, not specific to staking. |
 
+> **Update:** upstream commits that landed while this run was in progress address several of the open items below. None of them were tested in this run:
+> `88e70a8` (M-1: default the reconnect ceiling; `internal/transport/tcp` passes in Docker at `9d4e750`, including `TestDefaultOptionsBackOffGrows`), `4d1b7dd` (M-2: expose the local peer-hint exception), `b531c08` (M-3 doc), `40c43bc` (L-2), `f566f79` (L-1 line endings, L-3 CI comment).
+
 ## Status of the findings from the previous report
 
 | ID | Previous finding | Status at `dcd2ede` | Evidence |
