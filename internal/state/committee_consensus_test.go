@@ -245,6 +245,108 @@ func TestAThreeSeatCommitteeNeedsTheOneOverOneEscape(t *testing.T) {
 	}
 }
 
+// TestOneSilentSeatStopsThreeSeatsAndNotFour is the arithmetic behind the
+// README's displacement warning, corrected for the 2026-10-30 test run (audit
+// M-3: the README said a seat with no node behind it "stops the chain", which is
+// true on three seats and false on four or more, where the chain kept committing
+// on 3 of 4 power).
+//
+// The scenario is CONSTRUCTED, not provoked: the bond map is built directly, so
+// a bond from a key whose node is not running is just a candidate whose key no
+// node signs with. The committee's total and threshold come from the same
+// consensus.Config a validator builds, so the comparison below is the one the
+// commit path makes: a block commits when the precommits collected reach
+// Quorum(), and the seats with no signer contribute nothing.
+//
+// Two properties, both load-bearing for the wording:
+//   - THREE seats: below four seats the cap is 1/1, so one seat may hold almost
+//     all the power, and quorum is strictly MORE than two thirds. The two live
+//     seats of three hold exactly 2/3, which is one spark short when the bonds
+//     are equal - and less than that when the dead seat is a whale. Nothing
+//     commits, so the chain halts at the boundary.
+//   - FOUR OR MORE: the quarter cap bounds the silent seat at 1/4 of the power,
+//     so the survivors hold at least 3/4 > 2/3 and the chain keeps committing.
+//     For N equal seats that is the general inequality (N-1)/N > 2/3, which
+//     holds for every N >= 4, and stops holding for TWO silent seats until N >= 7.
+func TestOneSilentSeatStopsThreeSeatsAndNotFour(t *testing.T) {
+	// The fixture shapes the live run used: a MIN_STAKE bond competing with
+	// one-spark genesis seats on a full committee, so the newcomer is seated and
+	// one genesis seat is evicted. The newcomer is the seat with no signer.
+	shapes := []struct {
+		name   string
+		stakes []uint64
+		silent int // index of the seat whose key no node holds
+	}{
+		{"3 seats: a MIN_STAKE bond beside two one-spark fixture seats", []uint64{minStakeSparks, 1, 1}, 0},
+		{"4 seats: a MIN_STAKE bond beside three one-spark fixture seats", []uint64{minStakeSparks, 1, 1, 1}, 0},
+	}
+	for _, sh := range shapes {
+		t.Run(sh.name, func(t *testing.T) {
+			committee, _ := derive(t, sh.stakes, 0)
+			cfg := config(committee)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("derived committee does not validate: %v", err)
+			}
+			assertLiveAgainstQuorum(t, committee, cfg, sh.silent)
+		})
+	}
+
+	// Equal MIN_STAKE seats, one or two of them without a signer: the general
+	// rule the README states in terms of N.
+	for n := 3; n <= 8; n++ {
+		committee, _ := derive(t, repeatStake(minStakeSparks, n), 0)
+		cfg := config(committee)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("%d seats do not validate: %v", n, err)
+		}
+		if n == 3 {
+			// The margin is a single spark: two live seats hold exactly two
+			// thirds, and quorum is strictly greater than two thirds.
+			if short := int64(cfg.Quorum()) - int64(livePower(cfg, committee, 0)); short != 1 {
+				t.Fatalf("3 seats, one silent: live power is %d sparks short of quorum, want exactly 1 (%d vs %d)",
+					short, livePower(cfg, committee, 0), cfg.Quorum())
+			}
+		}
+		// One silent seat: commits iff at least four seats.
+		assertCommit(t, fmt.Sprintf("%d seats, one silent", n), cfg, committee, n >= 4, 0)
+		// Two silent seats: commits iff at least seven seats.
+		if n >= 4 {
+			assertCommit(t, fmt.Sprintf("%d seats, two silent", n), cfg, committee, n >= 7, 0, 1)
+		}
+	}
+}
+
+// livePower is the config's total power minus the seats with no signer. It does
+// NOT mutate the committee: the callers compare several silent sets against one
+// derived committee.
+func livePower(cfg consensus.Config, committee []genesis.Validator, silent ...int) uint64 {
+	live := cfg.TotalPower()
+	for _, i := range silent {
+		live -= committee[i].Power
+	}
+	return live
+}
+
+// assertCommit compares the live power against the config's own threshold and
+// fails unless it lands on the documented side of it.
+func assertCommit(t *testing.T, name string, cfg consensus.Config, committee []genesis.Validator, want bool, silent ...int) {
+	t.Helper()
+	live, quorum := livePower(cfg, committee, silent...), cfg.Quorum()
+	if got := live >= quorum; got != want {
+		t.Fatalf("%s: live power %d vs quorum %d commits = %v, want %v", name, live, quorum, got, want)
+	}
+}
+
+func assertLiveAgainstQuorum(t *testing.T, committee []genesis.Validator, cfg consensus.Config, silent int) {
+	t.Helper()
+	want := len(committee) >= consensusPowerCapMinSeats
+	live, quorum := livePower(cfg, committee, silent), cfg.Quorum()
+	if got := live >= quorum; got != want {
+		t.Fatalf("%d seats with seat %d silent: live power %d vs quorum %d commits = %v, want %v",
+			len(committee), silent, live, quorum, got, want)
+	}
+}
+
 // repeatStake returns n copies of one stake.
 func repeatStake(stake uint64, n int) []uint64 {
 	out := make([]uint64, n)

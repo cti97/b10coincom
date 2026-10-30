@@ -524,16 +524,28 @@ exit **only in full**, which is what `unstake` without `--amount` does.
 > path. The arithmetic is in the repository README's
 > [Staking](../../README.md#staking) section.
 
-> **⚠️ A bond is a seat, and a seat without a node stops the chain.** A bond at
-> or above a genesis seat's power is ranked against it, ties by key bytes. With
+> **⚠️ A bond is a seat, and a seat without a node is a wasted seat — a halt on
+> three seats, a thinner committee on four or more.** A bond at or above a
+> genesis seat's power is ranked against it, ties by key bytes. With
 > `committee_size` equal to the number of validators (the old default) each
 > newcomer evicts a genesis seat; the shipped example asks for one spare seat
 > (4 against 3 keys), so the fourth bond is seated *beside* the three genesis
-> seats and a fifth bond displaces one of the four. If the bonding key's node is **not** running as
-> a validator — the obvious mistake is staking from a key other than the one the
-> node holds — the new seat has no signer, the committee cannot reach its
-> two-thirds quorum, and the chain halts at the boundary. Stake only with the
-> key the node runs, and keep every genesis key's node running.
+> seats and a fifth bond displaces one of the four. If the bonding key's node is
+> **not** running as a validator — the obvious mistake is staking from a key
+> other than the one the node holds — the new seat has no signer. What follows
+> depends on the size (audit M-3):
+>
+> - **3 seats: the chain halts at the boundary.** Below four seats there is no
+>   power cap (1/1) and quorum is strictly more than two thirds, so two live
+>   seats of three hold exactly 2/3 — one spark short of the threshold when all
+>   three bonds are `MIN_STAKE` — and cannot commit.
+> - **4 or more seats: the chain keeps finalising.** The one-quarter cap means
+>   the silent seat holds at most 1/4 of the power, so the survivors hold at
+>   least 3/4 > 2/3. At four seats that is exactly 3 of 4 power
+>   (`floor(2·4/3)+1 = 3`); the displaced node stops voting but keeps following.
+>
+> Either way the seat is wasted and the margin is one failure thinner: stake only
+> with the key the node runs, and keep every genesis key's node running.
 
 `unstake` and `withdraw` **run** here without any spendable funds — an exit is
 free by consensus rule (§3.2 bonds every genesis seat with
@@ -682,6 +694,15 @@ hashes below, never from reachability).
    ```sh
    scripts/deploy/acceptance.sh --pis 192.0.2.11,192.0.2.12,192.0.2.13 --relay example.com
    ```
+
+   **Fault recipes: name the survivors, not the stopped node.** The harness also
+   accepts **two** validators, which is how §8's "stop one seat and see whether
+   the two survivors are STALLED" is judged: pass the two live Pis and expect
+   **STALLED** (exit 2), the correct verdict for 2 of 3, below quorum. A
+   two-validator PASS is possible too, and the output says it is a partial
+   reading rather than M4's criterion. Entries are de-duplicated by *machine*, so
+   `pi-a` and `pi-a:8645` are one validator, and a repeated host is a usage error
+   instead of a phantom third seat.
 
 ## 8. When it does not work: the five failures
 
