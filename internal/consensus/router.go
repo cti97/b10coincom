@@ -138,6 +138,11 @@ type MessageRouter struct {
 	// means a peer is sending frames for a chain this node is not on (or a
 	// stranger reached the port); zero is the healthy value.
 	refused atomic.Uint64
+	// verified counts successful signature verifications - the work a relay
+	// link's replay flood used to buy once per frame (audit PX-4). It is an
+	// observable, not a signal: it exists so "a replayed vote costs one lookup,
+	// not one Ed25519" can be asserted as a number instead of inferred.
+	verified atomic.Uint64
 }
 
 // NewMessageRouter builds a router with the given server half. The optional
@@ -262,10 +267,33 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 	// membership; and a vote for a height the engine has already left or has
 	// not reached is dead weight whatever its signature says.
 	//
-	// Dedup is consulted AFTER Verify, never before (audit N-7): a frame that
-	// fails Verify must not record a key, or a stranger could poison the key
-	// of an honest vote it cannot sign and silence it.
+	// Dedup has TWO calls and their placement is the whole of audit PX-4:
+	//
+	//   - Has runs FIRST, before Verify and before the free membership checks.
+	//     It RECORDS NOTHING, so it cannot poison anything, and it is the cheap
+	//     map lookup that turns a genuine, already-seen member vote replayed at
+	//     line rate over the relay link - one Ed25519 verification per replay
+	//     before this - into one lookup and a drop. Measured by
+	//     TestAReplayedVoteCostsNoSecondVerification.
+	//   - Seen runs ONLY after Verify succeeded, and it is the only call that
+	//     records. That is audit N-7's no-poisoning property, unchanged: a frame
+	//     that fails Verify must not record a key, or a stranger could pre-seed
+	//     the key of an honest vote it cannot sign and silence it. Has-before
+	//     does not weaken it, because Has does not write; the test that fires
+	//     a forged frame carrying the honest key and then the honest vote pins
+	//     both halves.
+	//
+	// The window between Has and Seen is not a race in production: the transport
+	// serialises every reader's Route under one dispatch mutex, and the node's
+	// own tick loop never calls Route concurrently with itself. If that ever
+	// changed, the worst case is two verifications of the same frame, never a
+	// lost honest message.
 	if v, err := DecodeVote(m.Data); err == nil {
+		key := voteDedupKey(v)
+		if r.Dedup != nil && r.Dedup.Has(key) {
+			r.dups.Add(1)
+			return false
+		}
 		if member, known := r.isMemberAt(v.Validator, v.Height); known && !member {
 			r.refused.Add(1)
 			return false
@@ -275,7 +303,12 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 			return false
 		}
 		if v.Verify() == nil {
-			if r.Dedup != nil && r.Dedup.Seen(voteDedupKey(v)) {
+			r.verified.Add(1)
+			if r.Dedup != nil && r.Dedup.Seen(key) {
+				// Records ONLY now (the no-poisoning rule) AND keeps its return:
+				// the Has above is the fast path, this is the second line for the
+				// Has/Seen window, and it is what a caller that skips Has still
+				// gets. Deleting Has must not turn dedup into a no-op.
 				r.dups.Add(1)
 				return false
 			}
@@ -292,8 +325,16 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 			r.refused.Add(1)
 			return false
 		}
+		// The same Has-before / record-after split as the vote branch (audit
+		// PX-4), for the same reason: a replayed proposal is one map lookup.
+		key := proposalDedupKey(p)
+		if r.Dedup != nil && r.Dedup.Has(key) {
+			r.dups.Add(1)
+			return false
+		}
 		if p.Verify() == nil {
-			if r.Dedup != nil && r.Dedup.Seen(proposalDedupKey(p)) {
+			r.verified.Add(1)
+			if r.Dedup != nil && r.Dedup.Seen(key) {
 				r.dups.Add(1)
 				return false
 			}
@@ -388,6 +429,10 @@ func (r *MessageRouter) PeerExchangesSeen() uint64 { return r.peerExchanges.Load
 // because their dedup key had already been recorded. Zero is healthy in the
 // star topology (no loops); a nonzero count means a message arrived twice, as
 // a mesh would produce.
+// SignatureVerifications reports how many consensus frames this router verified
+// successfully (audit PX-4). A replayed, already-seen vote must not move it.
+func (r *MessageRouter) SignatureVerifications() uint64 { return r.verified.Load() }
+
 func (r *MessageRouter) DuplicatesDropped() uint64 { return r.dups.Load() }
 
 // UnknownDropped reports how many frames decoded as nothing. A steady nonzero

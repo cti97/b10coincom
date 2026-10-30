@@ -66,25 +66,44 @@ const WireTagFloor MsgType = 0x80
 // different messages by two different paths.
 var ErrUnknownMsgType = errors.New("wire: unknown message type")
 
+// MaxHelloNonceBytes bounds the HELLO's freshness nonce. The transport uses a
+// 32-byte per-connection nonce (tcp.connectionNonceBytes); the slack exists so
+// the wire layer is not the place a transport's nonce width is decided. Empty
+// is legal and means "this connection issued no challenge" (a relay link,
+// where one socket carries every member's frames and the transport therefore
+// has no peer nonce to bind - see tcp.adoptRelay).
+const MaxHelloNonceBytes = 64
+
 // Hello is the first message a connection speaks. It is not signed at this
 // layer - the Sig carries whatever the transport's handshake policy needs of
 // it, and verifying that policy is the connection's job, not the decoder's.
+//
+// Nonce is the RECEIVER's per-connection challenge, echoed so the signature is
+// bound to one socket (audit PX-2). The transport picks a fresh 32-byte value
+// per direct connection during the ID handshake and hands it to the node
+// layer; a HELLO signed over another connection's nonce - a captured member
+// HELLO replayed on a hint-dialled socket - does not verify HERE even though
+// its Ed25519 signature is perfectly valid. Empty means the connection issued
+// or demands no challenge (relay mode), not "check skipped": the check is an
+// equality against the value the transport recorded for that connection.
 type Hello struct {
 	ChainID   string
 	Validator []byte // Ed25519 public key
 	Height    uint64
+	Nonce     []byte // the receiver's per-connection challenge
 	Sig       []byte
 }
 
 // EncodeHello renders h canonically, in struct order:
 //
-//	tag(1) | len ChainID | len Validator | Height(8) | len Sig
+//	tag(1) | len ChainID | len Validator | Height(8) | len Nonce | len Sig
 func EncodeHello(h *Hello) []byte {
 	e := types.NewEncoder()
 	e.U8(uint8(MsgHello))
 	e.VarBytes([]byte(h.ChainID))
 	e.VarBytes(h.Validator)
 	e.U64(h.Height)
+	e.VarBytes(h.Nonce)
 	e.VarBytes(h.Sig)
 	return e.Bytes()
 }
@@ -115,6 +134,14 @@ func DecodeHello(b []byte) (*Hello, error) {
 		return nil, err
 	}
 	if h.Height, err = d.U64(); err != nil {
+		return nil, err
+	}
+	// The nonce is a fixed-size challenge with a hard ceiling (audit PX-2), so
+	// it is bounded before the copy for the same reason the validator key is:
+	// an attacker-supplied length must not turn one HELLO into a frame-sized
+	// allocation. Empty is legal - it is how a relay connection, which has no
+	// peer nonce, is framed.
+	if h.Nonce, err = d.VarBytesMax(MaxHelloNonceBytes); err != nil {
 		return nil, err
 	}
 	// The signature stays bounded only by the frame: its width is a property of

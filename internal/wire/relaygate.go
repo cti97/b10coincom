@@ -1,52 +1,96 @@
 package wire
 
-// The relay access-token gate's two fixed frames, and the minimum token
-// length (review, audit fix round 4).
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+)
+
+// The relay access-token gate (review, audit fix round 4; challenge-response,
+// audit PX-3).
 //
-// The gate fixes three problems with the original N-8 handshake, all of them
-// in the ORDER of the frames rather than in the comparison:
+// The gate exists because a relay is a dumb forwarder that every validator
+// trusts with no cryptographic relationship. The first version sent the token
+// as the FIRST frame; the second waited for a fixed greeting. Both shared one
+// defect the audit called PX-3: the token is a PUBLIC-CONSTANT-triggered
+// secret. The greeting is a constant any stranger behind a token-less relay
+// can make that relay forward into a token-configured node's handshake, so one
+// registered stranger could make the node send the token and the relay would
+// forward it to everyone.
 //
-//  1. the node sent the token to a relay that had not proved it wanted one. A
-//     relay started without --access-token-file skips its token read entirely
-//     and forwards whatever arrives as ordinary payload, so a misconfigured,
-//     rolled-back or older relay broadcast the operator's secret to every
-//     registered peer, strangers included, and neither side noticed;
-//  2. nothing distinguished "the relay refused my token" from "the link
-//     dropped", so a node with a wrong token redialled forever in silence;
-//  3. a token of any length, including one byte, was accepted.
+// The exchange is now a challenge-response, still with no decoder on either
+// side:
 //
-// The repair keeps the relay's "parses nothing" posture intact: these are
-// FIXED BYTE STRINGS, sent by the relay only to announce that it gates, and
-// echoed by it only to announce that the token it read matched. The relay
-// still calls no decoder on any frame and still understands nothing about
-// consensus. The greeting is a wire-format fact both ends must agree on, so
-// it lives here - in the framing package both ends already import - rather
-// than being duplicated as a string literal on each side.
+//	relay -> node   RelayGateGreeting                        (only with a token)
+//	relay -> node   RelayGateNonceBytes random bytes ‖ the relay's own
+//	                address bytes                           (the challenge)
+//	node  -> relay  RelayGateProof(token, challenge)         (HMAC-SHA-256)
+//	relay -> node   RelayGateAccepted                        (proof matched)
 //
-// The exchange, in frame order:
+// Everything here is FIXED-WIDTH or self-delimiting by construction, and the
+// relay never interprets a node's frame: it writes a constant, writes 32
+// random bytes it generated plus its own address, reads at most
+// RelayGateMACBytes and compares them in constant time. Its "parses nothing"
+// posture (pinned structurally by TestTheRelayCallsNoDecoder) is intact.
 //
-//	relay -> node   RelayGateGreeting   (only when the relay has a token)
-//	node  -> relay  <the access token>
-//	relay -> node   RelayGateAccepted   (token matched; the node is admitted)
+// What the challenge buys:
+//
+//   - The secret is never on the wire. A token-less relay that forwards the
+//     node's answer to every peer forwards a MAC, not the token.
+//   - A captured exchange is not replayable. The challenge contains 32 fresh
+//     random bytes and the relay's own listening address, so the relay's MAC
+//     for one connection is wrong for every other connection, and for every
+//     later connection to the same relay.
+//   - A stranger can still make a node answer with a MAC for a challenge the
+//     stranger chose (by looping the greeting through a token-less relay).
+//     That is a chosen-message oracle on HMAC-SHA-256 with a key of at least
+//     MinRelayAccessTokenBytes, not a disclosure: it yields no token bytes and
+//     no usable proof for any challenge the stranger did not choose.
 //
 // A relay WITHOUT a token sends nothing, so a token-configured node reads the
-// greeting, does not get it, refuses to send the secret and logs the refusal
-// (tcp.adoptRelay). That is the whole fix for case 1: the secret is never sent
-// to a relay that has not announced gating. A relay WITH a token closes the
-// socket on a wrong token, so the node's read of RelayGateAccepted fails and
-// the node logs that too - case 2. Both frames are the same on every
-// connection: nothing here is derived from the token or from any peer, so
-// neither frame leaks token bytes or token LENGTH (the node writes the token
-// only after the greeting, and the relay's ack is unconditional on match).
+// greeting, does not get it, refuses to answer and logs the refusal
+// (tcp.adoptRelay). A relay WITH a token closes the socket on a wrong proof, so
+// the node's read of RelayGateAccepted fails and the node logs that too.
 var (
 	// RelayGateGreeting is the first frame a token-configured relay sends to a
 	// connection it has accepted. Its presence is the relay's only claim: "I
-	// will ask for a token". It carries no token material.
+	// will ask for a proof". It carries no token material and no nonce.
 	RelayGateGreeting = []byte("b10coin-relay-gate-v1")
-	// RelayGateAccepted is the frame a relay sends after the presented token
-	// matched, and ONLY then. It is how the node tells a refusal from a dead
-	// socket instead of redialling in silence.
+	// RelayGateAccepted is the frame a relay sends after the proof matched,
+	// and ONLY then. It is how the node tells a refusal from a dead socket
+	// instead of redialling in silence.
 	RelayGateAccepted = []byte("b10coin-relay-gate-v1-ok")
+)
+
+// RelayGateProof is the answer to a gate challenge: HMAC-SHA-256 keyed by the
+// access token, over the challenge bytes EXACTLY as the relay sent them
+// (nonce ‖ the relay's address). Both ends already import this package, so the
+// one primitive lives here rather than being written twice; nothing about it
+// is a decode - it hashes bytes it is handed.
+//
+// The relay verifies the answer with hmac.Equal, which is constant-time, and
+// the node never sends the token itself, so a relay that forwards the answer
+// forwards no secret (audit PX-3).
+func RelayGateProof(token, challenge []byte) []byte {
+	m := hmac.New(sha256.New, token)
+	m.Write(challenge)
+	return m.Sum(nil)
+}
+
+const (
+	// RelayGateNonceBytes is the fixed width of the random part of the
+	// challenge. 32 bytes is the HMAC-SHA-256 block-friendly size and far
+	// beyond birthday collisions on a per-connection value.
+	RelayGateNonceBytes = 32
+	// RelayGateMACBytes is the fixed width of the answer: one HMAC-SHA-256
+	// output. The relay reads at most this many bytes, so the read is bounded
+	// before allocation whatever the sender declares.
+	RelayGateMACBytes = 32
+	// MaxRelayGateChallengeBytes bounds the challenge frame: the fixed nonce
+	// plus the relay's own listening address. The address is a string this
+	// side does not interpret beyond its length (the relay never parses the
+	// node's frame, and the node only needs the same bytes the relay hashed),
+	// so the bound is generous rather than semantic.
+	MaxRelayGateChallengeBytes = RelayGateNonceBytes + 256
 )
 
 // MinRelayAccessTokenBytes is the shortest access token either end accepts.

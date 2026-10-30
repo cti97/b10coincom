@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -54,7 +55,10 @@ func startFrozen(t *testing.T, allowLocal bool) *Validator {
 // on their own goroutine, so there is no concurrent read of the field.
 func recordPeerDial(v *Validator) *[]string {
 	dials := &[]string{}
-	v.peerAdd = func(addr string) error {
+	v.peerAdd = func(addr string, learned bool) error {
+		if !learned {
+			return fmt.Errorf("a peer hint asked for a CONFIGURED dial of %q; hints must be learned dials (audit PX-2)", addr)
+		}
 		*dials = append(*dials, addr)
 		return nil
 	}
@@ -366,18 +370,19 @@ func hasPeer(v *Validator, id transport.PeerID) bool {
 }
 
 // TestALearnedAddressIsNotAPeerUntilItSaysHello is the admission boundary of
-// design decision 5, stated the way the CODE behaves rather than the way a
-// first draft of the brief described it.
+// design decision 5 AND audit PX-2, stated the way the code behaves now.
 //
-// A hint can make this node DIAL a stranger, and a dialled connection is
-// admitted by the transport at install (the node chose to dial it), so the
-// stranger appears in Peers() by its handshake name. What it does NOT get is
-// any committee authority: a self-signed vote it sends is refused by the
-// router BEFORE verification and never reaches the engine, and a PEER_EXCHANGE
-// it sends is refused because its connection never carried a signed committee
-// HELLO (attestedConnection) - so a stranger cannot grow the dial set further.
-// The HELLO is what makes a peer, exactly as the signed-committee-HELLO rule
-// says; the transport name is only a routing key.
+// A hint can make this node DIAL a stranger. That dial is a LEARNED one
+// (tcp.AddLearnedPeer), so the connection is GATED: the stranger gets a socket
+// it can speak the transport handshake on, and nothing else. It is not in
+// Peers(), receives no Broadcast, its frames are dropped before OnMessage, and
+// its handshake name is not a peer name. What makes a peer is a signed committee
+// HELLO bound to the connection's nonce, exactly as the signed-HELLO rule says;
+// the transport name is only a routing key.
+//
+// Before PX-2 this test asserted the opposite for the first half - that the
+// stranger APPEARED in Peers() - because install admitted every dialled
+// connection. That was the finding: the dial direction reached strangers.
 func TestALearnedAddressIsNotAPeerUntilItSaysHello(t *testing.T) {
 	v, err := StartValidator(ValidatorConfig{
 		Dir:                 t.TempDir(),
@@ -406,14 +411,39 @@ func TestALearnedAddressIsNotAPeerUntilItSaysHello(t *testing.T) {
 	// A member advertises the stranger's address to v.
 	v.observePeerExchange("v1", memberHint(t, v, 1, []string{stranger.Addr().String()}))
 
-	// The hint DID cause a dial: the transport name appears.
-	waitPeer(t, v, "stranger", 5*time.Second)
+	// The hint DID cause a dial, and the dial is MAINTAINED - but it never
+	// becomes a peer. The observable that the dial happened is the learned
+	// address itself plus the transport's gated counter climbing, not a name in
+	// Peers(): a gated learned dial is absent from Peers() by construction
+	// (audit PX-2).
 	if got := v.LearnedPeerAddrs(); got != 1 {
 		t.Fatalf("LearnedPeerAddrs = %d, want 1", got)
 	}
+	// The dial has to complete before the stranger has a socket to broadcast
+	// on; the stranger admits its accepted connection at install (it has no
+	// Admit policy), so Peers() there is the observable, not a sleep.
+	waitFor(t, "the learned dial to complete at the stranger", 5*time.Second, func() bool {
+		return len(stranger.Peers()) == 1
+	})
+	_ = stranger.Broadcast([]byte("anything-not-a-hello"))
+	// Classified, one way or the other: gated (the fix) or admitted (pre-PX-2).
+	// Waiting on the gated counter alone would make a pre-fix run report a
+	// timeout instead of the finding, which is what the assertion below names.
+	waitFor(t, "the learned dial's frame to be classified (gated, or dispatched)", 5*time.Second, func() bool {
+		return v.ttp.GatedFrames() > 0 || hasPeer(v, "stranger")
+	})
+	if hasPeer(v, "stranger") {
+		t.Fatal("a hint-dialled stranger that never sent a signed committee HELLO is in Peers(): the learned dial was admitted at install (audit PX-2)")
+	}
+	if got := v.ttp.GatedFrames(); got == 0 {
+		t.Fatal("no frame was gated: the learned dial's frames reached the router without a signed committee HELLO")
+	}
 
-	// A valid-looking vote signed by the stranger's OWN key is refused before
-	// verification: the signature proves consistency, never membership.
+	// A valid-looking vote signed by the stranger's OWN key never even reaches
+	// the router now: the connection is gated, so the frame is dropped before
+	// Route. The counter that would move if it HAD been routed stays put, which
+	// is stronger than "refused before verification" - it was not classified at
+	// all.
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -423,24 +453,22 @@ func TestALearnedAddressIsNotAPeerUntilItSaysHello(t *testing.T) {
 	forged.Sig = crypto.Sign(priv, fh[:])
 	before := v.rt.RefusedBeforeVerify()
 	_ = stranger.Broadcast(consensus.EncodeVote(forged))
-	deadline := time.Now().Add(5 * time.Second)
-	for v.rt.RefusedBeforeVerify() == before {
-		if time.Now().After(deadline) {
-			t.Fatal("a self-signed vote from the learned address was not refused before verification")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 
-	// And the stranger cannot advertise: its hint is well formed and signed by
-	// its OWN key, and that key holds no seat, so it is refused instead of
-	// dialled (audit PX-1 - the connection it arrives on is irrelevant now).
+	// Nor can it advertise: its PEER_EXCHANGE is well formed and signed by its
+	// OWN key, and neither the frame (dropped by the gate) nor the key (no seat,
+	// audit PX-1) is authoritative. The stranger's address still costs exactly
+	// one learned slot, and no more.
 	refusedBefore := v.PeerHintsRefused()
 	_ = stranger.Broadcast(wire.EncodePeerExchange(strangerHint(t, v, []string{"203.0.113.9:6001"})))
-	for v.PeerHintsRefused() == refusedBefore {
-		if time.Now().After(deadline) {
-			t.Fatal("an unattested connection's PEER_EXCHANGE was not refused")
-		}
-		time.Sleep(10 * time.Millisecond)
+
+	waitFor(t, "both stranger frames to be gated", 5*time.Second, func() bool {
+		return v.ttp.GatedFrames() >= 2
+	})
+	if v.rt.RefusedBeforeVerify() != before {
+		t.Fatal("a gated stranger's vote reached the router: the admission gate did not hold")
+	}
+	if v.PeerHintsRefused() != refusedBefore {
+		t.Fatal("a gated stranger's PEER_EXCHANGE reached the router: the admission gate did not hold")
 	}
 	if got := v.LearnedPeerAddrs(); got != 1 {
 		t.Fatalf("LearnedPeerAddrs = %d after an unattested advertisement, want 1", got)
@@ -498,26 +526,39 @@ func TestALearnedAddressThatIsDownIsRetriedNotAbandoned(t *testing.T) {
 		}
 	}
 
-	// Replace the refusing listener with a real peer on the same address. The
-	// maintainer's next backoff retry must land: a dial failure never exits.
+	// Replace the refusing listener with a real PEER on the same address. It
+	// must be a full validator, not a bare transport: the learned dial is GATED
+	// (audit PX-2), so the recovering end has to produce a signed committee HELLO
+	// bound to the connection's nonce - a bare tcp.Transport never speaks one,
+	// and the connection would correctly stay unadmitted forever.
 	_ = refuse.Close()
-	var late *tcp.TcpTransport
+	var late *Validator
 	for i := 0; i < 100; i++ {
-		late, err = tcp.New(tcp.Options{LocalID: "late"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err = late.Listen(addr); err == nil {
+		late, err = StartValidator(ValidatorConfig{
+			Dir:        t.TempDir(),
+			Index:      1,
+			Validators: 4,
+			Listen:     addr,
+			TickEvery:  time.Hour,
+			WaveEvery:  20 * time.Millisecond, // its HELLOs are what admits it
+		})
+		if err == nil {
 			break
 		}
-		_ = late.Close()
 		time.Sleep(20 * time.Millisecond)
 	}
 	if err != nil {
 		t.Fatalf("could not rebind %s for the recovering peer: %v", addr, err)
 	}
 	defer late.Close()
-	waitPeer(t, v, "late", 10*time.Second)
+	// v's wave clock is frozen (so PX-1's eviction clock cannot retire the
+	// address mid-test), and HELLOs are what admission needs now, so drive v's
+	// HELLO by hand until the recovering peer admits it - the same constructed
+	// pattern TestALearnedAddressThatCompletesItsHandshakeIsNeverEvicted uses.
+	waitFor(t, "the recovering peer's signed HELLO to admit it", 10*time.Second, func() bool {
+		v.broadcastHello()
+		return hasPeer(v, "v1")
+	})
 }
 
 // TestAPeerExchangeMovesNoConsensusState is design decision 5's negative: the
@@ -873,8 +914,15 @@ func TestPeerExchangeDoesNotMeshAChain(t *testing.T) {
 		t.Fatalf("a learned %v, want exactly its neighbour's address %q: a second-hop address means hints propagated",
 			got, b.Addr())
 	}
+	// learnedAddrs returns SORTED addresses, so the expectation must be sorted
+	// too. Building it as [a.Addr(), c.Addr()] compared a sorted result against an
+	// insertion-ordered literal, which fails whenever the two addresses happen to
+	// sort the other way round - a coin flip that depends on the OS-assigned port.
+	// Caught by CI under -race on 2026-10-30: "b learned [127.0.0.1:41307
+	// 127.0.0.1:41673], want its two neighbours [127.0.0.1:41673 127.0.0.1:41307]".
 	want := []string{a.Addr(), c.Addr()}
-	if got := learnedAddrs(b); len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+	sort.Strings(want)
+	if got := learnedAddrs(b); !slices.Equal(got, want) {
 		t.Fatalf("b learned %v, want its two neighbours %v", got, want)
 	}
 	if got := learnedAddrs(c); len(got) != 1 || got[0] != b.Addr() {

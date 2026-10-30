@@ -27,10 +27,10 @@
 // refusal (below) used to be permanent, because the maintainer did not
 // redial. A relay connection is therefore registered under the fixed name
 // "relay:<addr>" and its handshake WRITES the local ID and reads nothing -
-// unless a relay access token is configured, in which case it reads exactly
-// the relay's two fixed gate frames and writes the token between them
-// (adoptRelay), so that the secret is never offered to a relay that has not
-// announced it gates.
+// unless a relay access token is configured, in which case it reads the gate
+// greeting and a per-connection challenge and writes an HMAC of that challenge
+// (adoptRelay), so the token itself is never offered to any relay, gated or
+// not (audit PX-3).
 // This is a transport-level name, NOT authentication - through a relay,
 // every frame arrives under the one relay name, and verifying who is behind
 // it is the wire layer's signed HELLO plus the membership checks of the node
@@ -74,6 +74,7 @@ package tcp
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -139,6 +140,14 @@ const (
 	// the handshake deadline. The bound is on the FRAME: no payload byte
 	// beyond the length is interpreted.
 	maxHandshakeIDBytes = 512
+	// connectionNonceBytes is the fixed width of the per-connection challenge
+	// both ends of a DIRECT connection exchange immediately after the ID frames
+	// (audit PX-2). It is the freshness binding a HELLO signature carries: the
+	// receiver's nonce goes into wire.Hello.Nonce, so a captured member HELLO
+	// replayed on another socket fails an equality check before any signature
+	// work. 32 bytes is far beyond guessing and matches the width the relay
+	// gate's own challenge uses.
+	connectionNonceBytes = 32
 	// relayPeerIDPrefix names a RELAY connection in the registry: the
 	// connection's far end is the relay (which has no identity and reads
 	// nothing of the payload), so the name is the fixed prefix plus the
@@ -155,9 +164,10 @@ const (
 	// bound of 64 is far above honest use and far below a squatting flood. A
 	// dial arriving at the cap is closed immediately and counted
 	// (RefusedConns); the honest peer's maintainer redials through its own
-	// backoff. Outbound (dialled) connections are NOT capped: they are
-	// configured peers the operator chose, and refusing them would silently
-	// strip a node of a link it was told to keep.
+	// backoff. Outbound (dialled) connections are NOT capped: an operator's
+	// configured peer must not be silently stripped of its link, and a LEARNED
+	// (hint) dial is already held to its own budget (maxLearnedPeerAddrs) and
+	// gated by Options.Admit until it proves a committee HELLO.
 	DefaultMaxConns = 64
 	// DefaultIdleReadTimeout is the per-connection IDLE READ DEADLINE (audit
 	// N-3): the longest a live connection may deliver NO complete frame
@@ -189,6 +199,22 @@ const (
 	// still bounds a flooder's share of the dispatch lock.
 	DefaultRateLimitPerSec = 2000
 	DefaultRateLimitBurst  = 4000
+	// DefaultRelayBytesPerSec and DefaultRelayBytesBurst are the RELAY-MODE
+	// byte-rate budget (audit PX-4). The frame bucket above is deliberately
+	// bypassed on a relay connection (one socket carries every member's
+	// traffic; see rateLimiter), which left the shared link with no ceiling at
+	// all - a stranger replaying a genuine, already-seen member vote at line
+	// rate bought one Ed25519 verification per replay. The dedup-before-verify
+	// ordering in the router removes the verification cost of a replay; this
+	// bucket bounds what is left (the read, the dispatch, the map lookup) by
+	// BYTES so that a 200-byte frame flood is paced rather than obeyed. It is a
+	// DELAY, not a drop: a lost frame on the shared link is an honest member's
+	// vote lost, which is the liveness trade the N-6 exemption exists to
+	// avoid. 512 KiB/s is roughly twelve times the honest ceiling for a
+	// 21-seat committee (each height is on the order of a few KB per member),
+	// and the 2 MiB burst absorbs a catch-up burst without pacing it.
+	DefaultRelayBytesPerSec = 512 << 10
+	DefaultRelayBytesBurst  = 2 << 20
 )
 
 // RelayPeerName returns the registry name a relay-mode connection to addr
@@ -288,35 +314,60 @@ type Options struct {
 	WriteTimeout time.Duration
 	// RateLimitPerSec and RateLimitBurst bound the frames one connection may
 	// deliver per second, as a token bucket; a frame over the rate is
-	// dropped, not the peer. Defaults DefaultRateLimitPerSec and
-	// DefaultRateLimitBurst.
+	// dropped, not the peer. They are applied to DIRECT connections only - a
+	// relay connection is the shared link, not the sender (see rateLimiter).
+	// Defaults DefaultRateLimitPerSec and DefaultRateLimitBurst.
 	RateLimitPerSec int
 	RateLimitBurst  int
-	// Admit authenticates an INBOUND connection before it becomes a peer
-	// (audit N-3/N-7). When non-nil, an accepted connection is held PENDING:
-	// its frames are offered to Admit and, until one is accepted, they are
-	// dropped and never reach OnMessage; the connection is absent from
-	// Peers() and receives no Broadcast. The first frame Admit accepts
-	// admits the connection and is dispatched normally. Admit is supplied by
-	// the node layer (this package holds no keys and no chain identity) and
-	// is expected to require a signed HELLO from a committee member on the
-	// node's chain; a nil Admit means "no admission policy", the behaviour
-	// the socket-free tests and non-consensus users want. Dialled
-	// connections are never gated: they are addresses the operator chose.
-	Admit func(frame []byte) bool
-	// RelayAccessToken, when non-empty, is the pre-shared credential sent on
-	// every RELAY-mode dial (audit N-8): the first-frame secret a relay with
-	// Options.AccessToken requires before it registers the connection. It is
-	// NOT sent first: this end waits for the relay's fixed gate greeting (see
-	// adoptRelay), so a relay that does not gate - one started without a token,
-	// which would forward whatever it received to every peer - never sees the
-	// secret at all. It has no effect on direct connections. At least
+	// RelayBytesPerSec and RelayBytesBurst are the relay-mode BYTE budget
+	// (audit PX-4). A relay connection paces its frames to this rate instead
+	// of dropping them: a frame that would exceed the budget is DELAYED in the
+	// reader goroutine until it fits, so a flooder cannot turn the shared link
+	// into an Ed25519 verification queue, and an honest member's vote is never
+	// shed. Defaults DefaultRelayBytesPerSec and DefaultRelayBytesBurst.
+	RelayBytesPerSec int
+	RelayBytesBurst  int
+	// Admit authenticates a connection before it becomes a peer
+	// (audit N-3/N-7, PX-2). When non-nil, a connection that was not admitted
+	// at install - an accepted inbound socket, and a HINT-DIALLED outbound one
+	// (AddLearnedPeer) - is held PENDING: its frames are offered to Admit and,
+	// until one is accepted, they are dropped and never reach OnMessage; the
+	// connection is absent from Peers() and receives no Broadcast. The first
+	// frame Admit accepts admits the connection and is dispatched normally.
+	//
+	// The nonce argument is the connection's LOCAL challenge, the 32 bytes this
+	// side generated during the direct ID handshake and expects the peer's
+	// HELLO to echo (wire.Hello.Nonce). A policy that accepts a HELLO must
+	// compare it against this value, or a captured HELLO replayed on another
+	// socket admits a stranger - the PX-2 residual. It is nil on a relay
+	// connection, where one socket carries every member's frames and there is
+	// no peer nonce to bind.
+	//
+	// Admit is supplied by the node layer (this package holds no keys and no
+	// chain identity) and is expected to require a signed HELLO from a
+	// committee member on the node's chain; a nil Admit means "no admission
+	// policy", the behaviour the socket-free tests and non-consensus users
+	// want. The old sentence "dialled connections are never gated: they are
+	// addresses the operator chose" was TRUE until hints made this node dial
+	// addresses a PEER chose; it is false now, and this is the corrected
+	// contract: an OPERATOR-CONFIGURED dial (Dial/AddPeer) is admitted at
+	// install, a LEARNED dial (AddLearnedPeer) is not.
+	Admit func(frame []byte, localNonce []byte) bool
+	// RelayAccessToken, when non-empty, is the pre-shared credential a
+	// RELAY-mode dial answers the relay's gate challenge with (audit N-8,
+	// PX-3). The token itself is NEVER written: this end waits for the relay's
+	// fixed greeting and its 32-byte challenge (see adoptRelay) and answers
+	// wire.RelayGateProof(token, challenge), an HMAC-SHA-256 over bytes the
+	// relay chose for THIS connection. So a relay that does not gate - one
+	// started without a token, which would forward whatever it received to
+	// every peer - never sees the secret, and neither does a stranger on a
+	// relay that does: a forwarded answer is a MAC, useless for any other
+	// connection. It has no effect on direct connections. At least
 	// wire.MinRelayAccessTokenBytes bytes are required; New refuses less.
 	//
-	// TWO LIMITS an operator must know, neither of which this layer can fix:
-	// the token travels in PLAINTEXT over TCP, so any passive observer of the
-	// link reads it; and it is REPLAYABLE, because it is a constant the relay
-	// compares per connection and neither end challenges or expires it. It
+	// ONE LIMIT remains, and it is not this layer's to fix: the challenge and
+	// the answer travel in PLAINTEXT over TCP, so a passive observer of the
+	// link sees a valid proof for that one connection while it is live. It
 	// authenticates a connection, not a peer: use it over a trusted path (a
 	// VPN), or a token whose compromise you can absorb. It is documented in
 	// the README's relay section.
@@ -375,6 +426,12 @@ func (o Options) withDefaults() Options {
 	}
 	if o.RateLimitBurst <= 0 {
 		o.RateLimitBurst = DefaultRateLimitBurst
+	}
+	if o.RelayBytesPerSec <= 0 {
+		o.RelayBytesPerSec = DefaultRelayBytesPerSec
+	}
+	if o.RelayBytesBurst <= 0 {
+		o.RelayBytesBurst = DefaultRelayBytesBurst
 	}
 	if o.Rand == nil {
 		o.Rand = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -438,6 +495,65 @@ func (l *rateLimiter) allow() bool {
 	}
 	l.tokens--
 	return true
+}
+
+// byteBucket is the relay-mode BYTE budget behind audit PX-4. It differs from
+// rateLimiter in the one behaviour that matters on the shared link: it never
+// refuses. reserve takes the frame's bytes immediately, allowed to go into
+// debt, and returns how long the caller must wait before the bytes are paid
+// for. Pacing the reader is backpressure, not a drop, so an honest member's
+// vote is delayed at worst - the liveness trade the N-6 relay exemption
+// exists to preserve - while a replay flood is held to a fixed byte rate.
+//
+// The bucket is a LEAKY BUCKET, not a token refill: tokens start at the burst,
+// a frame is charged on arrival, and the debt pays itself back at perSec. The
+// wait is therefore bounded by one frame's size over the rate plus whatever
+// burst-sized headroom the bucket had, and it can never compound into an
+// unbounded sleep: after the wait the bucket is at zero, not deeper.
+//
+// The clock is a field for the same reason rateLimiter's is: a test constructs
+// the refill instants it wants instead of sleeping. reserve is safe for
+// concurrent use; the reader is its only production caller.
+type byteBucket struct {
+	mu     sync.Mutex
+	perSec float64
+	burst  float64
+	tokens float64
+	last   time.Time
+	now    func() time.Time
+}
+
+func newByteBucket(perSec, burst int) *byteBucket {
+	now := time.Now()
+	return &byteBucket{
+		perSec: float64(perSec),
+		burst:  float64(burst),
+		tokens: float64(burst),
+		last:   now,
+		now:    time.Now,
+	}
+}
+
+// reserve charges n bytes and reports how long the caller must wait before
+// they are paid for (zero when the bucket had room). A frame larger than the
+// burst is allowed through with a wait of one frame's overage: refusing it
+// would be a drop, and the frame-size bound already caps it at 1 MiB.
+func (b *byteBucket) reserve(n int) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	if elapsed := now.Sub(b.last); elapsed > 0 {
+		b.tokens += elapsed.Seconds() * b.perSec
+		if b.tokens > b.burst {
+			b.tokens = b.burst
+		}
+		b.last = now
+	}
+	b.tokens -= float64(n)
+	if b.tokens >= 0 || b.perSec <= 0 {
+		return 0
+	}
+	return time.Duration(-b.tokens / b.perSec * float64(time.Second))
 }
 
 // conn is one live TCP connection. Its immutable fields (remote, nc, tq,
@@ -527,12 +643,44 @@ type conn struct {
 	// so the bucket stays exactly as it was and still stops one flooder from
 	// monopolising the single dispatch callback. See reader.
 	relayMode bool
+	// relayBudget is the relay-mode BYTE budget (audit PX-4): the reader PACES
+	// a relay connection to it instead of dropping frames. It is nil on a
+	// direct connection, where rl (a frame bucket) applies. Delaying here is
+	// the whole point: the relay's own per-sender share bounds a SENDER, but
+	// the receiver still reads whatever survives, and a replay of an honest,
+	// already-seen member vote costs work per frame at the router. Pacing by
+	// bytes caps that work without shedding an honest vote.
+	relayBudget *byteBucket
+	// localNonce is the 32-byte challenge THIS side generated for the
+	// connection, and the value the peer's HELLO must echo (wire.Hello.Nonce);
+	// remoteNonce is the challenge the PEER generated, and the value this side
+	// signs into its own HELLOs to it. Both are written under the transport's
+	// mutex (the conn is already in the registry while the nonce exchange runs,
+	// so an unlocked write would race PeerChallenges/ConnNonces) and are
+	// read-only once ready is set. They are nil on a relay connection, which has
+	// no peer handshake (audit PX-2).
+	localNonce  []byte
+	remoteNonce []byte
+	// ready is set by start, after the connection's last handshake frame has
+	// been exchanged and immediately before its reader and writer begin. A
+	// connection that is admitted but not ready is still HANDSHAKING: Peers(),
+	// Broadcast and PeerChallenges skip it, so no caller can observe a peer
+	// whose nonces are half-written or enqueue work for a writer that does not
+	// exist yet.
+	ready atomic.Bool
+	// needsAdmit marks a connection that must pass Options.Admit (audit
+	// N-3/PX-2): an accepted inbound socket, and a dial this node made because
+	// a PEER advertised the address (AddLearnedPeer). A configured dial and a
+	// relay link are not gated at install. gated, below, is the DROP COUNTER,
+	// not this flag.
+	needsAdmit bool
 	// gated counts frames dropped because the connection was not yet
-	// admitted; rateLimited counts frames dropped by rl. Observables for the
-	// tests, and the numbers an operator would want if a listener is being
-	// probed.
+	// admitted; rateLimited counts frames dropped by rl; relayPaced counts
+	// frames the relay byte budget delayed. Observables for the tests, and the
+	// numbers an operator would want if a listener is being probed.
 	gated       atomic.Uint64
 	rateLimited atomic.Uint64
+	relayPaced  atomic.Uint64
 }
 
 // finish tears the connection down exactly once: unblock the maintainer, make
@@ -592,6 +740,12 @@ type outbound struct {
 	// the direct handshake reads whatever frame the relay forwards first as
 	// the peer's identity, which is stranger-controlled (audit N-1).
 	relay bool
+	// gated marks a learned dial (audit PX-2): the address came from a PEER's
+	// hint, not from the operator's configuration, so the connection is NOT
+	// admitted at install and must present a signed committee HELLO over the
+	// connection's nonce. A configured dial keeps the operator's intent and is
+	// admitted at install.
+	gated bool
 	// stop ends THIS maintainer and everything it holds. It is closed only by
 	// RemovePeer - the node's own peer policy retiring an address it decided
 	// to stop dialling (audit PX-1: a learned address whose handshake never
@@ -771,7 +925,9 @@ func (t *TcpTransport) acceptLoop(l net.Listener) {
 			// there is no registered maintainer to redial a stranger. The
 			// slot is released here because no conn owns it; a successful
 			// adopt hands it to install, and finish releases it there.
-			if _, err := t.adopt(nc, addr, false); err != nil {
+			// An ACCEPTED socket is a peer only after Options.Admit accepts a frame
+			// from it: pass gated=true so it is held pending (audit N-3/PX-2).
+			if _, err := t.adopt(nc, addr, false, true); err != nil {
 				t.mu.Lock()
 				if t.inboundSlots > 0 {
 					t.inboundSlots--
@@ -793,7 +949,7 @@ func (t *TcpTransport) acceptLoop(l net.Listener) {
 // see outbound.relay).
 func (t *TcpTransport) Dial(addr string) error {
 	res := make(chan error, 1) // buffered: the maintainer must never park on us
-	spawned, err := t.registerOutbound(addr, false, res)
+	spawned, err := t.registerOutbound(addr, false, false, res)
 	if err != nil {
 		return err
 	}
@@ -808,8 +964,25 @@ func (t *TcpTransport) Dial(addr string) error {
 // It never blocks on the network: the first dial happens on the maintainer
 // goroutine and retries with backoff, which is what a node wants from its
 // static peer list at boot, when a peer may be down for minutes.
+//
+// The connection is OPERATOR INTENT: it is admitted at install, without
+// waiting for a signed HELLO (audit PX-2's corrected Admit contract).
 func (t *TcpTransport) AddPeer(addr string) error {
-	_, err := t.registerOutbound(addr, false, nil)
+	_, err := t.registerOutbound(addr, false, false, nil)
+	return err
+}
+
+// AddLearnedPeer is AddPeer for an address a PEER advertised: a hint, not the
+// operator's configuration (audit PX-2). The maintainer, backoff and
+// duplicate rules are identical; the ONE difference is admission. The
+// connection is GATED: it is not a peer at install, receives no Broadcast,
+// appears in no Peers(), and is admitted only when Options.Admit accepts a
+// frame from it - in the node layer, a committee HELLO whose signature is bound
+// to this connection's nonce. A stranger whose address reached the dial book
+// therefore gets a socket that is maintained (so an honest peer at that address
+// can complete the link) and nothing else.
+func (t *TcpTransport) AddLearnedPeer(addr string) error {
+	_, err := t.registerOutbound(addr, false, true, nil)
 	return err
 }
 
@@ -864,6 +1037,54 @@ func (t *TcpTransport) PeerAddr(id transport.PeerID) (string, bool) {
 	return c.addr, true
 }
 
+// ConnNonces returns the two per-connection challenges (audit PX-2) for the
+// connection registered under id: ours is the value the PEER's HELLOs must
+// echo, theirs is the value THIS side must echo in the HELLOs it sends to that
+// peer. ok is false for an unknown connection. Both are copies, so a caller
+// cannot mutate the handshake state; a relay-mode connection returns two nil
+// slices and true, because a relay link has no peer handshake.
+func (t *TcpTransport) ConnNonces(id transport.PeerID) (ours, theirs []byte, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	c, found := t.conns[id]
+	if !found || !c.ready.Load() {
+		return nil, nil, false
+	}
+	return append([]byte(nil), c.localNonce...), append([]byte(nil), c.remoteNonce...), true
+}
+
+// PeerChallenges returns, for every REGISTERED connection, the challenge this
+// side must echo in a HELLO sent to it - the HELLO's connection binding (audit
+// PX-2). Two kinds of connection are included for the same reason: a peer that
+// is already admitted must keep receiving our HELLO, and a GATED connection
+// this node DIALED (a learned hint) needs our HELLO to admit US - the bootstrap
+// is mutually gated, so both sides must offer their signed height before either
+// can become a peer. An accepted and still-unadmitted stranger is excluded:
+// the node did not choose it, and its frames have not been vouched for.
+//
+// The value is nil on a relay connection, where one socket carries every
+// member's frames and there is no peer nonce; a HELLO sent there carries an
+// empty nonce, and every receiver behind the relay checks it against its own
+// relay connection's (empty) nonce. That is the documented PX-2 residual: over
+// a relay the connection is not a peer, `via` is the relay name for every
+// member, and PX-1 makes the SIGNATURE the hint authority, so replaying a
+// member HELLO there changes no decision except refreshing its height.
+func (t *TcpTransport) PeerChallenges() map[transport.PeerID][]byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[transport.PeerID][]byte, len(t.conns))
+	for id, c := range t.conns {
+		if !c.ready.Load() {
+			continue // still handshaking: its challenge is not published yet
+		}
+		if !c.admitted.Load() && !(c.dialled && c.needsAdmit) {
+			continue
+		}
+		out[id] = append([]byte(nil), c.remoteNonce...)
+	}
+	return out
+}
+
 // MaintainerCount reports how many maintainer goroutines are running. A
 // retired address must take its goroutine with it: RemovePeer deletes the
 // registration, and this is the observable that the worker ended rather than
@@ -890,7 +1111,7 @@ func (t *TcpTransport) Maintains(addr string) bool {
 // self-connection refusal that used to be permanent).
 func (t *TcpTransport) DialRelay(addr string) error {
 	res := make(chan error, 1)
-	spawned, err := t.registerOutbound(addr, true, res)
+	spawned, err := t.registerOutbound(addr, true, false, res)
 	if err != nil {
 		return err
 	}
@@ -904,7 +1125,7 @@ func (t *TcpTransport) DialRelay(addr string) error {
 // network, backoff redials - and, since the N-1 fix, redials that cannot be
 // permanently stopped by anything the relay or its strangers do.
 func (t *TcpTransport) AddRelay(addr string) error {
-	_, err := t.registerOutbound(addr, true, nil)
+	_, err := t.registerOutbound(addr, true, false, nil)
 	return err
 }
 
@@ -914,7 +1135,7 @@ func (t *TcpTransport) AddRelay(addr string) error {
 // can never be spawned "after" Close finished waiting on zero goroutines -
 // the classic Add-after-Wait race, refused here by construction, not by
 // counting on -race to find it.
-func (t *TcpTransport) registerOutbound(addr string, relay bool, first chan<- error) (bool, error) {
+func (t *TcpTransport) registerOutbound(addr string, relay, gated bool, first chan<- error) (bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.closed.Load() {
@@ -923,7 +1144,7 @@ func (t *TcpTransport) registerOutbound(addr string, relay bool, first chan<- er
 	if _, ok := t.outbounds[addr]; ok {
 		return false, nil
 	}
-	ob := &outbound{addr: addr, relay: relay, stop: make(chan struct{})}
+	ob := &outbound{addr: addr, relay: relay, gated: gated, stop: make(chan struct{})}
 	t.outbounds[addr] = ob
 	t.wg.Add(1)
 	go t.maintain(ob, first)
@@ -999,7 +1220,7 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 			if ob.relay {
 				c, err = t.adoptRelay(nc, addr)
 			} else {
-				c, err = t.adopt(nc, addr, true)
+				c, err = t.adopt(nc, addr, true, ob.gated)
 			}
 			report(err)
 			if err == nil {
@@ -1095,9 +1316,12 @@ func (t *TcpTransport) forgetOutbound(ob *outbound) {
 // dialled says whether THIS end is the side that opened the connection (the
 // maintainer's dial) or the side that accepted it; it feeds the duplicate
 // rank, which needs the direction to stay decidable identically at both ends.
+// gated says whether that dial was a LEARNED one (a peer's hint, not the
+// operator's configuration): a gated connection is not admitted at install
+// and must pass Options.Admit first (audit PX-2).
 // It does NOT select relay mode: a DIRECT connection is never relay mode,
 // whatever name the peer announces (see install).
-func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled bool) (*conn, error) {
+func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*conn, error) {
 	if err := t.writeHello(nc, addr); err != nil {
 		return nil, err
 	}
@@ -1105,7 +1329,68 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled bool) (*conn, err
 	if err != nil {
 		return nil, err
 	}
-	return t.install(nc, addr, dialled, false, id)
+	// The registry acceptance runs BEFORE the nonce exchange so a refused name
+	// (self, the reserved relay:<addr> form, a duplicate) is refused for that
+	// reason and not for a handshake timeout on a frame the peer was never
+	// going to send; the reader stays stopped until the exchange is done, so no
+	// payload byte can be mistaken for a challenge (audit PX-2).
+	c, err := t.install(nc, addr, dialled, false, gated, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.exchangeNonce(nc, c); err != nil {
+		t.finish(c)
+		return nil, err
+	}
+	t.start(c)
+	return c, nil
+}
+
+// exchangeNonce performs the per-connection challenge exchange that binds a
+// HELLO signature to one socket (audit PX-2). Both sides write their 32-byte
+// nonce before reading the peer's, mirroring the ID exchange, so neither can
+// block the other and the two frames never deadlock. A failed write or read -
+// including a peer that sends a frame of the wrong width - ends the connection;
+// the maintainer treats it as an ordinary failure and redials.
+//
+// The nonces are 32 random bytes from crypto/rand: an attacker who observes
+// one connection's nonce (the frames are plaintext) cannot use it on another,
+// because each connection's value is fresh and the receiver checks equality
+// against the value IT generated.
+func (t *TcpTransport) exchangeNonce(nc net.Conn, c *conn) error {
+	local := make([]byte, connectionNonceBytes)
+	if _, err := cryptorand.Read(local); err != nil {
+		_ = nc.Close()
+		return fmt.Errorf("tcp: generating a connection nonce for %s: %w", c.addr, err)
+	}
+	if err := t.writeHandshakeFrame(nc, c.addr, local); err != nil {
+		return err
+	}
+	if err := nc.SetReadDeadline(time.Now().Add(t.opts.HandshakeTimeout)); err != nil {
+		_ = nc.Close()
+		return err
+	}
+	remote, err := wire.ReadFrame(nc, connectionNonceBytes)
+	if err != nil {
+		_ = nc.Close()
+		return fmt.Errorf("tcp: reading the connection nonce from %s: %w", c.addr, err)
+	}
+	if len(remote) != connectionNonceBytes {
+		_ = nc.Close()
+		return fmt.Errorf("tcp: connection nonce from %s is %d bytes, want %d", c.addr, len(remote), connectionNonceBytes)
+	}
+	if err := nc.SetReadDeadline(time.Time{}); err != nil {
+		_ = nc.Close()
+		return err
+	}
+	// The conn is already registered (install ran first so a refused name never
+	// waits on this frame), so the publish must be under the transport's mutex
+	// that PeerChallenges and ConnNonces take.
+	t.mu.Lock()
+	c.localNonce = local
+	c.remoteNonce = remote
+	t.mu.Unlock()
+	return nil
 }
 
 // writeHello sends the local ID under the handshake write deadline - the
@@ -1179,43 +1464,102 @@ func (t *TcpTransport) readHello(nc net.Conn, addr string) (transport.PeerID, er
 // maintainer for good (audit N-1). dialled is true: this end opened the socket,
 // and the duplicate rank needs the direction to stay decidable.
 //
-// When Options.RelayAccessToken is set, the token is NOT written first: this
-// end waits for the relay to present wire.RelayGateGreeting, sends the token
-// only to a relay that has announced it gates, and then waits for
-// wire.RelayGateAccepted before installing the connection (review, audit fix
-// round 4). The ID announcement is omitted on this path. Without a token the
-// ID announcement is unchanged, so every relay deployment that configures no
-// token behaves exactly as before.
+// When Options.RelayAccessToken is set, the token is NEVER written: this end
+// waits for the relay to present wire.RelayGateGreeting and its per-connection
+// challenge, answers wire.RelayGateProof(token, challenge) - HMAC-SHA-256 over
+// bytes the relay just generated - and only then waits for
+// wire.RelayGateAccepted before installing the connection (audit PX-3,
+// replacing round 4's constant-greeting-then-token exchange). The ID
+// announcement is omitted on this path. Without a token the ID announcement is
+// unchanged, so every relay deployment that configures no token behaves exactly
+// as before.
 //
-// The order is the fix, not a detail. The previous shape wrote the token
-// unconditionally, and a relay started without --access-token-file consumes no
-// token frame at all: it forwarded the operator's secret to EVERY registered
-// connection as ordinary payload. A token-configured node therefore refuses to
-// send the secret to a relay that has not announced gating, which is the only
-// rule that works when the remote end is misconfigured, rolled back, or older
-// than the greeting. The price is that a token-configured node requires a
-// token-configured relay of at least this vintage; a relay with no token is
-// refused loudly and repeatedly rather than trusted with the secret. Every
-// refusal here is logged (relayHandshakeFailed) - before this, a node with a
-// wrong token redialled forever in silence and the failure was visible only in
-// the relay's unauthorized counter.
+// The order and the MAC are the fix, not details. The first shape wrote the
+// token unconditionally, and a relay started without --access-token-file
+// consumes no token frame at all: it forwarded the operator's secret to EVERY
+// registered connection. The second waited for a fixed greeting, which is a
+// public constant: a registered stranger on a token-less relay could send that
+// constant through it, have the relay forward it into this handshake, and then
+// read the token as the relay forwarded it onward (audit PX-3). Now the answer
+// is a MAC over a fresh challenge, so even a stranger who wins that exchange
+// receives no token, and cannot replay the answer on any other connection. The
+// price is that a token-configured node requires a token-configured relay of
+// at least this vintage; a relay with no token is refused loudly and repeatedly
+// rather than trusted with a proof of the secret. Every refusal here is logged
+// (relayHandshakeFailed) - before this, a node with a wrong token redialled
+// forever in silence and the failure was visible only in the relay's
+// unauthorized counter.
+//
+// WHAT IS NOT FIXED HERE, stated so it is not mistaken for closed: the gate
+// authenticates the RELAY to this node only to the extent that a stranger
+// behind a token-less relay cannot distinguish its forged greeting/challenge/
+// accepted trio from the relay's own - the node reads frames, not provenance.
+// Such a stranger can make this node answer a challenge it chose and then
+// install a connection to a relay that never gated. That is a misconfigured
+// relay the operator chose to dial; the secret is still never disclosed, which
+// was PX-3's finding.
 func (t *TcpTransport) adoptRelay(nc net.Conn, addr string) (*conn, error) {
 	if len(t.opts.RelayAccessToken) > 0 {
 		if err := t.readGateFrame(nc, addr, wire.RelayGateGreeting,
-			"the relay did not announce the access-token gate, so the token was NOT sent (a relay without a token would forward it to every peer)"); err != nil {
+			"the relay did not announce the access-token gate, so no proof was sent (a relay without a token would forward whatever it received to every peer)"); err != nil {
 			return nil, err
 		}
-		if err := t.writeHandshakeFrame(nc, addr, t.opts.RelayAccessToken); err != nil {
+		challenge, err := t.readGateChallenge(nc, addr)
+		if err != nil {
+			return nil, err
+		}
+		// The answer is an HMAC over the relay's per-connection challenge, never
+		// the token itself (audit PX-3). A stranger who makes this node answer a
+		// chosen challenge through a token-less relay receives a MAC, which is
+		// useless for any other connection and discloses nothing about the key.
+		if err := t.writeHandshakeFrame(nc, addr, wire.RelayGateProof(t.opts.RelayAccessToken, challenge)); err != nil {
 			return nil, err
 		}
 		if err := t.readGateFrame(nc, addr, wire.RelayGateAccepted,
-			"the relay closed the socket instead of accepting the token (a wrong or mismatched token, or a relay that predates the gate handshake)"); err != nil {
+			"the relay closed the socket instead of accepting the proof (a wrong or mismatched token, a replayed handshake, or a relay that predates the challenge-response gate)"); err != nil {
 			return nil, err
 		}
 	} else if err := t.writeHello(nc, addr); err != nil {
 		return nil, err
 	}
-	return t.install(nc, addr, true, true, RelayPeerName(addr))
+	c, err := t.install(nc, addr, true, true, false, RelayPeerName(addr))
+	if err != nil {
+		return nil, err
+	}
+	// Relay mode exchanges no peer nonce: the far end is a forwarder, not a
+	// peer, and every member behind it arrives under the same relay name
+	// (audit PX-2's residual, documented on PeerChallenges).
+	t.start(c)
+	return c, nil
+}
+
+// readGateChallenge reads the relay's gate challenge: the fixed nonce plus the
+// relay's own listening address, in one frame bounded at
+// wire.MaxRelayGateChallengeBytes. The bytes are NOT interpreted - the node
+// hands exactly what it received to wire.RelayGateProof, which is what makes
+// the two ends agree on the MAC input without an address-format negotiation -
+// and the length is checked before anything is hashed.
+func (t *TcpTransport) readGateChallenge(nc net.Conn, addr string) ([]byte, error) {
+	if err := nc.SetReadDeadline(time.Now().Add(t.opts.HandshakeTimeout)); err != nil {
+		relayHandshakeFailed(addr, err)
+		_ = nc.Close()
+		return nil, err
+	}
+	frame, err := wire.ReadFrame(nc, wire.MaxRelayGateChallengeBytes)
+	if err == nil && len(frame) < wire.RelayGateNonceBytes {
+		err = fmt.Errorf("the gate challenge is %d bytes, want at least the %d-byte nonce", len(frame), wire.RelayGateNonceBytes)
+	}
+	if err != nil {
+		relayHandshakeFailed(addr, fmt.Errorf("the relay sent no usable challenge, so no proof was sent: %w", err))
+		_ = nc.Close()
+		return nil, fmt.Errorf("tcp: relay handshake with %s: no usable challenge: %w", addr, err)
+	}
+	if err := nc.SetReadDeadline(time.Time{}); err != nil {
+		relayHandshakeFailed(addr, err)
+		_ = nc.Close()
+		return nil, err
+	}
+	return frame, nil
 }
 
 // readGateFrame reads exactly one relay-gate frame under the handshake
@@ -1266,13 +1610,22 @@ func relayHandshakeFailed(addr string, err error) {
 // install runs the registry acceptance an adopt or adoptRelay has already
 // negotiated: refusal of the useless IDs (self; the reserved relay:<addr>
 // form; a duplicate that outranks the newcomer), the identical-rank
-// replacement otherwise, and the reader and writer goroutines. On refusal the
-// socket is closed and the error is the sentinel the maintainer's backoff
-// path treats as every other failure.
+// replacement otherwise. It does NOT start the reader and writer; the caller
+// does that with start once any remaining handshake frame (the connection
+// nonce, audit PX-2) has been exchanged, so no payload byte can be read as a
+// handshake frame and a refused name never waits on one. On refusal the socket
+// is closed and the error is the sentinel the maintainer's backoff path treats
+// as every other failure.
+//
+// gated is ADMISSION INTENT (audit PX-2): false for a connection the OPERATOR
+// chose (Dial/AddPeer) and for a relay link; true for a dial made because a
+// PEER advertised the address (AddLearnedPeer), which must present a signed
+// committee HELLO over the connection's nonce before it is a peer. With a nil
+// Admit there is no policy and every connection is admitted at install.
 //
 // relay is DIAL INTENT, not a fact about the peer: it is true only on the
 // connection adoptRelay installed because this end opened it with
-// DialRelay/AddRelay. It sets relayMode (the rate-bucket exemption) and it is
+// DialRelay/AddRelay. It sets relayMode (the frame-bucket exemption) and it is
 // the ONLY key that does. The fourth review round found the hole in deriving
 // relayMode from the id instead: relayMode used to be
 // `dialled && strings.HasPrefix(id, relayPeerIDPrefix)`, so a peer this node
@@ -1285,25 +1638,33 @@ func relayHandshakeFailed(addr string, err error) {
 // claim the transport's own relay registration (which is dialled too, so the
 // old `!dialled` guard left the dial direction wide open to the same free
 // handle).
-func (t *TcpTransport) install(nc net.Conn, addr string, dialled, relay bool, id transport.PeerID) (*conn, error) {
+func (t *TcpTransport) install(nc net.Conn, addr string, dialled, relay, gated bool, id transport.PeerID) (*conn, error) {
 	c := &conn{
-		remote:    id,
-		nc:        nc,
-		tq:        make(chan []byte, t.opts.WriteQueueSize),
-		dead:      make(chan struct{}),
-		addr:      addr,
-		dialled:   dialled,
-		inbound:   !dialled,
-		relayMode: relay,
-		rl:        newRateLimiter(t.opts.RateLimitPerSec, t.opts.RateLimitBurst),
+		remote:     id,
+		nc:         nc,
+		tq:         make(chan []byte, t.opts.WriteQueueSize),
+		dead:       make(chan struct{}),
+		addr:       addr,
+		dialled:    dialled,
+		inbound:    !dialled,
+		relayMode:  relay,
+		needsAdmit: gated && t.opts.Admit != nil,
+		rl:         newRateLimiter(t.opts.RateLimitPerSec, t.opts.RateLimitBurst),
 	}
-	// Admission (audit N-3): an INBOUND connection is a peer only after the
-	// node's Admit callback has accepted a frame from it. A dialled
-	// connection is one the operator chose, and a nil Admit means no policy
-	// was supplied (the socket-free tests and non-consensus users), so both
-	// are admitted at install. The reader promotes an inbound connection the
-	// moment Admit accepts a frame.
-	c.admitted.Store(dialled || t.opts.Admit == nil)
+	if relay {
+		// The frame bucket is bypassed on this connection (one socket carries
+		// every member's traffic), so the BYTE budget is what bounds it (audit
+		// PX-4). It paces rather than drops.
+		c.relayBudget = newByteBucket(t.opts.RelayBytesPerSec, t.opts.RelayBytesBurst)
+	}
+	// Admission (audit N-3, PX-2): a connection is a peer only after the node's
+	// Admit callback has accepted a frame from it when it was GATED. Gated means
+	// an accepted inbound socket, or a dial this node made because a PEER
+	// advertised the address. A dial the OPERATOR configured, and a relay link,
+	// are admitted at install - the operator chose the former, and the relay's
+	// per-sender share is the bound on the latter. The reader promotes a gated
+	// connection the moment Admit accepts a frame.
+	c.admitted.Store(!c.needsAdmit || t.opts.Admit == nil)
 
 	t.mu.Lock()
 	if t.closed.Load() {
@@ -1391,10 +1752,16 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled, relay bool, id
 	if existing != nil {
 		t.finish(existing)
 	}
+	return c, nil
+}
 
+// start launches the connection's reader and writer. It is separate from
+// install so the handshake can finish first (the nonce exchange, audit PX-2)
+// without any payload frame racing into the reader as a handshake frame.
+func (t *TcpTransport) start(c *conn) {
+	c.ready.Store(true)
 	go t.writer(c)
 	go t.reader(c)
-	return c, nil
 }
 
 // newcomerWins decides which of two connections to the same peer keeps the
@@ -1445,9 +1812,19 @@ func newcomerWins(local transport.PeerID, existing, newcomer *conn) bool {
 //     for a stranger's flood. relayMode is DIAL INTENT - set only by
 //     adoptRelay, never by the name a peer announces, and the reserved relay
 //     name is refused on every direct connection (install) - and the relay's
-//     own per-sender share is the bound that replaces the bucket there;
-//   - the ADMISSION GATE (audit N-3/N-7) holds an inbound connection out of
-//     Peers() and Broadcast until Options.Admit accepts a frame.
+//     own per-sender share plus the BYTE BUDGET below are the bounds that
+//     replace the bucket there;
+//   - the RELAY BYTE BUDGET (audit PX-4) replaces that rate limit on a relay
+//     connection: it PACES the frame to a byte rate instead of dropping it, so
+//     a stranger replaying genuine votes cannot turn the shared link into a
+//     verification queue while an honest member's vote is never shed. The
+//     verification cost itself is already gone: the router checks Dedup.Has
+//     BEFORE Verify;
+//   - the ADMISSION GATE (audit N-3/PX-2) holds a GATED connection - an accepted
+//     inbound socket and a hint-dialled one - out of Peers() and Broadcast until
+//     Options.Admit accepts a frame. The frame it is offered carries the
+//     connection's local nonce so the policy can require a HELLO bound to THIS
+//     socket.
 func (t *TcpTransport) reader(c *conn) {
 	for {
 		if err := c.nc.SetReadDeadline(time.Now().Add(t.opts.IdleReadTimeout)); err != nil {
@@ -1469,12 +1846,16 @@ func (t *TcpTransport) reader(c *conn) {
 			// through its maintainer; the consensus layer tolerates the loss.
 			break
 		}
-		if !c.relayMode && !c.rl.allow() {
+		if c.relayMode {
+			if !t.paceRelay(c, len(payload)) {
+				break // the connection died while pacing
+			}
+		} else if !c.rl.allow() {
 			c.rateLimited.Add(1)
 			continue // the frame is consumed, so framing stays intact
 		}
 		if !c.admitted.Load() {
-			if t.opts.Admit == nil || !t.opts.Admit(payload) {
+			if t.opts.Admit == nil || !t.opts.Admit(payload, c.localNonce) {
 				// Not yet a peer: the frame is dropped, never dispatched,
 				// and the connection stays out of Peers() and off every
 				// Broadcast. A stranger cannot reach OnMessage at all.
@@ -1486,6 +1867,33 @@ func (t *TcpTransport) reader(c *conn) {
 		t.dispatch(transport.Message{From: c.remote, Data: payload})
 	}
 	t.finish(c)
+}
+
+// paceRelay charges one relay frame to the connection's byte budget and waits
+// out the debt. It reports false only when the connection died (or the
+// transport closed) while waiting, in which case the caller ends the reader.
+//
+// Waiting, not dropping, is the PX-4 fix: the frame the bucket delays might be
+// an honest member's vote, and the cost of delaying it is bounded by one
+// frame's size over the configured rate. The counter (RelayPacedFrames) is the
+// observable that the path ran, so a test can assert the delay without timing
+// it.
+func (t *TcpTransport) paceRelay(c *conn, n int) bool {
+	wait := c.relayBudget.reserve(n)
+	if wait <= 0 {
+		return true
+	}
+	c.relayPaced.Add(1)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-c.dead:
+		return false
+	case <-t.quit:
+		return false
+	}
 }
 
 // skipOversized discards exactly the bytes of a frame the bound refused, so
@@ -1612,7 +2020,7 @@ func (t *TcpTransport) Broadcast(data []byte) error {
 	t.mu.Lock()
 	targets := make([]*conn, 0, len(t.conns))
 	for _, c := range t.conns {
-		if c.admitted.Load() {
+		if c.admitted.Load() && c.ready.Load() {
 			targets = append(targets, c)
 		}
 	}
@@ -1690,7 +2098,7 @@ func (t *TcpTransport) Peers() []transport.PeerID {
 	defer t.mu.Unlock()
 	ids := make([]transport.PeerID, 0, len(t.conns))
 	for id, c := range t.conns {
-		if c.admitted.Load() {
+		if c.admitted.Load() && c.ready.Load() {
 			ids = append(ids, id)
 		}
 	}
@@ -1704,10 +2112,13 @@ func (t *TcpTransport) Peers() []transport.PeerID {
 func (t *TcpTransport) RefusedConns() uint64 { return t.refusedConns.Load() }
 
 // GatedFrames reports how many frames were dropped because their connection
-// had not passed Options.Admit (audit N-3/N-7); RateLimitedFrames reports the
-// frames the per-connection rate limit dropped (audit N-6). Both are
-// diagnostics: a steady nonzero GatedFrames on a healthy committee means
-// something is dialing the listener without a committee HELLO.
+// had not passed Options.Admit (audit N-3/PX-2); RateLimitedFrames reports the
+// frames the per-connection rate limit dropped (audit N-6); RelayPacedFrames
+// reports the relay-link frames a byte budget DELAYED rather than dropped
+// (audit PX-4). All three are diagnostics: a steady nonzero GatedFrames on a
+// healthy committee means something is dialing the listener without a
+// committee HELLO; a steady nonzero RelayPacedFrames means the shared relay
+// link is over its byte budget and every member behind it is being paced.
 func (t *TcpTransport) GatedFrames() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1725,6 +2136,20 @@ func (t *TcpTransport) RateLimitedFrames() uint64 {
 	var n uint64
 	for _, c := range t.conns {
 		n += c.rateLimited.Load()
+	}
+	return n
+}
+
+// RelayPacedFrames reports the relay-link frames the byte budget delayed
+// instead of dropping (audit PX-4). A frame counted here was delivered, just
+// paced; the counter exists so "the fix delays rather than drops" is an
+// observable a test can assert without timing the delay.
+func (t *TcpTransport) RelayPacedFrames() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var n uint64
+	for _, c := range t.conns {
+		n += c.relayPaced.Load()
 	}
 	return n
 }

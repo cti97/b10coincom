@@ -73,6 +73,82 @@ func TestDedupIsConsultedOnlyAfterVerify(t *testing.T) {
 	}
 }
 
+// TestAReplayedVoteCostsNoSecondVerification is audit PX-4's count, BEFORE and
+// AFTER. The relay link has no per-connection FRAME ceiling (one socket carries
+// every member's traffic, so a frame bucket there would shed honest votes), and
+// before this fix every replayed frame bought a full Ed25519 verification:
+// Has-before-Verify turns the replay into one map lookup.
+//
+// The test constructs the state rather than racing it: one verified vote, then
+// its exact bytes replayed 100 times. The number asserted is the router's own
+// verification counter, not a wall-clock measurement, so the assertion cannot
+// flake on a slow host. A mutant that deletes the Has check verifies 101 and
+// fails the bound; a mutant that records before Verify fails
+// TestDedupIsConsultedOnlyAfterVerify, so neither half can be dropped alone.
+func TestAReplayedVoteCostsNoSecondVerification(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vote := &Vote{Type: MsgPrevote, Height: 7, Round: 1, Validator: pub}
+	h := vote.SigningHash()
+	vote.Sig = crypto.Sign(priv, h[:])
+	frame := EncodeVote(vote)
+
+	r := &MessageRouter{Dedup: transport.NewDedup(0)}
+	if !r.Route(transport.Message{From: "relay:example:7001", Data: frame}) {
+		t.Fatal("the first, genuine vote was not routed")
+	}
+	if got := r.SignatureVerifications(); got != 1 {
+		t.Fatalf("SignatureVerifications = %d after one genuine vote, want 1", got)
+	}
+	for i := 0; i < 100; i++ {
+		if r.Route(transport.Message{From: "relay:example:7001", Data: frame}) {
+			t.Fatalf("replay %d was routed a second time", i)
+		}
+	}
+	if got := r.SignatureVerifications(); got != 1 {
+		t.Fatalf("100 replayed already-seen votes cost %d verifications, want 1: Has must run before Verify (audit PX-4) - at line rate this was tens of thousands of Ed25519 evaluations per second on the relay link", got)
+	}
+	if got := r.DuplicatesDropped(); got != 100 {
+		t.Fatalf("DuplicatesDropped = %d after 100 replays, want 100", got)
+	}
+}
+
+// TestAStrangerCannotPreseedADedupKey is audit N-7's no-poisoning property with
+// the PX-4 ordering in place, stated as a pair with the count above: Has runs
+// first, but it MUST NOT record. A stranger sends the honest vote's exact
+// (validator, height, round, type) under a signature it cannot produce; then the
+// honest vote arrives and must be delivered. Moving the record before Verify
+// (mutant: call Seen where Has is) makes this test fail on the second Route.
+func TestAStrangerCannotPreseedADedupKey(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	honest := &Vote{Type: MsgPrecommit, Height: 11, Round: 0, Validator: pub}
+	h := honest.SigningHash()
+	honest.Sig = crypto.Sign(priv, h[:])
+
+	forged := &Vote{Type: MsgPrecommit, Height: 11, Round: 0, Validator: pub, Sig: []byte("not-a-signature")}
+	r := &MessageRouter{Dedup: transport.NewDedup(0)}
+	if r.Route(transport.Message{From: "stranger", Data: EncodeVote(forged)}) {
+		t.Fatal("a forged vote was routed")
+	}
+	if r.Dedup.Has(voteDedupKey(honest)) {
+		t.Fatal("the forged frame RECORDED the honest vote's key: Has must not write (audit N-7/PX-4)")
+	}
+	if got := r.SignatureVerifications(); got != 0 {
+		t.Fatalf("SignatureVerifications = %d after a forged frame, want 0", got)
+	}
+	if !r.Route(transport.Message{From: "v1", Data: EncodeVote(honest)}) {
+		t.Fatal("the honest vote was suppressed: a stranger pre-seeded its dedup key")
+	}
+	if !r.Dedup.Has(voteDedupKey(honest)) {
+		t.Fatal("the honest vote was routed but not recorded: the replayed-replay bound is gone")
+	}
+}
+
 // TestWireTagsAreDisjointFromConsensusTags pins audit N-5: no wire message
 // tag may equal a consensus message tag, and every wire tag must sit at or
 // above wire.WireTagFloor. The two unions travel the same connection and are

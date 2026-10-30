@@ -52,6 +52,7 @@ package devnet
 //     forever at a height nobody is at; the rebuild is the rejoin.
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"fmt"
 	"log"
@@ -265,11 +266,15 @@ type Validator struct {
 
 	// hints is the PEER_EXCHANGE dial book: the bounded set of addresses this
 	// node learned from peers and the per-wave adoption window. peerAdd is the
-	// ONE dial path it may use - tcp.TcpTransport.AddPeer in a running node,
-	// and a recording seam in the tests that must count dials without touching
-	// a network (it is a field so a raw dial cannot hide inside the handler).
+	// ONE dial path it may use - tcp.TcpTransport.AddPeer (learned=false) or
+	// AddLearnedPeer (learned=true) in a running node, and a recording seam in
+	// the tests that must count dials without touching a network (it is a field
+	// so a raw dial cannot hide inside the handler). learned is exactly the
+	// distinction audit PX-2 requires: a learned dial is GATED by the transport
+	// until a signed committee HELLO arrives, while a configured one is admitted
+	// at install.
 	hints   peerHints
-	peerAdd func(addr string) error
+	peerAdd func(addr string, learned bool) error
 	// peerRemove retires the maintainer for a learned address whose handshake
 	// never completed (audit PX-1). It is a field for the same reason peerAdd
 	// is: the policy test must be able to count retirements without a
@@ -488,14 +493,32 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// driver's membership gate checks - and is never the set used to judge a
 	// height once this seam is wired.
 	ccfg.CommitteeFor = ch.CommitteeAt
-	// admitHello is the transport's admission policy (audit N-3/N-7): an
-	// INBOUND socket becomes a peer only once it has delivered a HELLO signed
-	// by a member of THIS chain's committee. Before that it is absent from
-	// Peers(), receives no Broadcast, and its frames never reach the router -
-	// so a scanner, a misconfigured node or a stranger replaying a peer's
-	// transport name cannot make this validator copy every frame for it. The
+	// admitHello is the transport's admission policy (audit N-3/N-7, PX-2): a
+	// GATED connection - an accepted inbound socket, and now also a dial this
+	// node made because a PEER advertised the address - becomes a peer only once
+	// it has delivered a HELLO signed by a member of THIS chain's committee and
+	// bound to THIS connection's nonce. Before that it is absent from Peers(),
+	// receives no Broadcast, and its frames never reach the router - so a
+	// scanner, a misconfigured node, or a stranger whose address reached the
+	// dial book cannot make this validator copy every broadcast for it. The
 	// policy lives here, not in the transport, because it needs the committee
 	// and the chain id; the transport only calls it.
+	//
+	// TWO checks carry PX-2, and both are load-bearing:
+	//
+	//   - the nonce equality binds the signature to this socket. A captured
+	//     member HELLO replayed on a hint-dialled socket is a VALID Ed25519
+	//     signature - over some other connection's challenge - so it fails here
+	//     before membership or verification work. localNonce is the transport's
+	//     fresh 32-byte value for this connection, and the honest peer learned
+	//     it in the handshake and signed it into its HELLO;
+	//   - the validator key must not be OUR OWN. The transport sends this node's
+	//     HELLO to a gated socket it dialled (the peer needs it to admit us), so
+	//     a hostile peer can echo it straight back. That frame verifies
+	//     perfectly and carries the right nonce, and it proves nothing about
+	//     the sender: a peer cannot be this node (self-connections are refused
+	//     at the ID handshake), so our own signature is never a stranger's
+	//     credential.
 	//
 	// Membership is per the committee of the HEIGHT THE HELLO ANNOUNCES (M5
 	// rotation), widened by committeeMemberAt to the genesis and head sets so
@@ -503,13 +526,19 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// bound, never a safety gate: every admitted frame still faces the
 	// router's per-height membership, and every adopted block the certificate
 	// gate.
-	admitHello := func(frame []byte) bool {
+	admitHello := func(frame []byte, localNonce []byte) bool {
 		h, err := wire.DecodeHello(frame)
 		if err != nil {
 			return false
 		}
 		if h.ChainID != g.ChainID {
 			return false
+		}
+		if bytes.Equal(h.Validator, pub) {
+			return false // our own HELLO is not a peer's proof (see above)
+		}
+		if !bytes.Equal(h.Nonce, localNonce) {
+			return false // signed for another connection (audit PX-2)
 		}
 		if !committeeMemberAt(ch, g, h.Validator, h.Height) {
 			return false
@@ -592,7 +621,15 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 			learned: make(map[string]*learnedHint),
 			sources: make(map[string]int),
 		},
-		peerAdd:    tp.AddPeer,
+		// A hint is a dial this node makes because a PEER chose the address, not
+		// the operator: AddLearnedPeer keeps the connection GATED until a signed
+		// committee HELLO bound to its nonce arrives (audit PX-2).
+		peerAdd: func(addr string, learned bool) error {
+			if learned {
+				return tp.AddLearnedPeer(addr)
+			}
+			return tp.AddPeer(addr)
+		},
 		peerRemove: tp.RemovePeer,
 		peerH:      make(map[string]*peerAttestation),
 		syncQ:      make(chan transport.Message, syncQueueDepth),
@@ -887,27 +924,44 @@ func (v *Validator) waveLoop() {
 	}
 }
 
-// broadcastHello puts this node's signed height on the wire. The signature is
-// domain-separated and carried so a receiver can refuse unvouched height
-// announcements; full peer authentication is a later milestone's work.
+// broadcastHello puts this node's signed height on the wire, ONE HELLO PER
+// CONNECTION (audit PX-2). The signature is domain-separated and covers the
+// receiver's per-connection challenge, so a HELLO is valid only on the socket
+// it was signed for: that is what makes a captured member HELLO useless to a
+// stranger replaying it on a hint-dialled socket. One signature per peer per
+// wave is the price; it is a few hundred microseconds of Ed25519 against a
+// 500 ms cadence.
+//
+// The peers iterated are PeerChallenges - every registered connection this
+// side may speak on, including a GATED learned dial. The latter is deliberate:
+// admission is mutual, so the peer this node dialled needs OUR HELLO to admit
+// US, exactly as this node needs ITS HELLO. Sending is not admission; the
+// connection still receives no Broadcast until its own HELLO arrives.
 func (v *Validator) broadcastHello() {
-	h := &wire.Hello{
-		ChainID:   v.g.ChainID,
-		Validator: v.pub,
-		Height:    v.ch.Height(),
+	height := v.ch.Height()
+	for peer, challenge := range v.ttp.PeerChallenges() {
+		h := &wire.Hello{
+			ChainID:   v.g.ChainID,
+			Validator: v.pub,
+			Height:    height,
+			Nonce:     challenge,
+		}
+		hh := helloHash(h)
+		h.Sig = crypto.Sign(v.priv, hh[:])
+		_ = v.ttp.Send(peer, wire.EncodeHello(h))
 	}
-	hh := helloHash(h)
-	h.Sig = crypto.Sign(v.priv, hh[:])
-	_ = v.ttp.Broadcast(wire.EncodeHello(h))
 }
 
 // helloHash is the HELLO signature's domain-separated hash, defined here (the
-// node layer owns the announcement policy; the wire layer only frames it).
+// node layer owns the announcement policy; the wire layer only frames it). The
+// nonce is inside the hash, so a HELLO cannot be moved to another connection
+// without invalidating the signature (audit PX-2).
 func helloHash(h *wire.Hello) [32]byte {
 	e := types.NewEncoder()
 	e.VarBytes([]byte(h.ChainID))
 	e.VarBytes(h.Validator)
 	e.U64(h.Height)
+	e.VarBytes(h.Nonce)
 	return crypto.HashParts([]byte("b10coin-hello"), e.Bytes())
 }
 
@@ -964,6 +1018,24 @@ func committeeMemberAt(ch *chain.Chain, g *genesis.Genesis, pub []byte, height u
 func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	if h.ChainID != v.g.ChainID {
 		return
+	}
+	// The HELLO must be bound to THIS connection (audit PX-2): the receiver's
+	// challenge is the value this side generated for the socket the frame
+	// arrived on. Without this, `via` would move to whatever connection a
+	// replayed member HELLO was pushed down, and that connection would become
+	// the sync pull target. On a GATED connection (an accepted socket, or a
+	// learned dial) the same equality is also the admission proof the transport
+	// ran; on an OPERATOR-CONFIGURED one it is still the anti-replay binding,
+	// because a fresh per-connection challenge is the only thing a captured
+	// HELLO cannot supply. A relay connection has no peer challenge (nil), and
+	// its HELLOs must carry an empty nonce - which they do, because this node
+	// signs them with the nil challenge PeerChallenges reports for the relay.
+	ours, _, ok := v.ttp.ConnNonces(from)
+	if !ok || !bytes.Equal(h.Nonce, ours) {
+		return
+	}
+	if bytes.Equal(h.Validator, v.pub) {
+		return // our own HELLO: already in the table, and not a peer's proof
 	}
 	if !committeeMemberAt(v.ch, v.g, h.Validator, h.Height) {
 		return

@@ -315,7 +315,7 @@ whose keys sign, and that is the security boundary:**
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
 | `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
-| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The node waits for the relay's **gate greeting** before sending it, then waits for the relay's **accepted** frame, so a relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — is refused WITHOUT ever being handed the secret, and the refusal is logged. Plaintext over TCP and replayable: see the relay section |
+| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The secret is **never sent**: the node waits for the relay's **gate greeting** and its per-connection **challenge** (32 fresh random bytes plus the relay's own address), answers `HMAC-SHA-256(token, challenge)`, and only then expects the relay's **accepted** frame. A relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — gets no proof at all and the refusal is logged; a stranger who drives the greeting through such a relay receives a MAC, never the token, and that MAC is useless on any other connection (audit PX-3). The token still travels in plaintext at the relay's end of the comparison: see the relay section |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
 | `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
@@ -466,20 +466,25 @@ allowlists the validators' IPs — and why the relay also supports a
 **pre-shared access token** (`--access-token-file` on the relay,
 `--relay-access-token-file` on each node), which is the layer that works
 behind CGNAT where a source-IP allowlist cannot, and why the fixture
-committee must never reach a publicly reachable relay. The token is compared
-by length and byte equality and is opaque to the relay: the relay still
-decodes nothing. The exchange is three FIXED frames and no decoding anywhere:
-the relay announces gating (`b10coin-relay-gate-v1`), the node answers with the
-token, and the relay confirms with a second fixed frame — so a node refuses to
-send the secret to a relay that has not announced it gates, and a node whose
-token is REFUSED logs the handshake death instead of redialling in silence.
-The token must be at least 16 bytes on both ends (a shorter one is
-brute-forced by dialling: one byte falls in 256 attempts). **Two limits to
-know:** the token travels in **plaintext** over TCP, so a passive observer of
-the link reads it, and it is **replayable** — it is a constant compared per
-connection, neither challenged nor expired — so use it over a trusted path (a
-VPN) or accept that its compromise is a connection you must be able to absorb.
-It authenticates a connection, never a peer. If relay-only trust ever stops
+committee must never reach a publicly reachable relay. The token is used only
+as an HMAC key and is opaque to the relay: the relay still decodes nothing.
+The exchange is four frames and no decoding anywhere: the relay announces
+gating (`b10coin-relay-gate-v1`), sends a per-connection challenge (32 random
+bytes plus its own listening address), the node answers
+`HMAC-SHA-256(token, challenge)` — the token itself is NEVER written — and the
+relay confirms with a fixed accepted frame, comparing the answer in constant
+time (`subtle.ConstantTimeCompare`). So a node refuses to answer a relay that
+has not announced it gates, a node whose proof is REFUSED logs the handshake
+death instead of redialling in silence, and a stranger on a token-less relay
+who loops the greeting and a challenge of its own making harvests a MAC, not
+the token (audit PX-3). The token must be at least 16 bytes on both ends (a
+shorter one is brute-forced by dialling: one byte falls in 256 attempts).
+**One limit remains:** the challenge and the answer travel in **plaintext**
+over TCP, so a passive observer sees a proof that is valid for that one
+connection while it is live. A captured proof is worthless on any other
+connection, because the challenge is fresh per connection. Use the token over
+a trusted path (a VPN) or accept that its compromise is a connection you must
+be able to absorb. It authenticates a connection, never a peer. If relay-only trust ever stops
 being acceptable the answer is multiple relays and direct connections — never
 a smarter relay, because a relay that understood consensus would be a relay
 that could be wrong about it.
@@ -1020,7 +1025,7 @@ by `cmd` alone.
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
 | `internal/transport/tcp` | The real TCP transport: a framed reader/writer with socket deadlines, direct dial/listen, a relay-aware dial mode registered under `relay:<addr>`, and reconnect backoff. Its per-connection frame-rate bucket (audit N-6, the bound that stops one flooder monopolising the single dispatch callback) is applied to DIRECT connections only: on a relay connection the connection is the shared link, not the sender, so the bucket would drop honest members' votes for a stranger's flood — the relay's own per-sender share is the bound that replaces it there |
-| `internal/relay` | The dumb frame forwarder (`cmd/b10coin-relay`): a peer registry, per-receiver byte- and frame-bounded queues, per-source-prefix connection caps, socket deadlines and an optional pre-shared access-token first frame; it decodes nothing beyond the length prefix |
+| `internal/relay` | The dumb frame forwarder (`cmd/b10coin-relay`): a peer registry, per-receiver byte- and frame-bounded queues, per-source-prefix connection caps, socket deadlines and an optional pre-shared access-token HMAC challenge-response gate; it decodes nothing beyond the length prefix |
 | `internal/wire` | The wire envelopes shared with the transport and the consensus syncer: HELLO and BLOCK_SYNC request/response codecs with their own signed hashes, and (M5) `PEER_EXCHANGE` — a bounded, canonical list of listening addresses inside a signed envelope (the advertising member's key, its height, and a signature over chain id, height and list; audit PX-1) |
 | `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, catch-up and prefix-agreement assertions — the harness the eight seeded scenarios drive, and the multi-validator devnet with it; M5 adds the rotation fixture's `Unbond` submission through a committee's mempool and per-height committee access |
 | `internal/devnet` | The in-process devnet driver used by both the CLI acceptance commands and the tests: the single-node transfer, claim and double-claim-refusal scenario with replay verification, the multi-validator committee run reporting per-validator heights and agreement, the M5 rotation fixture and the committed-state Nakamoto series (`nakamoto.go`), and the real-TCP node (`tcpnode.go`) the `node` command's committee mode runs |

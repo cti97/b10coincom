@@ -375,7 +375,12 @@ func (v *Validator) observePeerExchange(from transport.PeerID, p *wire.PeerExcha
 		// untouched. A learned address that is down costs a retrying maintainer,
 		// not a permanent exit (audit N-1) - until the eviction clock below
 		// retires an address that NEVER completed a handshake (audit PX-1).
-		if err := v.peerAdd(key); err != nil {
+		//
+		// learned=true is audit PX-2's whole point: this dial exists because a
+		// PEER named the address, so the transport holds it out of Peers() and
+		// off every Broadcast until a signed committee HELLO bound to the
+		// connection's nonce arrives.
+		if err := v.peerAdd(key, true); err != nil {
 			v.hintsRefused.Add(1)
 			continue
 		}

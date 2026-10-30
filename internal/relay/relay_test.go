@@ -146,6 +146,22 @@ func expectGateGreeting(t *testing.T, c net.Conn) {
 	}
 }
 
+// expectGateChallenge reads the relay's gate challenge (audit PX-3): a fixed
+// 32-byte nonce followed by the relay's own local address, in one frame. It
+// returns the bytes exactly as received, which is what the node hashes.
+func expectGateChallenge(t *testing.T, c net.Conn) []byte {
+	t.Helper()
+	challenge := readFrame(t, c, wire.MaxRelayGateChallengeBytes)
+	if len(challenge) < wire.RelayGateNonceBytes {
+		t.Fatalf("the gate challenge is %d bytes, want at least the %d-byte nonce", len(challenge), wire.RelayGateNonceBytes)
+	}
+	return challenge
+}
+
+// gateAnswer is the answer a token holder sends: the HMAC of the challenge it
+// just read, never the token (audit PX-3).
+func gateAnswer(token, challenge []byte) []byte { return wire.RelayGateProof(token, challenge) }
+
 func expectGateAccepted(t *testing.T, c net.Conn) {
 	t.Helper()
 	if got := readFrame(t, c, 1<<16); !bytes.Equal(got, wire.RelayGateAccepted) {
@@ -1966,11 +1982,12 @@ func TestTheAccessTokenGateAdmitsOnlyTheTokenHolder(t *testing.T) {
 
 	// A wrong token of the SAME length is refused by the byte comparison; a
 	// wrong token of a DIFFERENT length is refused on length alone.
-	sameLength := bytes.Repeat([]byte{'x'}, len(token))
-	differentLength := append([]byte("short"), token...)
+	sameLength := bytes.Repeat([]byte{'x'}, wire.RelayGateMACBytes)
+	differentLength := append(bytes.Repeat([]byte("short"), 8), token...)
 	for name, bad := range map[string][]byte{"same-length": sameLength, "different-length": differentLength} {
 		c := dial(t, r.Addr().String())
 		expectGateGreeting(t, c)
+		_ = expectGateChallenge(t, c) // read it, so the refusal is the MAC's and not a stalled read
 		writeFrame(t, c, bad)
 		waitClosed(t, c, "a "+name+" wrong-token dial")
 	}
@@ -1986,18 +2003,20 @@ func TestTheAccessTokenGateAdmitsOnlyTheTokenHolder(t *testing.T) {
 	// never hands its secret to a relay that would forward it as payload.
 	a := dial(t, r.Addr().String())
 	expectGateGreeting(t, a)
-	writeFrame(t, a, token)
+	writeFrame(t, a, gateAnswer(token, expectGateChallenge(t, a)))
 	expectGateAccepted(t, a)
 	waitRegistered(t, r, 1, "the first token holder was not registered")
 	b := dial(t, r.Addr().String())
 	expectGateGreeting(t, b)
-	writeFrame(t, b, token)
+	writeFrame(t, b, gateAnswer(token, expectGateChallenge(t, b)))
 	expectGateAccepted(t, b)
 	waitRegistered(t, r, 2, "the second token holder was not registered")
 
+	// Neither the token nor either answer reached the forwarding path: the
+	// first real frame a peer reads is the payload, and it is not a proof.
 	writeFrame(t, a, []byte("payload"))
 	if got := readFrame(t, b, 4096); !bytes.Equal(got, []byte("payload")) {
-		t.Fatalf("the token frame leaked into the forwarding path: the peer read %q", got)
+		t.Fatalf("a gate frame leaked into the forwarding path: the peer read %q", got)
 	}
 }
 
@@ -2011,10 +2030,11 @@ func TestTheRelayRefusesATokenDialThatSaysNothing(t *testing.T) {
 		WriteQueueBytes: 1 << 16, AccessToken: []byte("silent-dial-token"), AccessTimeout: 150 * time.Millisecond,
 	})
 	c := dial(t, r.Addr().String())
-	// The relay announces the gate first, then waits out AccessTimeout for a
-	// token that never comes.
+	// The relay announces the gate and its challenge first, then waits out
+	// AccessTimeout for an answer that never comes (audit PX-3).
 	expectGateGreeting(t, c)
-	waitClosed(t, c, "a dial that never presented the token")
+	_ = expectGateChallenge(t, c)
+	waitClosed(t, c, "a dial that never answered the challenge")
 	waitFor(t, func() bool { return r.Stats().Unauthorized >= 1 }, "the silent dial to be counted unauthorized")
 	if got := r.Stats().Conns; got != 0 {
 		t.Fatalf("a silent dial was registered (Conns=%d)", got)
