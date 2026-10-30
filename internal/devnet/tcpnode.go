@@ -170,14 +170,17 @@ type ValidatorConfig struct {
 	// consensus secret - the relay only compares bytes by length and equality
 	// - and an empty value keeps the previous behaviour.
 	RelayAccessToken []byte
-	// AllowLocalPeerHints is the DEVNET ACCEPTANCE EXCEPTION for PEER_EXCHANGE:
-	// it permits a hint naming a loopback, private or link-local address, which
-	// the default policy refuses (see validatePeerHint). It exists because the
-	// acceptance mesh runs every validator on one host behind 127.0.0.1, and a
-	// single-host devnet has no public address to advertise; the tests set it
-	// and say so. It is NOT set by the CLI and must never be set on a node
-	// whose reach extends beyond the operator's own machine: it is the one knob
-	// that turns a peer's hint into a dial at the operator's own network.
+	// AllowLocalPeerHints is the PEER_EXCHANGE admission exception: it permits a
+	// hint naming a loopback, private or link-local address, which the default
+	// policy refuses (see validatePeerHint). It exists because the acceptance
+	// mesh runs every validator on one host behind 127.0.0.1, and because a
+	// PRIVATE-RANGE deployment (a lab VLAN, a Docker bridge, a home network on
+	// 10/8) has no public address to advertise either: without this every hint
+	// such a node sends or receives is refused, so peer exchange can never link
+	// anyone there (audit M-2 - the CLI flag --allow-local-peer-hints sets it,
+	// and it is off unless the operator asks). It must never be set on a node
+	// whose reach extends beyond the operator's own machines: it is the one
+	// knob that turns a peer's hint into a dial at the operator's own network.
 	AllowLocalPeerHints bool
 	// TickEvery is the driver's tick cadence (zero: defaultTickEvery).
 	TickEvery time.Duration

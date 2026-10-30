@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"testing"
 	"time"
 
@@ -719,4 +720,177 @@ func TestAMeshedVoteIsCountedOnce(t *testing.T) {
 	if got := c.rt.PeerExchangesSeen(); got != 0 {
 		t.Fatalf("a vote changed PeerExchangesSeen to %d", got)
 	}
+}
+
+// TestPeerExchangeDoesNotMeshAChain pins the LIMITATION the 2026-10-30 Docker
+// run found (audit M-2, third variant) rather than a bug in the exchange: with
+// public-range listeners, four validators wired as a `--peers` CHAIN exchanged
+// hints only between direct neighbours and never formed a mesh, so the chain
+// stalled at height 0 with no relay.
+//
+// The cause is structural, and it is in sendPeerExchange: a node advertises
+// exactly ONE address, its own listener, and never re-advertises what it
+// learned. So a node can only ever learn the address of a node it is ALREADY
+// connected to; a hint can change the direction of a link but can never
+// discover a second hop. A relay hides this because every member is connected
+// to the relay's link, so every advertisement reaches every member and the mesh
+// forms in one broadcast; a chain has no such shared link, so the link graph it
+// starts with is the link graph it keeps.
+//
+// The test constructs the chain and drives the waves by hand (frozen clocks),
+// so nothing here depends on timing: it asserts the neighbour links exist, then
+// that after two full advertisement rounds the two ENDS still do not know each
+// other - a's only learned address is its neighbour's, and c's name never
+// reaches a. If a future change makes advertisements transitive (the one hop
+// that would mesh a chain), UPDATE THIS TEST AND THE README with it: the
+// limitation is documented there as such.
+func TestPeerExchangeDoesNotMeshAChain(t *testing.T) {
+	start := func(index int) *Validator {
+		v, err := StartValidator(ValidatorConfig{
+			Dir:                 t.TempDir(),
+			Index:               index,
+			Validators:          3, // a, b and c are all seats, so hints have authority
+			Listen:              "127.0.0.1:0",
+			AllowLocalPeerHints: true,
+			TickEvery:           time.Hour, // no consensus traffic: only the links matter
+			WaveEvery:           time.Hour, // the test drives the waves
+		})
+		if err != nil {
+			t.Fatalf("starting validator %d: %v", index, err)
+		}
+		t.Cleanup(func() { _ = v.Close() })
+		return v
+	}
+	a, b, c := start(0), start(1), start(2)
+
+	// The chain: b -> a, c -> b. Each side needs the other's signed HELLO
+	// before an ACCEPTED connection is admitted, so the test drives those too.
+	if err := b.Connect(a.Addr()); err != nil {
+		t.Fatalf("b dialling a: %v", err)
+	}
+	if err := c.Connect(b.Addr()); err != nil {
+		t.Fatalf("c dialling b: %v", err)
+	}
+	// The dials register asynchronously; wait for each outbound side, then
+	// drive the HELLOs (re-sent every round, since a fresh inbound socket needs
+	// one) until the accepted sides admit. Bounded poll on an observable, never
+	// a sleep followed by a guess.
+	waitPeer(t, b, "v0", 5*time.Second)
+	waitPeer(t, c, "v1", 5*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		a.broadcastHello()
+		b.broadcastHello()
+		c.broadcastHello()
+		if hasPeer(a, "v1") && hasPeer(b, "v2") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the chain's links never admitted both ways: a %v, b %v, c %v",
+				a.ttp.Peers(), b.ttp.Peers(), c.ttp.Peers())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Advertise, then keep advertising while polling: delivery is asynchronous
+	// (the router's dispatch goroutine on the receiving side) and a socket the
+	// hint dials are churning can swallow one round - the real wave loop
+	// re-advertises every fourth wave for exactly that reason. The observable to
+	// wait on is the counts the frames leave behind: each end must observe the
+	// middle's advertisement, the middle both ends', and the adopted addresses
+	// must be its own neighbours'.
+	a.sendPeerExchange()
+	b.sendPeerExchange()
+	c.sendPeerExchange()
+	if got := a.PeerExchangesSent(); got != 1 {
+		t.Fatalf("a advertised %d times, want 1", got)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		a.broadcastHello() // the hint dials install accepted sockets that need a HELLO
+		b.broadcastHello()
+		c.broadcastHello()
+		if a.rt.PeerExchangesSeen() >= 2 && b.rt.PeerExchangesSeen() >= 4 && c.rt.PeerExchangesSeen() >= 2 &&
+			len(learnedAddrs(a)) == 1 && len(learnedAddrs(b)) == 2 && len(learnedAddrs(c)) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the advertisements were sent but not all adopted: seen a/b/c = %d/%d/%d, learned a/b/c = %v/%v/%v",
+				a.rt.PeerExchangesSeen(), b.rt.PeerExchangesSeen(), c.rt.PeerExchangesSeen(),
+				learnedAddrs(a), learnedAddrs(b), learnedAddrs(c))
+		}
+		a.sendPeerExchange()
+		b.sendPeerExchange()
+		c.sendPeerExchange()
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Four MORE advertisement rounds, now that every node's hint book is
+	// non-empty: this is the round that would carry a SECOND-HOP address if the
+	// advertisement ever included anything but the sender's own listener - the
+	// one change that would mesh a chain, and the mutant this test must catch.
+	// The real code re-advertises the same single address (a duplicate, no dial,
+	// no budget), so nothing changes; a transitive advertisement gives the ends
+	// each other's address and the assertions below fail.
+	for round := 0; round < 4; round++ {
+		a.sendPeerExchange()
+		b.sendPeerExchange()
+		c.sendPeerExchange()
+		a.broadcastHello()
+		b.broadcastHello()
+		c.broadcastHello()
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The chain is intact and has gained no shortcut. The hint dials are
+	// cross-dials to peers that are ALREADY linked, so the duplicate refusal may
+	// churn a socket for a moment; the link set is the observable that settles.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		a.broadcastHello()
+		b.broadcastHello()
+		c.broadcastHello()
+		if len(a.ttp.Peers()) == 1 && hasPeer(a, "v1") &&
+			len(c.ttp.Peers()) == 1 && hasPeer(c, "v1") &&
+			len(b.ttp.Peers()) == 2 && hasPeer(b, "v0") && hasPeer(b, "v2") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the chain's links did not settle after the exchange: a %v, b %v, c %v",
+				a.ttp.Peers(), b.ttp.Peers(), c.ttp.Peers())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if hasPeer(a, "v2") || hasPeer(c, "v0") {
+		t.Fatalf("the chain MESHED (a: %v, c: %v): hints became transitive, which this test and the README must be updated for",
+			a.ttp.Peers(), c.ttp.Peers())
+	}
+	// The learned address is the neighbour's, and only the neighbour's: a heard
+	// b's advertisement (its only peer) and nothing from c, two hops away. b, in
+	// the middle, learned exactly its two neighbours - the hint set is the LINK
+	// set, never larger, which is the whole reason a chain cannot mesh.
+	if got := learnedAddrs(a); len(got) != 1 || got[0] != b.Addr() {
+		t.Fatalf("a learned %v, want exactly its neighbour's address %q: a second-hop address means hints propagated",
+			got, b.Addr())
+	}
+	want := []string{a.Addr(), c.Addr()}
+	if got := learnedAddrs(b); len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("b learned %v, want its two neighbours %v", got, want)
+	}
+	if got := learnedAddrs(c); len(got) != 1 || got[0] != b.Addr() {
+		t.Fatalf("c learned %v, want exactly its neighbour's address %q", got, b.Addr())
+	}
+}
+
+// learnedAddrs is the in-package view of the hint book, in sorted order so a
+// failure message reads the same on every run.
+func learnedAddrs(v *Validator) []string {
+	v.hints.mu.Lock()
+	defer v.hints.mu.Unlock()
+	out := make([]string, 0, len(v.hints.learned))
+	for addr := range v.hints.learned {
+		out = append(out, addr)
+	}
+	sort.Strings(out)
+	return out
 }

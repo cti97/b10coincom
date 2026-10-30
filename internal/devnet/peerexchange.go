@@ -261,6 +261,20 @@ func peerExchangeHash(chainID string, height uint64, addrs []string) [32]byte {
 // checks. It is called from the wave loop at the peerExchangeEveryWaves
 // cadence; the test seam calls it directly to construct a wave instead of
 // waiting.
+//
+// It advertises EXACTLY ONE address: this node's own listener, never an
+// address it learned. That is what bounds the message against amplification
+// and keeps every advertised address attributable to the member that signs it,
+// and it has a consequence the 2026-10-30 Docker run found (audit M-2, third
+// variant): a node can only ever learn the address of a node it is ALREADY
+// connected to, so the hint set equals the link set and a `--peers` CHAIN never
+// becomes a mesh. A relay masks this - every member shares the relay's link, so
+// one broadcast reaches everyone - but with no relay and a chain, the graph
+// stays a chain and the committee never reaches quorum. TestPeerExchangeDoesNotMeshAChain
+// pins the limitation; the README documents it. Making advertisements carry the
+// advertiser's PROVEN neighbours as well (one more hop) is the change that would
+// mesh a chain, and it needs its own eviction policy for second-hand addresses,
+// so it is deliberately not done here.
 func (v *Validator) sendPeerExchange() {
 	addr := v.advertisableAddr()
 	if addr == "" {

@@ -317,6 +317,7 @@ whose keys sign, and that is the security boundary:**
 | `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
 | `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The node waits for the relay's **gate greeting** before sending it, then waits for the relay's **accepted** frame, so a relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — is refused WITHOUT ever being handed the secret, and the refusal is logged. Plaintext over TCP and replayable: see the relay section |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
+| `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |
 
@@ -341,6 +342,28 @@ listener, which bypasses the relay for those links — but the benefit is
 one-sided, and the mesh only forms among nodes that are directly reachable.
 This is design decision 5's honest limit, not a bug: `PEER_EXCHANGE` is a hint
 to dial, never an admission, and admission is still the signed committee HELLO.
+
+**Two limits found by the 2026-10-30 live run (audit M-2), both documented rather
+than hidden.** (1) *Private addresses need the flag.* A hint naming a loopback,
+private or link-local address is refused by default (`errHintLocal`), so a
+chain whose members all sit on a private range — a Docker bridge, a home LAN, a
+lab VLAN — exchanged no hints at all and stalled even though every member was
+reachable; `--allow-local-peer-hints` is the opt-in, and it is off unless the
+operator asks for it, because it lets a peer point this node at its own
+internal network. (2) *A `--peers` CHAIN does not become a mesh.* A member
+advertises **only its own listener**, never an address it learned, so a node can
+learn the address of a peer it is *already* connected to and never a
+second-hop one: the hint set equals the link set. A relay hides this, because
+every member is connected to the relay's link and one broadcast reaches all of
+them, which is why "listeners learned through the relay form a full mesh". With
+no relay and a chain (`b->a`, `c->b`, `d->c`), the graph stays a chain and the
+chain does not finalise — 4 validators stalled at height 0 in every variant
+tested. The fix, if one is wanted, is for an advertisement to carry the
+advertiser's *proven* neighbours as well as itself (one extra hop, and a
+re-eviction policy for addresses learned second-hand); until then this is a
+limitation of the message, not a defect in the dial path, and it is pinned by
+`TestPeerExchangeDoesNotMeshAChain`. Use `--relay`, or give every member every
+other member's address in `--peers`, for a topology that must mesh without one.
 
 Ctrl-C (or, on Unix, SIGTERM) stops block production and the HTTP server
 cleanly. The graceful stop listens for both through one cancellation
@@ -922,11 +945,36 @@ are at least `MIN_STAKE` each, and a newcomer that bonds at least the floor is
 ranked against them by stake, ties by key bytes — so with
 `committee_size == len(validators)` (the default) admission means eviction of
 one genesis seat. Give the file a spare seat (`committee_size` above the list,
-as the shipped example does) and a newcomer is seated beside them instead. If
-the key that bonds is **not** the key a running validator signs with, the new
-seat has no node behind it: the committee can no longer reach its two-thirds
-quorum and the chain stops at the boundary. Stake only with the key whose node
-will run as that validator, and keep every genesis key's node running.
+as the shipped example does) and a newcomer is seated beside them instead.
+
+If the key that bonds is **not** the key a running validator signs with, the new
+seat has no node behind it. What that costs depends on the committee size, and
+the honest answer is not "the chain stops" (audit M-3): the power cap and the
+quorum threshold decide it.
+
+- **Three seats: the chain stops at the boundary.** Below four seats the power
+  cap is 1/1 — no cap — so one seat may hold almost all of the power, and quorum
+  is *strictly more* than two thirds of the total. Two live seats out of three
+  therefore hold at most 2/3, which is exactly one spark short of quorum when all
+  three bonds are `MIN_STAKE` (`quorumFor(3·MIN_STAKE) = 2·MIN_STAKE + 1`), and
+  far less when the dead seat is a whale bond against one-spark fixture seats.
+  Nothing can commit; the chain halts at the epoch boundary.
+- **Four or more seats: the chain keeps committing without it.** At four seats
+  the one-quarter cap applies, so no seat holds more than 1/4 of the total power:
+  dropping the seat that has no signer leaves **at least 3/4 of the power**,
+  which is above the 2/3 threshold. At four seats that is exactly 3 of 4 power
+  (`quorumFor(4) = 3`, and three seats hold 3/4 > 2/3). With equal seats the
+  threshold needs at most `floor(2N/3)+1` of the N, and the `N-1` survivors
+  always supply that many for `N >= 4` — exactly at 4, 5 and 6 seats, with slack
+  above that. (Two silent seats are still fatal up to six seats: `(N-2)/N > 2/3`
+  needs `N >= 7`.) Only the node that lost its seat stops voting: it keeps its
+  links and can still adopt certified blocks, but it can no longer propose or
+  vote, and nothing waits for it.
+
+Either way the seat is wasted, and the deployment is one further failure from a
+stall — so stake only with the key whose node will run as that validator, and
+keep every genesis key's node running. The three-seat recipe halts; the
+four-seat recipes lose one seat's worth of safety margin and keep finalising.
 
 **The end-to-end run behind these claims** (one process, a devnet-parameter
 chain, the fixture key file described above): `stake --amount 1000` submitted a

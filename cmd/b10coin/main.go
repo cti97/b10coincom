@@ -79,6 +79,7 @@ Usage:
   b10coin keygen [--out PATH]                                            Generate this validator's key file (owner-only permissions; refuses to overwrite)
   b10coin node   --dir PATH [--http ADDR] [--block-time DURATION]
                  [--peers ADDR,...] [--relay ADDR] [--listen ADDR]       Run the single-node devnet producer, or — with --peers/--relay/--listen — a consensus validator
+                 [--allow-local-peer-hints]                              (accept loopback/private peer hints: private-range and single-host networks only)
                  --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
@@ -892,6 +893,13 @@ func cmdNode(args []string) error {
 	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
 	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8; at least 16 bytes). Sent only after the relay announces its gate with a fixed first frame, so a relay without a token never receives it; a refused token is logged and retried. Plaintext over TCP and replayable: use it over a trusted path")
 	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
+	// The PEER_EXCHANGE admission exception (audit M-2). A hint naming a
+	// loopback, private or link-local address is refused by default, which is
+	// the right policy for a network whose members have public listeners - and
+	// the wrong one for a private-range deployment (a lab VLAN, a Docker
+	// bridge, a home network on 10/8), where EVERY address a peer can advertise
+	// is private, so peer exchange could never link anyone without it.
+	allowLocalHints := fs.Bool("allow-local-peer-hints", false, "accept PEER_EXCHANGE hints naming loopback/private/link-local addresses (private-range and single-host deployments; never on a node reachable from the public internet)")
 	validators := fs.Int("validators", 0, "FIXTURE committee size (development mode; committee from --genesis otherwise)")
 	index := fs.Int("index", 0, "FIXTURE committee seat (development mode; the seat of --key is derived from --genesis otherwise)")
 	keyPath := fs.String("key", "", "this validator's key file (b10coin keygen); REQUIRED with --genesis")
@@ -912,6 +920,12 @@ func cmdNode(args []string) error {
 		}
 		if *relayTokenPath != "" {
 			return fmt.Errorf("--relay-access-token-file credentials a --relay connection, but no networking flag is set: give --relay ADDR together with it, or drop it")
+		}
+		if *allowLocalHints {
+			// PEER_EXCHANGE only exists on a networked node, and a producer
+			// that silently accepted a security-relevant switch it never
+			// consults would be a flag that lies.
+			return fmt.Errorf("--allow-local-peer-hints relaxes PEER_EXCHANGE admission, which only a networked node runs: give --peers, --relay or --listen together with it, or drop it")
 		}
 		return runProducerNode(*dir, *addr, *blockTime)
 	}
@@ -935,7 +949,7 @@ func cmdNode(args []string) error {
 				*relayTokenPath, len(relayToken), wire.MinRelayAccessTokenBytes)
 		}
 	}
-	return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken)
+	return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints)
 }
 
 // runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
@@ -1057,7 +1071,7 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 //
 // --block-time is refused with networking: a committee's cadence is its
 // round-timeout ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte) error {
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool) error {
 	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -1160,9 +1174,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 	var v *devnet.Validator
 	var err error
 	if g != nil {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, RelayAccessToken: relayToken})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
 	} else {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, RelayAccessToken: relayToken})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
 	}
 	if err != nil {
 		return err

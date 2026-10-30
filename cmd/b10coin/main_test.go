@@ -669,6 +669,16 @@ func TestNodeGenesisModeFlagContract(t *testing.T) {
 	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d5"), "--genesis", filepath.Join(dir, "missing.json"), "--key", k1}); err == nil {
 		t.Error("a committee file that cannot be read must fail the command")
 	}
+	// --allow-local-peer-hints (audit M-2) is a PEER_EXCHANGE admission
+	// exception, and PEER_EXCHANGE only runs on a networked node: a producer
+	// that accepted, and silently ignored, a security-relevant switch would be
+	// a flag that lies.
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d6"), "--allow-local-peer-hints"}); err == nil || !strings.Contains(err.Error(), "--allow-local-peer-hints") {
+		t.Errorf("--allow-local-peer-hints on the single-node producer must be refused, got: %v", err)
+	}
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d7"), "--allow-local-peer-hints", "--genesis", cf}); err == nil || !strings.Contains(err.Error(), "--key") {
+		t.Errorf("--allow-local-peer-hints must be ACCEPTED on the networked path (the refusal here must be --genesis's own demand for --key), got: %v", err)
+	}
 }
 
 // The happy path through the REAL binary: a one-member committee from a
