@@ -68,6 +68,7 @@ func usage() {
 
 Usage:
   b10coin devnet --blocks N [--validators N] [--dir PATH] [--claims N]   Build and verify a local chain (or, with --validators given, a consensus devnet over the FIXTURE committee)
+                 [--epoch-blocks N] [--rotate-demo] [--plot-nakamoto]   (epoch length, the rotation fixture, and the committed-state Nakamoto series)
   b10coin keygen [--out PATH]                                            Generate this validator's key file (owner-only permissions; refuses to overwrite)
   b10coin node   --dir PATH [--http ADDR] [--block-time DURATION]
                  [--peers ADDR,...] [--relay ADDR] [--listen ADDR]       Run the single-node devnet producer, or — with --peers/--relay/--listen — a consensus validator
@@ -121,6 +122,9 @@ func cmdDevnet(args []string) error {
 	// (`devnet --validators 4 --blocks 100`) and could not honour until M3,
 	// because a single node needs no agreement.
 	validators := fs.Uint64("validators", 1, "committee size; giving the flag at all — 1 included — runs a multi-validator consensus devnet (the faucet-claim scenario does not apply)")
+	epochBlocks := fs.Uint64("epoch-blocks", 0, "epoch length in blocks for BOTH the committee epoch (0-based) and the faucet claim epoch (1-based), overridden in the genesis before hashing (0 = the compiled-in value); a --dir built at another length is refused by the store, not silently reused")
+	rotateDemo := fs.Bool("rotate-demo", false, "rotation fixture: one seat unbonds mid-epoch through an ordinary Unbond transaction and leaves at the boundary (needs --validators >= 5, --epoch-blocks >= 4, --blocks > --epoch-blocks; not with --claims)")
+	plotNakamoto := fs.Bool("plot-nakamoto", false, "print the Nakamoto coefficient per epoch boundary plus the head, from committed state (needs --validators; the threshold is 1/3, the BFT figure, not 1/2)")
 	dir := fs.String("dir", "", "data directory (default: a fresh temporary directory)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -142,6 +146,18 @@ func cmdDevnet(args []string) error {
 		}
 	})
 
+	// The two committee-only flags must not be silently dropped on the
+	// single-node path: Run has one validator and no series, and a flag that
+	// asked for a plot and printed nothing would look like an empty result
+	// rather than a misuse.
+	multi := *validators > 1 || validatorsSet
+	if *plotNakamoto && !multi {
+		return fmt.Errorf("--plot-nakamoto reports a committee's coefficient from committed state; give --validators N (the single-node run has no committee to plot)")
+	}
+	if *rotateDemo && !multi {
+		return fmt.Errorf("--rotate-demo is the committee rotation fixture; give --validators N (at least 5)")
+	}
+
 	if *dir == "" {
 		d, err := os.MkdirTemp("", "b10coin-devnet-")
 		if err != nil {
@@ -161,7 +177,10 @@ func cmdDevnet(args []string) error {
 		if claimsSet && *claims > 0 {
 			return fmt.Errorf("--claims runs the single-node faucet scenario and does not apply to a --validators %d run; drop --claims (the single-node default still pays one)", *validators)
 		}
-		summary, err := devnet.RunMulti(devnet.Options{Dir: *dir, Blocks: *blocks, Validators: *validators})
+		summary, err := devnet.RunMulti(devnet.Options{
+			Dir: *dir, Blocks: *blocks, Validators: *validators,
+			EpochBlocks: *epochBlocks, RotateDemo: *rotateDemo, PlotNakamoto: *plotNakamoto,
+		})
 		// Only a run that RAN (its summary names a committee) prints a report;
 		// an option-validation failure returns an empty summary, and printing
 		// `validators   0` ahead of its error would be noise, not diagnosis.
@@ -177,7 +196,7 @@ func cmdDevnet(args []string) error {
 		return nil
 	}
 
-	summary, err := devnet.Run(devnet.Options{Dir: *dir, Blocks: *blocks, Claims: *claims})
+	summary, err := devnet.Run(devnet.Options{Dir: *dir, Blocks: *blocks, Claims: *claims, EpochBlocks: *epochBlocks})
 	if err != nil {
 		return err
 	}
@@ -218,6 +237,12 @@ func printMultiDevnet(s devnet.Summary) {
 		agreed = "yes"
 	}
 	fmt.Printf("agreed       %s\n", agreed)
+	// The acceptance artefact, when it was asked for. A blank line separates
+	// the run report from the series so the table is readable on its own.
+	if len(s.Nakamoto) > 0 {
+		fmt.Println()
+		fmt.Print(devnet.FormatNakamoto(s.Nakamoto))
+	}
 }
 
 // validatorHeightsLine renders the per-validator heights as v0=H v1=H ... in
