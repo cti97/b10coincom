@@ -73,8 +73,10 @@ a number this project can graph instead of assert.
    backoff, and are still refused unless they complete a signed committee HELLO.
 6. **The Nakamoto coefficient is computed from committed state, not from `Peers()`.**
    It is the smallest number of validators whose combined power exceeds one third —
-   the BFT threshold, not an arbitrary fraction — and it is reported per height so a
-   run can be plotted.
+   the BFT threshold, not an arbitrary fraction — and it is reported at each epoch
+   boundary and at the head, so a run is plotted as a step series. (The code emits
+   one row per epoch boundary plus the head, never one per height; an earlier
+   revision of this decision said "per height" and was wrong — audit CI-5.)
 
 ## File structure
 
@@ -89,7 +91,7 @@ a number this project can graph instead of assert.
 - `internal/consensus/router.go`, `internal/consensus/sync.go` — membership and certificate gates by height
 - `internal/wire/peerexchange.go` (new) — the `PEER_EXCHANGE` message
 - `internal/devnet`, `internal/node` — wiring, and the rotation at boundaries
-- `internal/devnet/nakamoto.go` (new) — the coefficient per height (no `internal/metrics` package: one pure function does not justify one)
+- `internal/devnet/nakamoto.go` (new) — the coefficient per epoch boundary plus the head (no `internal/metrics` package: one pure function does not justify one)
 - `internal/rpc/server.go` — `/status` params + genesis hash, and `/account/{address}`
 - `cmd/b10coin` — `devnet --plot-nakamoto`, and `stake`/`unstake` CLI verbs
 
@@ -513,7 +515,8 @@ func (d *Driver) newEngine(h uint64, parent [32]byte) (*Engine, error)
 - A driver whose own key is not seated at that height builds an *inert* engine: it
   tallies inbound frames and emits nothing, because `emitVote` and `CheckMembership`
   already refuse to sign without a seat. That is how a rotated-out validator stops
-  without a flag, an error path or a panic.
+  voting without a flag, an error path or a panic; it is not inert as a follower — it
+  still tallies inbound frames and follows the chain to the head (audit CI-5).
 - Every reader varies by height: the driver (per height), the router's membership check
   (per frame height), the certificate re-tally (per block height), HELLO admission (per
   the frame's height within the existing head/head+1 window), and BLOCK_SYNC
@@ -745,9 +748,12 @@ func (n *Net) CommitteeAt(i int, h uint64) ([]genesis.Validator, error)
 - Rows are monotone in height, one per epoch boundary plus the head. The series is a
   report: it reads a clone, takes no lock and changes no state.
 - The fixture rotates through the ordinary `Unbond` transaction (Decision 4's path).
-  After the boundary it waits only on the seated validators: a rotated-out validator's
-  height is *expected* to stop, and the run's agreement check must read its history as a
-  prefix rather than calling it a fork.
+  After the boundary a rotated-out validator KEEPS FOLLOWING to the head and merely
+  stops voting: its driver holds no seat, so it emits nothing, but it still tallies and
+  commits the seated validators' blocks. It does not stop at height 39 (audit CI-5):
+  Task 3's end-to-end test is explicit that "the departed validator fell behind instead
+  of following" is a FAILURE, and the Nakamoto test asserts all six chains reach the
+  head, so the run's agreement check sees one history rather than a prefix.
 - The fixture's stakes are the simnet genesis's `Power`, one spark per seat. Shares are
   what the coefficient measures; the report must not present a spark as money.
 - `--epoch-blocks` changes the genesis hash, so it defines a different chain: a `--dir`
@@ -780,9 +786,11 @@ func (n *Net) CommitteeAt(i int, h uint64) ([]genesis.Validator, error)
 - `TestThePlotShowsAStepAtTheBoundary`: the acceptance fixture — 6 seats, `E = 40`,
   rotation at height ~10 — prints `0: 6 seats, k=3` and `40: 5 seats, k=2`. Asserts the
   rows, not the formatting. Fails if the fixture does not actually rotate.
-- `TestTheRotatedOutValidatorStopsAtTheBoundary`: its height is 39 while the rest reach
-  105, and its history is a prefix. This is the cross-check that the plotted step and
-  the rotation are the same event.
+- The rotated-out validator is pinned INSIDE `TestThePlotShowsAStepAtTheBoundary`: all six
+  chains reach the head, so the rotation is proved by the 6 -> 5 seat step at height 40,
+  never by a stopped chain. The plan originally promised a separate
+  `TestTheRotatedOutValidatorStopsAtTheBoundary` asserting height 39; the code does not,
+  and should not, behave that way, so that test does not exist (audit CI-5).
 - `TestTheReportChangesNoState`: the head and state root before and after building the
   rows are identical.
 - `TestNakamotoOverAnEmptyCommitteeRefuses`: a chain with no validators reports an

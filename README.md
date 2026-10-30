@@ -1351,7 +1351,8 @@ Implemented — modules M0 through M5:
   boundary (top `committee_size` by stake, ties by public-key bytes, 1/4 power
   cap); genesis seats bonded by the genesis hash; `PEER_EXCHANGE` turning the
   relay star into a mesh among reachable nodes; the Nakamoto coefficient
-  computed from committed state and plotted per height (`--plot-nakamoto`);
+  computed from committed state and plotted at each epoch boundary plus the
+  head (`--plot-nakamoto`; a step series, not one row per height);
   `stake`/`unstake`/`withdraw` clients; and the deployment recipe's staking
   section. Acceptance: the rotation run above (6 seats / k=3 → 5 seats / k=2 at
   height 40) and the single-node root, which moved once inside M5 to
