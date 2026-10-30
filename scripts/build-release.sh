@@ -132,13 +132,19 @@ done
 # The assertion is TOKEN-BASED, not sentence-based. file(1) implementations
 # disagree on where the CPU goes (see the header note), so demanding a fixed
 # sentence only pins the check to one vendor's wording. Instead each target
-# requires a format token (Mach-O / ELF / PE32+) AND its architecture token
-# (x86_64, arm64, x86-64, aarch64), wherever they sit in the output. The
+# requires a format token (Mach-O / ELF / PE32+) AND an architecture matching a
+# small alternation, wherever they sit in the output. The
 # tokens are what varies per TARGET; the order is what varies per file(1)
 # IMPLEMENTATION — so this stays a real assertion (an x86_64 binary never
 # reports arm64, an ELF never reports Mach-O) while being portable across
-# vendors. Arch tokens are matched case-insensitively because implementations
-# capitalize the 64-bit ARM name differently (arm64/Aarch64/AArch64).
+# vendors. Arch patterns are matched case-insensitively AND as alternations,
+# because implementations name the same architecture differently: the 64-bit ARM
+# core shows up as arm64 / ARM64 / Aarch64 / aarch64, and x86-64 as x86_64 or
+# x86-64. A single literal cannot span them: 'aarch64' does not match 'ARM64' even
+# case-insensitively, which is exactly how the windows/arm64 assertion broke when
+# the runner image moved to a newer file(1). Both forms still name one
+# architecture, so accepting either stays a real assertion - an x86_64 binary
+# reports neither.
 command -v file >/dev/null 2>&1 ||
     fail "file(1) is required to assert the artifacts really match their targets"
 for t in $targets; do
@@ -147,12 +153,12 @@ for t in $targets; do
     suffix=""
     [ "$os" = "windows" ] && suffix=".exe"
     case "$os/$arch" in
-        darwin/amd64)  fmt="Mach-O" tok="x86_64"  ;;
-        darwin/arm64)  fmt="Mach-O" tok="arm64"   ;;
-        linux/amd64)   fmt="ELF"    tok="x86-64"  ;;
-        linux/arm64)   fmt="ELF"    tok="aarch64" ;;
-        windows/amd64) fmt="PE32+"  tok="x86-64"  ;;
-        windows/arm64) fmt="PE32+"  tok="aarch64" ;;
+        darwin/amd64)  fmt="Mach-O" tok="x86[-_]64"        ;;
+        darwin/arm64)  fmt="Mach-O" tok="arm64|aarch64"    ;;
+        linux/amd64)   fmt="ELF"    tok="x86[-_]64"        ;;
+        linux/arm64)   fmt="ELF"    tok="arm64|aarch64"    ;;
+        windows/amd64) fmt="PE32+"  tok="x86[-_]64"        ;;
+        windows/arm64) fmt="PE32+"  tok="arm64|aarch64"    ;;
         *)             fail "no arch assertion for $os/$arch" ;;
     esac
     for name in b10coin b10coin-relay; do
@@ -163,8 +169,8 @@ for t in $targets; do
             echo "$got" >&2
             exit 1
         fi
-        if ! printf '%s\n' "$got" | grep -iq -- "$tok"; then
-            echo "FAIL: $f does not report the $tok architecture its $os/$arch name claims:" >&2
+        if ! printf '%s\n' "$got" | grep -iqE -- "$tok"; then
+            echo "FAIL: $f does not report an architecture matching /$tok/ that its $os/$arch name claims:" >&2
             echo "$got" >&2
             exit 1
         fi
