@@ -1,11 +1,12 @@
 package wire
 
-// The connection's message set: HELLO, which opens a connection, and the
-// BLOCK_SYNC pair, which pulls a chain the node has fallen behind on. They
-// are not consensus messages; they travel the wire layer of every peer and
-// relay connection. Anything they decode is attacker-supplied, so every
-// decoder here follows the same canonical discipline as the consensus
-// messages in internal/consensus/message.go:
+// The connection's message set: HELLO, which opens a connection, the
+// BLOCK_SYNC pair, which pulls a chain the node has fallen behind on, and
+// PEER_EXCHANGE (peerexchange.go), which advertises listening addresses so
+// the relay star becomes a mesh. They are not consensus messages; they travel
+// the wire layer of every peer and relay connection. Anything they decode is
+// attacker-supplied, so every decoder here follows the same canonical
+// discipline as the consensus messages in internal/consensus/message.go:
 //
 //   - a leading tag byte (MsgType) discriminates the message union;
 //   - fixed-width integers are big-endian;
@@ -48,6 +49,9 @@ const (
 	MsgBlockSyncReq MsgType = 0x81
 	// MsgBlockSyncResp answers a request with the encoded blocks.
 	MsgBlockSyncResp MsgType = 0x82
+	// MsgPeerExchange advertises listening addresses (the M5 mesh), and is
+	// framed by peerexchange.go beside this file.
+	MsgPeerExchange MsgType = 0x83
 )
 
 // WireTagFloor is the lowest value the wire message union may use: every

@@ -162,6 +162,15 @@ type ValidatorConfig struct {
 	// consensus secret - the relay only compares bytes by length and equality
 	// - and an empty value keeps the previous behaviour.
 	RelayAccessToken []byte
+	// AllowLocalPeerHints is the DEVNET ACCEPTANCE EXCEPTION for PEER_EXCHANGE:
+	// it permits a hint naming a loopback, private or link-local address, which
+	// the default policy refuses (see validatePeerHint). It exists because the
+	// acceptance mesh runs every validator on one host behind 127.0.0.1, and a
+	// single-host devnet has no public address to advertise; the tests set it
+	// and say so. It is NOT set by the CLI and must never be set on a node
+	// whose reach extends beyond the operator's own machine: it is the one knob
+	// that turns a peer's hint into a dial at the operator's own network.
+	AllowLocalPeerHints bool
 	// TickEvery is the driver's tick cadence (zero: defaultTickEvery).
 	TickEvery time.Duration
 	// WaveEvery is the HELLO/catch-up cadence (zero: defaultWaveEvery).
@@ -243,6 +252,24 @@ type Validator struct {
 	syncQ       chan transport.Message
 	syncWG      sync.WaitGroup
 	syncDropped atomic.Uint64
+
+	// hints is the PEER_EXCHANGE dial book: the bounded set of addresses this
+	// node learned from peers and the per-wave adoption window. peerAdd is the
+	// ONE dial path it may use - tcp.TcpTransport.AddPeer in a running node,
+	// and a recording seam in the tests that must count dials without touching
+	// a network (it is a field so a raw dial cannot hide inside the handler).
+	hints   peerHints
+	peerAdd func(addr string) error
+
+	// The PEER_EXCHANGE observables. Adopted/refused/duplicate/over-budget
+	// describe the node's receive policy; sent describes its own advertising.
+	// None of them is a consensus signal (design decision 5).
+	hintsSeen       atomic.Uint64
+	hintsRefused    atomic.Uint64
+	hintsDuplicates atomic.Uint64
+	hintsAdopted    atomic.Uint64
+	hintsOverBudget atomic.Uint64
+	hintsSent       atomic.Uint64
 
 	// adopted counts blocks brought in by catch-up pulls: the observable a
 	// convergence test reads to prove the joiner ADOPTED rather than voted.
@@ -488,9 +515,13 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		cfgC:  ccfg,
 		drv:   drv,
 		dedup: dedup,
-		peerH: make(map[string]*peerAttestation),
-		syncQ: make(chan transport.Message, syncQueueDepth),
-		stop:  make(chan struct{}),
+		// The learned-address book starts empty; nothing is dialled from a hint
+		// until a peer advertises it through an attested connection.
+		hints:   peerHints{learned: make(map[string]struct{})},
+		peerAdd: tp.AddPeer,
+		peerH:   make(map[string]*peerAttestation),
+		syncQ:   make(chan transport.Message, syncQueueDepth),
+		stop:    make(chan struct{}),
 	}
 	// A BLOCK_SYNC request is answered by the bounded worker pool, never on
 	// the transport's dispatch goroutine (audit C-4): serving one costs disk
@@ -500,6 +531,10 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	tp.OnMessage(v.route)
 	// The router's height observer: the wave loop pulls from what this sees.
 	rt.OnHello = v.observeHello
+	// The mesh hint's observer. It applies the dial policy and calls AddPeer;
+	// it runs on the transport's dispatch goroutine, so it stays bounded - see
+	// observePeerExchange.
+	rt.OnPeerExchange = v.observePeerExchange
 	for i := 0; i < syncWorkers; i++ {
 		v.syncWG.Add(1)
 		go v.syncWorker()
@@ -663,16 +698,28 @@ func (v *Validator) tickLoop() {
 // from the tallest peer known to be ahead of us. It also prunes the dedup
 // seen-set below the committed height (audit N-7): Forget is bucket-grained,
 // so this is O(live heights) and the set cannot grow with the run.
+//
+// Every peerExchangeEveryWaves-th wave it also advertises this node's listening
+// address (PEER_EXCHANGE), which is what lets peers on the relay star find each
+// other directly. The cadence is a BOUND, not a nicety: an advertisement per
+// frame would make the message an amplifier, while a direct link is worth
+// forming within seconds rather than instantly (design decision 5: the mesh is
+// an optimization, the relay and the signed HELLO are the guarantees).
 func (v *Validator) waveLoop() {
 	defer v.wg.Done()
 	ticker := time.NewTicker(v.cfg.WaveEvery)
 	defer ticker.Stop()
+	waves := 0
 	for {
 		select {
 		case <-v.stop:
 			return
 		case <-ticker.C:
+			waves++
 			v.broadcastHello()
+			if waves%peerExchangeEveryWaves == 0 {
+				v.sendPeerExchange()
+			}
 			v.maybeCatchUp()
 			if v.dedup != nil {
 				v.dedup.Forget(v.ch.Height())

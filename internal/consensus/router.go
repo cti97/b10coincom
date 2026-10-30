@@ -89,6 +89,21 @@ type MessageRouter struct {
 	SendReply  func(peer transport.PeerID, frame []byte) error
 	OnHello    func(peer transport.PeerID, h *wire.Hello)
 	AsyncServe func(m transport.Message)
+	// OnPeerExchange, when non-nil, observes a decoded PEER_EXCHANGE frame:
+	// a list of listening addresses the sender claims it (or a peer it knows)
+	// can be reached at. It is a HINT, never a peer. The callback is where the
+	// node layer applies the dial policy - parse as IP:port, refuse the node's
+	// own address, the reserved relay:<addr> name and local addresses from a
+	// hint, deduplicate, and call transport.AddPeer (never a raw dial) - and it
+	// runs on the transport's dispatch goroutine, so it must not block.
+	//
+	// The frame is NOT signed and carries no consensus meaning. Its authority
+	// is the connection it arrived on; the node layer should therefore also
+	// require that the connection has carried a verified committee HELLO
+	// (devnet's observePeerExchange does), and nothing here may treat the
+	// addresses as evidence about the chain. Nil means such frames are counted
+	// and dropped.
+	OnPeerExchange func(peer transport.PeerID, p *wire.PeerExchange)
 	// Committee, when non-nil, is the validator set whose keys may carry a
 	// consensus frame. A vote or proposal whose key is absent from it is
 	// refused BEFORE any Ed25519 verification (audit C-8): the key set check
@@ -113,6 +128,10 @@ type MessageRouter struct {
 	servedReq atomic.Uint64
 	filed     atomic.Uint64
 	dups      atomic.Uint64
+	// peerExchanges counts PEER_EXCHANGE frames routed. It is an observable
+	// only: the message moves no consensus state, so the healthy number says
+	// how the mesh is forming, never whether the chain is advancing.
+	peerExchanges atomic.Uint64
 	// refused counts consensus-tagged frames this router refused before any
 	// signature verification: a non-member's key, or a vote whose height the
 	// live engine cannot judge. A steady nonzero count on a healthy committee
@@ -320,6 +339,21 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 		}
 		return false
 	}
+	// PEER_EXCHANGE: a list of listening addresses, consumed by the node
+	// layer's dial policy. It is NOT a consensus message and is deliberately
+	// not deduplicated: recording an address frame in the seen-set would let
+	// repeated advertisements evict real vote keys under the bucket ceiling,
+	// and there is no engine state it could double-apply (audit N-7's ordering
+	// is about verified votes and proposals, which this branch is disjoint
+	// from). A frame that decodes as nothing still reaches the unknown counter
+	// below, so silence stays the posture for garbage.
+	if p, err := wire.DecodePeerExchange(m.Data); err == nil {
+		r.peerExchanges.Add(1)
+		if r.OnPeerExchange != nil {
+			r.OnPeerExchange(m.From, p)
+		}
+		return false
+	}
 	r.unknown.Add(1)
 	return false
 }
@@ -343,6 +377,12 @@ func (r *MessageRouter) NoteServed() { r.servedReq.Add(1) }
 // SyncRepliesFiled reports how many BLOCK_SYNC responses were routed into the
 // local syncer's reply slot.
 func (r *MessageRouter) SyncRepliesFiled() uint64 { return r.filed.Load() }
+
+// PeerExchangesSeen reports how many PEER_EXCHANGE frames were routed. The
+// message carries no consensus meaning, so this is a mesh-formation observable
+// and never a liveness signal: a zero count on a mesh run means the nodes are
+// not advertising, not that consensus is broken.
+func (r *MessageRouter) PeerExchangesSeen() uint64 { return r.peerExchanges.Load() }
 
 // DuplicatesDropped reports how many VERIFIED consensus messages were refused
 // because their dedup key had already been recorded. Zero is healthy in the

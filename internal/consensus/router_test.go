@@ -86,6 +86,7 @@ func TestWireTagsAreDisjointFromConsensusTags(t *testing.T) {
 		"MsgHello":         wire.MsgHello,
 		"MsgBlockSyncReq":  wire.MsgBlockSyncReq,
 		"MsgBlockSyncResp": wire.MsgBlockSyncResp,
+		"MsgPeerExchange":  wire.MsgPeerExchange,
 	}
 	consensusTags := map[string]MsgType{
 		"MsgProposal":  MsgProposal,
@@ -277,6 +278,21 @@ func TestTheRouterNeverMisroutesWireFrames(t *testing.T) {
 	}
 	if got := rig.rt.SyncRepliesFiled(); got != 1 {
 		t.Fatalf("response filed %d times, want 1", got)
+	}
+
+	// PEER_EXCHANGE (tag 0x83, above both earlier unions): the node layer's
+	// hint observer sees it and the engine does not, and it is not mistaken for
+	// any of the three above.
+	observed := 0
+	rig.rt.OnPeerExchange = func(transport.PeerID, *wire.PeerExchange) { observed++ }
+	if got := rig.rt.Route(transport.Message{From: "v0", Data: wire.EncodePeerExchange(&wire.PeerExchange{Addrs: []string{"203.0.113.4:6001"}})}); got {
+		t.Fatal("a PEER_EXCHANGE frame was routed to the engine")
+	}
+	if observed != 1 {
+		t.Fatalf("the hint observer saw %d frames, want 1", observed)
+	}
+	if got := rig.rt.PeerExchangesSeen(); got != 1 {
+		t.Fatalf("PeerExchangesSeen = %d, want 1", got)
 	}
 }
 
