@@ -628,6 +628,44 @@ To update a binary: overwrite `/opt/b10coin/b10coin` (§2's `install`) and
 `sudo systemctl restart b10coin` on each machine — **all machines from the
 same build**, for the §3 reason.
 
+> **⚠️ Restart the committee TOGETHER — a rolling reboot can hold the chain
+> down for minutes.** Each round at an undecided height is given
+> `200 ms + 100 ms × round`, with no cap, and that growth is what lets
+> validators whose rounds have drifted apart converge again: the one further
+> behind fires sooner and gains a round at a time. A restart that leaves the
+> members' rounds apart — one Pi at a time, or one unit a few seconds before
+> the others — therefore hands the committee a round gap that only the ladder
+> can close, and **the wait grows with how far the rounds ran**: a one-round
+> gap at round 40 takes about 13 s, a five-round gap there about 25 minutes
+> (the arithmetic is in `internal/consensus/driver.go` and the main README's
+> [Consensus](../../README.md#consensus)). A four-seat committee with one
+> seat without a node is the slow shape: the round-resync jump needs 2 of the
+> 4 seats' power, so one live seat that has run ahead cannot pull the others
+> forward, and the ladder is the only closer. The 2026-10-30 Docker re-run
+> measured exactly this: restarting three seated validators one at a time
+> left a four-seat chain at one head for 4 to 6.5 minutes, twice.
+>
+> - **Do:** restart all three nodes within one block time (a few seconds of
+>   each other) — `sudo systemctl restart b10coin` back to back on the three
+>   machines, or reboot the Pis together.
+> - **Expect if you cannot:** safety is unaffected and no node diverges; the
+>   chain stops finalising until the ladder closes the gap, then resumes. A
+>   node now says so, once per stuck height, as soon as the stall is real, so
+>   it is no longer silent (example — the height is wherever the chain was):
+>
+>   ```
+>   b10coin: no block for 8 rounds at height 4177 (round 8, step propose): quorum reachable with 3 of 4 power (quorum 3), yet nothing commits; peers=2[seat1/v1 h=4177, seat2/v2 h=4177]; tallies r7 (last round with a vote): proposal=absent; prevote votes=3 power=3 quorum=3 nil=3 ids=[00000000:3]; precommit votes=0 power=0 quorum=3 nil=0; selfprevote=nil; the round ladder is the only closer for a round divergence here, so a rolling restart can hold this for minutes - restart the committee together or expect the delay (README: rolling restart)
+>   ```
+>
+>   Read it as "the committee this node can reach could commit and is not".
+>   `peers=` counts signed member identities, so it survives the relay (where
+>   every member shares one transport name). The `tallies` are the newest
+>   round that holds a vote: nil prevotes from every live seat mean the
+>   committee agrees there is nothing to commit and is merely out of step,
+>   while an empty tally means frames are not arriving. A node that cannot
+>   reach quorum says nothing — with its peers gone, a stall is expected, not
+>   a fault.
+
 ## 7. Exactly what output means success
 
 Success is **agreement — the same finalized history on all three Pis** — not

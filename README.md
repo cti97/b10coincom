@@ -243,6 +243,9 @@ seeds, which is exactly what makes these runs deterministic and reproducible
 | `--blocks N` | `100` | number of blocks to produce (must be > 0) |
 | `--claims N` | `1` | faucet-claim attempts after the block loop (single-node run only); each paid claim is followed by the same key's same-epoch double claim, which must be refused (a run that sees the double claim applied fails) |
 | `--validators N` | *unset (single node)* | committee size; omitting the flag keeps the M0–M2 single-node run as it shipped, and any explicit value — `1` included — runs the consensus committee of that size |
+| `--epoch-blocks N` | `0` (the compiled-in length) | epoch length in blocks for **both** the committee epoch (0-based) and the faucet claim epoch (1-based), overridden in the genesis before hashing; `--dir` built at another length is refused by the store rather than silently reused. Use `40` with `--validators 6 --blocks 105` to cross two rotation boundaries in a short run |
+| `--rotate-demo` | `off` | rotation fixture (needs `--validators` ≥ 5, `--epoch-blocks` ≥ 4, `--blocks` > `--epoch-blocks`, not with `--claims`): one seat unbonds mid-epoch through an ordinary `Unbond` transaction and leaves at the boundary, so 6 seats become 5 and every validator must still hold one history |
+| `--plot-nakamoto` | `off` | print the Nakamoto coefficient per epoch boundary plus the head, computed from **committed state** (needs `--validators`; the threshold is 1/3, the BFT figure, not 1/2) |
 | `--dir PATH` | *fresh temporary directory* | data directory; a temporary one is deleted afterwards, an explicit path is kept (multi-validator runs lay out one chain per validator under `PATH/v0`, `PATH/v1`, …) |
 
 ### `b10coin keygen`
@@ -781,6 +784,24 @@ rather than in round still catches up through BLOCK_SYNC). The measured
 numbers and the choice of the linear ladder over the slower sub-linear
 alternatives are recorded in `internal/consensus/driver.go`.
 
+**A rolling restart is the everyday way to meet that limit.** Restarting a
+committee's validators one at a time leaves their rounds apart, and only the
+ladder closes the gap. In the 2026-10-30 Docker re-run a four-seat chain with
+one seat without a node sat at one head for 4 to 6.5 minutes after a rolling
+restart — twice — and recovered only once the nodes were restarted together.
+Recovery depends on the round the divergence reaches, not only on the gap:
+measured on the constructed three-of-four state (one live seat ahead), a
+one-round gap starting at round 40 commits after about 13 s and a five-round
+gap after about 26 minutes, both slower than the same gaps starting near round
+16. So restart the members within one block time of each other, or expect the
+wait; [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
+has the operator's version. A node that has spent eight rounds at one height
+while the seats it can reach hold a quorum now says so, once per height:
+`b10coin: no block for 8 rounds at height H (round R, step S): quorum reachable
+with P of T power (quorum Q), yet nothing commits; peers=…; tallies …` — with
+the per-round vote tallies and the peers it sees, so the stall is no longer
+silent.
+
 Three rules carry the safety, and all three are about the arithmetic of
 distrust:
 
@@ -1210,7 +1231,14 @@ One operational limit to know before the Pi run: the timeout ladder is
 unbounded, so an outage that leaves one live seat a round ahead can hold the
 chain effectively down for minutes (or, for a deep divergence, days) while the
 round gap closes. It is a liveness limit, not a safety one — see
-[Consensus](#consensus).
+[Consensus](#consensus). The everyday case is a **rolling restart**: restart
+the three Pis within one block time of each other (back-to-back `systemctl
+restart`, or reboot them together), because a one-at-a-time restart leaves
+their rounds apart and can keep the chain at one head for minutes — the
+2026-10-30 Docker re-run measured 4 to 6.5 minutes. A node now logs the stall
+once per height (`b10coin: no block for 8 rounds at height …`), and
+[`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
+has the operator's procedure.
 
 After the Pis are running, the acceptance run itself becomes one command:
 

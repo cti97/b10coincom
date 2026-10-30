@@ -76,10 +76,18 @@ jobs:
       # with the flag's default unnoticed. The third is M3's: four validators
       # must AGREE, not merely each produce blocks — the multi-validator
       # devnet reports each validator's final height and fails the job unless
-      # the validators hold one history.
+      # the validators hold one history. The fourth is M5's rotation: one seat
+      # unbonds mid-epoch, six seats become five at the boundary, and the
+      # Nakamoto coefficient is computed from committed state at each one. It
+      # was missing here while the README claimed four (M5 re-run, 2026-10-30).
+      # It adds about 8 s (measured: 105 blocks, six in-process validators, two
+      # rotation boundaries) to a job already running the suite and the race
+      # suite, so keeping the milestone check is far cheaper than deleting it
+      # from the README to make the count true.
       - run: go run ./cmd/b10coin devnet --blocks 100
       - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1
       - run: go run ./cmd/b10coin devnet --validators 4 --blocks 100
+      - run: go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto
 
   # The supply-chain/lint gate (the audit's B-1): formatting, module hygiene,
   # staticcheck and govulncheck. The two external tools are pinned by exact
