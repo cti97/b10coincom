@@ -7,6 +7,12 @@
 #     scripts/deploy/acceptance.sh --pis pi-a.local,pi-b.example.net,pi-c.example.net \
 #                                  --relay relay.example.net
 #
+# It also judges a TWO-validator reading, because the fault recipes in deploy
+# README §8 are stated that way: stop one seat of a three-seat network and ask
+# whether "the two survivors are STALLED". A harness that refused two could not
+# produce that verdict at all (audit L-2). Three remains the M4 acceptance
+# criterion, and a two-validator run says so in its own output.
+#
 # What it checks, in order:
 #
 #   1. REACHABILITY  every validator answers RPC GET /status. The RPC binds
@@ -80,20 +86,27 @@ FETCH_TIMEOUT=8         # per-HTTP-request bound, seconds
 
 usage() {
     cat <<EOF
-$PROG — the b10coin M4 acceptance harness (three Pis finalising one chain).
+$PROG — the b10coin M4 acceptance harness (three Pis finalising one chain; a
+two-validator list judges the survivors of a three-seat network).
 
 Usage:
   $PROG --pis HOST[,HOST...] [--relay RELAYHOST[:PORT]] [options]
 
-  --pis LIST        comma-separated validators (FEWER THAN THREE is REFUSED:
-                    the M4 criterion is three validators finalising one chain,
-                    so one or two cannot produce the acceptance verdict even if
-                    they agree). In ssh mode (default) each entry
+  --pis LIST        comma-separated validators (FEWER THAN TWO is REFUSED: a
+                    one-validator reading cannot tell a finalising chain from a
+                    stalled one. THREE is the M4 acceptance criterion; a
+                    two-validator list is the legitimate reading of the
+                    SURVIVORS of a three-seat network minus one, which is how
+                    deploy README §8 states its fault recipes). In ssh mode
+                    (default) each entry
                     is [user@]host — a user@ prefix overrides --ssh-user —
                     and its RPC is read over SSH at
                     http://127.0.0.1:<http-port>/status (the RPC is
                     loopback-only). In http mode each entry is host[:port],
                     queried directly — for direct-peer and loopback runs.
+                    host, host:<http-port> and user@host name ONE validator: a
+                    list that repeats a machine under two spellings is refused,
+                    not counted twice.
   --relay ADDR      the VPS relay from deploy README §4, host[:7001]. Probed
                     with a plain bounded TCP connect from THIS machine. Omit
                     for runs with no relay (direct --peers setups).
@@ -150,6 +163,23 @@ case $PROBE_TIMEOUT in *[!0-9]*|"") die_usage "--relay-timeout must be seconds (
 [ "$PROBE_TIMEOUT" -ge 1 ] || die_usage "--relay-timeout must be at least 1 s"
 [ -n "$PIS_ARG" ] || die_usage "--pis is required (comma-separated validator hosts)"
 
+# validator_key ENTRY — the identity two --pis spellings share when they name
+# ONE validator. `host`, `host:<http-port>` and `user@host` all reach the same
+# node's RPC: the port is the one this script itself supplies (the effective
+# --http-port, or the loopback port in ssh mode), and an ssh user picks the
+# login, not the machine. Without this, `pi-a,pi-a:8645` counted as TWO
+# validators, which could turn a two-node reading into a three-node-looking PASS
+# (audit L-2). A NON-default port is kept: `host:9000` is a different endpoint.
+# DNS names are case-insensitive, so the key is lowercased.
+validator_key() {
+    local k=$1
+    k=${k##*@}                                  # drop an ssh user prefix
+    case $k in
+        *":$HTTP_PORT") k=${k%":$HTTP_PORT"} ;;  # the port this script would add
+    esac
+    printf '%s' "$k" | tr '[:upper:]' '[:lower:]'
+}
+
 # split --pis on commas into PIS, trimming, dropping empties, rejecting dups
 PIS=()
 _seen=","
@@ -157,16 +187,21 @@ OLDIFS=$IFS; IFS=,
 for raw in $PIS_ARG; do
     t=${raw#"${raw%%[![:space:]]*}"}; t=${t%"${t##*[![:space:]]}"}
     [ -n "$t" ] || continue
-    case $_seen in *",$t,"*) die_usage "duplicate validator '$t' in --pis" ;; esac
-    PIS+=("$t"); _seen="$_seen$t,"
+    _key=$(validator_key "$t")
+    case $_seen in *",$_key,"*)
+        die_usage "duplicate validator '$t' in --pis: '$t' and an earlier entry name the same machine (host, host:$HTTP_PORT and user@host are one validator)" ;;
+    esac
+    PIS+=("$t"); _seen="$_seen$_key,"
 done
 IFS=$OLDIFS
 [ ${#PIS[@]} -ge 1 ] || die_usage "--pis named no validators"
-# One validator can never demonstrate the acceptance criterion (three
-# validators finalising ONE chain), and a one-entry --pis is almost always a
-# truncation or typo — a usage error, failed before any probing, not a verdict
-# that could look like evidence.
-[ ${#PIS[@]} -ge 3 ] || die_usage "--pis named ${#PIS[@]} validator(s) — the M4 criterion is THREE validators finalising one chain, so fewer cannot produce the acceptance verdict even if they agree; is the list truncated?"
+# Two validators are the legitimate reading of the SURVIVORS of a three-seat
+# network minus one — the fault recipes in deploy README §8 are written that
+# way, and a harness that refuses two cannot judge them (audit L-2). One
+# validator can never distinguish a finalising chain from a stalled one, so that
+# stays a usage error, failed before any probing rather than looking like
+# evidence.
+[ ${#PIS[@]} -ge 2 ] || die_usage "--pis named ${#PIS[@]} validator(s) — this harness judges a chain from at least TWO validators (the survivors of a 3-seat network minus one); one validator cannot tell a finalising chain from a stalled one"
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -351,6 +386,10 @@ SECOND_RUN=no
 echo "=== b10coin M4 acceptance check ==="
 echo "time        $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "validators  $N: ${PIS[*]}"
+if [ "$N" -lt 3 ]; then
+    echo "note        $N validators: a PARTIAL reading — three is M4's acceptance criterion; two is"
+    echo "            the survivors of a 3-seat network minus one (deploy README §8)"
+fi
 if [ "$MODE" = ssh ]; then
     echo "mode        ssh — each validator's RPC is read on its own loopback (port $HTTP_PORT), as in deploy README §7"
 else
@@ -600,6 +639,10 @@ else
     echo "VERDICT: PASS — $N validators on chain ${CH[0]}, every height increased during the ${ADVANCE_WAIT}s wait, and all"
     echo "  report the identical block at height $COMMON_H: the committee finalises ONE shared chain. M4's criterion —"
     echo "  validators finalising blocks — holds for the machines named above; paste this entire output."
+    if [ "$N" -lt 3 ]; then
+        echo "  NOTE: this is a $N-validator reading, not the three-validator acceptance criterion. It is what the"
+        echo "  survivors of a 3-seat network minus one produce; quote the stopped validator's log beside it."
+    fi
 fi
 
 exit $CODE
