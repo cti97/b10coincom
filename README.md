@@ -401,9 +401,9 @@ appending to one store is not a client design.
 
 | Verb | Flags | Transaction |
 |---|---|---|
-| `stake` | `--node URL --key PATH --amount 1000` | `Bond` (tag 3): moves `amount` b10 from the spendable balance into the key's bond, paying `min_fee_sparks` |
-| `unstake` | `--node URL --key PATH [--amount 1000]` | `Unbond` (tag 4): moves all (the default) or part of the bond into an unbonding record; a partial exit must leave at least `MIN_STAKE` bonded; fee 0 by consensus rule |
-| `withdraw` | `--node URL --key PATH` | `Withdraw` (tag 5): releases **every** matured unbonding record to the spendable balance; fee 0 by consensus rule |
+| `stake` | `--node URL --key PATH --amount 1000 [--max-fee SPARKS] [--yes \| --dry-run]` | `Bond` (tag 3): moves `amount` b10 from the spendable balance into the key's bond, paying `min_fee_sparks` |
+| `unstake` | `--node URL --key PATH [--amount 1000] [--yes \| --dry-run]` | `Unbond` (tag 4): moves all (the default) or part of the bond into an unbonding record; a partial exit must leave at least `MIN_STAKE` bonded; fee 0 by consensus rule |
+| `withdraw` | `--node URL --key PATH [--yes \| --dry-run]` | `Withdraw` (tag 5): releases **every** matured unbonding record to the spendable balance; fee 0 by consensus rule |
 
 `--amount` is b10 as an exact decimal, parsed by integer arithmetic (no float
 ever holds an amount); the transaction carries sparks. `stake` refuses an amount
@@ -411,17 +411,61 @@ below the node's `min_stake_sparks` and a bond the balance cannot cover, before
 submitting; `unstake` refuses more than is bonded, and refuses a partial exit
 that would leave a bond under `MIN_STAKE` — the state's candidacy floor, so the
 verb and the chain refuse the same remainders; `withdraw` refuses while no
-record has matured and names the next release height. Neither verb waits for
-inclusion: a bond is a transaction, and a *seat* changes only at the next epoch
-boundary, so "nothing happened yet" is correct for up to an epoch. Example, from
-the live run in [Staking](#staking):
+record has matured and names the next release height. None of the verbs waits
+for inclusion: a bond is a transaction, and a *seat* changes only at the next
+epoch boundary, so "nothing happened yet" is correct for up to an epoch.
+
+**Every verb builds the transaction, prints it, and only then signs — after a
+confirmation.** Type `yes` at the terminal prompt, or pass `--yes` when stdin
+is not a terminal (a script, cron, CI); a run with no terminal and no `--yes`
+prints the transaction and then refuses. `--dry-run` builds and prints, then
+stops: nothing is signed and nothing is posted. The preview is printed **from
+the bytes that get signed**: the hex on stdout is the unsigned canonical
+encoding, the POSTed bytes are exactly those bytes plus the signature, and the
+human-readable fields are decoded from the same bytes, so the summary cannot
+disagree with what was authorized.
+
+**The fee ceiling defaults to 1 spark.** That number is derived, not rounded:
+both shipped chains set `min_fee_sparks = 1` (`genesis.sharedParams`, which the
+devnet and testnet share), the mempool judges a fee only as "at least the
+state's minimum" and `Take` hands transactions to a block in arrival order (no
+fee market at this milestone, so a larger fee buys no earlier admission), and
+`state.applyBond` charges the fee to the sender without crediting anyone — the
+extra is burned. One spark is therefore the entire cost of admission and
+anything above it destroys value for nothing. `--max-fee SPARKS` raises the
+ceiling for a chain whose genesis really sets a higher minimum; a node asking
+for more is refused before any signature exists.
+
+What the ceiling does **not** fix: the nonce, balance, bond and genesis hash
+still come from the node the verb is pointed at, and the CLI has no independent
+copy of them. The preview makes them visible instead of silent — the nonce is
+labelled the node's claim, and with no `--amount` an unbond says its amount is
+*the whole bond as this node reports it*, with an under-report making it a
+partial exit. A lying node can therefore still delay a bond with a future
+nonce, turn a full exit into a partial one by under-reporting the bond (or
+refuse a full `--amount` exit by reporting a bond below it), or make the
+transaction invalid by misreporting the genesis hash. What it can no longer do
+is choose the fee: the default bounds that loss to one spark, and the
+confirmation shows the number before anything is signed.
+
+Example, from the live run in [Staking](#staking):
 
 ```text
 $ b10coin stake --node http://127.0.0.1:8645 --key b10coin.key --amount 1000
-bond        1000 b10 (100000000000 sparks)
-from        b10n6bx7wjzbjlw4xd5aqbo5jp27uq5yxhcziim7dy
-nonce       0
-fee         1 spark
+transaction to sign (built, not yet signed):
+  type        bond (3)
+  from        b10n6bx7wjzbjlw4xd5aqbo5jp27uq5yxhcziim7dy
+  public key  9f2c0e5a1d7b4386c9e2f0ab5d31c8e7a64b09df2c1e8a37b5d04f6c9a1e2b3d
+  nonce       0  (the node's claim)
+  fee         1 spark  (the node's claim; ceiling 1)
+  amount      100000000000 sparks (1000 b10)  (from --amount)
+  genesis     bb884a8c1a688674dd329b1effd4551fba01fbf277f37d73f45bdf0053515111  (the node's claim; the signature is bound to it)
+  bytes       03de98c0af74f66fcf8f2fbb7bd876ce6848b5b15c20595a3002843c7001986d530a75f3b22301018390eab909d88096b241c9c99f2d00000000000000000000000000000001000000174876e80000
+  nonce, fee and genesis above come from http://127.0.0.1:8645 and this CLI cannot check
+  them: a node reporting a future nonce builds a bond that applies later,
+  and one under-reporting the bond makes an exit partial. Only --amount
+  (when given) and the signing key are yours.
+Type "yes" to sign and post this transaction: yes
 txid        5586cdb24337ea3d0f1a9989777f0057bb74a3b6d66caeea1ef788f24bba47af
 the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every 1000 blocks), never mid-epoch.
 ```

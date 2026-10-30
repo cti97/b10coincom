@@ -2,11 +2,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -83,9 +85,12 @@ Usage:
                  --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
-  b10coin stake  --node URL --key PATH --amount 1000    Bond b10 to this key's committee seat (signed tx)
-  b10coin unstake --node URL --key PATH [--amount 1000] Unbond all or part of the bond; a partial exit must leave MIN_STAKE or nothing
-  b10coin withdraw --node URL --key PATH                Release matured unbonding records to the spendable balance
+  b10coin stake  --node URL --key PATH --amount 1000 [--max-fee SPARKS] [--yes | --dry-run]
+                                                        Bond b10 to this key's committee seat (signed tx, printed first)
+  b10coin unstake --node URL --key PATH [--amount 1000] [--yes | --dry-run]
+                                                        Unbond all or part of the bond; a partial exit must leave MIN_STAKE or nothing
+  b10coin withdraw --node URL --key PATH [--yes | --dry-run]
+                                                        Release matured unbonding records to the spendable balance
   b10coin version
 
 A node with --peers/--relay/--listen runs the M4 consensus committee over real
@@ -126,6 +131,22 @@ one claim per key per epoch (1 b10 on the devnet parameters, 100 b10 on the
 testnet parameters), and claim signs with an ephemeral key it never saves. See
 README "Staking" for the arithmetic and for the one pre-funded fixture account
 a local devnet ships.
+
+Every staking verb BUILDS the transaction, prints its fields and its canonical
+bytes, and only then signs - after a confirmation: type "yes" at the prompt,
+or pass --yes when stdin is not an interactive terminal. --dry-run prints the
+transaction and stops without signing and without posting. The fee ceiling
+defaults to 1 spark because that is min_fee_sparks on every shipped genesis and
+a fee above it buys nothing: the mempool admits on nonce and state rather than
+on price, and applyBond burns the whole fee. --max-fee SPARKS raises the
+ceiling; a node asking for more than one spark is refused by default.
+WHAT THIS DOES NOT FIX: the nonce, balance, bond and genesis hash still come
+from the node the verb is pointed at, and the CLI has no independent copy of
+them. The printed transaction makes them visible instead of silent, so a lying
+node can still delay a bond with a future nonce, turn a full exit into a
+partial one by under-reporting the bond, or make the transaction invalid by
+misreporting the genesis hash - but it can no longer choose the fee, and the
+default ceiling bounds that loss to one spark.
 `)
 }
 
@@ -504,6 +525,52 @@ type stakingUnbondingRec struct {
 	ReleaseHeight uint64 `json:"release_height"`
 }
 
+// defaultMaxFeeSparks is the ceiling on the fee a staking verb will sign unless
+// --max-fee raises it. The number is DERIVED from the shipped chains, not
+// rounded:
+//
+//   - every shipped genesis sets MinFeeSparks = 1 (genesis.sharedParams, which
+//     the devnet and the testnet both use and every simnet genesis wraps), and
+//     genesis.Validate refuses a zero minimum;
+//   - one spark is the WHOLE admission price. internal/mempool judges a fee
+//     only as "at least the state's minimum" (admitNonClaim) and Mempool.Take
+//     hands transactions to a block in arrival order, so this milestone has no
+//     fee market: a larger fee buys no earlier admission and no better
+//     position;
+//   - state.applyBond subtracts the fee from the sender's balance and credits
+//     it to nobody, so every spark above the minimum is simply burned.
+//
+// An honest node therefore never charges more than one spark, and a node that
+// asks for more is either misconfigured or running the CL-1 attack (report
+// fee = balance - amount so the bond burns the whole spendable balance). A
+// chain whose genesis really does set a higher minimum is usable with
+// --max-fee SPARKS.
+const defaultMaxFeeSparks uint64 = 1
+
+// maxFeeHelp is shared by the verbs so the help text cannot drift from the
+// ceiling's derivation.
+const maxFeeHelp = "ceiling on the signed fee, in sparks (uint64, never b10). The default 1 is min_fee_sparks on every shipped genesis and is also the whole admission price (the mempool does not price transactions and applyBond burns the fee, so a higher fee buys nothing); a node that asks for more is refused unless this raises it"
+
+// stakingTxOptions is the confirmation surface the three staking verbs share.
+type stakingTxOptions struct {
+	// maxFee is the ceiling on the signed fee, in sparks. An exit's fee is
+	// fixed at 0 by consensus (state.applyUnbond, state.applyWithdraw), so
+	// the exits pass 0: any non-zero fee they somehow built would be refused.
+	maxFee uint64
+	// yes is --yes: sign and post without asking, for a non-interactive run.
+	yes bool
+	// dryRun is --dry-run: build and print, then stop. Nothing is signed and
+	// nothing is posted.
+	dryRun bool
+}
+
+// addTxConfirmationFlags registers the two flags every verb shares.
+func addTxConfirmationFlags(fs *flag.FlagSet) (yes, dryRun *bool) {
+	yes = fs.Bool("yes", false, "confirm and sign without a terminal prompt; required when stdin is not an interactive terminal (a script, cron, CI)")
+	dryRun = fs.Bool("dry-run", false, "build and print the transaction, then stop: nothing is signed and nothing is posted")
+	return yes, dryRun
+}
+
 // stakingTarget is one node plus the key the verb signs with, already vetted:
 // the key file loaded, the node's chain identity parsed, and the account read
 // and checked to be the one this key signs as.
@@ -558,14 +625,197 @@ func connectStakingNode(nodeURL, keyPath string) (*stakingTarget, error) {
 	return &stakingTarget{base: base, priv: priv, pub: pub, addr: addr, status: st, account: acc, genesis: gh}, nil
 }
 
-// submit signs the transaction against the genesis hash the NODE reported and
-// posts the canonical encoding. This is the same chain binding and the same
-// encode/decode path a transfer uses: a transaction signed for another chain
-// fails the node's VerifySignature and is never admitted.
-func (t *stakingTarget) submit(tx *types.Tx) (string, error) {
-	hash := tx.SigningHash(t.genesis)
-	tx.Sig = crypto.Sign(t.priv, hash[:])
-	return postTxHex(t.base+"/tx", tx.Encode())
+// txProvenance records where the preview's non-byte facts came from, so the
+// reader can tell an operator's own --amount from a node's claim.
+type txProvenance struct {
+	amount string // where a bond/unbond Amount came from
+	note   string // an optional node-supplied fact worth showing (a withdraw payout)
+}
+
+// builtTx is one fully built transaction, read back from its own canonical
+// bytes. submit builds it ONCE and both prints and signs THIS value, so the
+// transaction a user reads is the transaction that receives the signature -
+// never a re-rendered summary that could disagree with the signed bytes
+// (audit CL-1).
+type builtTx struct {
+	raw []byte
+	tx  *types.Tx // decoded from raw
+}
+
+// buildTx encodes tx once and decodes those bytes back. Everything printed and
+// signed afterwards is derived from the decode, so a divergence between what
+// is displayed and what is signed is not representable.
+func buildTx(tx *types.Tx) (*builtTx, error) {
+	raw := tx.Encode()
+	back, err := types.DecodeTx(raw)
+	if err != nil {
+		return nil, fmt.Errorf("the transaction this verb built does not decode: %w", err)
+	}
+	return &builtTx{raw: raw, tx: back}, nil
+}
+
+// txTypeLabel names a transaction type for the preview.
+func txTypeLabel(t types.TxType) string {
+	switch t {
+	case types.TxTransfer:
+		return "transfer"
+	case types.TxFaucetClaim:
+		return "faucet claim"
+	case types.TxBond:
+		return "bond"
+	case types.TxUnbond:
+		return "unbond"
+	case types.TxWithdraw:
+		return "withdraw"
+	}
+	return "unknown"
+}
+
+// print writes the transaction that will be signed. Each field is read from
+// b.tx (decoded from b.raw) and b.raw is printed verbatim, so the hex a reader
+// can decode offline is the same byte string the signature will cover.
+// genesisHash, node and prov are annotated as what they are - facts the NODE
+// supplied, or the operator's own --amount - so a reader can tell which values
+// this CLI could check and which it merely echoes.
+func (b *builtTx) print(w io.Writer, genesisHash [32]byte, node string, prov txProvenance, maxFee uint64) {
+	fmt.Fprintf(w, "transaction to sign (built, not yet signed):\n")
+	fmt.Fprintf(w, "  type        %s (%d)\n", txTypeLabel(b.tx.Type), b.tx.Type)
+	fmt.Fprintf(w, "  from        %s\n", b.tx.From)
+	fmt.Fprintf(w, "  public key  %x\n", b.tx.PubKey)
+	fmt.Fprintf(w, "  nonce       %d  (the node's claim)\n", b.tx.Nonce)
+	if b.tx.Type == types.TxBond {
+		fmt.Fprintf(w, "  fee         %d spark  (the node's claim; ceiling %d)\n", b.tx.Fee, maxFee)
+	} else {
+		// An exit's fee is not a node claim: state.applyUnbond and
+		// state.applyWithdraw refuse anything but 0. Saying "the node's claim"
+		// here would be false.
+		fmt.Fprintf(w, "  fee         %d spark  (fixed at 0 by consensus: an exit is free)\n", b.tx.Fee)
+	}
+	if b.tx.Type == types.TxBond || b.tx.Type == types.TxUnbond {
+		fmt.Fprintf(w, "  amount      %d sparks (%s b10)  (%s)\n",
+			b.tx.Amount, genesis.FormatB10(b.tx.Amount), prov.amount)
+	}
+	if prov.note != "" {
+		fmt.Fprintf(w, "  node says   %s\n", prov.note)
+	}
+	fmt.Fprintf(w, "  genesis     %x  (the node's claim; the signature is bound to it)\n", genesisHash)
+	fmt.Fprintf(w, "  bytes       %x\n", b.raw)
+	if b.tx.Type == types.TxBond {
+		fmt.Fprintf(w, "  the nonce, fee and genesis above come from %s and this CLI cannot\n", node)
+	} else {
+		fmt.Fprintf(w, "  the nonce and genesis above come from %s and this CLI cannot\n", node)
+	}
+	fmt.Fprintf(w, "  check them: a node reporting a future nonce builds a bond that applies later,\n")
+	fmt.Fprintf(w, "  and one under-reporting the bond makes an exit partial. Only --amount\n")
+	fmt.Fprintf(w, "  (when given) and the signing key are yours.\n")
+}
+
+// errNoAnswer means the confirmation question had no answer: stdin is not an
+// interactive terminal (a pipe, a file, cron) or it closed.
+var errNoAnswer = errors.New("stdin is not an interactive terminal, or it closed before an answer")
+
+// stdinIsTerminal reports whether f is an interactive terminal. A real terminal
+// is a character device; /dev/null is one too (and is what `go test`, cron and
+// CI hand a process), so identity with the null device is excluded explicitly.
+// Reading is still what decides: an empty answer is a refusal whatever the
+// device was, because EOF must never look like consent.
+func stdinIsTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	if null, err := os.Stat(os.DevNull); err == nil && os.SameFile(fi, null) {
+		return false
+	}
+	return true
+}
+
+// askConfirmation is the interactive half of the confirmation boundary, kept
+// as a variable so a test can construct the TTY/no-TTY states instead of
+// provoking them through a timing race.
+var askConfirmation = func() (string, error) {
+	if !stdinIsTerminal(os.Stdin) {
+		return "", errNoAnswer
+	}
+	fmt.Fprint(os.Stderr, `Type "yes" to sign and post this transaction: `)
+	// A partial line without a trailing newline is still an answer; an empty
+	// line is a refusal whether the read returned EOF or nothing. Ignoring the
+	// error here is deliberate, and it is why EOF (/dev/null, a closed pipe)
+	// can never be mistaken for consent.
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if line == "" {
+		return "", errNoAnswer
+	}
+	return line, nil
+}
+
+// confirmTransaction is the trust boundary the audit asked for: a staking
+// transaction is not signed merely because a command line was typed. --yes
+// states the confirmation explicitly; otherwise a terminal must answer "yes".
+// Any other answer, or no terminal, refuses BEFORE Sign is called.
+func confirmTransaction(yes bool) error {
+	if yes {
+		return nil
+	}
+	answer, err := askConfirmation()
+	if err != nil {
+		return fmt.Errorf("refusing to sign: nothing was signed because this run cannot confirm the transaction (%w). Re-run with --yes to confirm non-interactively, or with --dry-run to print it without signing", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(answer), "yes") {
+		return fmt.Errorf("refusing to sign: nothing was signed; the answer was %q, not %q", strings.TrimSpace(answer), "yes")
+	}
+	return nil
+}
+
+// feeCeilingReason explains the ceiling in a refusal, with the number's origin.
+func feeCeilingReason(maxFee uint64) string {
+	if maxFee == defaultMaxFeeSparks {
+		return fmt.Sprintf("the default ceiling of %d spark: every shipped genesis sets min_fee_sparks to 1, the mempool does not price transactions, and applyBond burns the whole fee, so a higher fee buys nothing", defaultMaxFeeSparks)
+	}
+	return fmt.Sprintf("the ceiling of %d spark this run set with --max-fee", maxFee)
+}
+
+// submit is the ONLY path from a built staking transaction to a signature. It
+// builds the transaction once, prints those bytes, enforces the fee ceiling on
+// the fee read back from them, honours --dry-run, and asks for confirmation -
+// all before Sign. posted=false means nothing was signed and nothing was sent:
+// either a dry run (no error) or a refusal (an error).
+func (t *stakingTarget) submit(tx *types.Tx, o stakingTxOptions, prov txProvenance) (txid string, posted bool, err error) {
+	built, err := buildTx(tx)
+	if err != nil {
+		return "", false, err
+	}
+
+	// PRINT BEFORE SIGNING, FROM THE SAME BYTES THAT WILL BE SIGNED.
+	built.print(os.Stdout, t.genesis, t.base, prov, o.maxFee)
+
+	// The ceiling is enforced on the fee read back from the printed bytes,
+	// before any signature exists. It must not depend on the reported
+	// min_fee_sparks being honest: the ceiling is this CLI's own number.
+	if built.tx.Fee > o.maxFee {
+		return "", false, fmt.Errorf("refusing to sign: the node at %s puts a fee of %d spark on this transaction, above %s. Re-run with --max-fee %d (sparks) only if you accept that cost",
+			t.base, built.tx.Fee, feeCeilingReason(o.maxFee), built.tx.Fee)
+	}
+
+	if o.dryRun {
+		fmt.Println("dry run: the transaction above was NOT signed and NOT posted.")
+		return "", false, nil
+	}
+
+	if err := confirmTransaction(o.yes); err != nil {
+		return "", false, err
+	}
+
+	// Sign the decoded transaction and post its canonical re-encoding. The
+	// signature covers SigningHash(encodeBody), which is a function of the
+	// same bytes printed above; the only bytes added are the signature.
+	hash := built.tx.SigningHash(t.genesis)
+	built.tx.Sig = crypto.Sign(t.priv, hash[:])
+	txid, err = postTxHex(t.base+"/tx", built.tx.Encode())
+	if err != nil {
+		return "", false, err
+	}
+	return txid, true, nil
 }
 
 // stakingFundingNote is the honest answer to "where do I get MIN_STAKE?".
@@ -650,6 +900,8 @@ func cmdStake(args []string) error {
 	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC")
 	keyPath := fs.String("key", "", "key file to sign with (b10coin keygen); the bond seats THIS key")
 	amountB10 := fs.String("amount", "", "amount to bond, in b10 as an exact decimal (at least MIN_STAKE, 1000 b10)")
+	maxFee := fs.Uint64("max-fee", defaultMaxFeeSparks, maxFeeHelp)
+	yes, dryRun := addTxConfirmationFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -672,6 +924,13 @@ func cmdStake(args []string) error {
 	}
 	if t.status.MinStakeSparks == 0 {
 		return fmt.Errorf("the node reports min_stake_sparks 0: staking is not parameterised on that chain")
+	}
+	// A bond with fee 0 could never apply: every shipped genesis sets at least
+	// one spark and genesis.Validate refuses a zero minimum, so a node
+	// reporting 0 is either misconfigured or steering this verb into a
+	// transaction the real chain will reject.
+	if t.status.MinFeeSparks == 0 {
+		return fmt.Errorf("the node reports min_fee_sparks 0: every shipped genesis sets at least 1 spark and genesis.Validate refuses a zero minimum, so a zero-fee bond could never apply")
 	}
 	// The floor is on the RESULTING bond, not on this transaction
 	// (state.applyBond), so an existing bond may be topped up: 600 then 400 is
@@ -699,15 +958,13 @@ func cmdStake(args []string) error {
 		Fee:    t.status.MinFeeSparks,
 		Amount: amount,
 	}
-	txid, err := t.submit(tx)
+	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: *maxFee, yes: *yes, dryRun: *dryRun}, txProvenance{amount: "from --amount"})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bond        %s b10 (%d sparks)\n", genesis.FormatB10(amount), amount)
-	fmt.Printf("from        %s\n", t.addr)
-	fmt.Printf("nonce       %d\n", t.account.Nonce)
-	fmt.Printf("fee         %d spark\n", t.status.MinFeeSparks)
-	fmt.Printf("txid        %s\n", txid)
+	if posted {
+		fmt.Printf("txid        %s\n", txid)
+	}
 	if t.status.EpochBlocks > 0 {
 		fmt.Printf("the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every %d blocks), never mid-epoch.\n", t.status.EpochBlocks)
 	} else {
@@ -721,6 +978,9 @@ func cmdUnstake(args []string) error {
 	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC")
 	keyPath := fs.String("key", "", "key file that holds the bond (b10coin keygen)")
 	amountB10 := fs.String("amount", "", "amount to unbond, in b10 as an exact decimal (default: the whole bond; a partial exit must leave at least MIN_STAKE bonded)")
+	// No --max-fee here: state.applyUnbond requires fee 0 exactly, so there is
+	// no fee for a ceiling to bound.
+	yes, dryRun := addTxConfirmationFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -735,7 +995,13 @@ func cmdUnstake(args []string) error {
 		return fmt.Errorf("the account %s holds no bond; there is nothing to unbond (a bond is created by `b10coin stake`)", t.addr)
 	}
 	amount := t.account.Bonded
+	// Where the unbond amount came from is printed with the transaction: with
+	// no --amount this verb cannot know the bond, and a node that under-reports
+	// it turns a full exit into a partial one ONLY IF the operator cannot see
+	// which number was signed. The preview names the source (audit CL-1).
+	amountSource := "the WHOLE bond as this node reports it (no --amount given): an under-reporting node makes this a PARTIAL exit"
 	if *amountB10 != "" {
+		amountSource = "from --amount"
 		amount, err = genesis.ParseB10(*amountB10)
 		if err != nil {
 			return err
@@ -772,15 +1038,15 @@ func cmdUnstake(args []string) error {
 		Fee:    0,
 		Amount: amount,
 	}
-	txid, err := t.submit(tx)
+	// An exit carries fee 0 by consensus, so its ceiling is 0: any non-zero
+	// fee this verb somehow built would be refused rather than signed.
+	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{amount: amountSource})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("unbond      %s b10 (%d sparks)\n", genesis.FormatB10(amount), amount)
-	fmt.Printf("from        %s\n", t.addr)
-	fmt.Printf("nonce       %d\n", t.account.Nonce)
-	fmt.Printf("fee         0 sparks (an exit is free by consensus rule)\n")
-	fmt.Printf("txid        %s\n", txid)
+	if posted {
+		fmt.Printf("txid        %s\n", txid)
+	}
 	if cooldown, ok := cooldownBlocks(t.status); ok {
 		// The applying block is at least head+1, so this is the EARLIEST
 		// release height; the block that actually applies the unbond sets the
@@ -804,6 +1070,7 @@ func cmdWithdraw(args []string) error {
 	fs := flag.NewFlagSet("withdraw", flag.ExitOnError)
 	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC")
 	keyPath := fs.String("key", "", "key file that holds the unbonding records (b10coin keygen)")
+	yes, dryRun := addTxConfirmationFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -858,15 +1125,20 @@ func cmdWithdraw(args []string) error {
 		Nonce:  t.account.Nonce,
 		Fee:    0,
 	}
-	txid, err := t.submit(tx)
+	// An exit carries fee 0 by consensus, so its ceiling is 0. The payout is
+	// the state's (applyWithdraw derives it from every matured record), and the
+	// node's count is shown as the node's claim, not as a field of the bytes.
+	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{
+		note: fmt.Sprintf("%d matured record(s), %s b10 (%d sparks), released to the spendable balance",
+			matured, genesis.FormatB10(total), total),
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("withdraw    %d matured record(s), %s b10 (%d sparks), back to the spendable balance\n", matured, genesis.FormatB10(total), total)
-	fmt.Printf("from        %s\n", t.addr)
-	fmt.Printf("nonce       %d\n", t.account.Nonce)
-	fmt.Printf("fee         0 sparks (an exit is free by consensus rule)\n")
-	fmt.Printf("txid        %s\n", txid)
+	if posted {
+		fmt.Printf("txid        %s\n", txid)
+		fmt.Printf("withdraw    %d matured record(s), %s b10 (%d sparks), back to the spendable balance\n", matured, genesis.FormatB10(total), total)
+	}
 	fmt.Println("withdraw releases EVERY record that is mature when the block applies; a second withdraw of the same record pays nothing.")
 	return nil
 }

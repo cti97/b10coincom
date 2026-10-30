@@ -462,20 +462,26 @@ the key never leaves the machine, and the verbs never open the data directory:
 sudo -u b10coin /opt/b10coin/b10coin stake \
     --node http://127.0.0.1:8645 \
     --key  /var/lib/b10coin/b10coin.key \
-    --amount 1000
+    --amount 1000 --yes
 ```
 
 `--amount` is **b10**, as an exact decimal — the command converts it to sparks
 with integer arithmetic and signs against the `genesis_hash` the node reports,
 so it is the same ordinary signed transaction a transfer is. It prints the
-bond, the account nonce, the fee and the **txid**; it does not wait, because a
+whole transaction (from, nonce, fee, amount, genesis hash and canonical bytes)
+*before* signing and then the **txid**; `--yes` confirms a non-interactive run
+(the verbs otherwise require a terminal answer of "yes", and `--dry-run`
+prints the transaction without signing or posting). It does not wait, because a
 bond takes effect when a block applies it and a **seat** changes only at the
-next epoch boundary. To exit:
+next epoch boundary. The fee ceiling is one spark by default (the protocol
+minimum on every shipped genesis; a higher fee is burned and buys nothing) —
+`--max-fee SPARKS` raises it, and a node asking for more is refused. To exit:
 
 ```sh
 # unbond everything (or give --amount, leaving at least MIN_STAKE bonded);
 # fee 0 by consensus rule
-sudo -u b10coin /opt/b10coin/b10coin unstake --node http://127.0.0.1:8645 \
+sudo -u b10coin /opt/b10coin/b10coin unstake --yes \
+    --node http://127.0.0.1:8645 \
     --key /var/lib/b10coin/b10coin.key
 # ... the output names the RELEASE HEIGHT: the coins are neither spendable
 # nor counted in the committee until that height. The cooldown is
@@ -486,7 +492,8 @@ sudo -u b10coin /opt/b10coin/b10coin unstake --node http://127.0.0.1:8645 \
 # minute apart (the driver's rhythm is the round protocol's; `block_time_ms` is
 # the spec's target, not a pacing timer).
 # Once the chain is at or past it:
-sudo -u b10coin /opt/b10coin/b10coin withdraw --node http://127.0.0.1:8645 \
+sudo -u b10coin /opt/b10coin/b10coin withdraw --yes \
+    --node http://127.0.0.1:8645 \
     --key /var/lib/b10coin/b10coin.key
 ```
 
