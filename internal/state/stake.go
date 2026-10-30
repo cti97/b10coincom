@@ -61,8 +61,11 @@ var (
 	// M0-M1 behaviour is that staking is unusable, never that it panics or
 	// divides by zero).
 	ErrStakeUnconfigured = errors.New("state: staking is not parameterised on this chain")
-	// ErrStakeBelowMinimum reports a Bond whose RESULTING bond is under the
-	// chain's MinStake. The floor is on the result, not on one transaction, so
+	// ErrStakeBelowMinimum reports a stake transition whose RESULTING bond is
+	// under the chain's MinStake: a Bond that would land there, or an Unbond
+	// that would LEAVE a positive remainder there (audit ST-1 - a sub-minimum
+	// bond is still a committee candidate, and the power cap lifts one spark to
+	// a full seat). The floor is on the result, not on one transaction, so
 	// several bonds may accumulate to it (a single payment below it is cheap
 	// spam: one bond record per attacker-chosen key).
 	ErrStakeBelowMinimum = errors.New("state: the resulting bond is below the chain's minimum stake")
@@ -307,6 +310,25 @@ func (s *State) applyUnbond(tx *types.Tx) error {
 	if tx.Amount > bond.Amount {
 		return fmt.Errorf("%w: unbond %d, bonded %d", ErrUnbondExceedsBond, tx.Amount, bond.Amount)
 	}
+	// THE CANDIDACY FLOOR, as a state invariant (audit ST-1). Committee seats
+	// every bond with a positive amount, and applyPowerCap's fixed point then
+	// equalises a one-spark seat with a whale - the repository's own vector
+	// (10^12 plus three at one spark) converges to four seats of power 1, so
+	// three one-spark seats hold 3/4 of the committee and can commit alone.
+	// An Unbond therefore leaves either nothing or at least MinStake.
+	//
+	// The carve-out is the `remainder == 0` half of the rule, and it needs no
+	// special case. A bond ALREADY below the floor - a genesis seat, which
+	// chain.genesisState seeds at Amount = Power, so the devnet and simnet
+	// fixtures sit at one spark - cannot leave a partial remainder that clears
+	// the floor, because every partial remainder is smaller than the bond. Its
+	// only legal exit is the full one, which is `remainder == 0`: a genesis
+	// seat can leave, it cannot leave a sub-minimum bond behind.
+	remainder := bond.Amount - tx.Amount
+	if remainder != 0 && remainder < s.params.MinStake {
+		return fmt.Errorf("%w: unbond %d of %d would leave %d bonded, below the minimum %d; exit in full or leave at least the minimum",
+			ErrStakeBelowMinimum, tx.Amount, bond.Amount, remainder, s.params.MinStake)
+	}
 
 	release, err := releaseHeightFor(s.height, s.params.UnbondingEpochs, s.params.EpochBlocks)
 	if err != nil {
@@ -332,7 +354,7 @@ func (s *State) applyUnbond(tx *types.Tx) error {
 	}
 
 	// Every validation has run; write.
-	if remainder := bond.Amount - tx.Amount; remainder == 0 {
+	if remainder == 0 {
 		delete(s.bonds, tx.From)
 	} else {
 		bond.Amount = remainder

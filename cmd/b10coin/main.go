@@ -83,7 +83,7 @@ Usage:
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
   b10coin stake  --node URL --key PATH --amount 1000    Bond b10 to this key's committee seat (signed tx)
-  b10coin unstake --node URL --key PATH [--amount 1000] Unbond all or part of the bond; cooldown, then withdraw
+  b10coin unstake --node URL --key PATH [--amount 1000] Unbond all or part of the bond; a partial exit must leave MIN_STAKE or nothing
   b10coin withdraw --node URL --key PATH                Release matured unbonding records to the spendable balance
   b10coin version
 
@@ -566,7 +566,7 @@ func (t *stakingTarget) submit(tx *types.Tx) (string, error) {
 // It is returned at the point a verb refuses for lack of funds or stake, so an
 // operator meets it with the command in hand rather than in a doc they have not
 // opened yet.
-const stakingFundingNote = "no shipped genesis funds an operator's key with MIN_STAKE: the faucet pays one claim per key per epoch and `b10coin claim` signs with an ephemeral key it does not save, so a fresh operator has no shipped path to this balance; see README \"Staking\" for the claim arithmetic"
+const stakingFundingNote = "no shipped genesis gives an operator's key MIN_STAKE in spendable funds: the faucet pays one claim per key per epoch and `b10coin claim` signs with an ephemeral key it does not save, so a fresh operator has no shipped path to this balance; see README \"Staking\" for the claim arithmetic"
 
 // checkSpendable refuses a bond the account cannot cover, before submitting:
 // the node would refuse it at execution, but the operator learns why here.
@@ -667,7 +667,7 @@ func cmdUnstake(args []string) error {
 	fs := flag.NewFlagSet("unstake", flag.ExitOnError)
 	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC")
 	keyPath := fs.String("key", "", "key file that holds the bond (b10coin keygen)")
-	amountB10 := fs.String("amount", "", "amount to unbond, in b10 as an exact decimal (default: the whole bond)")
+	amountB10 := fs.String("amount", "", "amount to unbond, in b10 as an exact decimal (default: the whole bond; a partial exit must leave at least MIN_STAKE bonded)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -694,6 +694,18 @@ func cmdUnstake(args []string) error {
 			return fmt.Errorf("--amount %s b10 (%d sparks) is more than the bonded %s b10 (%d sparks)",
 				genesis.FormatB10(amount), amount, genesis.FormatB10(t.account.Bonded), t.account.Bonded)
 		}
+	}
+	// The state's candidacy floor, mirrored (audit ST-1): a partial exit must
+	// leave the bond at zero or at MIN_STAKE or above, because any positive
+	// bond is a committee candidate and the power cap equalises small seats
+	// with large ones. A bond ALREADY under the floor (a genesis seat bonded at
+	// `power` one spark) can only be exited in full, which is what this check
+	// does without a special case: every partial remainder is below the bond,
+	// so every partial remainder is below the floor.
+	if remainder := t.account.Bonded - amount; remainder != 0 && remainder < t.status.MinStakeSparks {
+		return fmt.Errorf("--amount %s b10 (%d sparks) would leave %s b10 (%d sparks) bonded, below this chain's MIN_STAKE %s b10 (%d sparks); unbond the whole bond, or leave at least the minimum",
+			genesis.FormatB10(amount), amount, genesis.FormatB10(remainder), remainder,
+			genesis.FormatB10(t.status.MinStakeSparks), t.status.MinStakeSparks)
 	}
 
 	// Fee 0 is a CONSENSUS rule for an exit (state.applyUnbond), not a

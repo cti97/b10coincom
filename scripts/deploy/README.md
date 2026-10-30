@@ -210,10 +210,11 @@ failure 3.
 {
   "chain_id": "example-testnet-1",
   "note": "optional human annotation — never enters the genesis hash",
+  "committee_size": 4,
   "validators": [
-    { "name": "pi-0", "pubkey": "<Pi 0's public key hex>", "power": 1 },
-    { "name": "pi-1", "pubkey": "<Pi 1's public key hex>", "power": 1 },
-    { "name": "pi-2", "pubkey": "<Pi 2's public key hex>", "power": 1 }
+    { "name": "pi-0", "pubkey": "<Pi 0's public key hex>", "power": 100000000000 },
+    { "name": "pi-1", "pubkey": "<Pi 1's public key hex>", "power": 100000000000 },
+    { "name": "pi-2", "pubkey": "<Pi 2's public key hex>", "power": 100000000000 }
   ]
 }
 ```
@@ -222,15 +223,25 @@ A checked example lives at `scripts/deploy/committee.example.json`. The
 binary enforces (refusing the file otherwise): `chain_id` non-empty — chosen
 by you, and unlike the fixture's `b10coin-simnet-N` it must not be made to
 encode the committee size; every `pubkey` a 64-hex-character Ed25519 public
-key, with **duplicates refused** (one key holds one seat); `power` ≥ 1; and
-**order matters** — a validator's seat is its entry's position. `power` is
-also the seat's genesis **bond**, in sparks and not rescaled: `1` is one
-spark, and `100000000000` is 1,000 b10 (`MIN_STAKE`). §5.1 explains what that
-means for staking and for keeping a live seat. The file
-carries the committee and nothing else: monetary and protocol parameters
-stay the compiled-in devnet fixture values (trivial puzzle, 1 b10 claims,
-2 s blocks), so a shared chain stays valueless test currency and no member
-can rewrite its economy hand-edited. **Treat the file as final once the
+key, with **duplicates refused** (one key holds one seat); `power` **at least
+`MIN_STAKE`**; and **order matters** — a validator's seat is its entry's
+position. `power` is also the seat's genesis **bond**, in sparks and not
+rescaled: `100000000000` is 1,000 b10 (`MIN_STAKE`), and the loader refuses
+anything less. That floor is audit RT-2: a one-spark seat is a bond below the
+candidacy floor, and on a full committee one `MIN_STAKE` bond then outranks it
+and holds about all of the power (10^11 of 10^11+2 on this three-seat shape).
+
+`committee_size` is optional and is **how many seats the chain has room for**.
+It must be at least the number of validators (a key the file publishes must be
+able to be seated) and may be larger: with one spare seat, a newcomer that
+bonds is seated *beside* the three genesis seats instead of evicting one. Omit
+it and the chain seats exactly the keys listed — then admission implies
+eviction, and the key that bonds must be a running validator's (see §5.1).
+
+The file carries the committee and nothing else: monetary and protocol
+parameters stay the compiled-in devnet fixture values (trivial puzzle, 1 b10
+claims, 2 s blocks), so a shared chain stays valueless test currency and no
+member can rewrite its economy hand-edited. **Treat the file as final once the
 chain starts** — editing it changes the genesis hash, i.e. it starts a
 different chain.
 
@@ -462,7 +473,8 @@ bond takes effect when a block applies it and a **seat** changes only at the
 next epoch boundary. To exit:
 
 ```sh
-# unbond everything (or give --amount); fee 0 by consensus rule
+# unbond everything (or give --amount, leaving at least MIN_STAKE bonded);
+# fee 0 by consensus rule
 sudo -u b10coin /opt/b10coin/b10coin unstake --node http://127.0.0.1:8645 \
     --key /var/lib/b10coin/b10coin.key
 # ... the output names the RELEASE HEIGHT: the coins are neither spendable
@@ -476,40 +488,56 @@ sudo -u b10coin /opt/b10coin/b10coin withdraw --node http://127.0.0.1:8645 \
     --key /var/lib/b10coin/b10coin.key
 ```
 
-> **⚠️ With the genesis this recipe builds, `stake` is not usable, and the
-> reason is structural — read it before planning around it.** The committee
-> file's `power` field **is** the genesis bond (it is not rescaled: `power` is
-> in sparks, so 1,000 b10 is `100000000000`), and the example above uses
-> `power: 1`. The file mints no premine, so every account starts at zero, and
-> `stake` needs `MIN_STAKE` = 1,000 b10 (10^11 sparks) in **spendable funds**.
-> The only funding path is the faucet: **1 b10 per claim, one claim per key per
-> epoch**, and an epoch is 1,000 blocks — so 1,000 claims take 1,000 epochs,
-> **one million blocks**. At the single-node producer's 2 s default that is
-> about 23 days; a healthy committee commits faster (its cadence is the round
-> protocol's — measure two `/status` readings a minute apart), so the wait is
-> however long this chain takes to produce a million blocks. It is worse than
-> that in practice:
-> `b10coin claim` signs with a fresh ephemeral key each run and never saves it,
-> and there is no `transfer` verb, so each claim lands at a new address and
-> cannot be accumulated. **No shipped genesis funds an operator's key with
-> `MIN_STAKE`, and this deployment has no path to a bond today.** The CLI says
-> exactly this when it refuses; the arithmetic is in the repository README's
-> [Staking](../../README.md#staking) section.
+A partial `--amount` must leave the bond at zero or at `MIN_STAKE` or above:
+any positive bond is a committee candidate, so a one-spark remainder would be a
+one-spark *seat* carrying a full seat's power (audit ST-1). Both `unstake` and
+the state machine refuse the rest; a seat already bonded below `MIN_STAKE` —
+possible only on the devnet/simnet fixtures, whose seats carry `power: 1` — can
+exit **only in full**, which is what `unstake` without `--amount` does.
 
-> **⚠️ A bond is a seat, and a seat without a node stops the chain.** A bond
-> above a genesis seat's power takes that seat at the next boundary. If the
-> bonding key's node is **not** running as a validator — the obvious mistake is
-> staking from a key other than the one in `--key` — the new seat has no
-> signer, the committee cannot reach its two-thirds quorum, and the chain halts
-> at the boundary. Stake only with the key the node runs.
+> **⚠️ `stake` needs spendable funds this genesis does not give it — read this
+> before planning around a new bond.** The committee file's `power` field **is**
+> the genesis bond (not rescaled: `power` is in sparks, so 1,000 b10 is
+> `100000000000`), and the loader refuses anything below `MIN_STAKE`, so the
+> three genesis seats start with 1,000 b10 bonded each, funded by no balance
+> (the genesis-hash bond; audit ST-3 records the open question about that being
+> an unfunded premine). The file mints no premine, so every *account* starts at
+> zero, and `stake` needs `MIN_STAKE` = 1,000 b10 (10^11 sparks) in **spendable
+> funds**. The only funding path is the faucet: **1 b10 per claim, one claim per
+> key per epoch, at most 8 claims per block**, funded by emission at **0.5 b10
+> per block**. The faucet's balance is the real constraint, not the epoch
+> length: **2,000 blocks** of emission produce the 1,000 b10, and 1,000 claims
+> from 1,000 distinct keys at 8 per block take **125 blocks** — about **2,125
+> blocks**, roughly 71 minutes at 2 s blocks (a healthy committee commits
+> faster; measure two `/status` readings a minute apart). This recipe used to
+> say "1,000 epochs, one million blocks, 23 days", which wrongly divided by the
+> one-claim-per-key rule instead of issuing one claim per key: the old figure was
+> about **470× too long**. It is still not a path this deployment can walk
+> today: `b10coin claim` signs with a fresh ephemeral key each run and never
+> saves it, and there is no `transfer` verb, so each claim lands at a new address
+> and cannot be accumulated. **No shipped command funds an operator's key with
+> `MIN_STAKE`**; the numbers above describe what the protocol allows a client
+> holding 1,000 keys and a transfer path. The arithmetic is in the repository
+> README's [Staking](../../README.md#staking) section.
 
-`unstake` and `withdraw` **are** usable here without funds if the genesis
-already bonds the seat with at least `MIN_STAKE`: set each committee entry's
-`power` to `100000000000` (1,000 b10) in §3.2 before the chain starts. The
-genesis bond then satisfies the exit path, and the coins released by
-`withdraw` are real spendable balance — with which `stake` can then bond again.
-Decide that before the chain starts: the file is final once it has, because
-editing it changes the genesis hash and starts a different chain.
+> **⚠️ A bond is a seat, and a seat without a node stops the chain.** A bond at
+> or above a genesis seat's power is ranked against it, ties by key bytes. With
+> `committee_size` equal to the number of validators (the old default) each
+> newcomer evicts a genesis seat; the shipped example asks for one spare seat
+> (4 against 3 keys), so the fourth bond is seated *beside* the three genesis
+> seats and a fifth bond displaces one of the four. If the bonding key's node is **not** running as
+> a validator — the obvious mistake is staking from a key other than the one the
+> node holds — the new seat has no signer, the committee cannot reach its
+> two-thirds quorum, and the chain halts at the boundary. Stake only with the
+> key the node runs, and keep every genesis key's node running.
+
+`unstake` and `withdraw` **are** usable here without any spendable funds,
+because §3.2 bonds every genesis seat with `power: 100000000000` (1,000 b10 =
+`MIN_STAKE`). The genesis bond satisfies the exit path, and the coins released
+by `withdraw` are real spendable balance — with which `stake` can then bond
+again, paying the 1-spark fee out of them. Decide the powers before the chain
+starts: the file is final once it has, because editing it changes the genesis
+hash and starts a different chain.
 
 Two limits to keep straight: the verbs act on the chain whose `genesis_hash`
 the node reports, so pointing one at a node on another chain produces a

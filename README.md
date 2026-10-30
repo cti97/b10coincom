@@ -350,13 +350,15 @@ appending to one store is not a client design.
 | Verb | Flags | Transaction |
 |---|---|---|
 | `stake` | `--node URL --key PATH --amount 1000` | `Bond` (tag 3): moves `amount` b10 from the spendable balance into the key's bond, paying `min_fee_sparks` |
-| `unstake` | `--node URL --key PATH [--amount 1000]` | `Unbond` (tag 4): moves all (the default) or part of the bond into an unbonding record; fee 0 by consensus rule |
+| `unstake` | `--node URL --key PATH [--amount 1000]` | `Unbond` (tag 4): moves all (the default) or part of the bond into an unbonding record; a partial exit must leave at least `MIN_STAKE` bonded; fee 0 by consensus rule |
 | `withdraw` | `--node URL --key PATH` | `Withdraw` (tag 5): releases **every** matured unbonding record to the spendable balance; fee 0 by consensus rule |
 
 `--amount` is b10 as an exact decimal, parsed by integer arithmetic (no float
 ever holds an amount); the transaction carries sparks. `stake` refuses an amount
 below the node's `min_stake_sparks` and a bond the balance cannot cover, before
-submitting; `unstake` refuses more than is bonded; `withdraw` refuses while no
+submitting; `unstake` refuses more than is bonded, and refuses a partial exit
+that would leave a bond under `MIN_STAKE` — the state's candidacy floor, so the
+verb and the chain refuse the same remainders; `withdraw` refuses while no
 record has matured and names the next release height. Neither verb waits for
 inclusion: a bond is a transaction, and a *seat* changes only at the next epoch
 boundary, so "nothing happened yet" is correct for up to an epoch. Example, from
@@ -373,14 +375,15 @@ the bond is applied when a block includes it; the seat it buys is considered at 
 ```
 
 **Where the stake comes from is a real limitation, not a footnote.** A bond
-must clear `MIN_STAKE` (1,000 b10 = 10^11 sparks), and **no shipped genesis
-funds an operator's key with it** — the verbs are usable only against a chain that
-already bonds a key (a genesis `power` at or above `MIN_STAKE`, or the devnet
-fixture account, which no shipped command turns into a key file). The faucet
-pays one claim per key per epoch and `claim` signs with an ephemeral key it
-never saves, so there is no shipped path from zero to a bond. The refusal
-messages say exactly that and point at [Staking](#staking), which carries the
-claim arithmetic.
+must clear `MIN_STAKE` (1,000 b10 = 10^11 sparks), and **no shipped genesis gives
+an operator's key that much in spendable funds** — the verbs are usable only
+against a chain that already bonds a key (a genesis `power` at or above
+`MIN_STAKE`, which is locked stake and not spendable, or the devnet fixture
+account, which no shipped command turns into a key file). The faucet pays one
+claim per key per epoch and `claim` signs with an ephemeral key it never saves,
+so there is no shipped path from zero to a bond. The refusal messages say
+exactly that and point at [Staking](#staking), which carries the claim
+arithmetic.
 
 ### `b10coin-relay`
 
@@ -765,6 +768,31 @@ at `e*epoch_blocks − 1`, so a bond applied at height `h` is considered at the
 next boundary and never mid-epoch. Genesis seats are bonded by the genesis
 hash: a committee file's `power` **is** that seat's bond.
 
+**A bond is at least `MIN_STAKE` or it is not a bond.** Both transitions enforce
+the floor: `Bond` judges the *resulting* bond, and `Unbond` accepts a remainder
+of exactly zero or at least `MIN_STAKE` — a partial exit that would leave a
+positive bond under the floor is refused. That rule is a state invariant, not
+CLI politeness: any positive bond is a committee candidate, and the cap's fixed
+point equalises small seats with large ones, so a one-spark bond would be a
+one-spark **seat** carrying a full seat's power. Bond `MIN_STAKE`, unbond all but
+one spark, and three such seats hold three quarters of a four-seat committee —
+the vector is pinned in `internal/state/committee_test.go`. The carve-out is for
+a bond **already** below the floor, which a genesis seat on the devnet and
+simnet fixtures is (their validators carry `power: 1`): such a seat may exit,
+and only in full — exactly what the M5 rotation fixture does. The operator-facing
+path cannot create one: a committee file's `power` must be at least `MIN_STAKE`.
+
+**The cap is per key, not per operator.** Each seated key's power is capped at a
+quarter of the seated total, so on a committee of four or more seats no single
+key can hold more than 25% — and bonding far above the floor on one key buys no
+larger share than the cap allows. The cap does not merge keys: `k` keys that
+each hold the floor buy `k` seats, and on `N` equal-stake seats each holds `1/N`,
+so `k` colluding keys hold `k/N` of the committee's power. A seat therefore
+costs `MIN_STAKE` per key, and the count of keys — not only the stake behind
+each — is what the committee measures. The Nakamoto series the acceptance run
+prints is computed from these capped powers, so it describes the committee's
+composition, not the underlying stake distribution.
+
 **The verbs** are `stake`, `unstake` and `withdraw` (see
 [The CLI](#the-cli)). They are ordinary signed transactions — same signature,
 same genesis-hash binding, same fee rule, same `/tx` admission as a transfer.
@@ -772,13 +800,24 @@ The state machine, not the verb, is the authority: the verb only refuses early,
 with a readable reason, what the node would refuse at execution.
 
 **Where `MIN_STAKE` comes from — the honest answer.** `MIN_STAKE` is 1,000 b10
-(10^11 sparks), and the only in-protocol funding path is the faucet, which pays
-**one claim per key per epoch**. The arithmetic:
+(10^11 sparks), and the only in-protocol funding path is the faucet: **one claim
+per key per epoch**, at most **8 claims per block**, funded by emission at
+**0.5 b10 per block**. The binding constraint is the faucet's balance, not the
+per-key rule:
 
-| Chain parameters | Claim | Epoch | Claims for 1,000 b10 | Blocks needed | At 2 s blocks |
-|---|---|---|---|---|---|
-| devnet, **and any operator committee file** (the file keeps the devnet fixture parameters) | 1 b10 | 1,000 blocks | 1,000 | 1,000,000 | ~23 days |
-| testnet (compiled in, but it names no validators — no chain runs on it) | 100 b10 | 10,000 blocks | 10 | 100,000 | ~2.3 days |
+- **2,000 blocks of emission** produce the 1,000 b10 that 1,000 b10 of claims
+  need (1,000 ÷ 0.5) before the faucet can pay them out;
+- the claims themselves are cheap: 1,000 claims of 1 b10 from 1,000 distinct
+  keys at 8 per block is **125 blocks**, and on the testnet parameters 10 claims
+  of 100 b10 is **2 blocks**;
+- the 1,000 separate balances must then be consolidated into one key by
+  transfers; a block carries up to 10,000 transactions, so that is about **one
+  more block**.
+
+| Chain parameters | Claim | Claims for 1,000 b10 | Faucet fill | Claim blocks | Total | At 2 s blocks |
+|---|---|---|---|---|---|---|
+| devnet, **and any operator committee file** (the file keeps the devnet fixture parameters) | 1 b10 | 1,000 (1,000 keys) | 2,000 | 125 | ~2,125 | ~71 min |
+| testnet (compiled in, but it names no validators — no chain runs on it) | 100 b10 | 10 (10 keys) | 2,000 | 2 | ~2,000 | ~67 min |
 
 The wall-clock column is an illustration at 2 s blocks, the single-node
 producer's default. **A consensus committee is not paced by
@@ -786,15 +825,23 @@ producer's default. **A consensus committee is not paced by
 Argon2 budget, while the driver's cadence is the round protocol's (a timeout is
 the failure path, not the rhythm). Measure it on the chain you care about —
 two `/status` readings a minute apart give blocks/second — and divide the
-1,000,000 (or 100,000) blocks by it. A faster committee shortens the wait; it
-does not loosen the one-claim-per-key-per-epoch rule.
+~2,000 blocks by it. A faster committee shortens the wait; it does not loosen
+the one-claim-per-key-per-epoch rule.
 
-Those figures already assume a **fixed key** claiming every epoch. `b10coin
-claim` does not do that: it generates a fresh ephemeral key per run and never
-saves it, and there is no `transfer` verb, so a claimant's coins land at a new
-address each time and cannot be accumulated. **No shipped genesis funds an
-operator's key with `MIN_STAKE`, and no shipped command reaches it through the
-faucet.**
+> **Correction (audit RT-2).** This table used to divide 1,000 claims by the
+> one-claim-per-key rule and report 1,000 epochs = 1,000,000 blocks ≈ 23 days.
+> That was wrong by a factor of about 470. The rule is per **key** per epoch, so
+> 1,000 distinct keys claim inside one epoch, and the 8-per-block bound plus the
+> faucet's 0.5 b10/block emission — not the epoch length — set the real floor.
+> The shipped CLI still cannot walk this path (see below); the numbers above are
+> what the *protocol* allows, which is what a reader sizing a deployment needs.
+
+Those figures assume a client that holds **1,000 keys** and can **transfer**
+their balances into one. `b10coin claim` does neither: it generates a fresh
+ephemeral key per run and never saves it, and there is no `transfer` verb, so a
+claimant's coins land at a new address each time and cannot be accumulated.
+**No shipped command reaches `MIN_STAKE` through the faucet** — the arithmetic
+above is what the protocol allows, not a path an operator can walk today.
 What does exist, stated so it is not mistaken for a path:
 
 - The **devnet fixture** premines one account — `b10coin-devnet-faucet-tester`,
@@ -803,18 +850,25 @@ What does exist, stated so it is not mistaken for a path:
   CLI verb turns it into a key file, and it must never be used on a shared
   chain. It is what the M5 end-to-end run below used, with a hand-built key
   file, and that is **verification, not a shipped funding path**.
-- A **genesis bond**: a committee file whose `power` is at least `MIN_STAKE`
-  gives that seat a bond without any balance, so `unstake` and `withdraw` are
-  exercisable immediately and a fresh `stake` still needs spendable funds.
+- A **genesis bond**: a committee file's `power` is its seat's bond and must be
+  at least `MIN_STAKE` (the loader refuses less), so a genesis seat holds real
+  stake without any balance, `unstake` and `withdraw` are exercisable
+  immediately, and a fresh `stake` still needs spendable funds. Note what that
+  implies: the file's powers are an **unfunded** genesis bond — no balance ever
+  paid for it, the same standing as the devnet fixture's premine, and audit ST-3
+  records the open question of whether such a bond should be withdrawable at
+  all — and `unstake` + `withdraw` release it after one cooldown.
 
-**The operational consequence, for anyone deploying the recipe.** With the
-recipe's `power: 1` genesis seats, a single `MIN_STAKE` bond outranks every
-genesis seat and takes one of them at the next epoch boundary. If the key that
-bonded is **not** the key a running validator signs with, the new seat has no
-node behind it: the committee can no longer reach its two-thirds quorum and the
-chain stops at the boundary. Stake only with the key whose node will run as that
-validator. If the genesis seats must stay seated, give them a `power`
-comfortably above `MIN_STAKE` (a tie is decided by the key-byte break).
+**The operational consequence, for anyone deploying the recipe.** Genesis seats
+are at least `MIN_STAKE` each, and a newcomer that bonds at least the floor is
+ranked against them by stake, ties by key bytes — so with
+`committee_size == len(validators)` (the default) admission means eviction of
+one genesis seat. Give the file a spare seat (`committee_size` above the list,
+as the shipped example does) and a newcomer is seated beside them instead. If
+the key that bonds is **not** the key a running validator signs with, the new
+seat has no node behind it: the committee can no longer reach its two-thirds
+quorum and the chain stops at the boundary. Stake only with the key whose node
+will run as that validator, and keep every genesis key's node running.
 
 **The end-to-end run behind these claims** (one process, a devnet-parameter
 chain, the fixture key file described above): `stake --amount 1000` submitted a
@@ -1111,7 +1165,7 @@ Implemented — modules M0 through M5:
   section. Acceptance: the rotation run above (6 seats / k=3 → 5 seats / k=2 at
   height 40) and the unchanged single-node root, now
   `3c1dae9c…`. **The funding limit is stated in [Staking](#staking): no
-  shipped genesis funds an operator's key with `MIN_STAKE`.**
+  shipped command reaches `MIN_STAKE` through the faucet.**
 
 Pending:
 

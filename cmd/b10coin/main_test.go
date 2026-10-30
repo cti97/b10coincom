@@ -585,7 +585,10 @@ func writeCommitteeFile(t *testing.T, dir, chainID string, pubHexes ...string) s
 	t.Helper()
 	entries := make([]genesis.CommitteeEntry, 0, len(pubHexes))
 	for i, k := range pubHexes {
-		entries = append(entries, genesis.CommitteeEntry{Name: fmt.Sprintf("pi-%d", i), PubKey: k, Power: 1})
+		// A seat's power IS its genesis bond and must clear MIN_STAKE
+		// (audit RT-2); one spark is the shape that made committee capture
+		// cost a single MIN_STAKE.
+		entries = append(entries, genesis.CommitteeEntry{Name: fmt.Sprintf("pi-%d", i), PubKey: k, Power: genesis.Devnet().Params.MinStakeSparks})
 	}
 	raw, err := json.Marshal(genesis.CommitteeFile{ChainID: chainID, Validators: entries})
 	if err != nil {
@@ -930,17 +933,92 @@ func TestUnstakeWithNoAmountUnbondsTheWholeBond(t *testing.T) {
 }
 
 // TestUnstakePartialUsesTheGivenAmount is the other half of the amount rule:
-// with --amount the transaction carries exactly that, not the whole bond.
+// with --amount the transaction carries exactly that, not the whole bond. The
+// fixture bonds 1,500 b10 so the 250.5 b10 exit leaves 1,249.5 b10 — above the
+// floor audit ST-1 makes a partial exit respect.
 func TestUnstakePartialUsesTheGivenAmount(t *testing.T) {
 	keyPath, _, addr := stakingTestKey(t)
 	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
-		Address: addr.String(), Nonce: 0, Bonded: 1_000 * genesis.SparksPerB10,
+		Address: addr.String(), Nonce: 0, Bonded: 1_500 * genesis.SparksPerB10,
 	})
 	if err := cmdUnstake([]string{"--node", stub.url, "--key", keyPath, "--amount", "250.5"}); err != nil {
 		t.Fatalf("cmdUnstake: %v", err)
 	}
 	if got, want := stub.posted().Amount, uint64(250*genesis.SparksPerB10+50_000_000); got != want {
 		t.Errorf("amount = %d, want %d (250.5 b10)", got, want)
+	}
+}
+
+// TestUnstakeRefusesAPartialExitBelowMinStake mirrors the state rule (audit
+// ST-1): an exit must leave nothing or at least MIN_STAKE, so the verb refuses
+// the same remainders the chain would, before signing anything. The carve-out
+// shows up as the last case: a bond ALREADY under the floor (a genesis seat)
+// may be exited in full, but not partially.
+func TestUnstakeRefusesAPartialExitBelowMinStake(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	const minStake = 1_000 * genesis.SparksPerB10
+
+	for _, tc := range []struct {
+		name   string
+		bonded uint64
+		amount string
+	}{
+		{"leaves one spark", minStake, "999.99999999"},
+		{"leaves one spark under the floor", minStake, "0.00000001"},
+		{"leaves MIN_STAKE-1", 1_500 * genesis.SparksPerB10, "1000.00000001"},
+		{"partial exit from a sub-floor genesis seat", 600 * genesis.SparksPerB10, "100"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+				Address: addr.String(), Nonce: 0, Bonded: tc.bonded,
+			})
+			err := cmdUnstake([]string{"--node", stub.url, "--key", keyPath, "--amount", tc.amount})
+			if err == nil {
+				t.Fatalf("a partial exit leaving less than MIN_STAKE was accepted (bonded %d, amount %s)", tc.bonded, tc.amount)
+			}
+			if !strings.Contains(err.Error(), "MIN_STAKE") {
+				t.Errorf("the refusal must name MIN_STAKE, got: %v", err)
+			}
+			if len(stub.posts) != 0 {
+				t.Errorf("the verb posted %d transaction(s) despite refusing", len(stub.posts))
+			}
+		})
+	}
+}
+
+// TestUnstakeAllowsTheFullExitAndTheFloorRemainder is the accepting half of the
+// same rule, so the verb cannot pass the refusal test by refusing everything:
+// the whole bond goes through, and so does a partial that leaves EXACTLY
+// MIN_STAKE. A sub-floor genesis seat also goes through IN FULL.
+func TestUnstakeAllowsTheFullExitAndTheFloorRemainder(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+
+	for _, tc := range []struct {
+		name   string
+		bonded uint64
+		amount string
+		want   uint64
+	}{
+		{"full exit", 1_000 * genesis.SparksPerB10, "", 1_000 * genesis.SparksPerB10},
+		{"leaves exactly the floor", 1_500 * genesis.SparksPerB10, "500", 500 * genesis.SparksPerB10},
+		{"one-spark genesis seat in full", 1, "0.00000001", 1},
+		{"sub-floor genesis seat in full", 600 * genesis.SparksPerB10, "600", 600 * genesis.SparksPerB10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+				Address: addr.String(), Nonce: 0, Bonded: tc.bonded,
+			})
+			args := []string{"--node", stub.url, "--key", keyPath}
+			if tc.amount != "" {
+				args = append(args, "--amount", tc.amount)
+			}
+			if err := cmdUnstake(args); err != nil {
+				t.Fatalf("cmdUnstake: %v", err)
+			}
+			if got := stub.posted().Amount; got != tc.want {
+				t.Errorf("amount = %d sparks, want %d", got, tc.want)
+			}
+		})
 	}
 }
 

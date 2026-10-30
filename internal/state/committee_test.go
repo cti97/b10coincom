@@ -10,6 +10,7 @@ package state
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -667,5 +668,154 @@ func TestFewerCandidatesThanSeatsSeatsThemAll(t *testing.T) {
 	}
 	if got, want := committeeKeys(committee), keys; !equalKeySlices(got, want) {
 		t.Fatalf("seats = %x, want %x in stake order", got, want)
+	}
+}
+
+// TestOneSparkSeatsCannotBeBuiltByUnbonding is ST-1 at the committee level: the
+// attack's committee cannot be derived from any state the transition path can
+// reach. Three keys bond MIN_STAKE and each tries to unbond down to one spark;
+// every attempt is refused, so each attacker seat still costs a full MIN_STAKE.
+//
+// It also pins the CONSEQUENCE of the floor on the derivation: every seat's
+// power is at least MinStake. That is not a coincidence of the cap being 1/1
+// below four seats — with four or more seats the clamp limit is T/4, and
+// T >= 4*MinStake once every bond is at the floor, so the clamp cannot lower a
+// seat under the floor either.
+func TestOneSparkSeatsCannotBeBuiltByUnbonding(t *testing.T) {
+	p := stakingParams()
+	p.CommitteeSize = 4
+	s := NewWithParams(p)
+
+	attackerPubs := make([][]byte, 3)
+	for i := 0; i < 3; i++ {
+		addr, pub, priv := keypair(t)
+		attackerPubs[i] = pub
+		s.Set(addr, Account{Balance: minStakeSparks + 1})
+		if err := s.ApplyTx(bondTx(t, pub, priv, addr, 0, minStakeSparks, 1)); err != nil {
+			t.Fatalf("attacker %d bond: %v", i, err)
+		}
+		// The audit's step: unbond all but one spark.
+		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, minStakeSparks-1)); !errors.Is(err, ErrStakeBelowMinimum) {
+			t.Fatalf("attacker %d unbond down to one spark: err = %v, want ErrStakeBelowMinimum", i, err)
+		}
+		if got := s.Bonded(addr); got != minStakeSparks {
+			t.Fatalf("attacker %d holds %d sparks after the refused exit, want the full %d (the stake must not be recyclable)",
+				i, got, minStakeSparks)
+		}
+	}
+	// One honest bond ten times the floor: the pre-fix state was three
+	// one-spark seats against this, and the cap's fixed point made all four
+	// seats power 1 - the attacker held 3/4 and could commit alone.
+	honestAddr, honestPub, honestPriv := keypair(t)
+	const honest = 10 * minStakeSparks
+	s.Set(honestAddr, Account{Balance: honest + 1})
+	if err := s.ApplyTx(bondTx(t, honestPub, honestPriv, honestAddr, 0, honest, 1)); err != nil {
+		t.Fatalf("honest bond: %v", err)
+	}
+
+	committee, err := s.Committee()
+	if err != nil {
+		t.Fatalf("Committee: %v", err)
+	}
+	if len(committee) != 4 {
+		t.Fatalf("seats = %d, want 4", len(committee))
+	}
+	for i, v := range committee {
+		if v.Power < p.MinStake {
+			t.Fatalf("seat %d holds power %d, below MIN_STAKE %d: a one-spark candidate survived the floor", i, v.Power, p.MinStake)
+		}
+	}
+	// And the three attacker seats are the three attacker KEYS, each still
+	// holding its full bond - the committee did not shrink them to one spark.
+	seen := 0
+	for _, v := range committee {
+		for _, ap := range attackerPubs {
+			if bytes.Equal(v.PubKey, ap) {
+				seen++
+			}
+		}
+	}
+	if seen != 3 {
+		t.Fatalf("%d of the three attacker keys are seated, want 3", seen)
+	}
+}
+
+// TestSpareSeatsAdmitWithoutEvicting is RT-2's seat-count half, on the state a
+// committee file actually produces. The file lists three validators at
+// MIN_STAKE and asks for four seats, so the genesis committee has three seats
+// and one is free. A newcomer that bonds MIN_STAKE is then seated BESIDE the
+// genesis keys - every one of them keeps its seat and its power - instead of
+// evicting one. With committee_size = len(validators) (the pre-RT-2 default)
+// the same bond would have taken a genesis seat by the key-byte tie-break.
+func TestSpareSeatsAdmitWithoutEvicting(t *testing.T) {
+	pubs := make([][]byte, 3)
+	entries := make([]genesis.CommitteeEntry, 0, 3)
+	for i := 0; i < 3; i++ {
+		_, pub, _ := keypair(t)
+		pubs[i] = pub
+		entries = append(entries, genesis.CommitteeEntry{
+			Name:   fmt.Sprintf("pi-%d", i),
+			PubKey: hex.EncodeToString(pub),
+			Power:  minStakeSparks,
+		})
+	}
+	raw, err := json.Marshal(genesis.CommitteeFile{
+		ChainID:       "spare-seat-test-1",
+		CommitteeSize: 4, // one spare seat over the three listed keys
+		Validators:    entries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := genesis.ParseCommitteeJSON(raw)
+	if err != nil {
+		t.Fatalf("the committee file must load: %v", err)
+	}
+	if g.Params.CommitteeSize != 4 || len(g.Validators) != 3 {
+		t.Fatalf("committee_size = %d over %d validators, want 4 over 3", g.Params.CommitteeSize, len(g.Validators))
+	}
+
+	// The genesis state exactly as chain.genesisState builds it: one bond per
+	// validator at Amount = Power, Height 0.
+	p := stakingParams()
+	p.CommitteeSize = g.Params.CommitteeSize
+	s := NewWithParams(p)
+	for _, v := range g.Validators {
+		s.SetBond(types.AddressFromPub(v.PubKey), Bond{Validator: v.PubKey, Amount: v.Power, Height: 0})
+	}
+	before, err := s.Committee()
+	if err != nil {
+		t.Fatalf("Committee at genesis: %v", err)
+	}
+	if len(before) != 3 {
+		t.Fatalf("genesis seats = %d, want the file's 3", len(before))
+	}
+	beforePowers := make(map[string]uint64, len(before))
+	for _, v := range before {
+		beforePowers[string(v.PubKey)] = v.Power
+	}
+
+	// A newcomer bonds the floor.
+	addr, pub, priv := keypair(t)
+	s.Set(addr, Account{Balance: minStakeSparks + 1})
+	if err := s.ApplyTx(bondTx(t, pub, priv, addr, 0, minStakeSparks, 1)); err != nil {
+		t.Fatalf("newcomer bond: %v", err)
+	}
+	after, err := s.Committee()
+	if err != nil {
+		t.Fatalf("Committee after the newcomer: %v", err)
+	}
+	if len(after) != 4 {
+		t.Fatalf("seats = %d after the newcomer, want 4 (a spare seat admits without evicting)", len(after))
+	}
+	for _, v := range after {
+		if want, listed := beforePowers[string(v.PubKey)]; listed {
+			if v.Power != want {
+				t.Fatalf("genesis seat %x lost power to the newcomer: %d, want %d", v.PubKey[:4], v.Power, want)
+			}
+		}
+	}
+	if beforePowers[string(pub)] != 0 {
+		t.Fatal("the newcomer was already seated before it bonded")
 	}
 }

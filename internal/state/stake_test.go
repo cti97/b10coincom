@@ -201,8 +201,10 @@ func TestBondBelowMinStakeIsRefused(t *testing.T) {
 // TestBondAccumulatesToTheFloor: the floor is on the resulting bond, so 500 b10
 // added to an existing 600 b10 record is accepted because 1,100 b10 clears it.
 // Both routes to that existing record are exercised: one written directly (the
-// genesis-seat shape) and one produced by the real transitions (bond 1,000,
-// unbond 400, leaving 600).
+// genesis-seat shape) and one produced by the real transitions (bond 1,400,
+// unbond 400, leaving exactly the 1,000 b10 floor — audit ST-1 now forbids a
+// partial exit below it, so exactly the floor is the boundary a transition
+// can land on).
 func TestBondAccumulatesToTheFloor(t *testing.T) {
 	t.Run("genesis-shaped existing bond", func(t *testing.T) {
 		s := NewWithParams(stakingParams())
@@ -222,24 +224,24 @@ func TestBondAccumulatesToTheFloor(t *testing.T) {
 		}
 	})
 
-	t.Run("bond then partial unbond then top-up", func(t *testing.T) {
-		s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+	t.Run("bond then partial unbond to the floor then top-up", func(t *testing.T) {
+		s, addr, pub, priv := bondedValidator(t, 1_400*b10, 0)
 		s.SetHeight(5)
 		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 400*b10)); err != nil {
 			t.Fatalf("partial unbond: %v", err)
 		}
-		if got := s.Bonded(addr); got != 600*b10 {
-			t.Fatalf("after unbonding 400 b10 of 1,000, Bonded = %d, want 600 b10", got)
+		if got := s.Bonded(addr); got != 1_000*b10 {
+			t.Fatalf("after unbonding 400 b10 of 1,400, Bonded = %d, want 1,000 b10 (the floor)", got)
 		}
 		// Fund the top-up without changing the bond: a transfer into the
 		// account from a second key.
 		funder, fpub, fpriv := keypair(t)
-		s.Set(funder, Account{Balance: 500*b10 + 10})
-		if err := s.ApplyTx(stakeTransfer(t, fpub, fpriv, funder, 0, 500*b10+1, 1, addr)); err != nil {
+		s.Set(funder, Account{Balance: 100*b10 + 10})
+		if err := s.ApplyTx(stakeTransfer(t, fpub, fpriv, funder, 0, 100*b10+1, 1, addr)); err != nil {
 			t.Fatalf("funding transfer: %v", err)
 		}
-		if err := s.ApplyTx(bondTx(t, pub, priv, addr, 2, 500*b10, 1)); err != nil {
-			t.Fatalf("600 + 500 b10 clears the floor, got %v", err)
+		if err := s.ApplyTx(bondTx(t, pub, priv, addr, 2, 100*b10, 1)); err != nil {
+			t.Fatalf("1,000 + 100 b10 clears the floor, got %v", err)
 		}
 		if got := s.Bonded(addr); got != 1_100*b10 {
 			t.Fatalf("Bonded = %d, want 1,100 b10", got)
@@ -251,22 +253,25 @@ func TestBondAccumulatesToTheFloor(t *testing.T) {
 // purposes, on one constructed state. The third assertion - the transfer of the
 // unbonded amount failing - is what a "move but keep spendable" mutant dies on;
 // the accessor assertions are what a "leave it in the bond map" mutant dies on.
+//
+// The fixture bonds 1,600 b10 so the 600 b10 exit leaves exactly the 1,000 b10
+// floor bonded: audit ST-1 refuses a partial exit that would leave less.
 func TestUnbondingCoinsAreNeitherSpendableNorCounted(t *testing.T) {
-	// Bond the whole 1,000 b10 and leave NOTHING spendable, so any transfer
+	// Bond the whole 1,600 b10 and leave NOTHING spendable, so any transfer
 	// that could reach the unbonded sparks would have to credit the balance.
-	s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+	s, addr, pub, priv := bondedValidator(t, 1_600*b10, 0)
 	s.SetHeight(5)
 	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 600*b10)); err != nil {
 		t.Fatalf("Unbond: %v", err)
 	}
 
 	// 1. Not counted toward the committee: the bond accessor the derivation
-	// reads (Task 2's candidate set) sees only the 400 b10 left bonded, and the
-	// unbonding amount is in a different map entirely.
-	if got, want := s.Bonded(addr), uint64(400*b10); got != want {
+	// reads (Task 2's candidate set) sees only the 1,000 b10 left bonded, and
+	// the unbonding amount is in a different map entirely.
+	if got, want := s.Bonded(addr), uint64(1_000*b10); got != want {
 		t.Fatalf("Bonded = %d, want %d: the unbonded sparks are still counted", got, want)
 	}
-	if got, want := s.TotalBonded(), uint64(400*b10); got != want {
+	if got, want := s.TotalBonded(), uint64(1_000*b10); got != want {
 		t.Fatalf("TotalBonded = %d, want %d", got, want)
 	}
 	if got, want := s.TotalUnbonding(), uint64(600*b10); got != want {
@@ -294,8 +299,10 @@ func TestUnbondingCoinsAreNeitherSpendableNorCounted(t *testing.T) {
 
 // TestWithdrawReleasesOnlyMatured: two unbonds land at different heights, so a
 // withdraw between them must release the first and leave the second untouched.
+// The 2,000 b10 fixture keeps both partial exits legal under audit ST-1's floor
+// (400 leaves 1,600; 600 more leaves exactly 1,000).
 func TestWithdrawReleasesOnlyMatured(t *testing.T) {
-	s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+	s, addr, pub, priv := bondedValidator(t, 2_000*b10, 0)
 
 	s.SetHeight(5)
 	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 400*b10)); err != nil { // releases at 25
@@ -305,8 +312,8 @@ func TestWithdrawReleasesOnlyMatured(t *testing.T) {
 	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 2, 600*b10)); err != nil { // releases at 30
 		t.Fatalf("second unbond: %v", err)
 	}
-	if got := s.Bonded(addr); got != 0 {
-		t.Fatalf("Bonded = %d after unbonding the whole 1,000 b10, want 0", got)
+	if got := s.Bonded(addr); got != 1_000*b10 {
+		t.Fatalf("Bonded = %d after unbonding 1,000 of the 2,000 b10, want 1,000", got)
 	}
 
 	// At the first record's release height only the first is mature.
@@ -399,8 +406,9 @@ func TestAStakeTransactionNeverChangesTheSupplySum(t *testing.T) {
 		}
 	}
 
-	// Bond: moves sparks into the bond and burns its fee.
-	if err := s.ApplyTx(bondTx(t, pub, priv, addr, 0, minStakeSparks, 3)); err != nil {
+	// Bond: moves sparks into the bond and burns its fee. The bond is twice the
+	// floor so the partial exit below leaves exactly the floor (audit ST-1).
+	if err := s.ApplyTx(bondTx(t, pub, priv, addr, 0, 2*minStakeSparks, 3)); err != nil {
 		t.Fatalf("Bond: %v", err)
 	}
 	burned += 3
@@ -429,7 +437,7 @@ func TestAStakeTransactionNeverChangesTheSupplySum(t *testing.T) {
 
 	// And the final shape: bonded keeps the other half, the spendable term got
 	// the matured half back.
-	if got, want := s.Bonded(addr), uint64(minStakeSparks/2); got != want {
+	if got, want := s.Bonded(addr), uint64(3*minStakeSparks/2); got != want {
 		t.Fatalf("Bonded = %d, want %d", got, want)
 	}
 	if got := s.TotalUnbonding(); got != 0 {
@@ -552,8 +560,9 @@ func TestApplyBlockRollsBackAStakeFailure(t *testing.T) {
 	})
 
 	t.Run("valid unbond that merges, then a failed transfer", func(t *testing.T) {
-		// An existing record at release height R, created at height 5.
-		s, addr, pub, priv := bondedValidator(t, minStakeSparks, 5)
+		// An existing record at release height R, created at height 5, from a
+		// 1,500 b10 bond so both exits stay above the floor (audit ST-1).
+		s, addr, pub, priv := bondedValidator(t, 1_500*b10, 5)
 		s.SetHeight(5)
 		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 300*b10)); err != nil {
 			t.Fatalf("fixture unbond: %v", err)
@@ -584,7 +593,8 @@ func TestApplyBlockRollsBackAStakeFailure(t *testing.T) {
 // TestStakeTransactionsSpendTheNonce: the replay guard covers the new types, so
 // a replayed Bond/Unbond/Withdraw is refused like a replayed transfer.
 func TestStakeTransactionsSpendTheNonce(t *testing.T) {
-	s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+	// 1,100 b10 bonded so the 100 b10 exit leaves exactly the floor.
+	s, addr, pub, priv := bondedValidator(t, 1_100*b10, 0)
 	// The bond itself consumed nonce 0.
 	replay := bondTx(t, pub, priv, addr, 0, minStakeSparks, 1)
 	if err := s.ApplyTx(replay); !errors.Is(err, ErrBadNonce) {
@@ -714,9 +724,10 @@ func TestUnbondRules(t *testing.T) {
 
 // TestUnbondMergesRecordsAtOneReleaseHeight bounds unbond spam by distinct
 // heights rather than by transactions: two unbonds in one block produce ONE
-// record whose amount is their sum.
+// record whose amount is their sum. The 1,500 b10 fixture keeps both exits
+// above the audit ST-1 floor (1,200 then 1,000).
 func TestUnbondMergesRecordsAtOneReleaseHeight(t *testing.T) {
-	s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+	s, addr, pub, priv := bondedValidator(t, 1_500*b10, 0)
 	s.SetHeight(5)
 	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 300*b10)); err != nil {
 		t.Fatalf("first Unbond: %v", err)
@@ -872,7 +883,8 @@ func TestReleaseHeightArithmetic(t *testing.T) {
 
 // TestWithdrawWithNothingMatured covers the empty case explicitly.
 func TestWithdrawWithNothingMatured(t *testing.T) {
-	s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+	// 1,100 b10 bonded so the 100 b10 exit leaves exactly the floor.
+	s, addr, pub, priv := bondedValidator(t, 1_100*b10, 0)
 	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 1)); !errors.Is(err, ErrNothingToWithdraw) {
 		t.Fatalf("Withdraw with no records: err = %v, want ErrNothingToWithdraw", err)
 	}
@@ -883,4 +895,129 @@ func TestWithdrawWithNothingMatured(t *testing.T) {
 	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 2)); !errors.Is(err, ErrNothingToWithdraw) {
 		t.Fatalf("Withdraw with only immature records: err = %v, want ErrNothingToWithdraw", err)
 	}
+}
+
+// TestUnbondBelowTheFloorIsRefused is the inverse of
+// TestBondBelowMinStakeIsRefused (audit ST-1). A committee seats every bond
+// with a positive amount, so an Unbond that leaves a positive remainder under
+// MIN_STAKE would leave a CANDIDATE worth less than the floor — and the power
+// cap's fixed point lifts such a seat to equal power with an honest validator
+// (the repository's own 10^12-plus-three-at-one-spark vector converges to four
+// seats of power 1). The rule is on the REMAINDER: exactly zero, or at least
+// MinStake.
+//
+// The attack this kills is the whole finding: bond MIN_STAKE, unbond all but
+// one spark, and recycle the stake into the next key. The refusal must leave
+// the bond, the unbonding map, the nonce and the state ROOT untouched — a
+// refused transaction that wrote the decremented bond would be worse than no
+// rule at all, because it would leave the one-spark candidate behind while
+// returning an error.
+func TestUnbondBelowTheFloorIsRefused(t *testing.T) {
+	s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+	s.SetHeight(5)
+	beforeRoot, beforeBonded := s.Root(), s.Bonded(addr)
+
+	// The audit's step: unbond all but one spark.
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, minStakeSparks-1)); !errors.Is(err, ErrStakeBelowMinimum) {
+		t.Fatalf("unbond to one spark: err = %v, want ErrStakeBelowMinimum", err)
+	}
+	if got := s.Bonded(addr); got != beforeBonded {
+		t.Fatalf("a refused unbond changed the bond to %d, want %d", got, beforeBonded)
+	}
+	if recs := s.UnbondingOf(addr); len(recs) != 0 {
+		t.Fatalf("a refused unbond created unbonding records: %+v", recs)
+	}
+	if got := s.Get(addr).Nonce; got != 1 {
+		t.Fatalf("a refused unbond consumed a nonce: %d", got)
+	}
+	if s.Root() != beforeRoot {
+		t.Fatal("a refused unbond moved the state root")
+	}
+
+	// One spark over the boundary: leaving MIN_STAKE-1 is refused too, so the
+	// rule is the remainder and not "all but nothing".
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 1)); !errors.Is(err, ErrStakeBelowMinimum) {
+		t.Fatalf("unbond of one spark (leaving MIN_STAKE-1): err = %v, want ErrStakeBelowMinimum", err)
+	}
+
+	// And the boundary itself is legal: leaving EXACTLY MinStake is accepted.
+	s2, addr2, pub2, priv2 := bondedValidator(t, 1_500*b10, 0)
+	s2.SetHeight(5)
+	if err := s2.ApplyTx(unbondTx(t, pub2, priv2, addr2, 1, 500*b10)); err != nil {
+		t.Fatalf("unbond of 500 b10 leaving exactly MIN_STAKE: %v", err)
+	}
+	if got := s2.Bonded(addr2); got != minStakeSparks {
+		t.Fatalf("Bonded = %d, want exactly MIN_STAKE %d", got, minStakeSparks)
+	}
+
+	// A full exit is the other legal remainder (zero), and it still deletes the
+	// record.
+	if err := s2.ApplyTx(unbondTx(t, pub2, priv2, addr2, 2, minStakeSparks)); err != nil {
+		t.Fatalf("full exit from the floor: %v", err)
+	}
+	if _, ok := s2.bonds[addr2]; ok {
+		t.Fatal("a full exit left a bond record behind")
+	}
+}
+
+// TestASubMinimumGenesisSeatCanOnlyExitInFull is ST-1's carve-out, and it is
+// load-bearing rather than defensive: genesis seats are seeded at
+// `Amount = Validator.Power` (chain.genesisState), and the devnet and simnet
+// fixtures bond their seats at power ONE. Refusing every sub-floor unbond would
+// freeze those seats forever — the M5 rotation fixture unbonds exactly such a
+// seat, in full, through an ordinary transaction.
+//
+// So: a bond already below the floor may exit, and only in full. Both halves
+// are exercised at the two shapes that exist — a one-spark devnet seat and a
+// 600 b10 hand-set seat — because a one-spark bond has no expressible partial
+// exit and a 600 b10 one does.
+func TestASubMinimumGenesisSeatCanOnlyExitInFull(t *testing.T) {
+	t.Run("one-spark devnet seat exits in full", func(t *testing.T) {
+		s := NewWithParams(stakingParams())
+		addr, pub, priv := keypair(t)
+		s.SetBond(addr, Bond{Validator: pub, Amount: 1, Height: 0})
+		s.SetHeight(5)
+
+		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 0, 1)); err != nil {
+			t.Fatalf("a one-spark genesis seat must be able to exit (this is the M5 rotation fixture's seat): %v", err)
+		}
+		if recs := s.UnbondingOf(addr); len(recs) != 1 || recs[0].Amount != 1 {
+			t.Fatalf("unbonding = %+v, want one one-spark record", recs)
+		}
+		s.SetHeight(5 + stakeCooldown)
+		if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 1)); err != nil {
+			t.Fatalf("withdraw of the exited seat: %v", err)
+		}
+		if got := s.Get(addr).Balance; got != 1 {
+			t.Fatalf("balance = %d after the withdraw, want the one spark back", got)
+		}
+	})
+
+	t.Run("600 b10 sub-floor seat cannot exit partially", func(t *testing.T) {
+		s := NewWithParams(stakingParams())
+		addr, pub, priv := keypair(t)
+		s.SetBond(addr, Bond{Validator: pub, Amount: 600 * b10, Height: 0})
+		s.SetHeight(5)
+		beforeRoot := s.Root()
+
+		// Every partial remainder of a sub-floor bond is itself sub-floor, so
+		// any partial exit is refused ...
+		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 0, 100*b10)); !errors.Is(err, ErrStakeBelowMinimum) {
+			t.Fatalf("partial exit from a sub-floor genesis seat: err = %v, want ErrStakeBelowMinimum", err)
+		}
+		if got := s.Bonded(addr); got != 600*b10 {
+			t.Fatalf("a refused partial exit changed the seat's bond to %d", got)
+		}
+		if s.Root() != beforeRoot {
+			t.Fatal("a refused partial exit moved the state root")
+		}
+
+		// ... and the full exit is accepted.
+		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 0, 600*b10)); err != nil {
+			t.Fatalf("the full exit from a sub-floor genesis seat must be accepted: %v", err)
+		}
+		if got := s.Bonded(addr); got != 0 {
+			t.Fatalf("Bonded = %d after the full exit, want 0", got)
+		}
+	})
 }

@@ -8,6 +8,8 @@ package chain
 
 import (
 	"bytes"
+	"encoding/hex"
+	"encoding/json"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -75,6 +77,71 @@ func TestGenesisSeatsAreBondedAndCommitted(t *testing.T) {
 	}
 	if p.CommitteeSize != g.Params.CommitteeSize {
 		t.Fatalf("state CommitteeSize = %d, want %d", p.CommitteeSize, g.Params.CommitteeSize)
+	}
+}
+
+// TestACommitteeFileGenesisSeatsAtTheFloor opens the genesis the shipped
+// three-Pi recipe now describes (audit RT-2): three validators at MIN_STAKE and
+// one spare seat. Each seat's bond is its power — 10^11 sparks, not the one
+// spark the pre-fix example produced — and the chain's committee_size has room
+// for a fourth seat, so the epoch-0 committee is the three listed keys and a
+// later bond is admitted beside them.
+func TestACommitteeFileGenesisSeatsAtTheFloor(t *testing.T) {
+	entries := make([]genesis.CommitteeEntry, 0, 3)
+	pubA, _ := genesis.DevAccountKey(0)
+	pubB, _ := genesis.DevAccountKey(1)
+	third := make([]byte, 32)
+	copy(third, pubA)
+	third[0] ^= 0xff // a distinct 32-byte key; the loader only requires 32 bytes
+	for i, pub := range [][]byte{pubA, pubB, third} {
+		entries = append(entries, genesis.CommitteeEntry{
+			Name:   "pi-" + string(rune('0'+i)),
+			PubKey: hex.EncodeToString(pub),
+			Power:  genesis.Devnet().Params.MinStakeSparks,
+		})
+	}
+	raw, err := json.Marshal(genesis.CommitteeFile{
+		ChainID:       "recipe-test-1",
+		CommitteeSize: 4,
+		Validators:    entries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := genesis.ParseCommitteeJSON(raw)
+	if err != nil {
+		t.Fatalf("the recipe's committee file must load: %v", err)
+	}
+
+	c, err := Open(g, t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+
+	minStake := g.Params.MinStakeSparks
+	st := c.State()
+	for _, v := range g.Validators {
+		addr := types.AddressFromPub(v.PubKey)
+		if got := st.Bonded(addr); got != minStake {
+			t.Fatalf("genesis seat %x Bonded = %d sparks, want its genesis power %d (MIN_STAKE); a one-spark bond here is RT-2's capture vector",
+				v.PubKey[:4], got, minStake)
+		}
+	}
+	if got := g.Params.CommitteeSize; got != 4 {
+		t.Fatalf("chain committee_size = %d, want the file's 4 (3 keys + a spare seat)", got)
+	}
+	committee, err := c.CommitteeAt(0)
+	if err != nil {
+		t.Fatalf("CommitteeAt(0): %v", err)
+	}
+	if len(committee) != 3 {
+		t.Fatalf("epoch-0 committee = %d seats, want the 3 listed keys", len(committee))
+	}
+	for _, v := range committee {
+		if v.Power < minStake {
+			t.Fatalf("epoch-0 seat %x holds %d sparks of power, below MIN_STAKE %d", v.PubKey[:4], v.Power, minStake)
+		}
 	}
 }
 

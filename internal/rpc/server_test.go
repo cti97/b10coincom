@@ -453,10 +453,13 @@ func TestAccountReportsBondAndUnbonding(t *testing.T) {
 	devPub, devPriv := genesis.DevAccountKey(0)
 	addr := types.AddressFromPub(devPub)
 	const minStake = 1_000 * genesis.SparksPerB10
+	// 1,400 b10 bonded so the 400 b10 exit below leaves exactly MIN_STAKE:
+	// audit ST-1 refuses a partial exit that would leave a sub-minimum bond.
+	const bonded = 1_400 * genesis.SparksPerB10
 
 	bond := &types.Tx{
 		Type: types.TxBond, From: addr, PubKey: devPub,
-		Nonce: 0, Fee: g.Params.MinFeeSparks, Amount: minStake,
+		Nonce: 0, Fee: g.Params.MinFeeSparks, Amount: bonded,
 	}
 	signTx(t, c, bond, devPriv)
 	appendBlock(t, c, []types.Tx{*bond}, g.Time+1)
@@ -489,15 +492,15 @@ func TestAccountReportsBondAndUnbonding(t *testing.T) {
 	if got.Address != addr.String() {
 		t.Errorf("address = %q, want %q", got.Address, addr.String())
 	}
-	wantBalance := 1_000_000*genesis.SparksPerB10 - minStake - g.Params.MinFeeSparks
+	wantBalance := 1_000_000*genesis.SparksPerB10 - bonded - g.Params.MinFeeSparks
 	if got.Balance != wantBalance {
 		t.Errorf("balance = %d, want %d", got.Balance, wantBalance)
 	}
 	if got.Nonce != 2 {
 		t.Errorf("nonce = %d, want 2", got.Nonce)
 	}
-	if want := uint64(minStake - 400*genesis.SparksPerB10); got.Bonded != want {
-		t.Errorf("bonded = %d, want %d", got.Bonded, want)
+	if want := uint64(minStake); got.Bonded != want {
+		t.Errorf("bonded = %d, want %d (1,400 less the 400 b10 exit is exactly MIN_STAKE)", got.Bonded, want)
 	}
 	wantRelease := uint64(2) + g.Params.UnbondingEpochs*g.Params.EpochBlocks
 	if len(got.Unbonding) != 1 {
