@@ -7,6 +7,7 @@ package consensus
 // only as a committee that stopped committing.
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
@@ -285,7 +286,12 @@ func TestTheRouterNeverMisroutesWireFrames(t *testing.T) {
 	// any of the three above.
 	observed := 0
 	rig.rt.OnPeerExchange = func(transport.PeerID, *wire.PeerExchange) { observed++ }
-	if got := rig.rt.Route(transport.Message{From: "v0", Data: wire.EncodePeerExchange(&wire.PeerExchange{Addrs: []string{"203.0.113.4:6001"}})}); got {
+	if got := rig.rt.Route(transport.Message{From: "v0", Data: wire.EncodePeerExchange(&wire.PeerExchange{
+		Height:    1,
+		Validator: bytes.Repeat([]byte{0xA5}, ed25519.PublicKeySize),
+		Addrs:     []string{"203.0.113.4:6001"},
+		Sig:       bytes.Repeat([]byte{0x5A}, ed25519.SignatureSize),
+	})}); got {
 		t.Fatal("a PEER_EXCHANGE frame was routed to the engine")
 	}
 	if observed != 1 {

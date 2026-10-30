@@ -31,11 +31,19 @@ func TestTheRelayForwardsAPeerExchangeFrameUnchanged(t *testing.T) {
 	b := dial(t, r.Addr().String())
 	waitRegistered(t, r, 2, "a dial completed while its connection sat unregistered")
 
-	frame := wire.EncodePeerExchange(&wire.PeerExchange{Addrs: []string{
-		"203.0.113.4:6001",
-		"[2001:db8::7]:6002",
-		"198.51.100.20:1",
-	}})
+	// A REAL frame: a height, an advertising key and a signature. The relay
+	// must forward it byte-identically all the same - it may not know what
+	// any of those fields are (audit PX-1).
+	frame := wire.EncodePeerExchange(&wire.PeerExchange{
+		Height:    7,
+		Validator: bytes.Repeat([]byte{0xA5}, 32),
+		Addrs: []string{
+			"203.0.113.4:6001",
+			"[2001:db8::7]:6002",
+			"198.51.100.20:1",
+		},
+		Sig: bytes.Repeat([]byte{0x5A}, 64),
+	})
 	if len(frame) == 0 || wire.MsgType(frame[0]) != wire.MsgPeerExchange {
 		t.Fatalf("the test frame does not open with the PEER_EXCHANGE tag: %x", frame)
 	}

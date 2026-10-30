@@ -299,11 +299,17 @@ whose keys sign, and that is the security boundary:**
 
 **Peer exchange, and who it actually helps.** M5 adds `PEER_EXCHANGE`: a node
 that has a listener advertises its `IP:port` at most once every four waves
-(one frame per ~2 s at the default 500 ms wave), and a peer that received the
-frame through an admitted, HELLO-attested connection may dial it directly,
-through the same maintainer, backoff and committee-HELLO admission as any other
-peer. The message carries listening addresses and nothing else — no height, no
-key, no vote — and the relay still parses none of it. **A relay-only or NAT'd
+(one frame per ~2 s at the default 500 ms wave), and a peer that receives the
+frame may dial it directly, through the same maintainer, backoff and
+committee-HELLO admission as any other peer. The message carries **listening
+addresses, the advertising member's key, the chain height it advertises at, and
+a signature over all three** (audit PX-1) — no vote and no chain state, and the
+relay still parses none of it, because it only ever forwards bytes. The
+receiver dials only if the signature verifies and the key held a seat at that
+height; a stranger on a token-less relay, or a relay sender replaying someone
+else's frame, is not a hint authority. A member that advertises junk addresses
+is bounded per member per wave, and a learned address whose handshake never
+completes is evicted rather than retried until restart. **A relay-only or NAT'd
 Pi advertises nothing and can be dialled by nobody**: a node with no `--listen`
 (and a `0.0.0.0`/unspecified listener counts as no address) sends no frame, so
 the mesh never gains a direct path *to* it and the relay remains its only
@@ -914,7 +920,7 @@ by `cmd` alone.
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
 | `internal/transport/tcp` | The real TCP transport: a framed reader/writer with socket deadlines, direct dial/listen, a relay-aware dial mode registered under `relay:<addr>`, and reconnect backoff. Its per-connection frame-rate bucket (audit N-6, the bound that stops one flooder monopolising the single dispatch callback) is applied to DIRECT connections only: on a relay connection the connection is the shared link, not the sender, so the bucket would drop honest members' votes for a stranger's flood — the relay's own per-sender share is the bound that replaces it there |
 | `internal/relay` | The dumb frame forwarder (`cmd/b10coin-relay`): a peer registry, per-receiver byte- and frame-bounded queues, per-source-prefix connection caps, socket deadlines and an optional pre-shared access-token first frame; it decodes nothing beyond the length prefix |
-| `internal/wire` | The wire envelopes shared with the transport and the consensus syncer: HELLO and BLOCK_SYNC request/response codecs with their own signed hashes, and (M5) `PEER_EXCHANGE` — a bounded list of listening addresses, canonical, unsigned by design (its authority is the admitted connection it arrived on) |
+| `internal/wire` | The wire envelopes shared with the transport and the consensus syncer: HELLO and BLOCK_SYNC request/response codecs with their own signed hashes, and (M5) `PEER_EXCHANGE` — a bounded, canonical list of listening addresses inside a signed envelope (the advertising member's key, its height, and a signature over chain id, height and list; audit PX-1) |
 | `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, catch-up and prefix-agreement assertions — the harness the eight seeded scenarios drive, and the multi-validator devnet with it; M5 adds the rotation fixture's `Unbond` submission through a committee's mempool and per-height committee access |
 | `internal/devnet` | The in-process devnet driver used by both the CLI acceptance commands and the tests: the single-node transfer, claim and double-claim-refusal scenario with replay verification, the multi-validator committee run reporting per-validator heights and agreement, the M5 rotation fixture and the committed-state Nakamoto series (`nakamoto.go`), and the real-TCP node (`tcpnode.go`) the `node` command's committee mode runs |
 | `internal/keystore` | The versioned JSON validator key file `keygen` writes and `--key` loads: owner-only permissions, public key re-derived and checked against the file, refusing a group- or world-readable key |

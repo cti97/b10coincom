@@ -7,6 +7,7 @@ package consensus
 // this is the one place both sides of the tag boundary are visible.
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
@@ -23,7 +24,12 @@ import (
 // read as a vote by any path; the router's own branches then place the frame
 // in the wire stream (TestTheRouterDeliversPeerExchangeOffTheConsensusPath).
 func TestTheConsensusDecodersRejectAPeerExchangeFrame(t *testing.T) {
-	frame := wire.EncodePeerExchange(&wire.PeerExchange{Addrs: []string{"203.0.113.4:6001"}})
+	frame := wire.EncodePeerExchange(&wire.PeerExchange{
+		Height:    1,
+		Validator: bytes.Repeat([]byte{0xA5}, ed25519.PublicKeySize),
+		Addrs:     []string{"203.0.113.4:6001"},
+		Sig:       bytes.Repeat([]byte{0x5A}, ed25519.SignatureSize),
+	})
 	if len(frame) == 0 || wire.MsgType(frame[0]) != wire.MsgPeerExchange {
 		t.Fatalf("the frame does not open with the PEER_EXCHANGE tag: %x", frame)
 	}
@@ -63,7 +69,12 @@ func TestTheRouterDeliversPeerExchangeOffTheConsensusPath(t *testing.T) {
 			gotFrom, gotAddrs = from, p.Addrs
 		},
 	}
-	frame := wire.EncodePeerExchange(&wire.PeerExchange{Addrs: []string{"203.0.113.4:6001", "[2001:db8::7]:6002"}})
+	frame := wire.EncodePeerExchange(&wire.PeerExchange{
+		Height:    9,
+		Validator: bytes.Repeat([]byte{0xA5}, ed25519.PublicKeySize),
+		Addrs:     []string{"203.0.113.4:6001", "[2001:db8::7]:6002"},
+		Sig:       bytes.Repeat([]byte{0x5A}, ed25519.SignatureSize),
+	})
 	if r.Route(transport.Message{From: "v3", Data: frame}) {
 		t.Fatal("a PEER_EXCHANGE frame was routed to the engine as consensus")
 	}

@@ -1072,7 +1072,15 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 	seatName := fmt.Sprintf("seat %d", seat)
 	if g != nil {
 		committeeSize = len(g.Validators)
-		seatName = fmt.Sprintf("seat %d, %s", seatFromKey(g, priv), keyDesc)
+		// A genesis seat is named by its position. A key that joined after
+		// genesis has none (audit RT-1): its seat is a per-epoch property of
+		// committed state, so the banner must not print "-1" as if it were a
+		// position.
+		if pos := seatFromKey(g, priv); pos >= 0 {
+			seatName = fmt.Sprintf("seat %d, %s", pos, keyDesc)
+		} else {
+			seatName = fmt.Sprintf("rotated-in key (seated at head+1), %s", keyDesc)
+		}
 	}
 	if len(dial) == 0 && len(relayDial) == 0 && listen == "" && committeeSize > 1 && g == nil {
 		// Fixture mode can be refused before anything starts. Genesis-file
@@ -1182,9 +1190,10 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 	}
 }
 
-// seatFromKey finds the committee position a key signs as, or -1. The CLI uses
-// it only inside the seat-name banner; the hard refusal lives in
-// StartValidator, so a non-member key never gets this far.
+// seatFromKey finds the GENESIS committee position a key signs as, or -1. The
+// CLI uses it only inside the seat-name banner; the admission decision lives in
+// StartValidator, which admits a key seated at head+1 even though this returns
+// -1 for it (a validator that bonded after genesis, audit RT-1).
 func seatFromKey(g *genesis.Genesis, priv ed25519.PrivateKey) int {
 	pub, _ := priv.Public().(ed25519.PublicKey)
 	return genesis.SeatOfPubKey(g.Validators, pub)

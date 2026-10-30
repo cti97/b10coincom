@@ -22,6 +22,7 @@ import (
 	"github.com/cti97/b10coincom/internal/consensus"
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/relay"
+	"github.com/cti97/b10coincom/internal/simnet"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/transport/tcp"
 	"github.com/cti97/b10coincom/internal/wire"
@@ -57,6 +58,41 @@ func recordPeerDial(v *Validator) *[]string {
 		return nil
 	}
 	return dials
+}
+
+// memberHint builds the frame a SEATED member sends: signed with that member's
+// fixture key, over this node's chain id, at this node's height. The node's two
+// checks - a seat at the advertised height, and a signature over (chain, height,
+// addresses) - both pass, which is what makes the address policy below the only
+// thing left to refuse (audit PX-1).
+func memberHint(t *testing.T, v *Validator, seat int, addrs []string) *wire.PeerExchange {
+	t.Helper()
+	priv := simnet.ValidatorKey(seat)
+	p := &wire.PeerExchange{
+		Height:    v.Height(),
+		Validator: priv.Public().(ed25519.PublicKey),
+		Addrs:     addrs,
+	}
+	h := peerExchangeHash(v.g.ChainID, p.Height, p.Addrs)
+	p.Sig = crypto.Sign(priv, h[:])
+	return p
+}
+
+// strangerHint is the frame a RELAY STRANGER can produce: well formed, signed
+// by a key of its own that holds no seat. Before the audit's fix this frame was
+// authoritative the moment it arrived on a connection that had carried any
+// member's HELLO - which on a relay is every connection. Now it is refused by
+// the membership half of hintAuthority.
+func strangerHint(t *testing.T, v *Validator, addrs []string) *wire.PeerExchange {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &wire.PeerExchange{Height: v.Height(), Validator: pub, Addrs: addrs}
+	h := peerExchangeHash(v.g.ChainID, p.Height, p.Addrs)
+	p.Sig = crypto.Sign(priv, h[:])
+	return p
 }
 
 // TestAPeerHintMustBeALiteralIPPort is the policy table: every shape a hostile
@@ -129,17 +165,13 @@ func TestAPeerHintMustBeALiteralIPPort(t *testing.T) {
 func TestAPeerExchangeCannotAimTheNodeAtItsOwnNetwork(t *testing.T) {
 	v := startFrozen(t, false)
 	dials := recordPeerDial(v)
-	// The connection must have carried a signed committee HELLO to be
-	// authoritative for a hint; recordHeight is what observeHello leaves behind.
-	v.recordHeight("member", "v1", 0)
-
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: []string{
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{
 		"127.0.0.1:1",
 		"[::1]:1",
 		"10.0.0.5:9",
 		"169.254.1.1:9",
 		"example.com:9",
-	}})
+	}))
 	if len(*dials) != 0 {
 		t.Fatalf("a local, link-local, loopback or hostname hint produced %d dial(s) (%v); a peer may not aim this node at its own network", len(*dials), *dials)
 	}
@@ -150,7 +182,7 @@ func TestAPeerExchangeCannotAimTheNodeAtItsOwnNetwork(t *testing.T) {
 		t.Fatalf("PeerHintsRefused = %d, want 5", got)
 	}
 
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: []string{"203.0.113.4:6001"}})
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{"203.0.113.4:6001"}))
 	if len(*dials) != 1 || (*dials)[0] != "203.0.113.4:6001" {
 		t.Fatalf("a public hint produced dials %v, want exactly [203.0.113.4:6001]", *dials)
 	}
@@ -168,19 +200,18 @@ func TestAPeerExchangeCannotAimTheNodeAtItsOwnNetwork(t *testing.T) {
 func TestALearnedAddressThatIsMyOwnOrADuplicateOrAReservedNameIsIgnored(t *testing.T) {
 	v := startFrozen(t, true)
 	dials := recordPeerDial(v)
-	v.recordHeight("member", "v1", 0)
 
 	// The same address as this node's own listener: refused even though the
 	// devnet exception would otherwise accept a loopback hint.
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: []string{v.Addr()}})
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{v.Addr()}))
 	if len(*dials) != 0 {
 		t.Fatalf("a hint naming this node's own listen address (%q) produced %v; self-dial is refused", v.Addr(), *dials)
 	}
 
 	// A valid public address is dialled once...
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: []string{"203.0.113.4:6001"}})
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{"203.0.113.4:6001"}))
 	// ...and re-advertising it is ignored: no second dial, no budget spent.
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: []string{"203.0.113.4:6001"}})
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{"203.0.113.4:6001"}))
 	if len(*dials) != 1 {
 		t.Fatalf("a duplicate hint produced dials %v, want the one first dial", *dials)
 	}
@@ -189,7 +220,7 @@ func TestALearnedAddressThatIsMyOwnOrADuplicateOrAReservedNameIsIgnored(t *testi
 	}
 
 	// Unparseable and reserved-name hints never reach the dial path.
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: []string{"relay:203.0.113.4:6001", "not an address"}})
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{"relay:203.0.113.4:6001", "not an address"}))
 	if len(*dials) != 1 {
 		t.Fatalf("reserved/unparseable hints produced dials %v, want only the earlier public one", *dials)
 	}
@@ -209,7 +240,6 @@ func TestALearnedAddressThatIsMyOwnOrADuplicateOrAReservedNameIsIgnored(t *testi
 func TestOnePeerCannotSpendMoreThanThePerWaveOrLifetimeBudget(t *testing.T) {
 	v := startFrozen(t, false)
 	dials := recordPeerDial(v)
-	v.recordHeight("member", "v1", 0)
 
 	// One wave's worth, then a second frame in the SAME wave.
 	waveAddrs := func(base int) []string {
@@ -219,21 +249,20 @@ func TestOnePeerCannotSpendMoreThanThePerWaveOrLifetimeBudget(t *testing.T) {
 		}
 		return out
 	}
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: waveAddrs(10)})
+	v.observePeerExchange("v1", memberHint(t, v, 1, waveAddrs(10)))
 	if got := len(*dials); got != maxNewPeerHintsPerWave {
 		t.Fatalf("one frame produced %d dials, want %d", got, maxNewPeerHintsPerWave)
 	}
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: waveAddrs(20)})
+	v.observePeerExchange("v1", memberHint(t, v, 1, waveAddrs(20)))
 	if got := len(*dials); got != maxNewPeerHintsPerWave {
 		t.Fatalf("a second frame in one wave produced %d dials total, want %d: the per-wave budget did not bind", got, maxNewPeerHintsPerWave)
 	}
 
-	// Three more waves fill the lifetime budget (4 waves x 8). The attestation
-	// is refreshed each wave, as an honest peer's own HELLO would.
+	// Three more waves fill the lifetime budget (4 waves x 8). The member
+	// re-advertises each wave, as an honest peer would.
 	for _, base := range []int{30, 40, 50} {
 		v.beginWave()
-		v.recordHeight("member", "v1", 0)
-		v.observePeerExchange("v1", &wire.PeerExchange{Addrs: waveAddrs(base)})
+		v.observePeerExchange("v1", memberHint(t, v, 1, waveAddrs(base)))
 	}
 	if got := v.LearnedPeerAddrs(); got != maxLearnedPeerAddrs {
 		t.Fatalf("LearnedPeerAddrs = %d after four waves, want the lifetime budget %d", got, maxLearnedPeerAddrs)
@@ -245,8 +274,7 @@ func TestOnePeerCannotSpendMoreThanThePerWaveOrLifetimeBudget(t *testing.T) {
 	// The next wave's valid addresses are refused: the budget is lifetime, and
 	// an over-budget refusal is counted separately so an operator can see it.
 	v.beginWave()
-	v.recordHeight("member", "v1", 0)
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: waveAddrs(60)})
+	v.observePeerExchange("v1", memberHint(t, v, 1, waveAddrs(60)))
 	if got := len(*dials); got != maxLearnedPeerAddrs {
 		t.Fatalf("dials = %d after the budget was spent, want it capped at %d", got, maxLearnedPeerAddrs)
 	}
@@ -375,8 +403,7 @@ func TestALearnedAddressIsNotAPeerUntilItSaysHello(t *testing.T) {
 	}
 
 	// A member advertises the stranger's address to v.
-	v.recordHeight("member", "v1", 0)
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: []string{stranger.Addr().String()}})
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{stranger.Addr().String()}))
 
 	// The hint DID cause a dial: the transport name appears.
 	waitPeer(t, v, "stranger", 5*time.Second)
@@ -403,10 +430,11 @@ func TestALearnedAddressIsNotAPeerUntilItSaysHello(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// And the stranger cannot advertise: its connection never carried a signed
-	// committee HELLO, so its hint is refused instead of dialled.
+	// And the stranger cannot advertise: its hint is well formed and signed by
+	// its OWN key, and that key holds no seat, so it is refused instead of
+	// dialled (audit PX-1 - the connection it arrives on is irrelevant now).
 	refusedBefore := v.PeerHintsRefused()
-	_ = stranger.Broadcast(wire.EncodePeerExchange(&wire.PeerExchange{Addrs: []string{"203.0.113.9:6001"}}))
+	_ = stranger.Broadcast(wire.EncodePeerExchange(strangerHint(t, v, []string{"203.0.113.9:6001"})))
 	for v.PeerHintsRefused() == refusedBefore {
 		if time.Now().After(deadline) {
 			t.Fatal("an unattested connection's PEER_EXCHANGE was not refused")
@@ -454,8 +482,7 @@ func TestALearnedAddressThatIsDownIsRetriedNotAbandoned(t *testing.T) {
 	}
 	defer v.Close()
 
-	v.recordHeight("member", "v1", 0)
-	v.observePeerExchange("v1", &wire.PeerExchange{Addrs: []string{addr}})
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{addr}))
 	if got := v.LearnedPeerAddrs(); got != 1 {
 		t.Fatalf("LearnedPeerAddrs = %d, want 1", got)
 	}
@@ -499,10 +526,9 @@ func TestALearnedAddressThatIsDownIsRetriedNotAbandoned(t *testing.T) {
 func TestAPeerExchangeMovesNoConsensusState(t *testing.T) {
 	v := startFrozen(t, false)
 	dials := recordPeerDial(v)
-	v.recordHeight("member", "v1", 0)
 
 	height, round, voted := v.Height(), v.Round(), len(v.VotedHeights())
-	v.route(transport.Message{From: "v1", Data: wire.EncodePeerExchange(&wire.PeerExchange{Addrs: []string{"203.0.113.4:6001"}})})
+	v.route(transport.Message{From: "v1", Data: wire.EncodePeerExchange(memberHint(t, v, 1, []string{"203.0.113.4:6001"}))})
 	if len(*dials) != 1 {
 		t.Fatalf("the frame did not reach the node's dial policy (dials %v)", *dials)
 	}

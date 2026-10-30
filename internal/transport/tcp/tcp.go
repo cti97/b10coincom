@@ -583,6 +583,14 @@ type outbound struct {
 	// the direct handshake reads whatever frame the relay forwards first as
 	// the peer's identity, which is stranger-controlled (audit N-1).
 	relay bool
+	// stop ends THIS maintainer and everything it holds. It is closed only by
+	// RemovePeer - the node's own peer policy retiring an address it decided
+	// to stop dialling (audit PX-1: a learned address whose handshake never
+	// completed) - never by anything a peer sends. Closing is what releases
+	// the goroutine and the registration; without it the only exit was the
+	// transport closing, so a hint spent on an address that never answers
+	// cost a maintainer for the process's life.
+	stop chan struct{}
 }
 
 // TcpTransport moves opaque bytes over real TCP.
@@ -626,6 +634,13 @@ type TcpTransport struct {
 	// refusedConns counts inbound dials closed at accept because the cap was
 	// full. The observable an operator checks when honest peers cannot get in.
 	refusedConns atomic.Uint64
+	// maintainers counts the running maintainer goroutines. A registration
+	// and a goroutine are different things: RemovePeer deletes the former
+	// immediately, but the goroutine ends only when it observes the stop, and
+	// a retirement that leaves the goroutine awake would redial forever with
+	// nothing naming it. This is that difference made observable.
+	maintainers atomic.Int64
+
 	// lastRedialDelay records the delay the maintainer most recently backed
 	// off before redialling. Observability first - a peer flapping forever on
 	// a stuck 30s curve is diagnosable from this one number - and it is what
@@ -789,6 +804,73 @@ func (t *TcpTransport) AddPeer(addr string) error {
 	return err
 }
 
+// RemovePeer retires the maintainer for addr: its dial loop ends and any
+// connection it is holding is closed. It is the deliberate counterpart of
+// AddPeer, for a caller that has decided the address is not worth keeping -
+// the node's peer-hint policy uses it to evict a learned address whose signed
+// committee HELLO never completed (audit PX-1), which is what frees the
+// lifetime dial budget instead of spending it until restart.
+//
+// It reports whether a maintainer was registered. It is idempotent, and it
+// only ever releases the registration it found: a maintainer created after
+// this call (a fresh AddPeer for the same address) is untouched, and a
+// maintainer that already exited has already released its own entry.
+//
+// The caller must not use it on an address it configured itself: nothing a
+// PEER sends may end a maintainer (audit N-1), and this is the one API that
+// can. The policy that calls it lives in internal/devnet and knows which
+// addresses were learned from hints.
+func (t *TcpTransport) RemovePeer(addr string) bool {
+	t.mu.Lock()
+	ob, ok := t.outbounds[addr]
+	if ok {
+		delete(t.outbounds, addr)
+	}
+	t.mu.Unlock()
+	if !ok {
+		return false
+	}
+	// The maintainer owns its connection and is the one that closes it: it is
+	// either holding one (the stop case in maintain finishes it) or waiting
+	// out a backoff with no connection at all. A dial already in flight
+	// completes, installs, and is closed by that same stop case - bounded by
+	// DialTimeout - but the REGISTRATION is gone, so nothing redials after
+	// it. One owner for the socket is what keeps this from racing the
+	// reader's own teardown.
+	close(ob.stop)
+	return true
+}
+
+// PeerAddr reports the address of the live connection registered under id:
+// for a connection this node dialled, the address it dialled; for an accepted
+// one, the remote socket address. It is how a caller ties a peer's name back
+// to the address it learned (the hint book, audit PX-1).
+func (t *TcpTransport) PeerAddr(id transport.PeerID) (string, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	c, ok := t.conns[id]
+	if !ok {
+		return "", false
+	}
+	return c.addr, true
+}
+
+// MaintainerCount reports how many maintainer goroutines are running. A
+// retired address must take its goroutine with it: RemovePeer deletes the
+// registration, and this is the observable that the worker ended rather than
+// sleeping out its backoff and redialling with nothing naming it.
+func (t *TcpTransport) MaintainerCount() int { return int(t.maintainers.Load()) }
+
+// Maintains reports whether a maintainer is registered for addr. It is the
+// observable a test uses to prove a retired address is no longer being
+// redialled.
+func (t *TcpTransport) Maintains(addr string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.outbounds[addr]
+	return ok
+}
+
 // DialRelay is Dial for the relay's address: the connection is maintained in
 // the relay mode (outbound.relay) - the local ID is written, NOTHING is read
 // back as an identity, and the connection is registered under the fixed name
@@ -832,7 +914,7 @@ func (t *TcpTransport) registerOutbound(addr string, relay bool, first chan<- er
 	if _, ok := t.outbounds[addr]; ok {
 		return false, nil
 	}
-	ob := &outbound{addr: addr, relay: relay}
+	ob := &outbound{addr: addr, relay: relay, stop: make(chan struct{})}
 	t.outbounds[addr] = ob
 	t.wg.Add(1)
 	go t.maintain(ob, first)
@@ -841,11 +923,15 @@ func (t *TcpTransport) registerOutbound(addr string, relay bool, first chan<- er
 
 // maintain is the reconnection loop for one address: dial, handshake, hold
 // until the connection dies, then redial after a growing, jittered delay.
-// EXACTLY ONE finding ends the loop: the transport closing (quit). Every other
-// outcome - a dial error, a self or duplicate refusal, an oversized identity,
-// a read timeout, or the connection being SUPERSEDED by a higher-ranked
-// connection to the same peer - is an ordinary failure that backs off and
-// retries. Nothing a stranger can do to the registry may end a maintainer.
+// EXACTLY TWO findings end the loop, and neither is a peer's: the transport
+// closing (quit), and RemovePeer - this node's OWN policy retiring the address
+// (audit PX-1: a learned address whose signed committee HELLO never completed).
+// Every other outcome - a dial error, a self or duplicate refusal, an
+// oversized identity, a read timeout, or the connection being SUPERSEDED by a
+// higher-ranked connection to the same peer - is an ordinary failure that
+// backs off and retries. Nothing a stranger can do to the registry may end a
+// maintainer; only the node that owns the transport can, and only for an
+// address it decided to stop dialling.
 //
 // A self- or duplicate-peer refusal is not an end of the loop, which is the
 // heart of the audit's N-1 fix. Before it, such a refusal returned from
@@ -875,12 +961,15 @@ func (t *TcpTransport) registerOutbound(addr string, relay bool, first chan<- er
 // validator's own listener evicted the incumbent and the maintainer returned
 // here, so the link was gone until process restart. It is not any more.
 //
-// The deferred forgetOutbound still releases the address registration, but now
-// only when the transport itself is closing (the sole exit), where no
-// Dial/AddPeer can be misled by a stale entry: the maintainer that still owns
-// the address is still running.
+// The deferred forgetOutbound releases the address registration when the
+// maintainer exits: the transport closing, or RemovePeer retiring an address
+// the node's own policy gave up on (audit PX-1). The release is
+// identity-checked, so a racing AddPeer for the same address keeps its own
+// registration. No PEER-driven outcome reaches either exit.
 func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 	defer t.wg.Done()
+	t.maintainers.Add(1)
+	defer t.maintainers.Add(-1)
 	addr := ob.addr
 	// The release is identity-checked, so a dying maintainer can never
 	// delete a registration a racing AddPeer just created for the same
@@ -936,6 +1025,15 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 					// so the state is self-healing either way.
 				case <-t.quit:
 					return
+				case <-ob.stop:
+					// The node's own policy retired this address (audit
+					// PX-1). Close the connection this maintainer holds - it
+					// may be a socket that completed the ID handshake but
+					// never produced a signed committee HELLO - and end the
+					// loop. finish is idempotent, so the reader racing this
+					// is harmless.
+					t.finish(c)
+					return
 				}
 			}
 			// Every handshake failure - self, duplicate, ID too large, read
@@ -955,17 +1053,20 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 		select {
 		case <-t.quit:
 			return
+		case <-ob.stop:
+			return
 		case <-time.After(delay):
 		}
 	}
 }
 
 // forgetOutbound releases ob's address registration when its maintainer exits
-// for good. The only exit is the transport closing, so the release is
-// bookkeeping for shutdown rather than a live state change: while the
-// transport runs, every address a Dial/AddPeer registered still has the
-// maintainer it claims. (A self or duplicate refusal, and a supersede, are
-// not exits at all: they back off and retry - audit N-1, both passes.)
+// for good: the transport closing, or RemovePeer (audit PX-1, the node's own
+// policy retiring a learned address). The release is identity-checked, so a
+// registration a racing AddPeer created for the same address is untouched.
+// (A self or duplicate refusal, and a supersede, are not exits at all: they
+// back off and retry - audit N-1, both passes. Nothing a peer sends reaches
+// RemovePeer.)
 func (t *TcpTransport) forgetOutbound(ob *outbound) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

@@ -22,6 +22,7 @@ package wire
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"testing"
 )
 
@@ -167,8 +168,18 @@ func FuzzDecodeBlockSyncResp(f *testing.F) {
 }
 
 func FuzzDecodePeerExchange(f *testing.F) {
-	f.Add(EncodePeerExchange(&PeerExchange{Addrs: []string{"127.0.0.1:6001"}}))
-	f.Add(EncodePeerExchange(&PeerExchange{Addrs: []string{"[::1]:1", "10.0.0.5:65535"}}))
+	f.Add(EncodePeerExchange(&PeerExchange{
+		Height:    3,
+		Validator: bytes.Repeat([]byte{0xA5}, ed25519.PublicKeySize),
+		Addrs:     []string{"127.0.0.1:6001"},
+		Sig:       bytes.Repeat([]byte{0x5A}, ed25519.SignatureSize),
+	}))
+	f.Add(EncodePeerExchange(&PeerExchange{
+		Height:    1 << 40,
+		Validator: bytes.Repeat([]byte{0x11}, ed25519.PublicKeySize),
+		Addrs:     []string{"[::1]:1", "10.0.0.5:65535"},
+		Sig:       bytes.Repeat([]byte{0x22}, ed25519.SignatureSize),
+	}))
 	f.Add([]byte{})
 	f.Add([]byte{byte(MsgPeerExchange)})
 	f.Add([]byte{byte(MsgHello), 0x01, 0x01, 'x'})

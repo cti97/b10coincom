@@ -115,10 +115,14 @@ const (
 //
 //   - GENESIS-FILE MODE (real keys): Genesis names the shared committee
 //     document (public keys) and Key is THIS validator's held private key.
-//     The seat is the position its public key occupies in that document, and
-//     a key that is not in it REFUSES TO START (audit A-1): silently signing
-//     as a seat the key does not hold is the exact failure the committee
-//     file exists to prevent.
+//     The seat is the position its public key occupies in that document. A
+//     key that is in neither that document nor the committee at the chain's
+//     head+1 REFUSES TO START (audit A-1): silently signing as a seat the
+//     key does not hold is the exact failure the committee file exists to
+//     prevent. A key that joined the committee AFTER genesis - bonded, and
+//     seated by an epoch boundary the chain has already crossed - is admitted
+//     through the head+1 half (audit RT-1), because rotation-in is exactly
+//     the seat the consensus layer already knows how to use.
 //   - FIXTURE MODE (devnet only): Genesis nil. The committee is the derived
 //     simnet fixture (simnet.Committee(Validators), chain b10coin-simnet-N)
 //     and the seat key is derived from the Index — which means every member
@@ -141,7 +145,11 @@ type ValidatorConfig struct {
 	Key ed25519.PrivateKey
 	// Index is this node's seat in the fixture committee (fixture mode
 	// only; in genesis-file mode the seat is derived from the key and a
-	// nonzero value here is refused as a contradiction).
+	// nonzero value here is refused as a contradiction). In genesis-file
+	// mode the derived value is -1 when the key holds no GENESIS seat but is
+	// admitted by the committee at head+1 (a validator that bonded after
+	// genesis, audit RT-1); Seat reports that -1 and the per-height seat is
+	// the chain's to answer.
 	Index int
 	// Validators is the fixture committee size (fixture mode only).
 	Validators int
@@ -260,6 +268,11 @@ type Validator struct {
 	// a network (it is a field so a raw dial cannot hide inside the handler).
 	hints   peerHints
 	peerAdd func(addr string) error
+	// peerRemove retires the maintainer for a learned address whose handshake
+	// never completed (audit PX-1). It is a field for the same reason peerAdd
+	// is: the policy test must be able to count retirements without a
+	// network, and a raw RemovePeer must not hide inside the eviction path.
+	peerRemove func(addr string) bool
 
 	// The PEER_EXCHANGE observables. Adopted/refused/duplicate/over-budget
 	// describe the node's receive policy; sent describes its own advertising.
@@ -269,6 +282,7 @@ type Validator struct {
 	hintsDuplicates atomic.Uint64
 	hintsAdopted    atomic.Uint64
 	hintsOverBudget atomic.Uint64
+	hintsEvicted    atomic.Uint64
 	hintsSent       atomic.Uint64
 
 	// adopted counts blocks brought in by catch-up pulls: the observable a
@@ -344,10 +358,11 @@ func (l *driverTP) Close() error                         { return l.inner.Close(
 func (l *driverTP) OnMessage(fn func(transport.Message)) { l.msg.Store(&fn) }
 
 // StartValidator brings up one validator: opens its chain on the committee
-// genesis, builds the consensus stack over a real TCP transport, and starts
-// the tick and wave goroutines. It does NOT dial: call Connect once the
-// committee's addresses are known (the CLI does it right after; the mesh
-// tests collect every listener's port first).
+// genesis, admits this validator's key (a genesis seat, or - audit RT-1 - a
+// seat in the committee at head+1), builds the consensus stack over a real TCP
+// transport, and starts the tick and wave goroutines. It does NOT dial: call
+// Connect once the committee's addresses are known (the CLI does it right
+// after; the mesh tests collect every listener's port first).
 func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	var g *genesis.Genesis
 	seat := cfg.Index
@@ -365,17 +380,14 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		}
 		g = cfg.Genesis
 		pub, _ := cfg.Key.Public().(ed25519.PublicKey)
-		found := genesis.SeatOfPubKey(g.Validators, pub)
-		if found < 0 {
-			// THE refusal the audit asked for: a key outside the committee
-			// must not sign as any seat, and there is no seat-zero default
-			// to fall back to. Say what was checked and what fixes it.
-			return nil, fmt.Errorf("devnet: refusing to start: this validator's public key (%x) is not listed in the committee's genesis (%d seats named); a member key must be generated per machine (b10coin keygen) and its public key added to the file every validator shares",
-				pub, len(g.Validators))
-		}
-		seat = found
+		// The genesis position, or -1 for a key that joined the committee
+		// AFTER genesis (audit RT-1). A -1 is not a refusal here: whether the
+		// key is allowed to run depends on the chain this node holds, which
+		// is not open yet. See the admission below.
+		seat = genesis.SeatOfPubKey(g.Validators, pub)
 		// Normalise the config so the seat reporting (Seat) reflects the
-		// DERIVED seat, not the fixture flag that was correctly zero.
+		// DERIVED seat, not the fixture flag that was correctly zero. A
+		// rotated-in key has no genesis position and keeps -1.
 		cfg.Index = seat
 	case cfg.Validators >= 1 && cfg.Validators <= 255 && cfg.Index >= 0 && cfg.Index < cfg.Validators:
 		// Fixture mode, as before M4 A-1: derived committee, derived keys.
@@ -402,12 +414,16 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// trivially matches; in genesis-file mode the seat was found BY the key,
 	// so this can only fire on a constructed-by-hand genesis. It is here so
 	// that no future seat-selection path can ever pair a position with a
-	// different key silently.)
-	if n <= seat {
-		return nil, fmt.Errorf("devnet: committee seat %d out of range 0..%d", seat, n-1)
-	}
-	if string(g.Validators[seat].PubKey) != string(pub) {
-		return nil, fmt.Errorf("devnet: committee seat %d holds a key that is not this validator's", seat)
+	// different key silently.) A rotated-in key has no genesis position to
+	// belt: its seat is judged by the chain below, exactly as the driver
+	// judges every later height.
+	if seat >= 0 {
+		if n <= seat {
+			return nil, fmt.Errorf("devnet: committee seat %d out of range 0..%d", seat, n-1)
+		}
+		if string(g.Validators[seat].PubKey) != string(pub) {
+			return nil, fmt.Errorf("devnet: committee seat %d holds a key that is not this validator's", seat)
+		}
 	}
 
 	// The committee's power cap: the spec's 1/4 for four or more members,
@@ -429,6 +445,39 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	ch, err := chain.Open(g, cfg.Dir)
 	if err != nil {
 		return nil, err
+	}
+	// ROTATION-IN ADMISSION (audit RT-1). A key that is not in the genesis
+	// list may still run this node: if it holds a seat in the committee that
+	// judges the height this node will extend from - head+1, the height the
+	// driver's first engine judges - it can vote there, and refusing it is
+	// exactly the entry-point hole that left a bonded outsider's seat with no
+	// signer while its power silently raised the quorum bar.
+	//
+	// The check is made AFTER the chain is opened because the seat is a
+	// function of COMMITTED STATE, not of the genesis document: only the
+	// chain can answer it. It is head+1 and not "any height" on purpose. A
+	// key bonded but not yet seated (its epoch boundary has not arrived) has
+	// no voting duty yet and no chain that can judge it either; it must be
+	// started after the boundary that seats it, which is what the end-to-end
+	// test does. The genesis list stays the driver's base config
+	// (ccfg.Committee above) exactly as before - this decides WHO MAY RUN,
+	// not who may sign.
+	if g != nil && seat < 0 {
+		next := ch.Height() + 1
+		vals, cerr := ch.CommitteeAt(next)
+		if cerr != nil || genesis.SeatOfPubKey(vals, pub) < 0 {
+			_ = ch.Close()
+			// THE refusal: a key outside both the genesis committee and the
+			// committee at head+1 must not sign as any seat, and there is no
+			// seat-zero default to fall back to. Say what was checked and
+			// what fixes it.
+			reason := "holds no seat there"
+			if cerr != nil {
+				reason = "the committee for that height cannot be derived: " + cerr.Error()
+			}
+			return nil, fmt.Errorf("devnet: refusing to start: this validator's public key (%x) is not listed in the committee's genesis (%d seats named) and %s in the committee at height %d; a member key must be generated per machine (b10coin keygen) and its public key added to the file every validator shares, or the key must be bonded and seated by the epoch boundary it starts after",
+				pub, len(g.Validators), reason, next)
+		}
 	}
 	// The per-height committee source (M5 Task 3): every engine this driver
 	// builds asks the chain for the epoch's seats, and every other reader
@@ -466,8 +515,20 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		hh := helloHash(h)
 		return crypto.Verify(h.Validator, hh[:], h.Sig)
 	}
+	// The transport name this node announces. A genesis seat keeps the "vN"
+	// form every deployment and test already names it by. A key that joined
+	// after genesis has no genesis position, and reusing a committee index
+	// would collide with the genesis validator that still holds that name -
+	// a name collision is a self-connection refusal for one side and a
+	// registry fight for the other - so the name is derived from the key:
+	// stable across restarts, outside the "vN" space, and distinct for every
+	// key.
+	localID := transport.PeerID(fmt.Sprintf("v%d", cfg.Index))
+	if cfg.Index < 0 {
+		localID = transport.PeerID(fmt.Sprintf("k%x", pub[:6]))
+	}
 	tp, err := tcp.New(tcp.Options{
-		LocalID:          transport.PeerID(fmt.Sprintf("v%d", cfg.Index)),
+		LocalID:          localID,
 		Admit:            admitHello,
 		RelayAccessToken: cfg.RelayAccessToken,
 	})
@@ -525,11 +586,15 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		dedup: dedup,
 		// The learned-address book starts empty; nothing is dialled from a hint
 		// until a peer advertises it through an attested connection.
-		hints:   peerHints{learned: make(map[string]struct{})},
-		peerAdd: tp.AddPeer,
-		peerH:   make(map[string]*peerAttestation),
-		syncQ:   make(chan transport.Message, syncQueueDepth),
-		stop:    make(chan struct{}),
+		hints: peerHints{
+			learned: make(map[string]*learnedHint),
+			sources: make(map[string]int),
+		},
+		peerAdd:    tp.AddPeer,
+		peerRemove: tp.RemovePeer,
+		peerH:      make(map[string]*peerAttestation),
+		syncQ:      make(chan transport.Message, syncQueueDepth),
+		stop:       make(chan struct{}),
 	}
 	// A BLOCK_SYNC request is answered by the bounded worker pool, never on
 	// the transport's dispatch goroutine (audit C-4): serving one costs disk
@@ -623,8 +688,11 @@ func (v *Validator) AppendRefused() bool {
 	return v.drv != nil && v.drv.AppendRefused()
 }
 
-// Seat reports this validator's committee index (genesis-file mode derives it
-// from the key's position; fixture mode stores it).
+// Seat reports this validator's GENESIS committee index (genesis-file mode
+// derives it from the key's position; fixture mode stores it). It is -1 for a
+// key that joined after genesis (audit RT-1): such a key's seat is a per-epoch
+// property of committed state, so it is read from Chain().CommitteeAt for the
+// height in question rather than reported as one fixed number.
 func (v *Validator) Seat() int { return v.cfg.Index }
 
 // Chain exposes the validator's chain for tests and the CLI's RPC server.
@@ -902,17 +970,25 @@ func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	if !crypto.Verify(h.Validator, hh[:], h.Sig) {
 		return
 	}
+	// A verified HELLO on this connection also proves any LEARNED address this
+	// connection belongs to: it has a real member behind it, so its maintainer
+	// must never be retired by the hint eviction clock (audit PX-1).
+	v.markHintProven(from)
 	// Keyed on the signed member identity, with the transport name kept only
 	// as the address a pull for this member is sent to (round 7, F1/F2).
 	v.recordHeight(string(h.Validator), from, h.Height)
 }
 
 // beginWave advances the catch-up wave counter. Every wave boundary moves the
-// window in which a peer's announcement expires and a demotion lapses.
+// window in which a peer's announcement expires, a demotion lapses, and a
+// learned address that has never completed a handshake is retired (audit
+// PX-1: the wave clock is the eviction clock).
 func (v *Validator) beginWave() {
 	v.peerHMu.Lock()
 	v.wave++
+	wave := v.wave
 	v.peerHMu.Unlock()
+	v.expireUnprovenHints(wave)
 }
 
 // recordHeight keeps a member's LATEST attestation (audit C-6) under its
