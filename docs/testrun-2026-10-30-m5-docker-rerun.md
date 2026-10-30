@@ -87,3 +87,28 @@
 6. Doc items: README CI command count, the devnet flag table, and the L-3 CI comment.
 
 Raw logs from this run stayed on the test host and are not committed.
+
+## Network re-run at `6d54215` (after the upstream fixes)
+
+The network area was run again on its own at `6d54215`, which includes `88e70a8`, `4d1b7dd`, `40c43bc` and `f566f79`. As before, an independent verifier checked the results against the logs and re-ran the doubtful steps. **Overall result: fail.** Two liveness problems remain, described below. Everything else passed.
+
+| Item | Result | Evidence |
+|---|---|---|
+| M-1 reconnect backoff | **Fixed** | A node with the wrong token was refused 14 times in 125 s (previously about 690 per minute). The gaps grew 0.07 → 0.18 → 0.28 → 0.69 → 1.2 → 1.8 → 6.4 → 8.4 s, then stayed at 15–23 s, below the 30 s cap. After a 64 s relay outage the chain resumed about 20 s after the relay came back. |
+| M-2 `--peers` topologies | **Matches the README now** | Chain without `--allow-local-peer-hints`: stuck at height 0. The same chain with the flag: still stuck at 0, with the same 3 links, as the README now states. Star with the flag: stuck at 0 (no leaf-to-leaf link). Full `--peers` mesh with the flag: acceptance PASS. The no-progress windows observed were about 36–38 s, not the 90 s claimed. |
+| L-2 acceptance harness | **Fixed** | 2 survivors give "PARTIAL reading" with STALLED exit 2. `v0,v0:8645` is refused as one validator, exit 64. |
+| H-1 catch-up | **Fixed** (confirmed again) | On a 4-seat chain, a validator 250–260 blocks behind caught up in 11–14 s, twice. |
+| Relay down/up, foreign key, ungated relay, wrong token | Pass | Same behaviour as the previous run. |
+| Rolling restart, 3 seats | Pass | Recovered within 4–23 s of the last start. Restarting all together recovered within 8 s. |
+| **Rolling restart, 4 seats with 3 live** | **Fail, reproducible** | The chain froze for more than 9 min (first run) and more than 6 min (verifier, fresh chain). Node logs show only the startup banner. Starting the 4th seat recovered it in about 1 min, and so did restarting all four. This is the shape `internal/consensus/driver.go` describes as one the jump rule cannot close. |
+| **Stop/restart cycles, 3 seats (H-2 procedure)** | **Fail, intermittent** | 3 of 12 cycles froze all three validators at the same head, once for more than 6.7 min. Each time the victim restarted *at* the survivors' height, not one block behind as in the H-2 trigger. Each stall cleared only after another node was restarted. The verifier ran 18 cycles of the same procedure on a fresh chain and saw no stalls (0/18; at the observed 3/12 stall rate, the chance of that is about 0.6%). |
+
+### What the two failures mean
+- **The 3-seat stall is not the catch-up bug that was fixed in `235d33e`.** The victim was already level with the survivors, so the catch-up code had nothing to pull. The likely cause is a consensus *round* that differs between the nodes after the restart. With 3 of 3 signers required, this is the same family as the rolling-restart stall. It only appeared on a chain that had already been through relay outages, a node with a bad token and several restarts, so it seems to depend on the chain's history or on host load. It is not proven: nodes expose no round or step information, so the stall can't be inspected from outside.
+- **The 4-seat rolling-restart stall is deterministic and undocumented.** `scripts/deploy/README.md` §6 tells operators to restart each machine in turn, with no warning that this can freeze a chain that has exactly the quorum's power live.
+
+### Next steps (updated)
+1. Log the consensus round and step (and the timeout escalation) at INFO, or expose them on `/status`. Neither stall can be diagnosed without this.
+2. Investigate the 3-seat stall, using that visibility, on a long-lived chain with mixed faults.
+3. Document the restart procedure in the deploy README: restart all nodes together, or wait for the chain to advance between restarts.
+4. Log PEER_EXCHANGE and relay reconnect events. Right now they are visible only through `ss`.
