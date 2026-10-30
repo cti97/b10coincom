@@ -223,7 +223,10 @@ binary enforces (refusing the file otherwise): `chain_id` non-empty — chosen
 by you, and unlike the fixture's `b10coin-simnet-N` it must not be made to
 encode the committee size; every `pubkey` a 64-hex-character Ed25519 public
 key, with **duplicates refused** (one key holds one seat); `power` ≥ 1; and
-**order matters** — a validator's seat is its entry's position. The file
+**order matters** — a validator's seat is its entry's position. `power` is
+also the seat's genesis **bond**, in sparks and not rescaled: `1` is one
+spark, and `100000000000` is 1,000 b10 (`MIN_STAKE`). §5.1 explains what that
+means for staking and for keeping a live seat. The file
 carries the committee and nothing else: monetary and protocol parameters
 stay the compiled-in devnet fixture values (trivial puzzle, 1 b10 claims,
 2 s blocks), so a shared chain stays valueless test currency and no member
@@ -436,6 +439,87 @@ If you lose track of which Pi holds which seat: the banners name it
 `sudo -u b10coin /opt/b10coin/b10coin keygen --out /tmp/probe.key` on a Pi
 prints a NEW key's public half — never load such a probe key as a member;
 generate, read, delete.
+
+### 5.1 Staking: the verbs, and what this chain can actually fund
+
+The `stake`, `unstake` and `withdraw` clients talk to a node's **loopback**
+RPC, so they run on the Pi that holds the key file, as the `b10coin` user —
+the key never leaves the machine, and the verbs never open the data directory:
+
+```sh
+# on the Pi whose key is the validator's, from §3.1:
+sudo -u b10coin /opt/b10coin/b10coin stake \
+    --node http://127.0.0.1:8645 \
+    --key  /var/lib/b10coin/b10coin.key \
+    --amount 1000
+```
+
+`--amount` is **b10**, as an exact decimal — the command converts it to sparks
+with integer arithmetic and signs against the `genesis_hash` the node reports,
+so it is the same ordinary signed transaction a transfer is. It prints the
+bond, the account nonce, the fee and the **txid**; it does not wait, because a
+bond takes effect when a block applies it and a **seat** changes only at the
+next epoch boundary. To exit:
+
+```sh
+# unbond everything (or give --amount); fee 0 by consensus rule
+sudo -u b10coin /opt/b10coin/b10coin unstake --node http://127.0.0.1:8645 \
+    --key /var/lib/b10coin/b10coin.key
+# ... the output names the RELEASE HEIGHT: the coins are neither spendable
+# nor counted in the committee until that height. The cooldown is
+# unbonding_epochs x epoch_blocks = 2 x 1,000 blocks. How long that is in
+# wall time is this committee's cadence, not a constant: measure it from two
+# /status readings a minute apart (the driver's rhythm is the round protocol's;
+# `block_time_ms` is the spec's target, not a pacing timer).
+# Once the chain is at or past it:
+sudo -u b10coin /opt/b10coin/b10coin withdraw --node http://127.0.0.1:8645 \
+    --key /var/lib/b10coin/b10coin.key
+```
+
+> **⚠️ With the genesis this recipe builds, `stake` is not usable, and the
+> reason is structural — read it before planning around it.** The committee
+> file's `power` field **is** the genesis bond (it is not rescaled: `power` is
+> in sparks, so 1,000 b10 is `100000000000`), and the example above uses
+> `power: 1`. The file mints no premine, so every account starts at zero, and
+> `stake` needs `MIN_STAKE` = 1,000 b10 (10^11 sparks) in **spendable funds**.
+> The only funding path is the faucet: **1 b10 per claim, one claim per key per
+> epoch**, and an epoch is 1,000 blocks — so 1,000 claims take 1,000 epochs,
+> **one million blocks**. At the single-node producer's 2 s default that is
+> about 23 days; a healthy committee commits faster (its cadence is the round
+> protocol's — measure two `/status` readings a minute apart), so the wait is
+> however long this chain takes to produce a million blocks. It is worse than
+> that in practice:
+> `b10coin claim` signs with a fresh ephemeral key each run and never saves it,
+> and there is no `transfer` verb, so each claim lands at a new address and
+> cannot be accumulated. **No shipped genesis funds an operator's key with
+> `MIN_STAKE`, and this deployment has no path to a bond today.** The CLI says
+> exactly this when it refuses; the arithmetic is in the repository README's
+> [Staking](../../README.md#staking) section.
+
+> **⚠️ A bond is a seat, and a seat without a node stops the chain.** A bond
+> above a genesis seat's power takes that seat at the next boundary. If the
+> bonding key's node is **not** running as a validator — the obvious mistake is
+> staking from a key other than the one in `--key` — the new seat has no
+> signer, the committee cannot reach its two-thirds quorum, and the chain halts
+> at the boundary. Stake only with the key the node runs.
+
+`unstake` and `withdraw` **are** usable here without funds if the genesis
+already bonds the seat with at least `MIN_STAKE`: set each committee entry's
+`power` to `100000000000` (1,000 b10) in §3.2 before the chain starts. The
+genesis bond then satisfies the exit path, and the coins released by
+`withdraw` are real spendable balance — with which `stake` can then bond again.
+Decide that before the chain starts: the file is final once it has, because
+editing it changes the genesis hash and starts a different chain.
+
+Two limits to keep straight: the verbs act on the chain whose `genesis_hash`
+the node reports, so pointing one at a node on another chain produces a
+transaction that chain rejects — never one it accepts; and a `--relay`-only Pi
+(no `--listen`) advertises no direct address, so `PEER_EXCHANGE` gives the
+mesh no path to it (see the repository README's `b10coin node` section).
+**This recipe's three nodes are all relay-only** (§3.3, §5), so on this
+deployment `PEER_EXCHANGE` is inert: it only helps a node given `--listen` at
+an address the other validators can reach (a forwarded port or a public host),
+and then only for the links to such nodes.
 
 ## 6. The systemd units (what runs after the first contact test)
 
