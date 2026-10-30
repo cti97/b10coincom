@@ -89,6 +89,23 @@ type Driver struct {
 	// node from every peer that accepted it). A future milestone that gives a
 	// node a way to adopt a peer's block must clear this flag when it does.
 	appendRefused bool
+
+	// haltErr records that the committee for the engine's next height could
+	// not be derived or did not validate. It is a REFUSAL TO ACT at that
+	// height, never a fallback to the previous epoch's committee: a driver
+	// that kept judging with the old set would vote on a committee the chain
+	// no longer has, and a fallback is how a rotation turns into a fork. The
+	// driver stops - no proposal, no vote, no append - and reports the reason
+	// through HaltError so a stalled run is diagnosable rather than mute. The
+	// committed height is unaffected, exactly as for any other parked node.
+	haltErr error
+
+	// diagRounds is the bounded recent-round history a stalled run's report
+	// reads: the most recent diagRingRounds (height, round) observations,
+	// oldest first, updated in place by Observe. It is written only by the
+	// devnet harness (which calls Observe after each driver operation) and
+	// never read by a consensus decision. See diag.go.
+	diagRounds []DiagRound
 }
 
 // maxRoundEscalation is the STRIDE of one round-resync jump: jumpTarget
@@ -132,13 +149,31 @@ const maxRoundEscalation = uint32(16)
 // here, and this makes the consensus layer enforce it for every caller.
 func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transport.Transport, pool *mempool.Mempool) (*Driver, error) {
 	d := &Driver{cfg: cfg, ch: ch, pool: pool, priv: priv, tp: tp}
-	d.eng = d.newEngine(ch.Height()+1, ch.Head().ID())
+	// The engine judges head+1 with the committee THAT HEIGHT validates under
+	// (M5 epoch rotation), not with the genesis set: a driver built exactly at
+	// a boundary must already be holding the new epoch's seats.
+	eng, err := d.newEngine(ch.Height()+1, ch.Head().ID())
+	if err != nil {
+		return nil, err
+	}
+	d.eng = eng
 	// The membership gate (audit C-11): the engine computed its committee
 	// index at construction but never used it, so a key outside the committee
 	// reached emitVote and panicked there. Refuse it before the transport is
 	// wired, so a misconfigured validator fails to start instead of failing to
 	// vote.
-	if err := d.eng.CheckMembership(); err != nil {
+	//
+	// WHAT "OUTSIDE" MEANS UNDER ROTATION: a key that is neither in the chain's
+	// base (genesis) committee NOR seated at the height this driver will judge
+	// is a stranger and is refused. A key whose seat ENDED at this boundary is
+	// in the base committee and is NOT seated here - that is a legitimate
+	// rotated-out validator, and it must keep running rather than fail to
+	// construct: its engine is inert (emitVote and CheckMembership refuse to
+	// sign without a seat, see Engine.CheckMembership), so it tallies and
+	// follows the chain without voting. A key that joined AFTER genesis and is
+	// seated at this height is admitted by the second half of the test, which
+	// is what lets a rotated-in node restart and resume.
+	if err := eng.CheckMembership(); err != nil && cfg.IndexOf(priv.Public().(ed25519.PublicKey)) < 0 {
 		return nil, err
 	}
 	// timeoutAt is ARMED ON THE FIRST TICK, not at construction (the sentinel
@@ -165,6 +200,13 @@ func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transpor
 // durable the moment it happens, and any lock previously persisted for THIS
 // height - the height the engine is about to judge - is restored into it.
 //
+// THE CONFIG IS THE HEIGHT'S. It is built by configFor, which asks the chain
+// for the committee of this height's epoch, sizes the power cap to that
+// committee and validates the result. Nothing is carried over from the
+// previous engine: a validator whose seat ended at this boundary gets a Config
+// that does not contain it, and its engine is inert rather than wrong. An
+// error is returned, never papered over with the previous height's committee.
+//
 // Restoring is not optional and not best-effort cosmetic: the locking rule's
 // safety argument assumes a locked validator STAYS locked, and a validator
 // that precommitted and then restarted re-enters this height with no
@@ -176,8 +218,15 @@ func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transpor
 // in-memory lock uses, so a restored lock is not a second class of lock: it
 // survives enterRound and it refuses a differing block until a verified
 // justification exceeds its round.
-func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
-	eng := NewEngine(d.cfg, height, parent, d.priv, d.build)
+//
+// A lock belongs to a HEIGHT, not to an epoch: a rotation neither clears it
+// nor skips the restore. The same is true of the persisted round.
+func (d *Driver) newEngine(height uint64, parent [32]byte) (*Engine, error) {
+	cfg, err := d.configFor(height)
+	if err != nil {
+		return nil, err
+	}
+	eng := NewEngine(cfg, height, parent, d.priv, d.build)
 	eng.persistLock = d.persistLock
 	eng.persistRound = d.persistRound
 	// The validation seam (audit C-1): every engine the driver builds judges
@@ -213,8 +262,46 @@ func (d *Driver) newEngine(height uint64, parent [32]byte) *Engine {
 	if r, ok := d.ch.RoundAt(height); ok {
 		eng.restoreRound(r)
 	}
-	return eng
+	return eng, nil
 }
+
+// configFor builds the consensus configuration for ONE height: the committee
+// that height validates under (d.cfg.CommitteeAt, which is the chain's epoch
+// derivation when CommitteeFor is wired), the power cap that committee's size
+// calls for, and the rest of the driver's configuration unchanged.
+//
+// The cap is recomputed from the DERIVED seat count, not inherited from
+// genesis. A rotation can change the size - 6 to 5 is the acceptance fixture -
+// and genesis's 1/4 is not automatically the right ratio for the new set: at
+// three seats 1/4 is unsatisfiable, so PowerCapFor drops to 1/1 there. Keeping
+// the genesis ratio would make Validate refuse the boundary's committee and
+// halt the chain, which is the wrong response to a legitimate rotation.
+//
+// Validate RUNS on the result. The derivation must pass it, not be excused
+// from it: a committee that only fails at construction halts a running chain
+// instead of seating a safe one, and a derived committee with a zero-power
+// seat or an over-cap holder is refused here - as a refusal to act at this
+// height, never as a fallback to the previous epoch's set.
+func (d *Driver) configFor(height uint64) (Config, error) {
+	committee, err := d.cfg.CommitteeAt(height)
+	if err != nil {
+		return Config{}, fmt.Errorf("consensus: no committee for height %d: %w", height, err)
+	}
+	cfg := d.cfg
+	cfg.Committee = committee
+	cfg.PowerCapNum, cfg.PowerCapDen = PowerCapFor(len(committee))
+	if err := cfg.Validate(); err != nil {
+		return Config{}, fmt.Errorf("consensus: the committee for height %d is unusable: %w", height, err)
+	}
+	return cfg, nil
+}
+
+// HaltError reports why the driver stopped acting, if it did: the committee
+// for the next height could not be derived or did not validate. Nil is the
+// healthy value. It is the observable a stalled run needs, because "the height
+// is not moving" otherwise cannot be told apart from a parked Append or a
+// round divergence.
+func (d *Driver) HaltError() error { return d.haltErr }
 
 // persistRound is the hook the engine calls the moment it enters a later
 // round, before it emits any vote in that round (audit C-3): the round must
@@ -415,6 +502,11 @@ func (d *Driver) AppendRefused() bool { return d.appendRefused }
 // drained messages and performs the commit.
 func (d *Driver) Tick(nowMillis int64) {
 	d.now = nowMillis
+	if d.haltErr != nil {
+		// The committee for this height is not usable; see haltErr. Acting
+		// would mean judging with a set the chain does not have.
+		return
+	}
 	// Propose before the timeout check: if this validator is the current
 	// round's proposer and holds no proposal yet, it starts proposing now,
 	// not at whichever later tick gets around to it first.
@@ -528,6 +620,9 @@ func (d *Driver) Tick(nowMillis int64) {
 // produced. Malformed or foreign messages error back and are dropped - a
 // driver that crashed on garbage input would be a remote kill switch.
 func (d *Driver) OnMessage(m transport.Message) {
+	if d.haltErr != nil {
+		return
+	}
 	_ = d.eng.OnMessage(m.Data)
 	d.flush()
 }
@@ -630,7 +725,21 @@ func (d *Driver) flush() {
 	// TimeoutBase from the driver's current reading, so its propose phase
 	// runs before its timer can fire. The refusal flag belonged to the
 	// replaced engine's commit and starts over with the fresh one.
-	d.eng = d.newEngine(d.ch.Height()+1, d.ch.Head().ID())
+	//
+	// The fresh engine's committee is the NEXT height's, built by configFor.
+	// It can legitimately differ from the one that just committed this block:
+	// if this block was the last of an epoch, the next height is validated by
+	// the epoch the NEW state decided. That is the boundary, and it is exact:
+	// the set that committed this block still judged it.
+	eng, err := d.newEngine(d.ch.Height()+1, d.ch.Head().ID())
+	if err != nil {
+		// Refuse to act at the next height rather than judge it with the old
+		// epoch's committee (see haltErr). The commit above stands; this
+		// engine simply stops.
+		d.haltErr = err
+		return
+	}
+	d.eng = eng
 	d.appendRefused = false
 	d.timeoutAt = d.now + d.cfg.TimeoutBase
 }

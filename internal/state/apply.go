@@ -53,6 +53,15 @@ func (s *State) ApplyTx(tx *types.Tx) error {
 		return s.applyTransfer(tx)
 	case types.TxFaucetClaim:
 		return s.applyFaucetClaim(tx)
+	// The staking arms (M5 Task 1). They live in stake.go with the state they
+	// move; the switch stays the one dispatch point, so every type that reaches
+	// here still passes the signature check above first.
+	case types.TxBond:
+		return s.applyBond(tx)
+	case types.TxUnbond:
+		return s.applyUnbond(tx)
+	case types.TxWithdraw:
+		return s.applyWithdraw(tx)
 	default:
 		return fmt.Errorf("%w: %d", ErrUnsupportedTxType, tx.Type)
 	}

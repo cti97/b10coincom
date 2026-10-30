@@ -89,6 +89,21 @@ type MessageRouter struct {
 	SendReply  func(peer transport.PeerID, frame []byte) error
 	OnHello    func(peer transport.PeerID, h *wire.Hello)
 	AsyncServe func(m transport.Message)
+	// OnPeerExchange, when non-nil, observes a decoded PEER_EXCHANGE frame:
+	// a list of listening addresses the sender claims it (or a peer it knows)
+	// can be reached at. It is a HINT, never a peer. The callback is where the
+	// node layer applies the dial policy - parse as IP:port, refuse the node's
+	// own address, the reserved relay:<addr> name and local addresses from a
+	// hint, deduplicate, and call transport.AddPeer (never a raw dial) - and it
+	// runs on the transport's dispatch goroutine, so it must not block.
+	//
+	// The frame is NOT signed and carries no consensus meaning. Its authority
+	// is the connection it arrived on; the node layer should therefore also
+	// require that the connection has carried a verified committee HELLO
+	// (devnet's observePeerExchange does), and nothing here may treat the
+	// addresses as evidence about the chain. Nil means such frames are counted
+	// and dropped.
+	OnPeerExchange func(peer transport.PeerID, p *wire.PeerExchange)
 	// Committee, when non-nil, is the validator set whose keys may carry a
 	// consensus frame. A vote or proposal whose key is absent from it is
 	// refused BEFORE any Ed25519 verification (audit C-8): the key set check
@@ -113,12 +128,21 @@ type MessageRouter struct {
 	servedReq atomic.Uint64
 	filed     atomic.Uint64
 	dups      atomic.Uint64
+	// peerExchanges counts PEER_EXCHANGE frames routed. It is an observable
+	// only: the message moves no consensus state, so the healthy number says
+	// how the mesh is forming, never whether the chain is advancing.
+	peerExchanges atomic.Uint64
 	// refused counts consensus-tagged frames this router refused before any
 	// signature verification: a non-member's key, or a vote whose height the
 	// live engine cannot judge. A steady nonzero count on a healthy committee
 	// means a peer is sending frames for a chain this node is not on (or a
 	// stranger reached the port); zero is the healthy value.
 	refused atomic.Uint64
+	// verified counts successful signature verifications - the work a relay
+	// link's replay flood used to buy once per frame (audit PX-4). It is an
+	// observable, not a signal: it exists so "a replayed vote costs one lookup,
+	// not one Ed25519" can be asserted as a number instead of inferred.
+	verified atomic.Uint64
 }
 
 // NewMessageRouter builds a router with the given server half. The optional
@@ -134,26 +158,48 @@ func NewMessageRouter(sync *Syncer) *MessageRouter {
 	return &MessageRouter{Sync: sync}
 }
 
-// committee returns the validator set membership is checked against.
-// Committee, when set explicitly, wins; otherwise it is the syncer's chain's
-// genesis committee. The returned slice is never mutated here.
-func (r *MessageRouter) committee() []genesis.Validator {
+// committee returns the validator set membership is checked against FOR A
+// HEIGHT, and whether a committee is known at all.
+//
+// Committee, when set explicitly, wins and is height-independent: that is the
+// unit-test shape (a fixed fixture set), never a node built through
+// NewMessageRouter with a live syncer.
+//
+// Otherwise the set is the syncer chain's committee at THAT height - the
+// epoch's set, not the genesis one. This is the whole point of the per-frame
+// height here: a vote signed by a validator whose seat ended at the boundary
+// must fail membership, and a vote signed by one whose seat began there must
+// pass it, in the same round. A genesis-wide check admits the first and
+// refuses the second, which is the cross-boundary failure
+// TestTheRouterRefusesTheOldEpochsVotes pins.
+//
+// A height the chain cannot answer for (a future epoch, a chain whose genesis
+// cannot seat a committee) is reported as KNOWN-but-empty rather than unknown:
+// the caller then refuses the frame. Falling back to an unknown committee
+// would skip the membership check entirely and let a self-signed stranger
+// through to the signature branch, which proves nothing about membership.
+// The returned slice is never mutated here.
+func (r *MessageRouter) committee(h uint64) ([]genesis.Validator, bool) {
 	if r.Committee != nil {
-		return r.Committee
+		return r.Committee, true
 	}
 	if r.Sync != nil && r.Sync.chain != nil {
-		return r.Sync.chain.Genesis().Validators
+		vals, err := r.Sync.chain.CommitteeAt(h)
+		if err != nil {
+			return nil, true
+		}
+		return vals, true
 	}
-	return nil
+	return nil, false
 }
 
-// isMember reports whether pub is a committee key, and whether a committee is
-// known at all. known=false (no syncer chain and no explicit Committee) means
-// the caller must fall back to the signature check alone: the unit-test shape,
-// never a node built through NewMessageRouter.
-func (r *MessageRouter) isMember(pub []byte) (member, known bool) {
-	vals := r.committee()
-	if len(vals) == 0 {
+// isMemberAt reports whether pub is a committee key at height h, and whether a
+// committee is known at all. known=false (no syncer chain and no explicit
+// Committee) means the caller must fall back to the signature check alone: the
+// unit-test shape, never a node built through NewMessageRouter.
+func (r *MessageRouter) isMemberAt(pub []byte, h uint64) (member, known bool) {
+	vals, known := r.committee(h)
+	if !known {
 		return false, false
 	}
 	for i := range vals {
@@ -221,11 +267,34 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 	// membership; and a vote for a height the engine has already left or has
 	// not reached is dead weight whatever its signature says.
 	//
-	// Dedup is consulted AFTER Verify, never before (audit N-7): a frame that
-	// fails Verify must not record a key, or a stranger could poison the key
-	// of an honest vote it cannot sign and silence it.
+	// Dedup has TWO calls and their placement is the whole of audit PX-4:
+	//
+	//   - Has runs FIRST, before Verify and before the free membership checks.
+	//     It RECORDS NOTHING, so it cannot poison anything, and it is the cheap
+	//     map lookup that turns a genuine, already-seen member vote replayed at
+	//     line rate over the relay link - one Ed25519 verification per replay
+	//     before this - into one lookup and a drop. Measured by
+	//     TestAReplayedVoteCostsNoSecondVerification.
+	//   - Seen runs ONLY after Verify succeeded, and it is the only call that
+	//     records. That is audit N-7's no-poisoning property, unchanged: a frame
+	//     that fails Verify must not record a key, or a stranger could pre-seed
+	//     the key of an honest vote it cannot sign and silence it. Has-before
+	//     does not weaken it, because Has does not write; the test that fires
+	//     a forged frame carrying the honest key and then the honest vote pins
+	//     both halves.
+	//
+	// The window between Has and Seen is not a race in production: the transport
+	// serialises every reader's Route under one dispatch mutex, and the node's
+	// own tick loop never calls Route concurrently with itself. If that ever
+	// changed, the worst case is two verifications of the same frame, never a
+	// lost honest message.
 	if v, err := DecodeVote(m.Data); err == nil {
-		if member, known := r.isMember(v.Validator); known && !member {
+		key := voteDedupKey(v)
+		if r.Dedup != nil && r.Dedup.Has(key) {
+			r.dups.Add(1)
+			return false
+		}
+		if member, known := r.isMemberAt(v.Validator, v.Height); known && !member {
 			r.refused.Add(1)
 			return false
 		}
@@ -234,7 +303,12 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 			return false
 		}
 		if v.Verify() == nil {
-			if r.Dedup != nil && r.Dedup.Seen(voteDedupKey(v)) {
+			r.verified.Add(1)
+			if r.Dedup != nil && r.Dedup.Seen(key) {
+				// Records ONLY now (the no-poisoning rule) AND keeps its return:
+				// the Has above is the fast path, this is the second line for the
+				// Has/Seen window, and it is what a caller that skips Has still
+				// gets. Deleting Has must not turn dedup into a no-op.
 				r.dups.Add(1)
 				return false
 			}
@@ -247,12 +321,20 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 		// signature, which is the expensive part of judging the decoded frame
 		// (audit C-8). A non-member's proposal costs one decode, never a
 		// verification, and never reaches the engine.
-		if member, known := r.isMember(p.Validator); known && !member {
+		if member, known := r.isMemberAt(p.Validator, p.Height); known && !member {
 			r.refused.Add(1)
 			return false
 		}
+		// The same Has-before / record-after split as the vote branch (audit
+		// PX-4), for the same reason: a replayed proposal is one map lookup.
+		key := proposalDedupKey(p)
+		if r.Dedup != nil && r.Dedup.Has(key) {
+			r.dups.Add(1)
+			return false
+		}
 		if p.Verify() == nil {
-			if r.Dedup != nil && r.Dedup.Seen(proposalDedupKey(p)) {
+			r.verified.Add(1)
+			if r.Dedup != nil && r.Dedup.Seen(key) {
 				r.dups.Add(1)
 				return false
 			}
@@ -298,6 +380,21 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 		}
 		return false
 	}
+	// PEER_EXCHANGE: a list of listening addresses, consumed by the node
+	// layer's dial policy. It is NOT a consensus message and is deliberately
+	// not deduplicated: recording an address frame in the seen-set would let
+	// repeated advertisements evict real vote keys under the bucket ceiling,
+	// and there is no engine state it could double-apply (audit N-7's ordering
+	// is about verified votes and proposals, which this branch is disjoint
+	// from). A frame that decodes as nothing still reaches the unknown counter
+	// below, so silence stays the posture for garbage.
+	if p, err := wire.DecodePeerExchange(m.Data); err == nil {
+		r.peerExchanges.Add(1)
+		if r.OnPeerExchange != nil {
+			r.OnPeerExchange(m.From, p)
+		}
+		return false
+	}
 	r.unknown.Add(1)
 	return false
 }
@@ -322,10 +419,20 @@ func (r *MessageRouter) NoteServed() { r.servedReq.Add(1) }
 // local syncer's reply slot.
 func (r *MessageRouter) SyncRepliesFiled() uint64 { return r.filed.Load() }
 
+// PeerExchangesSeen reports how many PEER_EXCHANGE frames were routed. The
+// message carries no consensus meaning, so this is a mesh-formation observable
+// and never a liveness signal: a zero count on a mesh run means the nodes are
+// not advertising, not that consensus is broken.
+func (r *MessageRouter) PeerExchangesSeen() uint64 { return r.peerExchanges.Load() }
+
 // DuplicatesDropped reports how many VERIFIED consensus messages were refused
 // because their dedup key had already been recorded. Zero is healthy in the
 // star topology (no loops); a nonzero count means a message arrived twice, as
 // a mesh would produce.
+// SignatureVerifications reports how many consensus frames this router verified
+// successfully (audit PX-4). A replayed, already-seen vote must not move it.
+func (r *MessageRouter) SignatureVerifications() uint64 { return r.verified.Load() }
+
 func (r *MessageRouter) DuplicatesDropped() uint64 { return r.dups.Load() }
 
 // UnknownDropped reports how many frames decoded as nothing. A steady nonzero

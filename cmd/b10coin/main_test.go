@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +21,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/genesis"
+	"github.com/cti97/b10coincom/internal/keystore"
+	"github.com/cti97/b10coincom/internal/types"
 )
 
 // captureStdout runs fn with os.Stdout swapped for a pipe and returns what
@@ -580,7 +586,10 @@ func writeCommitteeFile(t *testing.T, dir, chainID string, pubHexes ...string) s
 	t.Helper()
 	entries := make([]genesis.CommitteeEntry, 0, len(pubHexes))
 	for i, k := range pubHexes {
-		entries = append(entries, genesis.CommitteeEntry{Name: fmt.Sprintf("pi-%d", i), PubKey: k, Power: 1})
+		// A seat's power IS its genesis bond and must clear MIN_STAKE
+		// (audit RT-2); one spark is the shape that made committee capture
+		// cost a single MIN_STAKE.
+		entries = append(entries, genesis.CommitteeEntry{Name: fmt.Sprintf("pi-%d", i), PubKey: k, Power: genesis.Devnet().Params.MinStakeSparks})
 	}
 	raw, err := json.Marshal(genesis.CommitteeFile{ChainID: chainID, Validators: entries})
 	if err != nil {
@@ -660,6 +669,16 @@ func TestNodeGenesisModeFlagContract(t *testing.T) {
 	}
 	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d5"), "--genesis", filepath.Join(dir, "missing.json"), "--key", k1}); err == nil {
 		t.Error("a committee file that cannot be read must fail the command")
+	}
+	// --allow-local-peer-hints (audit M-2) is a PEER_EXCHANGE admission
+	// exception, and PEER_EXCHANGE only runs on a networked node: a producer
+	// that accepted, and silently ignored, a security-relevant switch would be
+	// a flag that lies.
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d6"), "--allow-local-peer-hints"}); err == nil || !strings.Contains(err.Error(), "--allow-local-peer-hints") {
+		t.Errorf("--allow-local-peer-hints on the single-node producer must be refused, got: %v", err)
+	}
+	if err := cmdNode([]string{"--dir", filepath.Join(dir, "d7"), "--allow-local-peer-hints", "--genesis", cf}); err == nil || !strings.Contains(err.Error(), "--key") {
+		t.Errorf("--allow-local-peer-hints must be ACCEPTED on the networked path (the refusal here must be --genesis's own demand for --key), got: %v", err)
 	}
 }
 
@@ -758,5 +777,1013 @@ func TestCmdNodeRefusesAShortRelayAccessToken(t *testing.T) {
 	// And no data directory was created: the refusal precedes the store.
 	if _, statErr := os.Stat(filepath.Join(dir, "data")); !os.IsNotExist(statErr) {
 		t.Fatalf("the refused invocation created its data directory (stat err = %v)", statErr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M5 Task 6: the staking verbs
+// ---------------------------------------------------------------------------
+
+// stakingStub is the smallest node a staking verb talks to: /status with the
+// chain's identity and stake parameters, /account/{address}, and /tx capturing
+// the posted canonical bytes. It is a STUB, not a chain, because the verb's
+// whole job is "read the node, sign, submit" - what the node then does with the
+// bytes is the state machine's test, not this one's.
+type stakingStub struct {
+	t           *testing.T
+	genesisHash [32]byte
+	account     stakingAccount
+	mu          sync.Mutex
+	fee         uint64 // the min_fee_sparks this node reports; 1 unless a test lies
+	posts       [][]byte
+	url         string
+	ts          *httptest.Server
+}
+
+func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *stakingStub {
+	t.Helper()
+	s := &stakingStub{t: t, genesisHash: genesisHash, account: acc, fee: 1}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		fee := s.fee
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"chain_id":         "stub-chain-1",
+			"height":           uint64(7),
+			"genesis_hash":     hex.EncodeToString(s.genesisHash[:]),
+			"min_fee_sparks":   fee,
+			"min_stake_sparks": uint64(100_000_000_000),
+			"epoch_blocks":     uint64(1_000),
+			"unbonding_epochs": uint64(2),
+			"committee_size":   1,
+		})
+	})
+	mux.HandleFunc("/account/", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(s.account)
+	})
+	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading POST /tx: %v", err)
+		}
+		raw, err := hex.DecodeString(strings.TrimSpace(string(body)))
+		if err != nil {
+			t.Errorf("POST /tx body is not hex: %v", err)
+		}
+		s.mu.Lock()
+		s.posts = append(s.posts, raw)
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]string{"txid": strings.Repeat("ab", 32)})
+	})
+	s.ts = httptest.NewServer(mux)
+	t.Cleanup(s.ts.Close)
+	s.url = s.ts.URL
+	return s
+}
+
+// setFee makes the stub report a different min_fee_sparks - the hostile node's
+// lever in CL-1.
+func (s *stakingStub) setFee(fee uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fee = fee
+}
+
+// posted decodes the single transaction the verb submitted.
+func (s *stakingStub) posted() *types.Tx {
+	s.t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.posts) != 1 {
+		s.t.Fatalf("the verb posted %d transactions, want exactly 1", len(s.posts))
+	}
+	tx, err := types.DecodeTx(s.posts[0])
+	if err != nil {
+		s.t.Fatalf("the posted bytes do not decode: %v", err)
+	}
+	return tx
+}
+
+func stakingTestKey(t *testing.T) (string, ed25519.PublicKey, types.Address) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stake.key")
+	_, priv, err := keystore.Generate(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	return path, pub, types.AddressFromPub(pub)
+}
+
+// TestStakeVerbSubmitsABondWithTheRightFields: the stub reports a genesis hash
+// that is NOT the compiled-in devnet one. The verb must sign against the
+// REPORTED hash - the signature verifies there and fails against devnet's -
+// which is what makes a verb pointed at another chain produce a transaction
+// that chain can verify, and one pointed at a doctored node a useless
+// transaction rather than a dangerous one.
+func TestStakeVerbSubmitsABondWithTheRightFields(t *testing.T) {
+	keyPath, pub, addr := stakingTestKey(t)
+	var reported [32]byte
+	for i := range reported {
+		reported[i] = byte(0xa0 + i)
+	}
+	if reported == genesis.Devnet().Hash() {
+		t.Fatal("the test's reported hash must differ from the devnet genesis hash")
+	}
+	stub := newStakingStub(t, reported, stakingAccount{
+		Address: addr.String(),
+		Balance: 5_000 * genesis.SparksPerB10,
+		Nonce:   3,
+	})
+
+	if err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"}); err != nil {
+		t.Fatalf("cmdStake: %v", err)
+	}
+	tx := stub.posted()
+	if tx.Type != types.TxBond {
+		t.Errorf("type = %d, want TxBond (%d)", tx.Type, types.TxBond)
+	}
+	if tx.From != addr {
+		t.Errorf("from = %s, want %s", tx.From, addr)
+	}
+	if !bytes.Equal(tx.PubKey, pub) {
+		t.Errorf("pubkey = %x, want %x", tx.PubKey, pub)
+	}
+	if tx.Nonce != 3 {
+		t.Errorf("nonce = %d, want the account nonce 3", tx.Nonce)
+	}
+	if tx.Fee != 1 {
+		t.Errorf("fee = %d, want the node's min_fee_sparks (1)", tx.Fee)
+	}
+	if want := uint64(100_000_000_000); tx.Amount != want {
+		t.Errorf("amount = %d sparks, want %d (1000 b10; a b10 value passed straight through would be 1000)", tx.Amount, want)
+	}
+	if err := tx.VerifySignature(reported); err != nil {
+		t.Errorf("the transaction does not verify against the genesis hash the stub reported: %v", err)
+	}
+	if err := tx.VerifySignature(genesis.Devnet().Hash()); err == nil {
+		t.Error("the transaction verifies against the compiled-in devnet genesis hash: the verb signed for the wrong chain")
+	}
+}
+
+// TestUnstakeWithNoAmountUnbondsTheWholeBond: omitting --amount means the whole
+// bond read from /account, and an exit carries fee 0.
+func TestUnstakeWithNoAmountUnbondsTheWholeBond(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(),
+		Balance: 1,
+		Nonce:   4,
+		Bonded:  750 * genesis.SparksPerB10,
+	})
+	if err := cmdUnstake([]string{"--node", stub.url, "--key", keyPath, "--yes"}); err != nil {
+		t.Fatalf("cmdUnstake: %v", err)
+	}
+	tx := stub.posted()
+	if tx.Type != types.TxUnbond {
+		t.Errorf("type = %d, want TxUnbond (%d)", tx.Type, types.TxUnbond)
+	}
+	if got, want := tx.Amount, uint64(750*genesis.SparksPerB10); got != want {
+		t.Errorf("amount = %d, want the whole bond %d", got, want)
+	}
+	if tx.Fee != 0 {
+		t.Errorf("fee = %d, want 0 (an unbond must not carry a fee)", tx.Fee)
+	}
+	if tx.Nonce != 4 {
+		t.Errorf("nonce = %d, want 4", tx.Nonce)
+	}
+}
+
+// TestUnstakePartialUsesTheGivenAmount is the other half of the amount rule:
+// with --amount the transaction carries exactly that, not the whole bond. The
+// fixture bonds 1,500 b10 so the 250.5 b10 exit leaves 1,249.5 b10 — above the
+// floor audit ST-1 makes a partial exit respect.
+func TestUnstakePartialUsesTheGivenAmount(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 0, Bonded: 1_500 * genesis.SparksPerB10,
+	})
+	if err := cmdUnstake([]string{"--node", stub.url, "--key", keyPath, "--amount", "250.5", "--yes"}); err != nil {
+		t.Fatalf("cmdUnstake: %v", err)
+	}
+	if got, want := stub.posted().Amount, uint64(250*genesis.SparksPerB10+50_000_000); got != want {
+		t.Errorf("amount = %d, want %d (250.5 b10)", got, want)
+	}
+}
+
+// TestUnstakeRefusesAPartialExitBelowMinStake mirrors the state rule (audit
+// ST-1): an exit must leave nothing or at least MIN_STAKE, so the verb refuses
+// the same remainders the chain would, before signing anything. The carve-out
+// shows up as the last case: a bond ALREADY under the floor (a genesis seat)
+// may be exited in full, but not partially.
+func TestUnstakeRefusesAPartialExitBelowMinStake(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	const minStake = 1_000 * genesis.SparksPerB10
+
+	for _, tc := range []struct {
+		name   string
+		bonded uint64
+		amount string
+	}{
+		{"leaves one spark", minStake, "999.99999999"},
+		{"leaves one spark under the floor", minStake, "0.00000001"},
+		{"leaves MIN_STAKE-1", 1_500 * genesis.SparksPerB10, "1000.00000001"},
+		{"partial exit from a sub-floor genesis seat", 600 * genesis.SparksPerB10, "100"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+				Address: addr.String(), Nonce: 0, Bonded: tc.bonded,
+			})
+			err := cmdUnstake([]string{"--node", stub.url, "--key", keyPath, "--amount", tc.amount, "--yes"})
+			if err == nil {
+				t.Fatalf("a partial exit leaving less than MIN_STAKE was accepted (bonded %d, amount %s)", tc.bonded, tc.amount)
+			}
+			if !strings.Contains(err.Error(), "MIN_STAKE") {
+				t.Errorf("the refusal must name MIN_STAKE, got: %v", err)
+			}
+			if len(stub.posts) != 0 {
+				t.Errorf("the verb posted %d transaction(s) despite refusing", len(stub.posts))
+			}
+		})
+	}
+}
+
+// TestUnstakeAllowsTheFullExitAndTheFloorRemainder is the accepting half of the
+// same rule, so the verb cannot pass the refusal test by refusing everything:
+// the whole bond goes through, and so does a partial that leaves EXACTLY
+// MIN_STAKE. A sub-floor genesis seat also goes through IN FULL.
+func TestUnstakeAllowsTheFullExitAndTheFloorRemainder(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+
+	for _, tc := range []struct {
+		name   string
+		bonded uint64
+		amount string
+		want   uint64
+	}{
+		{"full exit", 1_000 * genesis.SparksPerB10, "", 1_000 * genesis.SparksPerB10},
+		{"leaves exactly the floor", 1_500 * genesis.SparksPerB10, "500", 500 * genesis.SparksPerB10},
+		{"one-spark genesis seat in full", 1, "0.00000001", 1},
+		{"sub-floor genesis seat in full", 600 * genesis.SparksPerB10, "600", 600 * genesis.SparksPerB10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+				Address: addr.String(), Nonce: 0, Bonded: tc.bonded,
+			})
+			args := []string{"--node", stub.url, "--key", keyPath, "--yes"}
+			if tc.amount != "" {
+				args = append(args, "--amount", tc.amount)
+			}
+			if err := cmdUnstake(args); err != nil {
+				t.Fatalf("cmdUnstake: %v", err)
+			}
+			if got := stub.posted().Amount; got != tc.want {
+				t.Errorf("amount = %d sparks, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStakeRefusesBelowMinStakeBeforeSubmitting: the node's min_stake_sparks is
+// checked by the verb, so the operator gets the reason and the funding reality
+// instead of a node-side refusal. Nothing is posted.
+func TestStakeRefusesBelowMinStakeBeforeSubmitting(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 10_000 * genesis.SparksPerB10,
+	})
+	err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "999", "--yes"})
+	if err == nil {
+		t.Fatal("stake below MIN_STAKE must be refused")
+	}
+	if !strings.Contains(err.Error(), "MIN_STAKE") {
+		t.Errorf("the refusal must name MIN_STAKE, got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+	if strings.Contains(err.Error(), "no shipped genesis") {
+		t.Errorf("a refusal on an account holding 10,000 b10 appended the no-funding-path hint: %v", err)
+	}
+}
+
+// TestTheResumeLineNamesARestoredRound pins the startup note for the
+// rolling-restart trigger: silent at round 0 (a fresh height, the healthy
+// restart), and naming the height, the restored round and the advice otherwise.
+func TestTheResumeLineNamesARestoredRound(t *testing.T) {
+	if got := resumeLine(1081, 0); got != "" {
+		t.Fatalf("a node starting at round 0 printed a resume note: %q", got)
+	}
+	got := resumeLine(1081, 20)
+	for _, want := range []string{"height 1081", "round 20", "after the chain has advanced", "rolling restart"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the resume note does not say %q: %q", want, got)
+		}
+	}
+}
+
+// TestTheFundingHintAppearsOnlyWhenTheBalanceCannotReachMinStake is the M5
+// re-run's misleading-hint finding (2026-10-30): refusing a stake for a
+// two-spark FEE shortfall appended "no shipped genesis gives an operator's key
+// MIN_STAKE" even though the account held a thousand times MIN_STAKE. The hint
+// is now conditional on the spendable balance being below MIN_STAKE, which is
+// the case it was written for. Both endings are asserted on constructed
+// balances, and the ST-1 refusal is checked through the real verb.
+func TestTheFundingHintAppearsOnlyWhenTheBalanceCannotReachMinStake(t *testing.T) {
+	const minStake = uint64(100_000_000_000)
+	// A thousand times MIN_STAKE, two sparks short of bond plus fee.
+	rich := 1000 * minStake
+	err := checkSpendable(rich, rich, 2, minStake)
+	if err == nil {
+		t.Fatal("a two-spark fee shortfall must still be refused")
+	}
+	if strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("an account holding 1000x MIN_STAKE was told it has no shipped path to MIN_STAKE: %v", err)
+	}
+	if !strings.Contains(err.Error(), "short 2 sparks") {
+		t.Fatalf("the refusal must still say how short it is: %v", err)
+	}
+	// An empty account: the hint is the honest answer and must stay.
+	err = checkSpendable(0, minStake, 1, minStake)
+	if err == nil {
+		t.Fatal("a bond the balance cannot cover must be refused")
+	}
+	if !strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("an account with no spendable funds was not told where MIN_STAKE comes from: %v", err)
+	}
+	// The same rule on the ST-1 refusal (the bond would end below MIN_STAKE):
+	// a funded account gets the arithmetic, not the funding lecture; a fresh
+	// account gets both.
+	keyPath, _, addr := stakingTestKey(t)
+	funded := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{Address: addr.String(), Balance: 10_000 * genesis.SparksPerB10})
+	if err := cmdStake([]string{"--node", funded.url, "--key", keyPath, "--amount", "999", "--yes"}); err == nil || strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("a funded account's ST-1 refusal carried the funding hint: %v", err)
+	}
+	empty := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{Address: addr.String(), Balance: 0})
+	if err := cmdStake([]string{"--node", empty.url, "--key", keyPath, "--amount", "999", "--yes"}); err == nil || !strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("a fresh account's ST-1 refusal dropped the funding hint: %v", err)
+	}
+}
+
+// TestTheVerbRefusesAKeyThatDoesNotOwnTheAccount: the node names a different
+// account at the address this key signs as. Signing would be pointless at best
+// and misleading at worst, so the verb refuses before submitting.
+func TestTheVerbRefusesAKeyThatDoesNotOwnTheAccount(t *testing.T) {
+	keyPath, _, _ := stakingTestKey(t)
+	otherPub, _ := genesis.DevAccountKey(0)
+	other := types.AddressFromPub(otherPub)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: other.String(), Balance: 5_000 * genesis.SparksPerB10,
+	})
+	err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"})
+	if err == nil {
+		t.Fatal("a key whose account the node names differently must be refused")
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+}
+
+// TestTheVerbsRefuseANodeWithoutAGenesisHash: a pre-M5 node has no
+// genesis_hash, and a staking signature bound to nothing the chain reports
+// would be the "compiled-in assumption" defect the reported hash exists to
+// prevent. The verb refuses instead of guessing.
+func TestTheVerbsRefuseANodeWithoutAGenesisHash(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"chain_id": "old-node-1", "height": uint64(1),
+			"min_fee_sparks": uint64(1), "min_stake_sparks": uint64(100_000_000_000),
+			"epoch_blocks": uint64(1_000), "unbonding_epochs": uint64(2),
+		})
+	})
+	mux.HandleFunc("/account/", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(stakingAccount{Address: addr.String(), Bonded: 1_000 * genesis.SparksPerB10})
+	})
+	// A /tx that ACCEPTS: if the verb fell through and signed against a
+	// zero genesis hash, this handler would take it and the assertion below
+	// would see a post. A stub that 404s would hide that by failing the POST
+	// for an unrelated reason.
+	var posted int
+	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
+		posted++
+		_ = json.NewEncoder(w).Encode(map[string]string{"txid": strings.Repeat("ab", 32)})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	if err := cmdUnstake([]string{"--node", ts.URL, "--key", keyPath, "--yes"}); err == nil {
+		t.Fatal("a node that reports no genesis_hash must be refused, not signed for")
+	}
+	if posted != 0 {
+		t.Errorf("the verb submitted %d transaction(s) to a node that reported no genesis_hash", posted)
+	}
+}
+
+// TestWithdrawVerbReleasesOnlyMaturedRecords: the withdraw verb submits one
+// TxWithdraw carrying no amount (the state machine derives the total from the
+// matured records), and it refuses before submitting when nothing has matured.
+func TestWithdrawVerbReleasesOnlyMaturedRecords(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	// Head 7, next 8. One record at 8 (mature by execution), one at 50.
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 9,
+		Unbonding: []stakingUnbondingRec{
+			{Amount: 400 * genesis.SparksPerB10, ReleaseHeight: 8},
+			{Amount: 600 * genesis.SparksPerB10, ReleaseHeight: 50},
+		},
+	})
+	if err := cmdWithdraw([]string{"--node", stub.url, "--key", keyPath, "--yes"}); err != nil {
+		t.Fatalf("cmdWithdraw: %v", err)
+	}
+	tx := stub.posted()
+	if tx.Type != types.TxWithdraw {
+		t.Errorf("type = %d, want TxWithdraw (%d)", tx.Type, types.TxWithdraw)
+	}
+	if tx.Amount != 0 {
+		t.Errorf("amount = %d, want 0 (withdraw carries no amount; applyWithdraw derives the total)", tx.Amount)
+	}
+	if tx.Fee != 0 {
+		t.Errorf("fee = %d, want 0", tx.Fee)
+	}
+	if tx.Nonce != 9 {
+		t.Errorf("nonce = %d, want 9", tx.Nonce)
+	}
+
+	// Nothing mature: refused, and the message names the next release height.
+	late := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 9,
+		Unbonding: []stakingUnbondingRec{{Amount: 1, ReleaseHeight: 50}},
+	})
+	err := cmdWithdraw([]string{"--node", late.url, "--key", keyPath, "--yes"})
+	if err == nil {
+		t.Fatal("withdraw with no matured record must be refused")
+	}
+	if !strings.Contains(err.Error(), "height 50") {
+		t.Errorf("the refusal should name the next release height, got: %v", err)
+	}
+	if len(late.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(late.posts))
+	}
+}
+
+// TestReleaseForecastRoundsToTheEpochBoundary: the unstake verb prints the
+// height the state will RECORD, not head+1+cooldown (audit ST-4). The cooldown
+// is a floor and the release height is the epoch boundary at or after it, so a
+// forecast that printed the raw sum would name a height that can never appear.
+func TestReleaseForecastRoundsToTheEpochBoundary(t *testing.T) {
+	st := stakingStatus{Height: 100, EpochBlocks: 1_000, UnbondingEpochs: 2}
+	line, ok := releaseForecast(1_000_000, 0, st, 2_000)
+	if !ok {
+		t.Fatal("no forecast for a funded exit")
+	}
+	// head+1+cooldown = 2,101; the next 1,000-block boundary is 3,000.
+	if !strings.Contains(line, "height 3000") {
+		t.Fatalf("the forecast does not name the epoch boundary: %q", line)
+	}
+	// A release that already lands on a boundary does not move.
+	st.Height = 999 // 1,000 + 2,000 = 3,000
+	line, ok = releaseForecast(1_000_000, 0, st, 2_000)
+	if !ok || !strings.Contains(line, "height 3000") {
+		t.Fatalf("an exact boundary moved: %q", line)
+	}
+}
+
+// TestReleaseForecastSaysAGenesisExitReleasesNothing is audit ST-3 in the verb:
+// when the whole exit is the seat's unfunded genesis power, the state destroys
+// it rather than recording it, so the verb must not print a release height that
+// promises a payout.
+func TestReleaseForecastSaysAGenesisExitReleasesNothing(t *testing.T) {
+	st := stakingStatus{Height: 5, EpochBlocks: 10, UnbondingEpochs: 2}
+	line, ok := releaseForecast(100, 100, st, 20)
+	if !ok {
+		t.Fatal("a genesis exit must still produce a message")
+	}
+	if !strings.Contains(line, "destroy") || !strings.Contains(line, "UNFUNDED") {
+		t.Fatalf("the genesis exit does not say the power is destroyed: %q", line)
+	}
+	if strings.Contains(line, "height") {
+		t.Fatalf("the genesis exit still forecasts a release height: %q", line)
+	}
+
+	// A funded exit from the same status still forecasts a height (5+1+20 = 26
+	// -> the next 10-block boundary, 30).
+	line, ok = releaseForecast(100, 0, st, 20)
+	if !ok || !strings.Contains(line, "height 30") {
+		t.Fatalf("the funded exit's forecast = %q, want height 30", line)
+	}
+}
+
+// TestWithdrawRefusesATruncatedUnbondingReply: /account is windowed (audit
+// ST-4), and a verb that signed on a partial list could report "nothing
+// matured" while the node holds a matured record. It refuses instead.
+func TestWithdrawRefusesATruncatedUnbondingReply(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 1,
+		Unbonding:      []stakingUnbondingRec{{Amount: 1, ReleaseHeight: 8}},
+		UnbondingTotal: 5,
+	})
+	err := cmdWithdraw([]string{"--node", stub.url, "--key", keyPath, "--yes"})
+	if err == nil {
+		t.Fatal("a windowed (truncated) unbonding reply must be refused")
+	}
+	if !strings.Contains(err.Error(), "record") {
+		t.Errorf("the refusal should name the record count, got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+}
+
+// TestStakeRefusesABondTheAccountCannotCover: the balance check is the verb's
+// own, run before signing. Without it the operator learns "insufficient funds"
+// from the node instead of from the command that asked, and the funding note
+// (the honest answer to "where do I get MIN_STAKE?") is never shown.
+func TestStakeRefusesABondTheAccountCannotCover(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 500 * genesis.SparksPerB10, Nonce: 0,
+	})
+	err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"})
+	if err == nil {
+		t.Fatal("a bond the account cannot cover must be refused by the verb")
+	}
+	if !strings.Contains(err.Error(), "short") {
+		t.Errorf("the refusal should name the shortfall, got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+}
+
+// TestStakeMayAccumulateToMinStake: the chain's floor is on the RESULTING bond
+// (state.applyBond), so an existing 600 b10 bond plus a 400 b10 bond is legal
+// even though 400 alone is not. A verb that checked only --amount would refuse
+// a transaction the chain accepts - and its own "the floor is on the result"
+// text would be false.
+func TestStakeMayAccumulateToMinStake(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(),
+		Balance: 5_000 * genesis.SparksPerB10,
+		Nonce:   2,
+		Bonded:  600 * genesis.SparksPerB10,
+	})
+	if err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "400", "--yes"}); err != nil {
+		t.Fatalf("staking a 400 b10 top-up onto a 600 b10 bond must be accepted: %v", err)
+	}
+	tx := stub.posted()
+	if want := uint64(400 * genesis.SparksPerB10); tx.Amount != want {
+		t.Errorf("amount = %d, want %d (the top-up, not the resulting bond)", tx.Amount, want)
+	}
+	if tx.Nonce != 2 {
+		t.Errorf("nonce = %d, want 2", tx.Nonce)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CL-1: the fee ceiling, the preview, the confirmation and --dry-run
+// ---------------------------------------------------------------------------
+
+// printedTx finds the canonical bytes the preview printed and decodes them. It
+// is deliberately a parser over stdout rather than a look at a variable: the
+// test must see exactly what a user would copy out.
+func printedTx(t *testing.T, out string) (*types.Tx, []byte) {
+	t.Helper()
+	const marker = "  bytes       "
+	i := strings.Index(out, marker)
+	if i < 0 {
+		t.Fatalf("the preview printed no canonical bytes:\n%s", out)
+	}
+	line := out[i+len(marker):]
+	if j := strings.IndexByte(line, '\n'); j >= 0 {
+		line = line[:j]
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatalf("the preview's bytes are not hex: %v\n%s", err, out)
+	}
+	tx, err := types.DecodeTx(raw)
+	if err != nil {
+		t.Fatalf("the preview's bytes do not decode: %v\n%s", err, out)
+	}
+	return tx, raw
+}
+
+// TestHostileNodeFeeIsRefused is CL-1's attack. The stub reports the TRUE
+// genesis hash (so a signature would be valid on the real chain) and a fee
+// equal to the whole spendable balance minus the bond. Before the fix the verb
+// signed that transaction and posted it; applyBond on the real chain would
+// then burn the entire balance as the fee. Now the ceiling refuses it before
+// Sign, and the preview shows the hostile number as evidence.
+func TestHostileNodeFeeIsRefused(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	balance := uint64(5_000) * genesis.SparksPerB10
+	amount := uint64(1_000) * genesis.SparksPerB10
+	hostileFee := balance - amount
+
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: balance, Nonce: 0,
+	})
+	stub.setFee(hostileFee)
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"})
+	})
+	if err == nil {
+		t.Fatal("a bond whose fee is the whole spendable balance was signed, not refused")
+	}
+	for _, want := range []string{"refusing to sign", "--max-fee", "ceiling", fmt.Sprint(hostileFee)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must contain %q for the operator to act on it, got: %v", want, err)
+		}
+	}
+	// The transaction the node asked for was built and printed BEFORE the
+	// refusal, so the operator can see the number that was refused.
+	printed, _ := printedTx(t, out)
+	if printed.Fee != hostileFee {
+		t.Errorf("the preview shows fee %d, want the node's hostile %d", printed.Fee, hostileFee)
+	}
+	if printed.Fee+printed.Amount != balance {
+		t.Errorf("the fixture no longer models the attack: fee %d + bond %d != balance %d",
+			printed.Fee, printed.Amount, balance)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb POSTed %d transaction(s) after a fee-ceiling refusal", len(stub.posts))
+	}
+	if len(printed.Sig) != 0 {
+		t.Error("the printed transaction carries a signature: it was signed before the ceiling was enforced")
+	}
+	t.Logf("the user sees: error: %v", err)
+}
+
+// TestFeeCeilingDefaultAndMaxFee pins both directions: the default is the
+// protocol minimum (1 spark on every shipped genesis), one spark above it is
+// refused until --max-fee raises the ceiling, and a --max-fee below the ask
+// still refuses.
+func TestFeeCeilingDefaultAndMaxFee(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		fee     uint64
+		extra   []string
+		wantFee uint64 // 0 means "must be refused"
+	}{
+		{"default accepts the protocol minimum", 1, nil, 1},
+		{"default refuses one spark above it", 2, nil, 0},
+		{"--max-fee raises the ceiling", 500, []string{"--max-fee", "500"}, 500},
+		{"--max-fee below the ask still refuses", 500, []string{"--max-fee", "499"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keyPath, _, addr := stakingTestKey(t)
+			stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+				Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 0,
+			})
+			stub.setFee(tc.fee)
+			args := append([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"}, tc.extra...)
+			var err error
+			captureStdout(t, func() { err = cmdStake(args) })
+			if tc.wantFee == 0 {
+				if err == nil {
+					t.Fatalf("a fee of %d spark was accepted with args %v", tc.fee, tc.extra)
+				}
+				if len(stub.posts) != 0 {
+					t.Errorf("the verb posted %d transaction(s) despite refusing", len(stub.posts))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a fee of %d spark should be accepted here: %v", tc.fee, err)
+			}
+			if got := stub.posted().Fee; got != tc.wantFee {
+				t.Errorf("signed fee = %d sparks, want %d", got, tc.wantFee)
+			}
+		})
+	}
+}
+
+// TestPrintedTransactionIsTheSignedBytes is the CL-1 preview property, checked
+// end to end: the hex on stdout is the unsigned canonical encoding, the posted
+// bytes are exactly those bytes plus a signature, and the signature verifies
+// over the SIGNING HASH OF THE PRINTED BYTES. Any code that printed a
+// re-rendered summary, or signed a different transaction than it showed, fails
+// here.
+func TestPrintedTransactionIsTheSignedBytes(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	var reported [32]byte
+	for i := range reported {
+		reported[i] = byte(0x40 + i)
+	}
+	stub := newStakingStub(t, reported, stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 3,
+	})
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"})
+	})
+	if err != nil {
+		t.Fatalf("cmdStake: %v", err)
+	}
+	printed, raw := printedTx(t, out)
+	posted := stub.posted()
+
+	if len(printed.Sig) != 0 {
+		t.Fatal("the printed transaction carries a signature: it was printed after Sign, not before")
+	}
+	// Identical except for the signature.
+	unsigned := *posted
+	unsigned.Sig = nil
+	if !bytes.Equal(unsigned.Encode(), raw) {
+		t.Errorf("the posted transaction is not the printed bytes plus a signature:\n printed %x\n posted  %x",
+			raw, unsigned.Encode())
+	}
+	// The signature covers the printed bytes' signing hash, not some other
+	// transaction's.
+	h := printed.SigningHash(reported)
+	if !crypto.Verify(posted.PubKey, h[:], posted.Sig) {
+		t.Error("the posted signature does not verify over the PRINTED transaction's signing hash")
+	}
+	// The human-readable fields agree with the bytes (they are decoded from
+	// them), so a summary rendered from another data source would show here.
+	for _, want := range []string{
+		fmt.Sprintf("  nonce       %d", printed.Nonce),
+		fmt.Sprintf("  fee         %d spark", printed.Fee),
+		fmt.Sprintf("  amount      %d sparks", printed.Amount),
+		printed.From.String(),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the preview does not show %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestBuildTxRendersTheDecodedBytes: the renderer takes bytes, not a struct, so
+// a summary can only ever describe the encoding it prints. Odd values make it
+// impossible to pass by echoing a stub's /status or the flag defaults.
+func TestBuildTxRendersTheDecodedBytes(t *testing.T) {
+	pub, _ := genesis.DevAccountKey(0)
+	tx := &types.Tx{
+		Type:   types.TxBond,
+		From:   types.AddressFromPub(pub),
+		PubKey: pub,
+		Nonce:  42,
+		Fee:    7,
+		Amount: 123,
+	}
+	b, err := buildTx(tx)
+	if err != nil {
+		t.Fatalf("buildTx: %v", err)
+	}
+	var buf bytes.Buffer
+	b.print(&buf, genesis.Devnet().Hash(), "http://node.invalid", txProvenance{amount: "from --amount"}, 9)
+	out := buf.String()
+	for _, want := range []string{
+		"  nonce       42",
+		"  fee         7 spark  (the node's claim; ceiling 9)",
+		"  amount      123 sparks (0.00000123 b10)  (from --amount)",
+		fmt.Sprintf("  bytes       %x", tx.Encode()),
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the preview does not render %q from the bytes:\n%s", want, out)
+		}
+	}
+}
+
+// TestNonInteractiveRunRefusesWithoutYes: a script (or cron, or CI) has no
+// terminal, so nothing is signed unless the run says --yes. The preview is
+// still printed, so the operator can see what was declined.
+func TestNonInteractiveRunRefusesWithoutYes(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 0,
+	})
+	old := askConfirmation
+	askConfirmation = func() (string, error) { return "", errNoAnswer }
+	defer func() { askConfirmation = old }()
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000"})
+	})
+	if err == nil {
+		t.Fatal("a non-interactive run without --yes signed a transaction")
+	}
+	for _, want := range []string{"refusing to sign", "--yes", "--dry-run"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must mention %q, got: %v", want, err)
+		}
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transaction(s) without confirmation", len(stub.posts))
+	}
+	printed, _ := printedTx(t, out)
+	if len(printed.Sig) != 0 {
+		t.Error("the unconfirmed transaction was signed anyway")
+	}
+	t.Logf("the user sees: error: %v", err)
+}
+
+// TestTerminalConfirmationControlsSigning: --yes is not the only path. A TTY
+// answer of "yes" signs; anything else refuses. Both states are constructed,
+// never raced.
+func TestTerminalConfirmationControlsSigning(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+
+	// "no" (and any non-"yes" answer) refuses.
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 0,
+	})
+	old := askConfirmation
+	askConfirmation = func() (string, error) { return "no\n", nil }
+	var err error
+	captureStdout(t, func() {
+		err = cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000"})
+	})
+	askConfirmation = old
+	if err == nil {
+		t.Fatal("the answer \"no\" still signed a transaction")
+	}
+	if !strings.Contains(err.Error(), `"no"`) {
+		t.Errorf("the refusal should quote the answer, got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("a refused confirmation posted %d transaction(s)", len(stub.posts))
+	}
+
+	// "yes" signs.
+	stub2 := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 0,
+	})
+	askConfirmation = func() (string, error) { return "YES\n", nil }
+	defer func() { askConfirmation = old }()
+	captureStdout(t, func() {
+		err = cmdStake([]string{"--node", stub2.url, "--key", keyPath, "--amount", "1000"})
+	})
+	if err != nil {
+		t.Fatalf("the answer \"yes\" must sign: %v", err)
+	}
+	if len(stub2.posts) != 1 {
+		t.Errorf("the confirmed transaction was posted %d times, want 1", len(stub2.posts))
+	}
+}
+
+// TestDryRunSignsAndPostsNothing: --dry-run builds and prints, then stops. The
+// stub records every POST, and there is not one; the preview carries no
+// signature; and the confirmation question is never asked.
+func TestDryRunSignsAndPostsNothing(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 0,
+	})
+	old := askConfirmation
+	asked := false
+	askConfirmation = func() (string, error) {
+		asked = true
+		return "", errNoAnswer
+	}
+	defer func() { askConfirmation = old }()
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--dry-run"})
+	})
+	if err != nil {
+		t.Fatalf("--dry-run must succeed without --yes: %v", err)
+	}
+	if asked {
+		t.Error("--dry-run asked for confirmation; it signs nothing and needs none")
+	}
+	if len(stub.posts) != 0 {
+		t.Fatalf("--dry-run POSTed %d transaction(s)", len(stub.posts))
+	}
+	if !strings.Contains(out, "NOT signed and NOT posted") {
+		t.Errorf("the dry run does not say plainly that nothing was signed or posted:\n%s", out)
+	}
+	if strings.Contains(out, "txid") {
+		t.Errorf("the dry run printed a txid:\n%s", out)
+	}
+	printed, _ := printedTx(t, out)
+	if len(printed.Sig) != 0 {
+		t.Error("--dry-run signed the transaction")
+	}
+	// The same proof for an exit, whose submit path shares the code.
+	bondStub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 0, Bonded: 1_000 * genesis.SparksPerB10,
+	})
+	var err2 error
+	out2 := captureStdout(t, func() {
+		err2 = cmdUnstake([]string{"--node", bondStub.url, "--key", keyPath, "--dry-run"})
+	})
+	if err2 != nil {
+		t.Fatalf("unstake --dry-run: %v", err2)
+	}
+	if len(bondStub.posts) != 0 {
+		t.Fatalf("unstake --dry-run POSTed %d transaction(s)", len(bondStub.posts))
+	}
+	if !strings.Contains(out2, "NOT signed and NOT posted") {
+		t.Errorf("unstake --dry-run does not say nothing was signed or posted:\n%s", out2)
+	}
+}
+
+// TestFutureNonceIsPrintedAsTheNodesClaim documents the decision for CL-1's
+// future-nonce variant: the CLI has no trusted nonce to compare against, so it
+// does not invent one. The nonce is printed as the node's claim and the whole
+// transaction must be confirmed with it visible.
+func TestFutureNonceIsPrintedAsTheNodesClaim(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 999,
+	})
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"})
+	})
+	if err != nil {
+		t.Fatalf("cmdStake: %v", err)
+	}
+	if !strings.Contains(out, "  nonce       999  (the node's claim)") {
+		t.Errorf("the preview must show the nonce as the node's claim:\n%s", out)
+	}
+	printed, _ := printedTx(t, out)
+	if printed.Nonce != 999 {
+		t.Errorf("printed nonce = %d, want the node's 999", printed.Nonce)
+	}
+	if got := stub.posted().Nonce; got != 999 {
+		t.Errorf("signed nonce = %d, want 999", got)
+	}
+}
+
+// TestUnstakeWithoutAmountSaysTheAmountIsTheNodesClaim is CL-1's
+// under-reported-bond variant: with no --amount the unbond amount is the bond
+// THIS NODE reported, which the CLI cannot verify. The fix is not to pretend
+// otherwise but to make the choice visible - the preview names the source and
+// says an under-report makes the exit partial; --amount makes the number the
+// operator's own.
+func TestUnstakeWithoutAmountSaysTheAmountIsTheNodesClaim(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	bonded := uint64(750) * genesis.SparksPerB10
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 4, Bonded: bonded,
+	})
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdUnstake([]string{"--node", stub.url, "--key", keyPath, "--yes"})
+	})
+	if err != nil {
+		t.Fatalf("cmdUnstake: %v", err)
+	}
+	if !strings.Contains(out, "the WHOLE bond as this node reports it") {
+		t.Errorf("the preview must say the whole-bond amount is the node's claim:\n%s", out)
+	}
+	if !strings.Contains(out, "PARTIAL exit") {
+		t.Errorf("the preview must say an under-report makes the exit partial:\n%s", out)
+	}
+	printed, _ := printedTx(t, out)
+	if printed.Amount != bonded {
+		t.Errorf("the unbond carries %d sparks, want the node's reported bond %d", printed.Amount, bonded)
+	}
+
+	// --amount replaces the node's number with the operator's.
+	stub2 := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 4, Bonded: 2_500 * genesis.SparksPerB10,
+	})
+	chosen := uint64(1_000) * genesis.SparksPerB10
+	out2 := captureStdout(t, func() {
+		err = cmdUnstake([]string{"--node", stub2.url, "--key", keyPath, "--amount", "1000", "--yes"})
+	})
+	if err != nil {
+		t.Fatalf("cmdUnstake --amount: %v", err)
+	}
+	if !strings.Contains(out2, "(from --amount)") {
+		t.Errorf("the preview must say the amount came from --amount:\n%s", out2)
+	}
+	printed2, _ := printedTx(t, out2)
+	if printed2.Amount != chosen {
+		t.Errorf("the unbond carries %d sparks, want the operator's %d", printed2.Amount, chosen)
+	}
+}
+
+// TestStakeRefusesAZeroReportedFee: a bond with fee 0 can never apply on a
+// validated genesis (MinFeeSparks >= 1), so a node reporting 0 is refused
+// before anything is built - the same class of lie as the hostile fee, in the
+// direction that would silently produce an invalid transaction.
+func TestStakeRefusesAZeroReportedFee(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 0,
+	})
+	stub.setFee(0)
+	err := cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"})
+	if err == nil {
+		t.Fatal("a bond with a zero fee was accepted; it can never apply")
+	}
+	if !strings.Contains(err.Error(), "min_fee_sparks 0") {
+		t.Errorf("the refusal should name the reported zero, got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transaction(s) despite refusing", len(stub.posts))
 	}
 }

@@ -210,10 +210,11 @@ failure 3.
 {
   "chain_id": "example-testnet-1",
   "note": "optional human annotation — never enters the genesis hash",
+  "committee_size": 4,
   "validators": [
-    { "name": "pi-0", "pubkey": "<Pi 0's public key hex>", "power": 1 },
-    { "name": "pi-1", "pubkey": "<Pi 1's public key hex>", "power": 1 },
-    { "name": "pi-2", "pubkey": "<Pi 2's public key hex>", "power": 1 }
+    { "name": "pi-0", "pubkey": "<Pi 0's public key hex>", "power": 100000000000 },
+    { "name": "pi-1", "pubkey": "<Pi 1's public key hex>", "power": 100000000000 },
+    { "name": "pi-2", "pubkey": "<Pi 2's public key hex>", "power": 100000000000 }
   ]
 }
 ```
@@ -222,12 +223,25 @@ A checked example lives at `scripts/deploy/committee.example.json`. The
 binary enforces (refusing the file otherwise): `chain_id` non-empty — chosen
 by you, and unlike the fixture's `b10coin-simnet-N` it must not be made to
 encode the committee size; every `pubkey` a 64-hex-character Ed25519 public
-key, with **duplicates refused** (one key holds one seat); `power` ≥ 1; and
-**order matters** — a validator's seat is its entry's position. The file
-carries the committee and nothing else: monetary and protocol parameters
-stay the compiled-in devnet fixture values (trivial puzzle, 1 b10 claims,
-2 s blocks), so a shared chain stays valueless test currency and no member
-can rewrite its economy hand-edited. **Treat the file as final once the
+key, with **duplicates refused** (one key holds one seat); `power` **at least
+`MIN_STAKE`**; and **order matters** — a validator's seat is its entry's
+position. `power` is also the seat's genesis **bond**, in sparks and not
+rescaled: `100000000000` is 1,000 b10 (`MIN_STAKE`), and the loader refuses
+anything less. That floor is audit RT-2: a one-spark seat is a bond below the
+candidacy floor, and on a full committee one `MIN_STAKE` bond then outranks it
+and holds about all of the power (10^11 of 10^11+2 on this three-seat shape).
+
+`committee_size` is optional and is **how many seats the chain has room for**.
+It must be at least the number of validators (a key the file publishes must be
+able to be seated) and may be larger: with one spare seat, a newcomer that
+bonds is seated *beside* the three genesis seats instead of evicting one. Omit
+it and the chain seats exactly the keys listed — then admission implies
+eviction, and the key that bonds must be a running validator's (see §5.1).
+
+The file carries the committee and nothing else: monetary and protocol
+parameters stay the compiled-in devnet fixture values (trivial puzzle, 1 b10
+claims, 2 s blocks), so a shared chain stays valueless test currency and no
+member can rewrite its economy hand-edited. **Treat the file as final once the
 chain starts** — editing it changes the genesis hash, i.e. it starts a
 different chain.
 
@@ -437,6 +451,130 @@ If you lose track of which Pi holds which seat: the banners name it
 prints a NEW key's public half — never load such a probe key as a member;
 generate, read, delete.
 
+### 5.1 Staking: the verbs, and what this chain can actually fund
+
+The `stake`, `unstake` and `withdraw` clients talk to a node's **loopback**
+RPC, so they run on the Pi that holds the key file, as the `b10coin` user —
+the key never leaves the machine, and the verbs never open the data directory:
+
+```sh
+# on the Pi whose key is the validator's, from §3.1:
+sudo -u b10coin /opt/b10coin/b10coin stake \
+    --node http://127.0.0.1:8645 \
+    --key  /var/lib/b10coin/b10coin.key \
+    --amount 1000 --yes
+```
+
+`--amount` is **b10**, as an exact decimal — the command converts it to sparks
+with integer arithmetic and signs against the `genesis_hash` the node reports,
+so it is the same ordinary signed transaction a transfer is. It prints the
+whole transaction (from, nonce, fee, amount, genesis hash and canonical bytes)
+*before* signing and then the **txid**; `--yes` confirms a non-interactive run
+(the verbs otherwise require a terminal answer of "yes", and `--dry-run`
+prints the transaction without signing or posting). It does not wait, because a
+bond takes effect when a block applies it and a **seat** changes only at the
+next epoch boundary. The fee ceiling is one spark by default (the protocol
+minimum on every shipped genesis; a higher fee is burned and buys nothing) —
+`--max-fee SPARKS` raises it, and a node asking for more is refused. To exit:
+
+```sh
+# unbond everything (or give --amount, leaving at least MIN_STAKE bonded);
+# fee 0 by consensus rule
+sudo -u b10coin /opt/b10coin/b10coin unstake --yes \
+    --node http://127.0.0.1:8645 \
+    --key /var/lib/b10coin/b10coin.key
+# ... the output names the RELEASE HEIGHT: the coins are neither spendable
+# nor counted in the committee until that height. The cooldown is
+# unbonding_epochs x epoch_blocks = 2 x 1,000 blocks, and the release height is
+# the EPOCH BOUNDARY at or after it (audit ST-4): it can be up to one epoch
+# later than the raw sum, never earlier. How long that is in wall time is this
+# committee's cadence, not a constant: measure it from two /status readings a
+# minute apart (the driver's rhythm is the round protocol's; `block_time_ms` is
+# the spec's target, not a pacing timer).
+# Once the chain is at or past it:
+sudo -u b10coin /opt/b10coin/b10coin withdraw --yes \
+    --node http://127.0.0.1:8645 \
+    --key /var/lib/b10coin/b10coin.key
+```
+
+A partial `--amount` must leave the bond at zero or at `MIN_STAKE` or above:
+any positive bond is a committee candidate, so a one-spark remainder would be a
+one-spark *seat* carrying a full seat's power (audit ST-1). Both `unstake` and
+the state machine refuse the rest; a seat already bonded below `MIN_STAKE` —
+possible only on the devnet/simnet fixtures, whose seats carry `power: 1` — can
+exit **only in full**, which is what `unstake` without `--amount` does.
+
+> **⚠️ `stake` needs spendable funds this genesis does not give it — read this
+> before planning around a new bond.** The committee file's `power` field **is**
+> the genesis bond (not rescaled: `power` is in sparks, so 1,000 b10 is
+> `100000000000`), and the loader refuses anything below `MIN_STAKE`, so the
+> three genesis seats start with 1,000 b10 bonded each, funded by no balance
+> (the genesis-hash bond). That bond is **unfunded and not withdrawable** (audit
+> ST-3): it seats a vote, and unbonding it DESTROYS the power rather than
+> releasing coins, so a seat is never a payout. The file mints no premine, so
+> every *account* starts at zero, and `stake` needs `MIN_STAKE` = 1,000 b10
+> (10^11 sparks) in **spendable funds**. The only funding path is the faucet:
+> **1 b10 per claim, one claim per key per epoch, at most 8 claims per block**,
+> funded by emission at **0.5 b10 per block**. The faucet's balance is the
+> real constraint, not the epoch length: **2,000 blocks** of emission produce
+> the 1,000 b10, and 1,000 claims from 1,000 distinct keys at 8 per block take
+> **125 blocks** — about **2,125 blocks**, roughly 71 minutes at 2 s blocks (a
+> healthy committee commits faster; measure two `/status` readings a minute
+> apart). This recipe used to say "1,000 epochs, one million blocks, 23 days",
+> which wrongly divided by the one-claim-per-key rule instead of issuing one
+> claim per key: the old figure was about **470× too long**. It is still not a
+> path this deployment can walk today: `b10coin claim` signs with a fresh
+> ephemeral key each run and never saves it, and there is no `transfer` verb,
+> so each claim lands at a new address and cannot be accumulated. **No shipped
+> command funds an operator's key with `MIN_STAKE`**; the numbers above
+> describe what the protocol allows a client holding 1,000 keys and a transfer
+> path. The arithmetic is in the repository README's
+> [Staking](../../README.md#staking) section.
+
+> **⚠️ A bond is a seat, and a seat without a node is a wasted seat — a halt on
+> three seats, a thinner committee on four or more.** A bond at or above a
+> genesis seat's power is ranked against it, ties by key bytes. With
+> `committee_size` equal to the number of validators (the old default) each
+> newcomer evicts a genesis seat; the shipped example asks for one spare seat
+> (4 against 3 keys), so the fourth bond is seated *beside* the three genesis
+> seats and a fifth bond displaces one of the four. If the bonding key's node is
+> **not** running as a validator — the obvious mistake is staking from a key
+> other than the one the node holds — the new seat has no signer. What follows
+> depends on the size (audit M-3):
+>
+> - **3 seats: the chain halts at the boundary.** Below four seats there is no
+>   power cap (1/1) and quorum is strictly more than two thirds, so two live
+>   seats of three hold exactly 2/3 — one spark short of the threshold when all
+>   three bonds are `MIN_STAKE` — and cannot commit.
+> - **4 or more seats: the chain keeps finalising.** The one-quarter cap means
+>   the silent seat holds at most 1/4 of the power, so the survivors hold at
+>   least 3/4 > 2/3. At four seats that is exactly 3 of 4 power
+>   (`floor(2·4/3)+1 = 3`); the displaced node stops voting but keeps following.
+>
+> Either way the seat is wasted and the margin is one failure thinner: stake only
+> with the key the node runs, and keep every genesis key's node running.
+
+`unstake` and `withdraw` **run** here without any spendable funds — an exit is
+free by consensus rule (§3.2 bonds every genesis seat with
+`power: 100000000000`, 1,000 b10 = `MIN_STAKE`) — but a genesis seat's exit
+**pays nothing**: the grant is unfunded, so `unstake` destroys its power and
+`withdraw` finds no record to release (audit ST-3, and `unstake` prints exactly
+that). The only sparks an operator can withdraw are the ones it funded itself
+through `stake`; those are recorded as a funded bond and released after one
+cooldown like any other. Decide the powers before the chain starts: the file is
+final once it has, because editing it changes the genesis hash and starts a
+different chain.
+
+Two limits to keep straight: the verbs act on the chain whose `genesis_hash`
+the node reports, so pointing one at a node on another chain produces a
+transaction that chain rejects — never one it accepts; and a `--relay`-only Pi
+(no `--listen`) advertises no direct address, so `PEER_EXCHANGE` gives the
+mesh no path to it (see the repository README's `b10coin node` section).
+**This recipe's three nodes are all relay-only** (§3.3, §5), so on this
+deployment `PEER_EXCHANGE` is inert: it only helps a node given `--listen` at
+an address the other validators can reach (a forwarded port or a public host),
+and then only for the links to such nodes.
+
 ## 6. The systemd units (what runs after the first contact test)
 
 This directory ships two units. They go on **different machines**:
@@ -489,6 +627,62 @@ journalctl -u b10coin -f        # (VPS: journalctl -u b10coin-relay -f)
 To update a binary: overwrite `/opt/b10coin/b10coin` (§2's `install`) and
 `sudo systemctl restart b10coin` on each machine — **all machines from the
 same build**, for the §3 reason.
+
+> **⚠️ Restart the committee TOGETHER — a rolling reboot can hold the chain
+> down for minutes.** Each round at an undecided height is given
+> `200 ms + 100 ms × round`, with no cap, and that growth is what lets
+> validators whose rounds have drifted apart converge again: the one further
+> behind fires sooner and gains a round at a time. A restart that leaves the
+> members' rounds apart — one Pi at a time, or one unit a few seconds before
+> the others — therefore hands the committee a round gap that only the ladder
+> can close, and **the wait grows with how far the rounds ran**: a one-round
+> gap at round 40 takes about 13 s, a five-round gap there about 27 minutes
+> (the arithmetic is in `internal/consensus/driver.go` and the main README's
+> [Consensus](../../README.md#consensus)). A four-seat committee with one
+> seat without a node is the slow shape: the round-resync jump needs 2 of the
+> 4 seats' power, so one live seat that has run ahead cannot pull the others
+> forward, and the ladder is the only closer. The 2026-10-30 Docker re-run
+> measured exactly this: restarting three seated validators one at a time
+> left a four-seat chain at one head for 4 to 6.5 minutes, twice.
+>
+> - **Do:** restart all three nodes within one block time (a few seconds of
+>   each other) — `sudo systemctl restart b10coin` back to back on the three
+>   machines, or reboot the Pis together.
+> - **If you must go one at a time** (an upgrade you want to watch Pi by
+>   Pi): restart one node, then **wait until the chain has advanced** —
+>   its `/status` height moves past where it stood — before you stop the
+>   next one. Why: a restarted node resumes at the round it had reached
+>   before it stopped, which is behind a committee that kept climbing
+>   rounds while it was down, and it jumps forward only once it hears 2 of
+>   the 4 seats ahead. Stop the next node too early and only one live seat
+>   is ahead of it, so it keeps the gap. With the wait, the 2026-10-30
+>   Docker check (4 seats, 3 nodes, 15 s down per restart, 3 trials, 9
+>   restarts) saw the chain advance 6 to 33 s after every restart and never
+>   stall afterwards. The node says when it resumes mid-height:
+>
+>   ```
+>   consensus    resuming height 1063 at round 17, the round this node reached before it stopped; ...
+>   ```
+>
+>   Round 0 prints nothing. A high round there right after a one-at-a-time
+>   restart is the gap forming.
+> - **Expect if you cannot:** safety is unaffected and no node diverges; the
+>   chain stops finalising until the ladder closes the gap, then resumes. A
+>   node now says so, once per stuck height, as soon as the stall is real, so
+>   it is no longer silent (example — the height is wherever the chain was):
+>
+>   ```
+>   b10coin: no block for 8 rounds at height 4177 (round 8, step propose): quorum reachable with 3 of 4 power (quorum 3), yet nothing commits; peers=2[seat1/v1 h=4177, seat2/v2 h=4177]; tallies r7 (last round with a vote): proposal=absent; prevote votes=3 power=3 quorum=3 nil=3 ids=[00000000:3]; precommit votes=0 power=0 quorum=3 nil=0; selfprevote=nil; the round ladder is the only closer for a round divergence here, so a rolling restart can hold this for minutes - restart the committee together or expect the delay (README: rolling restart)
+>   ```
+>
+>   Read it as "the committee this node can reach could commit and is not".
+>   `peers=` counts signed member identities, so it survives the relay (where
+>   every member shares one transport name). The `tallies` are the newest
+>   round that holds a vote: nil prevotes from every live seat mean the
+>   committee agrees there is nothing to commit and is merely out of step,
+>   while an empty tally means frames are not arriving. A node that cannot
+>   reach quorum says nothing — with its peers gone, a stall is expected, not
+>   a fault.
 
 ## 7. Exactly what output means success
 
@@ -563,6 +757,15 @@ hashes below, never from reachability).
    ```sh
    scripts/deploy/acceptance.sh --pis 192.0.2.11,192.0.2.12,192.0.2.13 --relay example.com
    ```
+
+   **Fault recipes: name the survivors, not the stopped node.** The harness also
+   accepts **two** validators, which is how §8's "stop one seat and see whether
+   the two survivors are STALLED" is judged: pass the two live Pis and expect
+   **STALLED** (exit 2), the correct verdict for 2 of 3, below quorum. A
+   two-validator PASS is possible too, and the output says it is a partial
+   reading rather than M4's criterion. Entries are de-duplicated by *machine*, so
+   `pi-a` and `pi-a:8645` are one validator, and a repeated host is a usage error
+   instead of a phantom third seat.
 
 ## 8. When it does not work: the five failures
 

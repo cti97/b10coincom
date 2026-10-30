@@ -81,6 +81,7 @@ package relay
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -1049,15 +1050,16 @@ func (r *Relay) releaseHandshake(nc net.Conn) {
 // connection whose accept-time slot the caller has already reserved against
 // both caps (audit F1). With no token configured it is the admit call alone.
 //
-// With a token, the exchange is three frames and no decoding at any point:
-// the relay writes the FIXED greeting frame FIRST (review, audit fix round 4),
-// so a token-configured node will not part with its secret until the relay has
-// announced that it wants one; the connection's FIRST inbound frame must then
-// equal the token EXACTLY - length and bytes - and is consumed, never
-// forwarded; and only on a match does the relay write the FIXED accepted frame
-// so the node can tell a refusal from a dead socket instead of redialling in
-// silence. The greeting costs one write on a socket that is already open,
-// before the relay knows anything about the peer.
+// With a token, the exchange is four frames and no decoding at any point
+// (audit PX-3): the relay writes the FIXED greeting FIRST, then a 32-byte
+// random nonce followed by this socket's own local address - the challenge;
+// the connection's FIRST inbound frame must then be the HMAC-SHA-256 of that
+// challenge under the token, and it is consumed, never forwarded; and only on
+// a match does the relay write the FIXED accepted frame so the node can tell a
+// refusal from a dead socket instead of redialling in silence. The challenge
+// costs one extra bounded write on a socket that is already open, before the
+// relay knows anything about the peer; the token is never sent, so forwarding
+// the node's answer to every peer forwards no secret.
 //
 // The relay still calls no decoder anywhere in this path: it reads a frame
 // (wire.ReadFrame), compares raw bytes in constant time (subtle.
@@ -1074,10 +1076,32 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 	defer r.wg.Done()
 	if len(r.opts.AccessToken) > 0 {
 		// Announce gating before asking for anything. A node that reads this
-		// knows the relay will consume a token frame; a node that does not
-		// get it refuses to send one (tcp.adoptRelay). The write is bounded
-		// like every other handshake write on this socket.
+		// knows the relay will ask for a proof; a node that does not get it
+		// refuses to answer (tcp.adoptRelay). The write is bounded like every
+		// other handshake write on this socket.
 		if err := writeGateFrame(nc, wire.RelayGateGreeting, r.opts.WriteTimeout); err != nil {
+			r.unauthorized.Add(1)
+			r.releaseHandshake(nc)
+			_ = nc.Close()
+			return
+		}
+		// The challenge (audit PX-3): 32 fresh random bytes, then this
+		// connection's own local address. It is BUILT, never parsed - the
+		// relay is not interpreting anything, it is choosing a nonce and
+		// stating which of its sockets the answer is for. The node hashes the
+		// bytes exactly as sent, so the two ends agree without the relay
+		// understanding an address format.
+		challenge := make([]byte, wire.RelayGateNonceBytes, wire.MaxRelayGateChallengeBytes)
+		if _, err := rand.Read(challenge); err != nil {
+			r.unauthorized.Add(1)
+			r.releaseHandshake(nc)
+			_ = nc.Close()
+			return
+		}
+		if la := nc.LocalAddr(); la != nil {
+			challenge = append(challenge, la.String()...)
+		}
+		if err := writeGateFrame(nc, challenge, r.opts.WriteTimeout); err != nil {
 			r.unauthorized.Add(1)
 			r.releaseHandshake(nc)
 			_ = nc.Close()
@@ -1089,15 +1113,16 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 			_ = nc.Close()
 			return
 		}
-		frame, err := wire.ReadFrame(nc, r.opts.MaxFrameBytes)
-		// Length-and-equality only: no decode, no interpretation. The
-		// comparison is constant-time (audit F5), so the bytes of the token
-		// leak nothing through timing; the LENGTH check is not a leak either,
-		// because the length is the frame's own declared prefix, which this
-		// layer must read anyway to bound the allocation. A wrong length is
-		// refused without touching the token's bytes.
-		if err != nil || len(frame) != len(r.opts.AccessToken) ||
-			subtle.ConstantTimeCompare(frame, r.opts.AccessToken) != 1 {
+		// The answer is one fixed-width MAC (audit PX-3): the read bound is
+		// the MAC's own width, so nothing is allocated from a declared
+		// length, and there is nothing to decode - it is compared as bytes.
+		// The comparison is constant-time (audit F5), and because the expected
+		// value is an HMAC keyed by the token, the token itself never touches
+		// the wire and a captured answer is worthless on another connection.
+		frame, err := wire.ReadFrame(nc, wire.RelayGateMACBytes)
+		expected := wire.RelayGateProof(r.opts.AccessToken, challenge)
+		if err != nil || len(frame) != len(expected) ||
+			subtle.ConstantTimeCompare(frame, expected) != 1 {
 			r.unauthorized.Add(1)
 			r.releaseHandshake(nc)
 			_ = nc.Close()
@@ -1138,13 +1163,13 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 	}
 }
 
-// writeGateFrame writes one of the access-token gate's two fixed frames under
-// a write deadline, so a peer that has stopped reading cannot park the
-// handshake goroutine on a 20-byte write. The greeting and the accepted frame
-// are the only things the relay ever writes before a connection is registered,
-// and both are constants: no token bytes, no peer-derived bytes, nothing to
-// decode on the other side. The deadline is cleared by the caller once the
-// gate is done, because the connection's reader and writer arm their own.
+// writeGateFrame writes one gate frame under a write deadline, so a peer that
+// has stopped reading cannot park the handshake goroutine on a 20-byte write.
+// The greeting and the accepted frame are constants; the challenge is 32 random
+// bytes the relay generated plus its own local address. None of them contains a
+// token byte or anything a peer sent, and nothing on the other side requires
+// decoding them. The deadline is cleared by the caller once the gate is done,
+// because the connection's reader and writer arm their own.
 func writeGateFrame(nc net.Conn, frame []byte, timeout time.Duration) error {
 	if err := nc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return err

@@ -28,8 +28,9 @@ import (
 	"github.com/cti97/b10coincom/internal/crypto"
 )
 
-// fuzzSignedTx builds a transfer or claim properly signed by a fresh key, so
-// the seed corpus starts with frames the decoders accept end to end.
+// fuzzSignedTx builds any transaction type properly signed by a fresh key, so
+// the seed corpus starts with frames the decoders accept end to end. Bond and
+// Unbond carry one fixed-width amount; Withdraw carries no body at all.
 func fuzzSignedTx(tb testing.TB, typ TxType, nonce, amount uint64) *Tx {
 	tb.Helper()
 	pub, priv, err := crypto.GenerateKey()
@@ -41,11 +42,15 @@ func fuzzSignedTx(tb testing.TB, typ TxType, nonce, amount uint64) *Tx {
 		tb.Fatal(err)
 	}
 	tx := &Tx{Type: typ, From: AddressFromPub(pub), PubKey: pub, Nonce: nonce}
-	if typ == TxTransfer {
+	switch typ {
+	case TxTransfer:
 		tx.To, tx.Amount = AddressFromPub(other), amount
-	}
-	if typ == TxFaucetClaim {
+	case TxFaucetClaim:
 		tx.Epoch, tx.PowNonce = 1, 42
+	case TxBond, TxUnbond:
+		tx.Amount = amount
+	case TxWithdraw:
+		// No body fields.
 	}
 	// SigningHash returns an array, which must be bound before it can be sliced.
 	hash := tx.SigningHash(testChain())
@@ -128,17 +133,23 @@ func fuzzTxWithRawPubKeyLen(tb testing.TB, rawLen []byte) []byte {
 }
 
 func FuzzDecodeBlock(f *testing.F) {
-	// Valid blocks: empty, one transfer, a transfer and a claim.
+	// Valid blocks: empty, one transfer, a transfer and a claim, and each
+	// staking type. Without a staking seed the new decode arms are unreachable
+	// from the corpus and the fuzzer never exercises them.
 	f.Add(fuzzBlockOf(f).Encode())
 	f.Add(fuzzBlockOf(f, *fuzzSignedTx(f, TxTransfer, 1, 50)).Encode())
 	f.Add(fuzzBlockOf(f, *fuzzSignedTx(f, TxTransfer, 1, 50), *fuzzSignedTx(f, TxFaucetClaim, 2, 0)).Encode())
+	f.Add(fuzzBlockOf(f, *fuzzSignedTx(f, TxBond, 3, 1000)).Encode())
+	f.Add(fuzzBlockOf(f, *fuzzSignedTx(f, TxUnbond, 4, 1000)).Encode())
+	f.Add(fuzzBlockOf(f, *fuzzSignedTx(f, TxWithdraw, 5, 0)).Encode())
 
 	// Malformed frames the decoder must reject - never panic on, never
 	// allocate into.
 	one := fuzzBlockOf(f, *fuzzSignedTx(f, TxTransfer, 1, 50)).Encode()
-	f.Add(one[:len(one)-1])                               // truncated mid-frame
-	f.Add(append(append([]byte{}, one...), 0xFF))         // trailing bytes
-	f.Add(fuzzBlockWithTxBytes(f, []byte{byte(TxBond)}))  // a reserved tx type inside a block
+	f.Add(one[:len(one)-1])                       // truncated mid-frame
+	f.Add(append(append([]byte{}, one...), 0xFF)) // trailing bytes
+	// A bare tag with no body: a truncated staking transaction inside a block.
+	f.Add(fuzzBlockWithTxBytes(f, []byte{byte(TxBond)}))
 	f.Add(fuzzBlockWithTxCount(f, MaxTxsPerBlock+1))      // a count over the limit, with no txs to pay for it
 	f.Add(fuzzBlockWithRawTxCount(f, []byte{0x88, 0x00})) // a non-canonical (redundant) varint count
 
@@ -173,9 +184,17 @@ func FuzzDecodeBlock(f *testing.F) {
 func FuzzDecodeTx(f *testing.F) {
 	f.Add(fuzzSignedTx(f, TxTransfer, 1, 50).Encode())
 	f.Add(fuzzSignedTx(f, TxFaucetClaim, 2, 0).Encode())
+	// One valid encoding per staking type: the new body arms are unreachable
+	// without a seed, including the zero amount and the empty Withdraw body.
+	f.Add(fuzzSignedTx(f, TxBond, 3, 1000).Encode())
+	f.Add(fuzzSignedTx(f, TxBond, 3, 0).Encode())
+	f.Add(fuzzSignedTx(f, TxUnbond, 4, 1000).Encode())
+	f.Add(fuzzSignedTx(f, TxWithdraw, 5, 0).Encode())
 	// Malformed frames the decoder must reject - never panic on.
-	f.Add([]byte{byte(TxBond)})                 // a reserved type: refused outright
+	f.Add([]byte{byte(TxBond)})                 // a bare staking tag: truncated body
 	f.Add([]byte{})                             // empty input
+	f.Add([]byte{byte(TxType(0))})              // type 0 is not a transaction
+	f.Add([]byte{byte(TxType(6))})              // type 6 is above the implemented range
 	f.Add([]byte{byte(TxTransfer), 0x00, 0x01}) // a truncated body
 	valid := fuzzSignedTx(f, TxTransfer, 3, 7).Encode()
 	f.Add(valid[:len(valid)-1])                                                                          // truncated

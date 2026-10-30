@@ -1,7 +1,11 @@
 package types
 
 import (
+	"bytes"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"math"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -132,23 +136,26 @@ func TestVerifySignatureRejectsMismatchedFrom(t *testing.T) {
 	}
 }
 
-func TestDecodeTxRejectsUnsupportedType(t *testing.T) {
-	for _, reserved := range []TxType{TxBond, TxUnbond, TxWithdraw} {
+// Tags 1..5 are transactions now; a decoder must still refuse the tags that are
+// not. Type 0 and type 6 are the boundary cases, and 255 the far end. Each
+// frame carries plenty of trailing bytes so the ONLY thing that can refuse it
+// is the tag: a short body would otherwise pass this test for the wrong reason.
+//
+// Trailing bytes are a separate protocol error on a valid frame: Done() is what
+// makes one extra byte on a Bond a refusal rather than a second reading.
+func TestDecodeRejectsReservedAndTrailingBytes(t *testing.T) {
+	for _, rawType := range []byte{0, 6, 7, 255} {
 		e := NewEncoder()
-		e.U8(uint8(reserved))
-		// AddressFromPub returns an array, which must be bound to a variable
-		// before it can be sliced (a call result is not addressable).
-		from := AddressFromPub([]byte("p"))
-		e.Raw(from[:])
-		e.VarBytes([]byte("pub"))
-		e.U64(0)
-		e.U64(0)
-		e.VarBytes([]byte("sig"))
-		// The decoder rejects by type before reading anything else, so the
-		// remainder of the body above is deliberately not a valid anything.
+		e.U8(rawType)
+		e.Raw(make([]byte, 64))
 		if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrUnsupportedTxType) {
-			t.Fatalf("type %d: expected ErrUnsupportedTxType, got %v", reserved, err)
+			t.Fatalf("type %d: expected ErrUnsupportedTxType, got %v", rawType, err)
 		}
+	}
+
+	bond := signedStaking(t, TxBond, 1, 1000)
+	if _, err := DecodeTx(append(bond.Encode(), 0xFF)); !errors.Is(err, ErrTrailingBytes) {
+		t.Fatalf("expected ErrTrailingBytes for a Bond with one extra byte, got %v", err)
 	}
 }
 
@@ -273,4 +280,293 @@ func TestFaucetClaimSignatureCoversEpochAndNonce(t *testing.T) {
 	if third.SigningHash(testChain()) == base {
 		t.Fatal("SigningHash ignored the proof-of-work nonce")
 	}
+}
+
+// signedStaking builds a signed TxBond, TxUnbond or TxWithdraw. The validator a
+// staking transaction names is From, its signer, so no address appears in the
+// body; Withdraw carries no amount at all.
+func signedStaking(t *testing.T, typ TxType, nonce, amount uint64) *Tx {
+	t.Helper()
+	pub, priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := &Tx{
+		Type:   typ,
+		From:   AddressFromPub(pub),
+		PubKey: pub,
+		Nonce:  nonce,
+		Fee:    3,
+		Amount: amount,
+	}
+	hash := tx.SigningHash(testChain())
+	tx.Sig = crypto.Sign(priv, hash[:])
+	return tx
+}
+
+// assertStakingRoundTrip encodes, decodes and re-encodes one staking
+// transaction, then checks the encoded LENGTH against a hand-built prefix and
+// signature with exactly bodyLen bytes between them.
+//
+// The length assertion is what makes the test non-vacuous: encode and decode can
+// share a misordering and still round-trip, but they cannot fake the offset. A
+// missing amount shortens it by 8, an amount on Withdraw lengthens it by 8, and
+// either is fatal here.
+func assertStakingRoundTrip(t *testing.T, typ TxType, nonce, amount uint64, bodyLen int) {
+	t.Helper()
+	tx := signedStaking(t, typ, nonce, amount)
+	enc := tx.Encode()
+	got, err := DecodeTx(enc)
+	if err != nil {
+		t.Fatalf("DecodeTx(%x): %v", enc, err)
+	}
+	if got.Type != tx.Type || got.From != tx.From || got.Nonce != tx.Nonce ||
+		got.Fee != tx.Fee || got.Amount != tx.Amount ||
+		!bytes.Equal(got.PubKey, tx.PubKey) || !bytes.Equal(got.Sig, tx.Sig) {
+		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got, tx)
+	}
+	if re := got.Encode(); !bytes.Equal(re, enc) {
+		t.Fatalf("re-encoding is not byte-identical:\n got %x\nwant %x", re, enc)
+	}
+
+	prefix := NewEncoder()
+	prefix.U8(uint8(tx.Type))
+	prefix.Raw(tx.From[:])
+	prefix.VarBytes(tx.PubKey)
+	prefix.U64(tx.Nonce)
+	prefix.U64(tx.Fee)
+	sig := NewEncoder()
+	sig.VarBytes(tx.Sig)
+	want := len(prefix.Bytes()) + bodyLen + len(sig.Bytes())
+	if len(enc) != want {
+		t.Fatalf("encoded length %d, want %d (prefix %d + body %d + sig %d)",
+			len(enc), want, len(prefix.Bytes()), bodyLen, len(sig.Bytes()))
+	}
+	if got.ID() != tx.ID() {
+		t.Fatal("round trip changed the tx ID")
+	}
+}
+
+// Bond is Amount(8) after the common prefix, at zero and at the maximum the
+// 8-byte field can hold.
+func TestBondRoundTrips(t *testing.T) {
+	for _, c := range []struct{ nonce, amount uint64 }{
+		{0, 0},
+		{1, 1},
+		{7, 1000},
+		{math.MaxUint64, math.MaxUint64},
+	} {
+		t.Run(fmt.Sprintf("nonce=%d/amount=%d", c.nonce, c.amount), func(t *testing.T) {
+			assertStakingRoundTrip(t, TxBond, c.nonce, c.amount, 8)
+		})
+	}
+}
+
+// Unbond carries the same single fixed-width amount as Bond.
+func TestUnbondRoundTrips(t *testing.T) {
+	for _, c := range []struct{ nonce, amount uint64 }{
+		{0, 0},
+		{1, 1},
+		{7, 1000},
+		{math.MaxUint64, math.MaxUint64},
+	} {
+		t.Run(fmt.Sprintf("nonce=%d/amount=%d", c.nonce, c.amount), func(t *testing.T) {
+			assertStakingRoundTrip(t, TxUnbond, c.nonce, c.amount, 8)
+		})
+	}
+}
+
+// Withdraw adds NO body bytes: its only new information is the signer and the
+// nonce, both in the common prefix.
+func TestWithdrawRoundTrips(t *testing.T) {
+	for _, nonce := range []uint64{0, 1, math.MaxUint64} {
+		t.Run(fmt.Sprintf("nonce=%d", nonce), func(t *testing.T) {
+			assertStakingRoundTrip(t, TxWithdraw, nonce, 0, 0)
+		})
+	}
+
+	// A Withdraw that sets Amount still encodes nothing for it: the field is a
+	// union member for the other types, and writing it here would be an
+	// eight-byte body the decoder does not expect.
+	base := signedStaking(t, TxWithdraw, 1, 0)
+	withAmount := *base
+	withAmount.Amount = 42
+	if !bytes.Equal(withAmount.Encode(), base.Encode()) {
+		t.Fatal("Withdraw encoded Amount; its body must be empty")
+	}
+	got, err := DecodeTx(withAmount.Encode())
+	if err != nil {
+		t.Fatalf("DecodeTx: %v", err)
+	}
+	if got.Amount != 0 {
+		t.Fatalf("Withdraw decoded an amount of %d, want 0", got.Amount)
+	}
+}
+
+func goldenPub() []byte {
+	p := make([]byte, 32)
+	for i := range p {
+		p[i] = byte(i + 1)
+	}
+	return p
+}
+
+func goldenSig() []byte {
+	s := make([]byte, 64)
+	for i := range s {
+		s[i] = byte(0xA0 + i)
+	}
+	return s
+}
+
+func goldenTo() Address {
+	var a Address
+	for i := range a {
+		a[i] = byte(0x40 + i)
+	}
+	return a
+}
+
+// Both sides of a round trip move together, so only a golden notices a
+// renumbering or a prefix change. These two hex strings were captured from the
+// PRE-M5 code at e937cfd, before encodeBody gained its staking branches; the
+// reservation existed precisely so they would not move.
+func TestATransferAndAClaimEncodeToTheSameGoldenBytesAsM2(t *testing.T) {
+	pub := goldenPub()
+	transfer := &Tx{
+		Type:   TxTransfer,
+		From:   AddressFromPub(pub),
+		PubKey: pub,
+		Nonce:  7,
+		Fee:    9,
+		To:     goldenTo(),
+		Amount: 1234,
+		Sig:    goldenSig(),
+	}
+	claim := &Tx{
+		Type:     TxFaucetClaim,
+		From:     AddressFromPub(pub),
+		PubKey:   pub,
+		Epoch:    3,
+		PowNonce: 42,
+		Sig:      goldenSig(),
+	}
+
+	const transferGolden = "01af3ce61b11f3ef2ed1545476372f30a23493fcd1200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2000000000000000070000000000000009404142434445464748494a4b4c4d4e4f5051525300000000000004d240a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+	const claimGolden = "02af3ce61b11f3ef2ed1545476372f30a23493fcd1200102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20000000000000000000000000000000000000000000000003000000000000002a40a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+
+	for _, tc := range []struct {
+		name string
+		tx   *Tx
+		want string
+	}{
+		{"transfer", transfer, transferGolden},
+		{"faucet claim", claim, claimGolden},
+	} {
+		if got := hex.EncodeToString(tc.tx.Encode()); got != tc.want {
+			t.Fatalf("%s encoding moved; every stored chain decodes these bytes:\n got %s\nwant %s",
+				tc.name, got, tc.want)
+		}
+		raw, err := hex.DecodeString(tc.want)
+		if err != nil {
+			t.Fatalf("%s golden is not hex: %v", tc.name, err)
+		}
+		// A golden only this build writes and no other reads would still be a
+		// fork: the frozen bytes must also decode.
+		if _, err := DecodeTx(raw); err != nil {
+			t.Fatalf("%s golden does not decode: %v", tc.name, err)
+		}
+	}
+}
+
+// A signature is over encodeBody, so changing the TYPE or the AMOUNT of the
+// signed transaction must invalidate it. The chain binding is inherited:
+// SigningHash folds genesisHash in, and VerifySignature is type-agnostic.
+func TestASignatureForABondDoesNotVerifyForAnotherTypeOrAmount(t *testing.T) {
+	bond := signedStaking(t, TxBond, 1, 1000)
+	if err := bond.VerifySignature(testChain()); err != nil {
+		t.Fatalf("the signed bond was refused: %v", err)
+	}
+
+	asUnbond := *bond
+	asUnbond.Type = TxUnbond
+	if err := asUnbond.VerifySignature(testChain()); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("a Bond signature verified as an Unbond: %v", err)
+	}
+
+	raised := *bond
+	raised.Amount = 1001
+	if err := raised.VerifySignature(testChain()); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("a Bond signature verified for a different amount: %v", err)
+	}
+
+	foreign := [32]byte{0xEE, 0xEE}
+	if foreign == testChain() {
+		t.Fatal("test bug: the foreign chain identifier equals the test chain")
+	}
+	if err := bond.VerifySignature(foreign); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("a Bond signed for one chain verified on another: %v", err)
+	}
+}
+
+// Every new decode path must refuse malformed input with the named sentinel,
+// not panic and not silently accept: these encodings come from the network.
+func TestDecodeTxRejectsMalformedStakingEncodings(t *testing.T) {
+	bond := signedStaking(t, TxBond, 1, 1000)
+	unbond := signedStaking(t, TxUnbond, 1, 1000)
+
+	t.Run("truncated Bond body", func(t *testing.T) {
+		// Built by hand: cutting Encode() would remove the signature first
+		// and never reach the amount branch. Here the prefix decodes and the
+		// amount is missing a byte.
+		e := NewEncoder()
+		e.U8(uint8(TxBond))
+		e.Raw(bond.From[:])
+		e.VarBytes(bond.PubKey)
+		e.U64(bond.Nonce)
+		e.U64(bond.Fee)
+		e.Raw(make([]byte, 7))
+		if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrShortBuffer) {
+			t.Fatalf("expected ErrShortBuffer for a truncated Bond body, got %v", err)
+		}
+	})
+
+	t.Run("truncated Unbond body", func(t *testing.T) {
+		e := NewEncoder()
+		e.U8(uint8(TxUnbond))
+		e.Raw(unbond.From[:])
+		e.VarBytes(unbond.PubKey)
+		e.U64(unbond.Nonce)
+		e.U64(unbond.Fee)
+		if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrShortBuffer) {
+			t.Fatalf("expected ErrShortBuffer for a missing Unbond amount, got %v", err)
+		}
+	})
+
+	t.Run("non-minimal PubKey length", func(t *testing.T) {
+		e := NewEncoder()
+		e.U8(uint8(TxBond))
+		e.Raw(bond.From[:])
+		e.Raw([]byte{0xA0, 0x00}) // 32 in two bytes: redundant continuation
+		e.Raw(bond.PubKey)
+		e.U64(bond.Nonce)
+		e.U64(bond.Fee)
+		e.U64(bond.Amount)
+		e.VarBytes(bond.Sig)
+		if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrNonCanonical) {
+			t.Fatalf("expected ErrNonCanonical for a redundant length varint, got %v", err)
+		}
+	})
+
+	t.Run("over-long PubKey length varint", func(t *testing.T) {
+		e := NewEncoder()
+		e.U8(uint8(TxBond))
+		e.Raw(bond.From[:])
+		// Nine continuation bytes then a terminator of 0x02: a well-framed
+		// 65-bit number, which no length can represent.
+		e.Raw([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02})
+		if _, err := DecodeTx(e.Bytes()); !errors.Is(err, ErrVarintOverflow) {
+			t.Fatalf("expected ErrVarintOverflow for a 64-bit-overflowing length, got %v", err)
+		}
+	})
 }

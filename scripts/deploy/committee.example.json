@@ -1,9 +1,10 @@
 {
   "chain_id": "example-testnet-1",
-  "note": "EXAMPLE committee file — copy, then replace every pubkey with the 'public key' line each Pi's `b10coin keygen` printed, and choose your own chain_id. The note never enters the genesis hash. Order matters: a validator's seat is its entry's position (pi-0 → seat 0). See scripts/deploy/README.md §3.",
+  "note": "EXAMPLE committee file — copy, then replace every pubkey with the 'public key' line each Pi's `b10coin keygen` printed, and choose your own chain_id. The note never enters the genesis hash. Order matters: a validator's seat is its entry's position (pi-0 -> seat 0). `power` IS that seat's genesis bond, in sparks and not rescaled: 100000000000 is 1,000 b10 = MIN_STAKE, the least a genesis seat may hold (the loader refuses anything below it, audit RT-2). `committee_size` is how many seats the chain has room for: it must be at least the number of validators below, and one spare seat (4 here against 3 keys) means a newcomer who bonds is seated BESIDE the genesis seats instead of evicting one. See scripts/deploy/README.md §3.2.",
+  "committee_size": 4,
   "validators": [
-    { "name": "pi-0", "pubkey": "1111111111111111111111111111111111111111111111111111111111111111", "power": 1 },
-    { "name": "pi-1", "pubkey": "2222222222222222222222222222222222222222222222222222222222222222", "power": 1 },
-    { "name": "pi-2", "pubkey": "3333333333333333333333333333333333333333333333333333333333333333", "power": 1 }
+    { "name": "pi-0", "pubkey": "1111111111111111111111111111111111111111111111111111111111111111", "power": 100000000000 },
+    { "name": "pi-1", "pubkey": "2222222222222222222222222222222222222222222222222222222222222222", "power": 100000000000 },
+    { "name": "pi-2", "pubkey": "3333333333333333333333333333333333333333333333333333333333333333", "power": 100000000000 }
   ]
 }

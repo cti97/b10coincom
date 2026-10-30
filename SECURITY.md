@@ -68,17 +68,33 @@ version a binary reports and the version CI scans are one source of truth.
 Dependabot does not manage the `toolchain` directive, so **every Go patch
 release re-creates the failure until someone edits that line**.
 
+Any other failed job on a `schedule` run now files its own issue naming the job
+(`test`, `release`, `cross`), so a red cron is never silent; this section is the
+govulncheck procedure specifically. Before CI-1, only a govulncheck failure was
+reported, and `main` failed its scheduled release for days unnoticed.
+
 If the scheduled `lint` run fails and the findings are all in the **standard
 library** (`net/http`, `crypto/...`, `net/url`, ...) with no third-party module
 named, the fix is one line:
 
-    toolchain go1.27.2      # was go1.27.1
+    toolchain go1.27.3      # was go1.27.2
 
-Then verify, per the CI gates:
+Then verify locally - **all four** must pass. These are the same four commands
+the scheduled-failure issue body lists; keep the two in step:
 
     go mod tidy && git diff --exit-code go.mod go.sum
     go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+    GOTOOLCHAIN=go1.26.9 go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+    go test -count=1 ./...
 
-The second command must print no findings. Push on a branch so the
-`pull_request` run exercises the full matrix and the release job's
-`BUILD-INFO` toolchain assertion.
+The staticcheck step is not optional and is pinned on purpose. `staticcheck`
+(2026.2.1, module `honnef.co/go/tools` v0.8.1) is the newest release that
+exists and its `golang.org/x/tools` reads compiler export data up to version 4,
+so a toolchain bump can break it with "export data version 5 is greater than
+maximum supported version 4" - an upstream limitation, not a finding about this
+code. `GOTOOLCHAIN=go1.26.9` judges the source against the module's language
+floor and keeps both gates green; when a staticcheck release reads version 5,
+that pin can go.
+
+Push on a branch so the `pull_request` run exercises the full matrix and the
+release job's `BUILD-INFO` toolchain assertion.

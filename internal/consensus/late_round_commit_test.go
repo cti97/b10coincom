@@ -234,12 +234,25 @@ func TestAQuorumAheadClearsAStaleProposalAndStillAppends(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	// The engine's own seat is the ROUND-1 proposer, so the driver can build the
-	// adopted round's block itself; round 0's proposer is a different seat.
-	idxY := cfg.IndexOf(cfg.Proposer(1, 1, parent))
+	// The engine's own seat must be the ADOPTED round's proposer (so the driver
+	// can build that round's block itself), and round 0's proposer must be a
+	// DIFFERENT seat. The proposer draw hashes the genesis block ID, which
+	// commits to the genesis state root - M5 Task 1's genesis bonds reshuffled
+	// it, and round 1 is no longer drawn to a different seat than round 0 - so
+	// the round is DERIVED rather than assumed: the first round above 0 whose
+	// proposer is not round 0's. The scenario is unchanged: the quorum is still
+	// completed in a round strictly AHEAD of the engine's round 0.
 	idxX := cfg.IndexOf(cfg.Proposer(1, 0, parent))
-	if idxX < 0 || idxY < 0 || idxX == idxY {
-		t.Fatalf("fixture: need distinct round-0 and round-1 proposers, got %d and %d", idxX, idxY)
+	adopted := uint32(0)
+	idxY := -1
+	for r := uint32(1); r < 16; r++ {
+		if idx := cfg.IndexOf(cfg.Proposer(1, r, parent)); idx >= 0 && idx != idxX {
+			adopted, idxY = r, idx
+			break
+		}
+	}
+	if idxX < 0 || idxY < 0 {
+		t.Fatalf("fixture: no round above 0 is drawn to a seat other than round 0's (%d)", idxX)
 	}
 
 	net := sim.New(sim.Options{Seed: 1, Latency: 1})
@@ -263,12 +276,12 @@ func TestAQuorumAheadClearsAStaleProposalAndStillAppends(t *testing.T) {
 		t.Fatal("fixture: the round-0 proposal was not accepted into e.proposal")
 	}
 
-	// Round 1's block is a DIFFERENT block at the same height (it is signed by
-	// round 1's proposer, so its ID differs). Three seats precommit it in round
-	// 1 - a quorum for a round AHEAD of the engine's round 0.
-	blkY, err := d.eng.propose(1, 1, parent)
+	// The adopted round's block is a DIFFERENT block at the same height (it is
+	// signed by that round's proposer, so its ID differs). Three seats precommit
+	// it in that round - a quorum for a round AHEAD of the engine's round 0.
+	blkY, err := d.eng.propose(1, adopted, parent)
 	if err != nil {
-		t.Fatalf("the fixture could not build the round-1 block: %v", err)
+		t.Fatalf("the fixture could not build the adopted round's block: %v", err)
 	}
 	idY := blkY.ID()
 	if idY == idX {
@@ -278,7 +291,7 @@ func TestAQuorumAheadClearsAStaleProposalAndStillAppends(t *testing.T) {
 		if i == idxY {
 			continue // three of four is a quorum
 		}
-		v := &Vote{Type: MsgPrecommit, Height: 1, Round: 1, BlockID: idY, Validator: testValidator(i, 1).PubKey}
+		v := &Vote{Type: MsgPrecommit, Height: 1, Round: adopted, BlockID: idY, Validator: testValidator(i, 1).PubKey}
 		h := v.SigningHash()
 		v.Sig = crypto.Sign(testCommitteeKey(i), h[:])
 		if err := d.eng.onVote(v); err != nil {
@@ -288,12 +301,13 @@ func TestAQuorumAheadClearsAStaleProposalAndStillAppends(t *testing.T) {
 	if cid, ok := d.eng.Committed(); !ok || cid != idY {
 		t.Fatalf("the round-1 quorum did not commit the block: committed=%v", ok)
 	}
-	if d.eng.Round() != 1 {
-		t.Fatalf("the engine did not adopt the decided round (at %d, want 1)", d.eng.Round())
+	if d.eng.Round() != adopted {
+		t.Fatalf("the engine did not adopt the decided round (at %d, want %d)", d.eng.Round(), adopted)
 	}
 
-	// Round 1's own proposal arrives. Only a cleared e.proposal lets it in.
-	envY := &Proposal{Height: 1, Round: 1, Block: blkY, ValidRound: -1, Validator: cfg.Proposer(1, 1, parent)}
+	// The adopted round's own proposal arrives. Only a cleared e.proposal lets
+	// it in.
+	envY := &Proposal{Height: 1, Round: adopted, Block: blkY, ValidRound: -1, Validator: cfg.Proposer(1, adopted, parent)}
 	envY.Sig = signProposal(t, cfg, envY)
 	if err := d.eng.onProposal(envY); err != nil {
 		t.Fatalf("the adopted round's proposal was refused: %v", err)
@@ -304,7 +318,7 @@ func TestAQuorumAheadClearsAStaleProposalAndStillAppends(t *testing.T) {
 			heldID := d.eng.proposal.ID()
 			held = fmt.Sprintf("%x", heldID[:8])
 		}
-		t.Fatalf("the adopted round's own proposal did not become e.proposal (held %s, want %x): the stale round-0 proposal was not cleared on adopting round 1, so \"first proposal wins\" strands the committed height", held, idY[:8])
+		t.Fatalf("the adopted round's own proposal did not become e.proposal (held %s, want %x): the stale round-0 proposal was not cleared on adopting round %d, so \"first proposal wins\" strands the committed height", held, idY[:8], adopted)
 	}
 
 	// The driver must append it: the chain advances and holds the very block the

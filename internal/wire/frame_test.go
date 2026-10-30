@@ -73,6 +73,7 @@ func TestDecodeRefusesAnOverLongWireKey(t *testing.T) {
 		e.VarBytes([]byte("b10coin-devnet"))
 		e.VarBytes(key)
 		e.U64(1)
+		e.VarBytes(nil) // the receiver's per-connection nonce (audit PX-2)
 		e.VarBytes(nil)
 		return e.Bytes()
 	}
@@ -244,13 +245,48 @@ func TestTheFrameOnTheWire(t *testing.T) {
 	}
 }
 
+// TestDecodeHelloBoundsTheConnectionNonce pins audit PX-2's decoder bound. The
+// nonce is attacker-supplied like every other HELLO field, and a HELLO is the
+// first frame a gated connection is allowed to offer an admission policy, so an
+// unbounded one would let that first frame allocate up to the frame limit before
+// any policy ran. Empty is legal (a relay connection carries no peer challenge);
+// MaxHelloNonceBytes decodes; one more does not.
+func TestDecodeHelloBoundsTheConnectionNonce(t *testing.T) {
+	hello := func(n int) []byte {
+		e := types.NewEncoder()
+		e.U8(uint8(MsgHello))
+		e.VarBytes([]byte("b10coin-devnet"))
+		e.VarBytes(make([]byte, ed25519.PublicKeySize))
+		e.U64(1)
+		e.VarBytes(make([]byte, n))
+		e.VarBytes(nil)
+		return e.Bytes()
+	}
+	for _, n := range []int{0, connectionNonceWidthForTest, MaxHelloNonceBytes} {
+		h, err := DecodeHello(hello(n))
+		if err != nil {
+			t.Fatalf("a %d-byte HELLO nonce was refused (%v); empty and up to the bound must decode", n, err)
+		}
+		if len(h.Nonce) != n {
+			t.Fatalf("a %d-byte HELLO nonce decoded as %d bytes", n, len(h.Nonce))
+		}
+	}
+	if _, err := DecodeHello(hello(MaxHelloNonceBytes + 1)); !errors.Is(err, types.ErrFieldTooLong) {
+		t.Fatalf("a %d-byte HELLO nonce decoded (%v); want ErrFieldTooLong", MaxHelloNonceBytes+1, err)
+	}
+}
+
+// connectionNonceWidthForTest is the width the transport uses; named here so the
+// wire test exercises the production size without importing the tcp package.
+const connectionNonceWidthForTest = 32
+
 // TestHelloRoundTrips: every field survives encode/decode, and the encoding is
 // canonical - re-encoding a decoded message reproduces the input byte for
 // byte. The field-by-field comparison is what pins each field: an encoder and
 // decoder that BOTH drop a field still round-trip the bytes while silently
 // losing the message.
 func TestHelloRoundTrips(t *testing.T) {
-	h := &Hello{ChainID: "b10coin-devnet", Validator: []byte("validator-key"), Height: 42, Sig: []byte("signature")}
+	h := &Hello{ChainID: "b10coin-devnet", Validator: []byte("validator-key"), Height: 42, Nonce: []byte("connection-challenge"), Sig: []byte("signature")}
 	enc := EncodeHello(h)
 	if len(enc) == 0 || MsgType(enc[0]) != MsgHello {
 		t.Fatalf("the encoded HELLO must open with its tag byte, got %v", enc)
@@ -260,7 +296,8 @@ func TestHelloRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 	if dec.ChainID != h.ChainID || dec.Height != h.Height ||
-		string(dec.Validator) != string(h.Validator) || string(dec.Sig) != string(h.Sig) {
+		string(dec.Validator) != string(h.Validator) ||
+		string(dec.Nonce) != string(h.Nonce) || string(dec.Sig) != string(h.Sig) {
 		t.Fatalf("round trip lost fields: want %+v, got %+v", h, dec)
 	}
 	if re := EncodeHello(dec); !bytes.Equal(re, enc) {

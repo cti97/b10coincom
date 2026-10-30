@@ -789,7 +789,7 @@ func nonNilPrevoteFor(t *testing.T, rec *stalledTransport, height uint64, round 
 // ValidRound -1): it is the Design Decision 11 counterexample, arriving at an
 // engine that did not exist when the promise was made.
 func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
-	cfg, pub0, priv0, g := restartCommittee(t)
+	cfg, _, _, g := restartCommittee(t)
 
 	// ---- Run 1: lock on B at height 1, then stop mid-height. ----
 	dir := t.TempDir()
@@ -798,6 +798,24 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent := ch1.Head().ID()
+
+	// The proposer draw hashes the genesis block ID, which commits to the
+	// genesis STATE ROOT, so M5 Task 1's genesis bonds reshuffled it. This
+	// fixture used to assume seat 0 happened to be drawn at round 0. DERIVE the
+	// seats instead of assuming: the engine's own validator has to be round 0's
+	// proposer (onProposal accepts a round-0 envelope only from the round's
+	// proposer, so any other seat's conflicting proposal is ignored rather than
+	// refused), and the OTHER seat is the peer whose signed prevote completes
+	// the polka. The committee has two seats, so the peer is simply the one that
+	// is not ours. No assertion below changes.
+	ownIdx := cfg.IndexOf(cfg.Proposer(1, 0, parent))
+	if ownIdx < 0 || ownIdx > 1 {
+		t.Fatalf("fixture: round 0's proposer is not a committee seat (index %d)", ownIdx)
+	}
+	peerIdx := 1 - ownIdx
+	priv0 := testCommitteeKey(ownIdx)
+	pub0 := priv0.Public().(ed25519.PublicKey)
+
 	tp1 := &stalledTransport{}
 	d1 := mustDriver(t, cfg, ch1, priv0, tp1, nil) // no pool: this test wires no transaction source
 	d1Engine := d1.eng                             // kept only to prove the restart built a different engine
@@ -817,11 +835,12 @@ func TestRestartedValidatorRefusesToPrevoteAConflictingBlock(t *testing.T) {
 		d1.Tick(now)
 		if string(cfg.Proposer(d1.eng.Height(), r, parent)) == string(pub0) &&
 			d1.eng.Round() == r && d1.eng.proposal != nil {
-			// v0 proposed B and prevoted it this round (its own prevote is
-			// tallied). One peer signature completes the prevote polka, which
-			// completes the precommit - and precommitting IS locking.
-			d1.OnMessage(transport.Message{From: "v1", Data: EncodeVote(
-				voteFrom(t, cfg, 1, MsgPrevote, d1.eng.Height(), r, d1.eng.proposal.ID()))})
+			// This validator proposed B and prevoted it this round (its own
+			// prevote is tallied). One peer signature completes the prevote
+			// polka, which completes the precommit - and precommitting IS
+			// locking.
+			d1.OnMessage(transport.Message{From: transport.PeerID(fmt.Sprintf("v%d", peerIdx)), Data: EncodeVote(
+				voteFrom(t, cfg, peerIdx, MsgPrevote, d1.eng.Height(), r, d1.eng.proposal.ID()))})
 			if d1.eng.lk.locked() {
 				lockRoundInt = d1.eng.lk.round()
 				lockID = d1.eng.lk.blockID()

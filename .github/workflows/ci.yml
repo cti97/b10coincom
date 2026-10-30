@@ -49,14 +49,25 @@ jobs:
       # T-3 ask: internal/devnet's poll loops carry wall-clock ceilings, so a
       # slow-but-progressing run can outlive go test's default 10-minute
       # package timeout and die with a goroutine dump — a failure that says
-      # nothing about the code. The audit's "roughly 940 s" is the tcp_test.go
-      # subset; re-measured, the package's poll ceilings now total ~1770 s
-      # (all second-literals, ~2340 s), so 20 m would still be short. 40 m
-      # clears the whole package's ceilings and is far above the measured
-      # healthy pass (~24 s), which is the only run that should ever finish.
+      # nothing about the code. `-timeout` applies to EACH package's test
+      # binary, so the number the timeout must clear is the worst single
+      # package's ceilings, not the suite's.
+      #
+      # Re-measured 2026-10-30 (audit L-3): the devnet package's ceilings —
+      # every deadline its wait helpers are given (waitAllReach, waitFor,
+      # reachError, convergedError) plus its bounded polls — now total about
+      # 3,030 s (~50 min); counting the sub-second polls as well, about
+      # 3,900 s (~65 min). The earlier "~1770 s (all second-literals, ~2340 s)"
+      # was already an undercount, and 40 m (2,400 s) no longer clears the
+      # package's own ceilings. 60 m does, for both the plain and the -race
+      # binary (same ceilings, slower execution), and it is still far above the
+      # measured healthy pass: internal/devnet takes 104 s alone, 177 s in the
+      # full suite and 201 s under -race on the audit host, and that healthy
+      # pass is the only run that should ever finish. A timeout this large is a
+      # bound on a pathological run, never an expectation.
       - run: go vet ./...
-      - run: go test -timeout 40m -count=1 ./...
-      - run: go test -race -timeout 40m -count=1 ./...
+      - run: go test -timeout 60m -count=1 ./...
+      - run: go test -race -timeout 60m -count=1 ./...
       - run: go build ./...
       # The milestone acceptance commands must keep printing OK with exit 0.
       # The first is the default run — its --claims default makes it pay one
@@ -65,10 +76,18 @@ jobs:
       # with the flag's default unnoticed. The third is M3's: four validators
       # must AGREE, not merely each produce blocks — the multi-validator
       # devnet reports each validator's final height and fails the job unless
-      # the validators hold one history.
+      # the validators hold one history. The fourth is M5's rotation: one seat
+      # unbonds mid-epoch, six seats become five at the boundary, and the
+      # Nakamoto coefficient is computed from committed state at each one. It
+      # was missing here while the README claimed four (M5 re-run, 2026-10-30).
+      # It adds about 8 s (measured: 105 blocks, six in-process validators, two
+      # rotation boundaries) to a job already running the suite and the race
+      # suite, so keeping the milestone check is far cheaper than deleting it
+      # from the README to make the count true.
       - run: go run ./cmd/b10coin devnet --blocks 100
       - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1
       - run: go run ./cmd/b10coin devnet --validators 4 --blocks 100
+      - run: go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto
 
   # The supply-chain/lint gate (the audit's B-1): formatting, module hygiene,
   # staticcheck and govulncheck. The two external tools are pinned by exact
@@ -152,13 +171,15 @@ jobs:
       #
       # It only ever files on the SCHEDULE trigger: a push or PR that fails
       # govulncheck is a normal failure its author sees immediately, and opening an
-      # issue for it would be noise. It is `failure()`-gated and no-ops unless THIS
-      # step's own output is on disk with advisory IDs in it, so an earlier lint
-      # gate failing (gofmt, shellcheck, tidy, staticcheck) files nothing.
+      # issue for it would be noise. It is `failure()`-gated and classifies THIS
+      # job's failure: govulncheck's output on disk with advisory IDs -> the
+      # toolchain-bump or triage issue; anything else (gofmt, shellcheck, tidy,
+      # staticcheck, or govulncheck missing) -> a generic `lint` issue. A red cron
+      # must never be silent (audit CI-1).
       # The reporter lives in scripts/ci/ so that the shellcheck gate above covers it -
       # ~90 lines of inline YAML shell was logic the rest of this workflow does not have
       # and nothing linted. See that script's header for what it files and why.
-      - name: file a toolchain-bump issue when the standard library is what regressed
+      - name: file an issue when a scheduled lint fails
         if: failure() && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -231,3 +252,53 @@ jobs:
           name: b10coin-release
           path: dist/
           if-no-files-found: error
+
+  # CI-1's durable fix, not just its instance: a scheduled run that fails ANY
+  # job is reported, not only one that fails govulncheck. `main` failed its
+  # scheduled release on every run from 2026-10-27 and nobody was told, because
+  # the only reporter lived in `lint` and watched one step.
+  #
+  # This job exists instead of appending a reporter step to each job for two
+  # reasons. First, the token scope: only `lint` had `issues: write`, and that
+  # stays true - `test`, `release` and `cross` remain read-only. Second, `lint`
+  # reports itself in-job, where govulncheck's output file still exists; a
+  # separate job cannot read another job's $RUNNER_TEMP, so the toolchain-bump
+  # body (with "Fixed in:" and the four verify commands) would be lost. The two
+  # paths never overlap: `lint` is not in the loop below.
+  #
+  # `always()` so a failure upstream still reaches it; the event gate keeps it
+  # off pushes and PRs, where the author already sees the failure. The script
+  # dedups by exact title and exits 0 on every path, including a failed gh call.
+  report:
+    if: always() && github.event_name == 'schedule'
+    needs: [test, lint, release, cross]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: file an issue for every failed scheduled job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_RESULT: ${{ needs.test.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          CROSS_RESULT: ${{ needs.cross.result }}
+        run: |
+          set -u
+          # `lint` reports itself in-job (its govulncheck output is there); the
+          # other jobs have no vuln output to classify, so each gets a generic
+          # "scheduled <job> job failed" issue. Matrix legs of `cross` share one
+          # title on purpose: one broken platform should not open six issues,
+          # and later legs comment on the first one.
+          for job in test release cross; do
+            case "$job" in
+              test)    result=$TEST_RESULT ;;
+              release) result=$RELEASE_RESULT ;;
+              cross)   result=$CROSS_RESULT ;;
+            esac
+            if [ "$result" = failure ]; then
+              REPORT_JOB=$job ./scripts/ci/file-toolchain-issue.sh \
+                || echo "::warning::the scheduled-failure reporter failed for the $job job"
+            fi
+          done

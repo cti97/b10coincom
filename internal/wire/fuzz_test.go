@@ -22,6 +22,7 @@ package wire
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"testing"
 )
 
@@ -161,6 +162,55 @@ func FuzzDecodeBlockSyncResp(f *testing.F) {
 		// The nil-field round trip below is not vacuous: an encoder that
 		// writes nil slices differently from empty ones would be caught here.
 		if re := EncodeBlockSyncResp(r); !bytes.Equal(re, b) {
+			t.Fatalf("an accepted frame is not canonical: %d B in, %d B back out", len(b), len(re))
+		}
+	})
+}
+
+func FuzzDecodePeerExchange(f *testing.F) {
+	f.Add(EncodePeerExchange(&PeerExchange{
+		Height:    3,
+		Validator: bytes.Repeat([]byte{0xA5}, ed25519.PublicKeySize),
+		Addrs:     []string{"127.0.0.1:6001"},
+		Sig:       bytes.Repeat([]byte{0x5A}, ed25519.SignatureSize),
+	}))
+	f.Add(EncodePeerExchange(&PeerExchange{
+		Height:    1 << 40,
+		Validator: bytes.Repeat([]byte{0x11}, ed25519.PublicKeySize),
+		Addrs:     []string{"[::1]:1", "10.0.0.5:65535"},
+		Sig:       bytes.Repeat([]byte{0x22}, ed25519.SignatureSize),
+	}))
+	f.Add([]byte{})
+	f.Add([]byte{byte(MsgPeerExchange)})
+	f.Add([]byte{byte(MsgHello), 0x01, 0x01, 'x'})
+	f.Add([]byte{byte(MsgPeerExchange), byte(MaxPeerExchangeAddrs + 1)})
+	f.Add([]byte{byte(MsgPeerExchange), 0x01, 0x00}) // an empty entry
+	f.Add([]byte{byte(MsgPeerExchange), 0x80, 0x00})
+	padded := append(EncodePeerExchange(&PeerExchange{Addrs: []string{"1.2.3.4:5"}}), 0x00)
+	f.Add(padded)
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		p, err := DecodePeerExchange(b)
+		if err != nil {
+			if p != nil {
+				t.Fatalf("a failed decode must hand back nil, got %d addresses", len(p.Addrs))
+			}
+			return
+		}
+		if len(p.Addrs) == 0 || len(p.Addrs) > MaxPeerExchangeAddrs {
+			t.Fatalf("a decoded frame carries %d addresses, outside 1..%d", len(p.Addrs), MaxPeerExchangeAddrs)
+		}
+		total := 0
+		for _, a := range p.Addrs {
+			if len(a) == 0 || len(a) > MaxListenAddrBytes {
+				t.Fatalf("a decoded address is %d B, outside 1..%d", len(a), MaxListenAddrBytes)
+			}
+			total += len(a)
+		}
+		if total > len(b) {
+			t.Fatalf("the decoded addresses hold %d B, more than the %d B they were decoded from", total, len(b))
+		}
+		if re := EncodePeerExchange(p); !bytes.Equal(re, b) {
 			t.Fatalf("an accepted frame is not canonical: %d B in, %d B back out", len(b), len(re))
 		}
 	})

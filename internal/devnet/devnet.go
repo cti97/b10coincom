@@ -45,6 +45,28 @@ var (
 	// that dropped o.Claims on the floor would print claims paid = 0 and
 	// look like a broken faucet — refuse loudly instead.
 	ErrClaimsAreMultiUnsupported = errors.New("devnet: the faucet-claim scenario runs on the single-node path only; a multi-validator run carries no transaction path")
+	// ErrCommitteeOptionsNeedRunMulti refuses RotateDemo/PlotNakamoto on the
+	// single-node Run. A one-validator chain has no committee to rotate and no
+	// series to plot; ignoring the options would make them flags that lie.
+	ErrCommitteeOptionsNeedRunMulti = errors.New("devnet: RotateDemo and PlotNakamoto are committee options and need RunMulti (Validators >= 1)")
+	// ErrRotateNeedsCommittee refuses a rotation fixture below five seats: the
+	// fixture removes one seat, and four remaining seats are the smallest
+	// committee the 1/4 cap applies to. A 4 -> 3 rotation would drop into the
+	// cap-free regime and change the power rule mid-run, so it is not the
+	// fixture this milestone's series is defined over.
+	ErrRotateNeedsCommittee = errors.New("devnet: RotateDemo removes one seat and needs Validators of at least 5 (so at least 4 remain and the 1/4 cap still applies)")
+	// ErrRotateNeedsEpoch refuses a rotation fixture without a short epoch the
+	// run can actually cross.
+	ErrRotateNeedsEpoch = errors.New("devnet: RotateDemo needs EpochBlocks of at least 4 so the Unbond can land mid-epoch and a boundary can follow it")
+	// ErrRotateNeedsBlocks refuses a rotation fixture whose run stops before
+	// the rotated committee has committed anything: the series would show no
+	// step, which is the one thing the acceptance artefact must show.
+	ErrRotateNeedsBlocks = errors.New("devnet: RotateDemo needs Blocks greater than EpochBlocks, so the rotated committee commits after the boundary")
+	// ErrRotateWithOffline refuses a rotation fixture combined with
+	// OfflineValidators: the fixture's post-boundary wait set is the seated
+	// committee, and a validator both offline and seated can never progress,
+	// so the combination is ambiguous rather than a stronger test.
+	ErrRotateWithOffline = errors.New("devnet: RotateDemo drives its own rotation and cannot be combined with OfflineValidators")
 )
 
 // maxPuzzleAttempts bounds one claim's solve. Since audit R-1 the reference
@@ -88,6 +110,30 @@ type Options struct {
 	// history must remain a strict prefix of the longest chain. Run/Replay
 	// ignore it.
 	OfflineValidators []int
+
+	// EpochBlocks, when non-zero, overrides the genesis epoch length BEFORE
+	// it is hashed, for the multi-validator run (and for Run's single-node
+	// fixture). It is one genesis parameter with two periods - the 0-based
+	// committee epoch and the 1-based faucet claim epoch - so changing it
+	// changes both, by design. Zero means "the compiled-in genesis value".
+	//
+	// Because the epoch length is committed in the genesis encoding, a
+	// directory built at one length is a different chain: store.CheckGenesis
+	// refuses to reopen it at another rather than silently reusing it.
+	EpochBlocks uint64
+
+	// RotateDemo drives the acceptance fixture: one validator unbonds
+	// mid-epoch through an ordinary Unbond transaction, and the committee that
+	// replaces it at the boundary is the one the report plots. It requires at
+	// least 5 validators, EpochBlocks >= 4 and Blocks > EpochBlocks, and cannot
+	// be combined with OfflineValidators; see the ErrRotate* values.
+	RotateDemo bool
+
+	// PlotNakamoto asks RunMulti to build the per-height Nakamoto series and
+	// return it in Summary.Nakamoto. The rows are read from committed state
+	// (each height's committee), never from the peer set; Run (single node)
+	// refuses it because there is no committee to plot.
+	PlotNakamoto bool
 }
 
 // Summary reports what a run produced.
@@ -152,6 +198,14 @@ type Summary struct {
 	Validators       uint64
 	ValidatorHeights map[int]uint64
 	Agreed           bool
+
+	// Nakamoto is the plotted coefficient series, set by RunMulti only when
+	// Options.PlotNakamoto is true and the run reached its target. It is empty
+	// otherwise - including on a failed run - so its presence means "a
+	// completed run produced these rows", not "a run was asked for a plot".
+	// Each row names the height its committee validated and the numbers the
+	// coefficient was measured from; see NakamotoRows.
+	Nakamoto []NakamotoRow
 }
 
 // Run creates a fresh devnet and drives it to o.Blocks. One transfer is
@@ -164,7 +218,15 @@ func Run(o Options) (Summary, error) {
 	if o.Blocks == 0 {
 		return Summary{}, ErrNoBlocks
 	}
+	if o.RotateDemo || o.PlotNakamoto {
+		return Summary{}, ErrCommitteeOptionsNeedRunMulti
+	}
 	g := genesis.Devnet()
+	if o.EpochBlocks != 0 {
+		// Before the genesis is hashed or any chain opened: a run at another
+		// epoch length is a different chain, and the state root records it.
+		g.Params.EpochBlocks = o.EpochBlocks
+	}
 	c, err := chain.Open(g, o.Dir)
 	if err != nil {
 		return Summary{}, err
@@ -362,10 +424,27 @@ func RunMulti(o Options) (Summary, error) {
 	if o.Claims > 0 {
 		return Summary{}, ErrClaimsAreMultiUnsupported
 	}
+	if o.RotateDemo {
+		if o.Validators < 5 {
+			return Summary{}, ErrRotateNeedsCommittee
+		}
+		if o.EpochBlocks < 4 {
+			return Summary{}, ErrRotateNeedsEpoch
+		}
+		if o.Blocks <= o.EpochBlocks {
+			return Summary{}, ErrRotateNeedsBlocks
+		}
+		if len(o.OfflineValidators) > 0 {
+			return Summary{}, ErrRotateWithOffline
+		}
+	}
 	net, err := simnet.New(int(o.Validators), simnet.Options{
 		TempDir:   o.Dir,
 		Seed:      runMultiSeed,
 		LatencyMS: runMultiLatencyMS,
+		// Rotation's fixture epoch length. It is applied to the harness's
+		// genesis before it is hashed; 0 keeps the compiled-in value.
+		EpochBlocks: o.EpochBlocks,
 		// DropPercent stays 0 on purpose: RunMulti advances only through
 		// RunBlocks and never pulls, so a validator whose quorum-committing
 		// proposal is dropped holds no block bytes and parks at that height
@@ -410,7 +489,94 @@ func RunMulti(o Options) (Summary, error) {
 		net.TakeOffline(i)
 	}
 
-	return drive(net, o)
+	var s Summary
+	if o.RotateDemo {
+		s, err = driveRotation(net, o)
+	} else {
+		s, err = drive(net, o)
+	}
+	// Build the series only for a run that completed: a stalled or forked run
+	// has no acceptance artefact, and rows read at a head that was never agreed
+	// would be a number about a chain that does not exist. The rows are read
+	// while the harness is still open, from committed state only.
+	if err == nil && o.PlotNakamoto {
+		rows, plotErr := nakamotoSeries(net, s)
+		if plotErr != nil {
+			return s, plotErr
+		}
+		s.Nakamoto = rows
+	}
+	return s, err
+}
+
+// driveRotation drives M5's rotation fixture: a validator unbonds mid-epoch
+// through the ordinary transaction path, the committee that replaces it is
+// decided at the boundary, and the run then advances on the SEATED validators
+// only.
+//
+// The post-boundary wait set is the SEATED validators. A rotated-out
+// validator's seat ends at the boundary, so its driver builds an inert engine
+// that emits no vote: it cannot make progress on its own. It does not
+// necessarily fall behind, however - an unseated engine still tallies and
+// commits the seated validators' blocks, and Task 3's end-to-end test asserts
+// exactly that follow ("the departed validator fell behind instead of
+// following"). The wait set names the committee whose progress the fixture is
+// about, and it stays correct if a follower ever does stop. The plan's Task 5
+// claim that the rotated-out validator's height is 39 is wrong about this
+// code; the fixture test records the height it actually reaches.
+//
+// The peer is still connected, which is why the report reads committed state
+// rather than the peer set: the peer is present, the bond is gone.
+func driveRotation(net *simnet.Net, o Options) (Summary, error) {
+	// Unbond a quarter of the way through the first epoch: early enough that
+	// the transaction is committed well before the boundary decides the next
+	// committee, late enough that it is not racing the genesis.
+	if _, err := net.RunBlocks(o.EpochBlocks / 4); err != nil {
+		return finish(net, o, net.Heights(), err)
+	}
+	if err := net.Unbond(int(o.Validators) - 1); err != nil {
+		return finish(net, o, net.Heights(), err)
+	}
+	// Cross the old epoch with every seat still seated: the departing one was
+	// seated by the genesis state, so it judges heights through E-1.
+	if _, err := net.RunBlocks(o.EpochBlocks - 1); err != nil {
+		return finish(net, o, net.Heights(), err)
+	}
+	seated := make([]int, 0, o.Validators-1)
+	for i := 0; i < int(o.Validators)-1; i++ {
+		seated = append(seated, i)
+	}
+	heights, err := net.RunBlocksAmong(o.Blocks, seated)
+	return finish(net, o, heights, err)
+}
+
+// nakamotoSeries reads the series for a completed run from the chain that
+// reached the reported height. The lowest such index is chosen so the source is
+// reproducible; every validator at that height holds the same committee memos.
+func nakamotoSeries(net *simnet.Net, s Summary) ([]NakamotoRow, error) {
+	index := -1
+	for i := 0; i < int(s.Validators); i++ {
+		if s.ValidatorHeights[i] == s.Height {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return nil, fmt.Errorf("devnet: no validator holds the run's height %d", s.Height)
+	}
+	return NakamotoRows(netCommitteeAt{net: net, index: index}, s.Height, net.EpochBlocks())
+}
+
+// netCommitteeAt adapts one validator's per-height committee to the report's
+// committed-state seam. It is a type rather than a closure so the report cannot
+// close over anything but the chain's CommitteeAt.
+type netCommitteeAt struct {
+	net   *simnet.Net
+	index int
+}
+
+func (c netCommitteeAt) CommitteeAt(h uint64) ([]genesis.Validator, error) {
+	return c.net.CommitteeAt(c.index, h)
 }
 
 // multiNet is the part of the harness RunMulti's driver consumes. It is an
@@ -432,7 +598,16 @@ type multiNet interface {
 // not hold one history.
 func drive(net multiNet, o Options) (Summary, error) {
 	heights, runErr := net.RunBlocks(o.Blocks)
+	return finish(net, o, heights, runErr)
+}
 
+// finish is the whole of drive after the wait: it reports the heights a run
+// produced, whether the committee holds one history, and the two ways a run can
+// fail without a single line of consensus code being wrong on paper - a
+// committee other than the one requested, and validators that disagree. The
+// rotation fixture reaches it with a NARROWED wait set (the seated validators);
+// everything it reports is still the whole committee's.
+func finish(net multiNet, o Options, heights map[uint64]uint64, runErr error) (Summary, error) {
 	s := Summary{
 		ChainID:          committeeChainID(o.Validators),
 		Validators:       o.Validators,

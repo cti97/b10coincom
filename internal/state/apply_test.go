@@ -485,20 +485,43 @@ func TestRootGoldenVectorFourAccounts(t *testing.T) {
 // An unsupported transaction type must be rejected. The signature is valid, so
 // execution reaches the type switch rather than failing the signature check
 // first.
+//
+// The three staking types were part of this table between M5 Tasks 0 and 1, on
+// purpose: Task 0 made them encodable and this kept "encodable" from quietly
+// meaning "applicable". Task 1 gave them arms, so they moved to their own
+// tests (stake_test.go) and only the RESERVED values remain here - 0 and 6+ are
+// still not transactions, and the arm for them must stay the default branch.
 func TestApplyTxRejectsUnsupportedType(t *testing.T) {
-	from, pub, priv := keypair(t)
-	to, _, _ := keypair(t)
+	cases := []struct {
+		name string
+		typ  types.TxType
+	}{
+		{"unreserved type 0", types.TxType(0)},
+		{"unreserved type 6", types.TxType(6)},
+		{"unreserved type 99", types.TxType(99)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			from, pub, priv := keypair(t)
+			to, _, _ := keypair(t)
 
-	s := New()
-	s.Set(from, Account{Balance: 100})
+			s := New()
+			s.Set(from, Account{Balance: 100})
 
-	tx := transfer(t, pub, priv, from, 0, 10, to)
-	tx.Type = types.TxType(99)
-	sigHash := tx.SigningHash(testChain())
-	tx.Sig = crypto.Sign(priv, sigHash[:])
+			tx := transfer(t, pub, priv, from, 0, 10, to)
+			tx.Type = tc.typ
+			// A staking transaction carries Amount only; To stays zeroed, as
+			// it would on a real Bond.
+			if tc.typ != types.TxTransfer {
+				tx.To = types.Address{}
+			}
+			sigHash := tx.SigningHash(testChain())
+			tx.Sig = crypto.Sign(priv, sigHash[:])
 
-	if err := s.ApplyTx(tx); !errors.Is(err, ErrUnsupportedTxType) {
-		t.Fatalf("expected ErrUnsupportedTxType, got %v", err)
+			if err := s.ApplyTx(tx); !errors.Is(err, ErrUnsupportedTxType) {
+				t.Fatalf("expected ErrUnsupportedTxType, got %v", err)
+			}
+		})
 	}
 }
 

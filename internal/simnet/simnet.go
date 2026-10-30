@@ -10,6 +10,7 @@ package simnet
 
 import (
 	"crypto/ed25519"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/cti97/b10coincom/internal/mempool"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/transport/sim"
+	"github.com/cti97/b10coincom/internal/types"
 	"github.com/cti97/b10coincom/internal/wire"
 )
 
@@ -65,6 +67,18 @@ type Options struct {
 	DropPercent int
 	TimeoutBase int64 // virtual ms before a round expires; 0 takes the default
 	TimeoutStep int64 // virtual ms added per further round; 0 takes the default
+
+	// EpochBlocks, when non-zero, overrides the genesis epoch length BEFORE
+	// the genesis is hashed, so it defines a different chain rather than a
+	// re-interpretation of the default one. It exists for M5's rotation
+	// fixture: at the shipped 1,000-block epoch a run short enough to be a
+	// test would never cross a boundary, and the acceptance series has to
+	// show a step. The chain ID string stays "b10coin-simnet-<n>" (it is
+	// pinned), so two epoch lengths share an ID and differ in genesis hash;
+	// store.CheckGenesis is what refuses to reuse a directory across them.
+	//
+	// 0 means "the genesis value", which is what every pre-M5 caller gets.
+	EpochBlocks uint64
 }
 
 // Net is N validators plus the network and clock joining them.
@@ -75,6 +89,11 @@ type Net struct {
 	drv  []*consensus.Driver
 	ch   []*chain.Chain
 	keys []keyPair
+	// pools is each validator's transaction pool. The driver builds its
+	// proposals from it; Net.Unbond (M5's rotation fixture) submits its
+	// transaction through the same pool the RPC path uses, rather than writing
+	// a bond into a chain's state behind the consensus layer's back.
+	pools []*mempool.Mempool
 	// syncs is each validator's BLOCK_SYNC syncer, built over the same tap
 	// its driver is built over: requests and answers travel the validator's
 	// own transport surface. Task 6's harness wiring: M4's catch-up made the
@@ -180,6 +199,13 @@ func New(n int, opts Options) (*Net, error) {
 		DropPercent: opts.DropPercent,
 	})
 	g := Committee(n)
+	if opts.EpochBlocks != 0 {
+		// Mutated before any chain.Open hashes the genesis: every validator
+		// opens THIS g, so all of them share the overridden epoch length and
+		// its hash. Setting it after the loop would open one chain per epoch
+		// length and fail chain.Open on every one but the first.
+		g.Params.EpochBlocks = opts.EpochBlocks
+	}
 	out.g = g
 	// The spec's power cap is 1/4, and it is enforced as written for committees
 	// of four or more. Below four validators a 1/4 cap is unsatisfiable - the
@@ -199,6 +225,7 @@ func New(n int, opts Options) (*Net, error) {
 	if err := out.cfg.Validate(); err != nil {
 		return nil, err
 	}
+	out.pools = make([]*mempool.Mempool, n)
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("v%d", i)
 		out.sim.AddPeer(id)
@@ -254,12 +281,28 @@ func (n *Net) newDriver(i int, tpOverride transport.Transport) (*consensus.Drive
 	if tpOverride != nil {
 		tp = tpOverride
 	}
-	d, err := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, tp, mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
+	pool := mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead)
+	// Retained so Net.Unbond can submit through every validator's own pool.
+	// newDriver is the ONE driver-build path, so a rebuilt driver and the
+	// pool Unbond writes to are always the current pair, not a stale one.
+	n.pools[i] = pool
+	d, err := consensus.NewDriver(n.driverConfig(i), n.ch[i], n.keys[i].priv, tp, pool)
 	if err != nil {
 		return nil, err
 	}
 	d.CommitWitness = n.syncs[i].RecordCommit
 	return d, nil
+}
+
+// driverConfig is the configuration validator i's driver is built with: the
+// harness config plus the per-height committee seam (M5 rotation). The genesis
+// set in Committee stays the base a driver's membership gate checks, and every
+// height is judged with the epoch's derived seats - which for every current
+// scenario (EpochBlocks 1,000, runs far shorter) are the genesis seats.
+func (n *Net) driverConfig(i int) consensus.Config {
+	cfg := n.cfg
+	cfg.CommitteeFor = n.ch[i].CommitteeAt
+	return cfg
 }
 
 // newSyncer builds validator i's BLOCK_SYNC syncer over tp and installs the
@@ -441,6 +484,73 @@ func (n *Net) Heights() map[uint64]uint64 {
 		out[uint64(i)] = c.Height()
 	}
 	return out
+}
+
+// EpochBlocks is the committee/claim epoch length the harness's genesis was
+// built with. The report needs it to bucket heights into epochs, and the
+// harness is the only component that knows whether Options.EpochBlocks
+// overrode the genesis value.
+func (n *Net) EpochBlocks() uint64 { return n.g.Params.EpochBlocks }
+
+// CommitteeAt returns the seats that validated height h on validator i's chain:
+// the epoch's committee derived from the committed state at the end of the
+// preceding epoch. It exposes the chain's per-height source to the devnet
+// report (M5 Task 5) without handing out the chain itself, so the report can
+// read committed state and nothing else.
+//
+// i is a validator index, not a seat: the committee is the same on every
+// validator that committed the deciding height, and a caller reading a
+// validator that is behind will get the chain's own refusal for a boundary it
+// has not reached.
+func (n *Net) CommitteeAt(i int, h uint64) ([]genesis.Validator, error) {
+	if i < 0 || i >= len(n.ch) {
+		return nil, fmt.Errorf("simnet: CommitteeAt: validator index %d out of range 0..%d", i, len(n.ch)-1)
+	}
+	return n.ch[i].CommitteeAt(h)
+}
+
+// Unbond submits validator i's full Unbond transaction to every validator's
+// mempool. It is the rotation fixture's own way to remove a bond: the
+// transaction travels the ordinary admission and proposal path (a signed
+// TxUnbond, fee 0, nonce from the validator's committed state), so the bond is
+// removed by a block the committee commits - not by a private state write that
+// no other validator would ever apply.
+//
+// The amount is the validator's CURRENT bond, so the call is a full exit; the
+// fixture's genesis seats each carry one spark of power. Duplicate admission is
+// not an error: the same transaction may already be pending in one pool, and
+// the other pools still need it so that whichever validator proposes next can
+// carry it.
+func (n *Net) Unbond(i int) error {
+	if i < 0 || i >= len(n.ch) {
+		return fmt.Errorf("simnet: Unbond: validator index %d out of range 0..%d", i, len(n.ch)-1)
+	}
+	if n.offline[i] {
+		return fmt.Errorf("simnet: Unbond: validator %d is offline; a powered-off machine cannot sign an exit", i)
+	}
+	pub := n.keys[i].priv.Public().(ed25519.PublicKey)
+	addr := types.AddressFromPub(pub)
+	st := n.ch[i].State()
+	bond := st.Bonded(addr)
+	if bond == 0 {
+		return fmt.Errorf("simnet: Unbond: validator %d holds no bond to exit", i)
+	}
+	tx := types.Tx{
+		Type:   types.TxUnbond,
+		From:   addr,
+		PubKey: pub,
+		Nonce:  st.Get(addr).Nonce,
+		Fee:    0,
+		Amount: bond,
+	}
+	hash := tx.SigningHash(n.g.Hash())
+	tx.Sig = crypto.Sign(n.keys[i].priv, hash[:])
+	for j := range n.ch {
+		if errs := n.pools[j].Add([]types.Tx{tx}); len(errs) != 0 && errs[0] != nil && !errors.Is(errs[0], mempool.ErrDuplicate) {
+			return fmt.Errorf("simnet: Unbond: submitting to validator %d: %w", j, errs[0])
+		}
+	}
+	return nil
 }
 
 // AssertSameChain fails unless every ONLINE validator agrees on the chain's
@@ -970,7 +1080,7 @@ func (n *Net) reseat(i int, c *chain.Chain) error {
 // restart scenario has always taken. The commit witness is re-wired so the
 // rebuilt driver keeps archiving certificates for the heights it commits.
 func (n *Net) rebuildDriver(i int) error {
-	d, err := consensus.NewDriver(n.cfg, n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
+	d, err := consensus.NewDriver(n.driverConfig(i), n.ch[i], n.keys[i].priv, n.transportFor(i), mempool.New(mempoolCapacity, n.g.Hash(), n.ch[i].AdmissionHead))
 	if err != nil {
 		return err
 	}

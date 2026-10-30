@@ -147,15 +147,21 @@ type Mempool struct {
 	claims        int
 	pending       map[types.Address]int
 	pendingClaims map[types.Address]int
-	// pendingNonces records the nonces of ordinary transfers already in the
-	// pool, per sender. A transfer is admitted against head state, and head
-	// state only advances when a block executes: two transactions from one
-	// sender carrying the SAME nonce both pass the "not below the head nonce"
-	// floor, so without this set both would sit in the pool, be handed to two
-	// different block builders, and one would fail at execution time - or, on
-	// one proposer, produce a block whose transactions cannot all apply. The
-	// per-sender cap already bounds how MANY transfers one sender holds; this
-	// set makes the nonces distinct. (audit S-9)
+	// pendingNonces records the nonces of ordinary (NON-CLAIM) transactions
+	// already in the pool, per sender: transfers and the three staking types.
+	// They are admitted against head state, and head state only advances when a
+	// block executes: two transactions from one sender carrying the SAME nonce
+	// both pass the "not below the head nonce" floor, so without this set both
+	// would sit in the pool, be handed to two different block builders, and one
+	// would fail at execution time - or, on one proposer, produce a block whose
+	// transactions cannot all apply. The per-sender cap already bounds how MANY
+	// one sender holds; this set makes the nonces distinct. (audit S-9)
+	//
+	// A faucet claim is excluded on purpose: claim admission already allows at
+	// most one pending claim per key and pins its nonce to the head nonce, so
+	// the claim's own rule is stricter than this set. Every other type is
+	// included, staking included - a proposer handed two Bonds from one key at
+	// one nonce would build a block whose second transaction cannot apply. (M5)
 	pendingNonces map[types.Address]map[uint64]struct{}
 }
 
@@ -262,8 +268,8 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 				errs[i] = err
 				continue
 			}
-		case types.TxTransfer:
-			if err := m.admitTransfer(&tx, st); err != nil {
+		case types.TxTransfer, types.TxBond, types.TxUnbond, types.TxWithdraw:
+			if err := m.admitNonClaim(&tx, st); err != nil {
 				errs[i] = err
 				continue
 			}
@@ -273,13 +279,19 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 	return errs
 }
 
-// admitTransfer applies the stateful transfer rules. The per-sender cap is
-// counted from the pool's own state, so it cannot be bypassed by sending more
-// transactions; the nonce floor refuses a transfer whose replay counter has
+// admitNonClaim applies the stateful rules shared by every non-claim
+// transaction: a transfer, and (M5) the three staking types. The per-sender cap
+// is counted from the pool's own state, so it cannot be bypassed by sending more
+// transactions; the nonce floor refuses a transaction whose replay counter has
 // already been spent by the head state. A future nonce is still admitted: it
 // may become applicable when its predecessors land, and the block filter is
 // what evicts a transaction that never does.
-func (m *Mempool) admitTransfer(tx *types.Tx, st *state.State) error {
+//
+// The staking types take exactly this admission and no more: their balance,
+// fee and minimum-stake rules are state-transition rules, judged at execution
+// like a transfer's balance, and duplicating them here would be a second copy
+// that could drift from apply.go's.
+func (m *Mempool) admitNonClaim(tx *types.Tx, st *state.State) error {
 	if m.pending[tx.From] >= MaxPendingTransfersPerSender {
 		return fmt.Errorf("%w: %d pending from %x", ErrSenderLimit, m.pending[tx.From], tx.From[:])
 	}
@@ -358,7 +370,7 @@ func (m *Mempool) insert(tx types.Tx, id [32]byte, sender types.Address) {
 	m.txs = append(m.txs, entry{tx: tx, id: id, sender: sender})
 	m.seen[id] = struct{}{}
 	m.pending[sender]++
-	if tx.Type == types.TxTransfer {
+	if tx.Type != types.TxFaucetClaim {
 		set := m.pendingNonces[sender]
 		if set == nil {
 			set = make(map[uint64]struct{})
@@ -380,7 +392,7 @@ func (m *Mempool) forget(e entry) {
 	} else {
 		m.pending[e.sender] = n - 1
 	}
-	if e.tx.Type == types.TxTransfer {
+	if e.tx.Type != types.TxFaucetClaim {
 		if set := m.pendingNonces[e.sender]; set != nil {
 			delete(set, e.tx.Nonce)
 			if len(set) == 0 {

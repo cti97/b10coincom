@@ -116,10 +116,14 @@ const (
 //
 //   - GENESIS-FILE MODE (real keys): Genesis names the shared committee
 //     document (public keys) and Key is THIS validator's held private key.
-//     The seat is the position its public key occupies in that document, and
-//     a key that is not in it REFUSES TO START (audit A-1): silently signing
-//     as a seat the key does not hold is the exact failure the committee
-//     file exists to prevent.
+//     The seat is the position its public key occupies in that document. A
+//     key that is in neither that document nor the committee at the chain's
+//     head+1 REFUSES TO START (audit A-1): silently signing as a seat the
+//     key does not hold is the exact failure the committee file exists to
+//     prevent. A key that joined the committee AFTER genesis - bonded, and
+//     seated by an epoch boundary the chain has already crossed - is admitted
+//     through the head+1 half (audit RT-1), because rotation-in is exactly
+//     the seat the consensus layer already knows how to use.
 //   - FIXTURE MODE (devnet only): Genesis nil. The committee is the derived
 //     simnet fixture (simnet.Committee(Validators), chain b10coin-simnet-N)
 //     and the seat key is derived from the Index — which means every member
@@ -142,7 +146,11 @@ type ValidatorConfig struct {
 	Key ed25519.PrivateKey
 	// Index is this node's seat in the fixture committee (fixture mode
 	// only; in genesis-file mode the seat is derived from the key and a
-	// nonzero value here is refused as a contradiction).
+	// nonzero value here is refused as a contradiction). In genesis-file
+	// mode the derived value is -1 when the key holds no GENESIS seat but is
+	// admitted by the committee at head+1 (a validator that bonded after
+	// genesis, audit RT-1); Seat reports that -1 and the per-height seat is
+	// the chain's to answer.
 	Index int
 	// Validators is the fixture committee size (fixture mode only).
 	Validators int
@@ -163,6 +171,18 @@ type ValidatorConfig struct {
 	// consensus secret - the relay only compares bytes by length and equality
 	// - and an empty value keeps the previous behaviour.
 	RelayAccessToken []byte
+	// AllowLocalPeerHints is the PEER_EXCHANGE admission exception: it permits a
+	// hint naming a loopback, private or link-local address, which the default
+	// policy refuses (see validatePeerHint). It exists because the acceptance
+	// mesh runs every validator on one host behind 127.0.0.1, and because a
+	// PRIVATE-RANGE deployment (a lab VLAN, a Docker bridge, a home network on
+	// 10/8) has no public address to advertise either: without this every hint
+	// such a node sends or receives is refused, so peer exchange can never link
+	// anyone there (audit M-2 - the CLI flag --allow-local-peer-hints sets it,
+	// and it is off unless the operator asks). It must never be set on a node
+	// whose reach extends beyond the operator's own machines: it is the one
+	// knob that turns a peer's hint into a dial at the operator's own network.
+	AllowLocalPeerHints bool
 	// TickEvery is the driver's tick cadence (zero: defaultTickEvery).
 	TickEvery time.Duration
 	// WaveEvery is the HELLO/catch-up cadence (zero: defaultWaveEvery).
@@ -171,13 +191,12 @@ type ValidatorConfig struct {
 
 // peerAttestation is what one peer's HELLO leaves behind (audit C-6): the
 // height it last announced, the highest height a pull from it actually
-// reached, whether any pull has proven it at all, the wave it was last
-// refreshed in, the wave until which selection skips it, and the transport
-// name its latest HELLO arrived on (the address a pull is sent to).
+// reached, the wave it was last refreshed in, the wave until which selection
+// skips it, and the transport name its latest HELLO arrived on (the address a
+// pull is sent to).
 type peerAttestation struct {
 	height        uint64           // latest announced height
 	substantiated uint64           // highest height a pull from this peer reached (a HIGH-WATER mark: a transient failure never lowers it - F3)
-	proven        bool             // a pull from this peer has completed (successfully or not)
 	seen          uint64           // wave of the latest HELLO
 	demoted       uint64           // skip selection while demoted > the current wave
 	via           transport.PeerID // transport name the latest HELLO arrived on
@@ -245,9 +264,45 @@ type Validator struct {
 	syncWG      sync.WaitGroup
 	syncDropped atomic.Uint64
 
+	// hints is the PEER_EXCHANGE dial book: the bounded set of addresses this
+	// node learned from peers and the per-wave adoption window. peerAdd is the
+	// ONE dial path it may use - tcp.TcpTransport.AddPeer (learned=false) or
+	// AddLearnedPeer (learned=true) in a running node, and a recording seam in
+	// the tests that must count dials without touching a network (it is a field
+	// so a raw dial cannot hide inside the handler). learned is exactly the
+	// distinction audit PX-2 requires: a learned dial is GATED by the transport
+	// until a signed committee HELLO arrives, while a configured one is admitted
+	// at install.
+	hints   peerHints
+	peerAdd func(addr string, learned bool) error
+	// peerRemove retires the maintainer for a learned address whose handshake
+	// never completed (audit PX-1). It is a field for the same reason peerAdd
+	// is: the policy test must be able to count retirements without a
+	// network, and a raw RemovePeer must not hide inside the eviction path.
+	peerRemove func(addr string) bool
+
+	// The PEER_EXCHANGE observables. Adopted/refused/duplicate/over-budget
+	// describe the node's receive policy; sent describes its own advertising.
+	// None of them is a consensus signal (design decision 5).
+	hintsSeen       atomic.Uint64
+	hintsRefused    atomic.Uint64
+	hintsDuplicates atomic.Uint64
+	hintsAdopted    atomic.Uint64
+	hintsOverBudget atomic.Uint64
+	hintsEvicted    atomic.Uint64
+	hintsSent       atomic.Uint64
+
 	// adopted counts blocks brought in by catch-up pulls: the observable a
 	// convergence test reads to prove the joiner ADOPTED rather than voted.
 	adopted atomic.Uint64
+
+	// framesIn counts verified consensus frames this node handed to its
+	// driver. It is the "did peer frames arrive at all" half of the stall
+	// report: a round with zero frames and a round whose frames were all
+	// dropped by the engine look the same from the committed height, and they
+	// are different faults. Read with atomic because route runs on several
+	// transport reader goroutines.
+	framesIn atomic.Uint64
 
 	// closing gates the dispatch path: Close sets it (under mu, so a reader
 	// goroutine already inside a driver operation finishes first), and every
@@ -259,6 +314,11 @@ type Validator struct {
 	// closed chain store panics (the panic is the persistence rule's, not
 	// this bug's - the fix is to stop dispatching before closing).
 	closing atomic.Bool
+
+	// stall is the once-per-height stall reporter's memory (stall.go): the
+	// height it last reported and whether it has reported there. Guarded by mu,
+	// the same lock the driver it describes runs under.
+	stall stallWatch
 
 	// stop ends the loops; once closed, Close idempotence follows.
 	stop     chan struct{}
@@ -310,10 +370,11 @@ func (l *driverTP) Close() error                         { return l.inner.Close(
 func (l *driverTP) OnMessage(fn func(transport.Message)) { l.msg.Store(&fn) }
 
 // StartValidator brings up one validator: opens its chain on the committee
-// genesis, builds the consensus stack over a real TCP transport, and starts
-// the tick and wave goroutines. It does NOT dial: call Connect once the
-// committee's addresses are known (the CLI does it right after; the mesh
-// tests collect every listener's port first).
+// genesis, admits this validator's key (a genesis seat, or - audit RT-1 - a
+// seat in the committee at head+1), builds the consensus stack over a real TCP
+// transport, and starts the tick and wave goroutines. It does NOT dial: call
+// Connect once the committee's addresses are known (the CLI does it right
+// after; the mesh tests collect every listener's port first).
 func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	var g *genesis.Genesis
 	seat := cfg.Index
@@ -331,17 +392,14 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		}
 		g = cfg.Genesis
 		pub, _ := cfg.Key.Public().(ed25519.PublicKey)
-		found := genesis.SeatOfPubKey(g.Validators, pub)
-		if found < 0 {
-			// THE refusal the audit asked for: a key outside the committee
-			// must not sign as any seat, and there is no seat-zero default
-			// to fall back to. Say what was checked and what fixes it.
-			return nil, fmt.Errorf("devnet: refusing to start: this validator's public key (%x) is not listed in the committee's genesis (%d seats named); a member key must be generated per machine (b10coin keygen) and its public key added to the file every validator shares",
-				pub, len(g.Validators))
-		}
-		seat = found
+		// The genesis position, or -1 for a key that joined the committee
+		// AFTER genesis (audit RT-1). A -1 is not a refusal here: whether the
+		// key is allowed to run depends on the chain this node holds, which
+		// is not open yet. See the admission below.
+		seat = genesis.SeatOfPubKey(g.Validators, pub)
 		// Normalise the config so the seat reporting (Seat) reflects the
-		// DERIVED seat, not the fixture flag that was correctly zero.
+		// DERIVED seat, not the fixture flag that was correctly zero. A
+		// rotated-in key has no genesis position and keeps -1.
 		cfg.Index = seat
 	case cfg.Validators >= 1 && cfg.Validators <= 255 && cfg.Index >= 0 && cfg.Index < cfg.Validators:
 		// Fixture mode, as before M4 A-1: derived committee, derived keys.
@@ -368,21 +426,24 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// trivially matches; in genesis-file mode the seat was found BY the key,
 	// so this can only fire on a constructed-by-hand genesis. It is here so
 	// that no future seat-selection path can ever pair a position with a
-	// different key silently.)
-	if n <= seat {
-		return nil, fmt.Errorf("devnet: committee seat %d out of range 0..%d", seat, n-1)
-	}
-	if string(g.Validators[seat].PubKey) != string(pub) {
-		return nil, fmt.Errorf("devnet: committee seat %d holds a key that is not this validator's", seat)
+	// different key silently.) A rotated-in key has no genesis position to
+	// belt: its seat is judged by the chain below, exactly as the driver
+	// judges every later height.
+	if seat >= 0 {
+		if n <= seat {
+			return nil, fmt.Errorf("devnet: committee seat %d out of range 0..%d", seat, n-1)
+		}
+		if string(g.Validators[seat].PubKey) != string(pub) {
+			return nil, fmt.Errorf("devnet: committee seat %d holds a key that is not this validator's", seat)
+		}
 	}
 
 	// The committee's power cap: the spec's 1/4 for four or more members,
 	// 1/1 below (small fixtures cannot satisfy 1/4). Sized by the committee
-	// that actually runs, whatever named it.
-	capNum, capDen := uint64(1), uint64(4)
-	if n < 4 {
-		capNum, capDen = 1, 1
-	}
+	// that actually runs, whatever named it. The DRIVER recomputes it for the
+	// per-height committee (a rotation can change the seat count); this is the
+	// startup sanity check on the GENESIS set, and both use the one rule.
+	capNum, capDen := consensus.PowerCapFor(n)
 	ccfg := consensus.Config{
 		Committee:   g.Validators,
 		TimeoutBase: consensusTimeoutBaseMS,
@@ -397,15 +458,80 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	if err != nil {
 		return nil, err
 	}
-	// admitHello is the transport's admission policy (audit N-3/N-7): an
-	// INBOUND socket becomes a peer only once it has delivered a HELLO signed
-	// by a member of THIS chain's committee. Before that it is absent from
-	// Peers(), receives no Broadcast, and its frames never reach the router -
-	// so a scanner, a misconfigured node or a stranger replaying a peer's
-	// transport name cannot make this validator copy every frame for it. The
+	// ROTATION-IN ADMISSION (audit RT-1). A key that is not in the genesis
+	// list may still run this node: if it holds a seat in the committee that
+	// judges the height this node will extend from - head+1, the height the
+	// driver's first engine judges - it can vote there, and refusing it is
+	// exactly the entry-point hole that left a bonded outsider's seat with no
+	// signer while its power silently raised the quorum bar.
+	//
+	// The check is made AFTER the chain is opened because the seat is a
+	// function of COMMITTED STATE, not of the genesis document: only the
+	// chain can answer it. It is head+1 and not "any height" on purpose. A
+	// key bonded but not yet seated (its epoch boundary has not arrived) has
+	// no voting duty yet and no chain that can judge it either; it must be
+	// started after the boundary that seats it, which is what the end-to-end
+	// test does. The genesis list stays the driver's base config
+	// (ccfg.Committee above) exactly as before - this decides WHO MAY RUN,
+	// not who may sign.
+	if g != nil && seat < 0 {
+		next := ch.Height() + 1
+		vals, cerr := ch.CommitteeAt(next)
+		if cerr != nil || genesis.SeatOfPubKey(vals, pub) < 0 {
+			_ = ch.Close()
+			// THE refusal: a key outside both the genesis committee and the
+			// committee at head+1 must not sign as any seat, and there is no
+			// seat-zero default to fall back to. Say what was checked and
+			// what fixes it.
+			reason := "holds no seat there"
+			if cerr != nil {
+				reason = "the committee for that height cannot be derived: " + cerr.Error()
+			}
+			return nil, fmt.Errorf("devnet: refusing to start: this validator's public key (%x) is not listed in the committee's genesis (%d seats named) and %s in the committee at height %d; a member key must be generated per machine (b10coin keygen) and its public key added to the file every validator shares, or the key must be bonded and seated by the epoch boundary it starts after",
+				pub, len(g.Validators), reason, next)
+		}
+	}
+	// The per-height committee source (M5 Task 3): every engine this driver
+	// builds asks the chain for the epoch's seats, and every other reader
+	// (router membership, certificate gate, HELLO admission, BLOCK_SYNC) asks
+	// the same chain. Committee above stays the genesis set - the base a
+	// driver's membership gate checks - and is never the set used to judge a
+	// height once this seam is wired.
+	ccfg.CommitteeFor = ch.CommitteeAt
+	// admitHello is the transport's admission policy (audit N-3/N-7, PX-2): a
+	// GATED connection - an accepted inbound socket, and now also a dial this
+	// node made because a PEER advertised the address - becomes a peer only once
+	// it has delivered a HELLO signed by a member of THIS chain's committee and
+	// bound to THIS connection's nonce. Before that it is absent from Peers(),
+	// receives no Broadcast, and its frames never reach the router - so a
+	// scanner, a misconfigured node, or a stranger whose address reached the
+	// dial book cannot make this validator copy every broadcast for it. The
 	// policy lives here, not in the transport, because it needs the committee
 	// and the chain id; the transport only calls it.
-	admitHello := func(frame []byte) bool {
+	//
+	// TWO checks carry PX-2, and both are load-bearing:
+	//
+	//   - the nonce equality binds the signature to this socket. A captured
+	//     member HELLO replayed on a hint-dialled socket is a VALID Ed25519
+	//     signature - over some other connection's challenge - so it fails here
+	//     before membership or verification work. localNonce is the transport's
+	//     fresh 32-byte value for this connection, and the honest peer learned
+	//     it in the handshake and signed it into its HELLO;
+	//   - the validator key must not be OUR OWN. The transport sends this node's
+	//     HELLO to a gated socket it dialled (the peer needs it to admit us), so
+	//     a hostile peer can echo it straight back. That frame verifies
+	//     perfectly and carries the right nonce, and it proves nothing about
+	//     the sender: a peer cannot be this node (self-connections are refused
+	//     at the ID handshake), so our own signature is never a stranger's
+	//     credential.
+	//
+	// Membership is per the committee of the HEIGHT THE HELLO ANNOUNCES (M5
+	// rotation), widened by committeeMemberAt to the genesis and head sets so
+	// the rotation does not lock out the peers it creates. Admission is a DoS
+	// bound, never a safety gate: every admitted frame still faces the
+	// router's per-height membership, and every adopted block the certificate
+	// gate.
+	admitHello := func(frame []byte, localNonce []byte) bool {
 		h, err := wire.DecodeHello(frame)
 		if err != nil {
 			return false
@@ -413,14 +539,32 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		if h.ChainID != g.ChainID {
 			return false
 		}
-		if genesis.SeatOfPubKey(g.Validators, h.Validator) < 0 {
+		if bytes.Equal(h.Validator, pub) {
+			return false // our own HELLO is not a peer's proof (see above)
+		}
+		if !bytes.Equal(h.Nonce, localNonce) {
+			return false // signed for another connection (audit PX-2)
+		}
+		if !committeeMemberAt(ch, g, h.Validator, h.Height) {
 			return false
 		}
 		hh := helloHash(h)
 		return crypto.Verify(h.Validator, hh[:], h.Sig)
 	}
+	// The transport name this node announces. A genesis seat keeps the "vN"
+	// form every deployment and test already names it by. A key that joined
+	// after genesis has no genesis position, and reusing a committee index
+	// would collide with the genesis validator that still holds that name -
+	// a name collision is a self-connection refusal for one side and a
+	// registry fight for the other - so the name is derived from the key:
+	// stable across restarts, outside the "vN" space, and distinct for every
+	// key.
+	localID := transport.PeerID(fmt.Sprintf("v%d", cfg.Index))
+	if cfg.Index < 0 {
+		localID = transport.PeerID(fmt.Sprintf("k%x", pub[:6]))
+	}
 	tp, err := tcp.New(tcp.Options{
-		LocalID:          transport.PeerID(fmt.Sprintf("v%d", cfg.Index)),
+		LocalID:          localID,
 		Admit:            admitHello,
 		RelayAccessToken: cfg.RelayAccessToken,
 	})
@@ -476,9 +620,25 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		cfgC:  ccfg,
 		drv:   drv,
 		dedup: dedup,
-		peerH: make(map[string]*peerAttestation),
-		syncQ: make(chan transport.Message, syncQueueDepth),
-		stop:  make(chan struct{}),
+		// The learned-address book starts empty; nothing is dialled from a hint
+		// until a peer advertises it through an attested connection.
+		hints: peerHints{
+			learned: make(map[string]*learnedHint),
+			sources: make(map[string]int),
+		},
+		// A hint is a dial this node makes because a PEER chose the address, not
+		// the operator: AddLearnedPeer keeps the connection GATED until a signed
+		// committee HELLO bound to its nonce arrives (audit PX-2).
+		peerAdd: func(addr string, learned bool) error {
+			if learned {
+				return tp.AddLearnedPeer(addr)
+			}
+			return tp.AddPeer(addr)
+		},
+		peerRemove: tp.RemovePeer,
+		peerH:      make(map[string]*peerAttestation),
+		syncQ:      make(chan transport.Message, syncQueueDepth),
+		stop:       make(chan struct{}),
 	}
 	// A BLOCK_SYNC request is answered by the bounded worker pool, never on
 	// the transport's dispatch goroutine (audit C-4): serving one costs disk
@@ -488,6 +648,10 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	tp.OnMessage(v.route)
 	// The router's height observer: the wave loop pulls from what this sees.
 	rt.OnHello = v.observeHello
+	// The mesh hint's observer. It applies the dial policy and calls AddPeer;
+	// it runs on the transport's dispatch goroutine, so it stays bounded - see
+	// observePeerExchange.
+	rt.OnPeerExchange = v.observePeerExchange
 	for i := 0; i < syncWorkers; i++ {
 		v.syncWG.Add(1)
 		go v.syncWorker()
@@ -568,8 +732,11 @@ func (v *Validator) AppendRefused() bool {
 	return v.drv != nil && v.drv.AppendRefused()
 }
 
-// Seat reports this validator's committee index (genesis-file mode derives it
-// from the key's position; fixture mode stores it).
+// Seat reports this validator's GENESIS committee index (genesis-file mode
+// derives it from the key's position; fixture mode stores it). It is -1 for a
+// key that joined after genesis (audit RT-1): such a key's seat is a per-epoch
+// property of committed state, so it is read from Chain().CommitteeAt for the
+// height in question rather than reported as one fixed number.
 func (v *Validator) Seat() int { return v.cfg.Index }
 
 // Chain exposes the validator's chain for tests and the CLI's RPC server.
@@ -593,6 +760,81 @@ func (v *Validator) PeerCount() int { return len(v.ttp.Peers()) }
 // the returning-weight assertions read.
 func (v *Validator) VotedHeights() []uint64 { return v.drvTP.VotedHeights() }
 
+// FramesIn reports how many verified consensus frames this validator handed to
+// its driver. Together with the router counters it separates "no frames
+// arrived" from "frames arrived and were refused, duplicated, or dropped by
+// the engine": a zero here on a node with peers is a delivery fault, a
+// nonzero here with zero tallied votes is a judging fault.
+func (v *Validator) FramesIn() uint64 { return v.framesIn.Load() }
+
+// Step reports the driver's current consensus step, read under the driver
+// mutex exactly as Round and AppendRefused are. On a stalled node "propose"
+// with no proposal received is a different fault from "prevote" with a tally
+// short of quorum.
+func (v *Validator) Step() consensus.Step {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return consensus.StepPropose
+	}
+	return v.drv.DiagStep()
+}
+
+// DiagRounds returns a copy of the driver's bounded recent-round history: the
+// proposer drawn, whether a proposal arrived, what the engine prevoted, and
+// the two tallies per round. See consensus.Driver.Observe.
+func (v *Validator) DiagRounds() []consensus.DiagRound {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return nil
+	}
+	// Fold the engine's CURRENT state into the ring before copying it. The
+	// harness observes after every operation, so this is normally a no-op;
+	// it guarantees a poll taken between two ticks never reports a round
+	// older than the engine it is looking at.
+	v.drv.Observe()
+	return v.drv.DiagRounds()
+}
+
+// DiagCounters reports the engine's frame-drop counters (per height).
+func (v *Validator) DiagCounters() consensus.DiagCounters {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return consensus.DiagCounters{}
+	}
+	return v.drv.DiagCounters()
+}
+
+// Quorum reports the quorum threshold at the height the engine is judging.
+func (v *Validator) Quorum() uint64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return 0
+	}
+	return v.drv.DiagQuorum()
+}
+
+// TotalPower reports the committee's total voting power at the height the
+// engine is judging; printed beside Quorum so a power sum means something.
+func (v *Validator) TotalPower() uint64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return 0
+	}
+	return v.drv.DiagTotalPower()
+}
+
+// Router counters. They are atomics on the router and safe to read from the
+// poll goroutine; the report prints them per validator because the refused and
+// duplicate counts are per node, not per committee.
+func (v *Validator) RefusedBeforeVerify() uint64 { return v.rt.RefusedBeforeVerify() }
+func (v *Validator) DuplicatesDropped() uint64   { return v.rt.DuplicatesDropped() }
+func (v *Validator) UnknownDropped() uint64      { return v.rt.UnknownDropped() }
+
 // route is the transport's OnMessage callback. It classifies by verified
 // decode and, for consensus frames, hands the message to the active driver
 // under mu - the serialisation that keeps the engine single-threaded across
@@ -610,7 +852,12 @@ func (v *Validator) route(m transport.Message) {
 		if v.closing.Load() {
 			return
 		}
+		v.framesIn.Add(1)
 		(*f)(m)
+		// Record what the engine retained after this frame. The observe call
+		// is diagnostic only and runs under the same lock as the driver
+		// operation, so it can never read a half-driven engine.
+		v.drv.Observe()
 	}
 }
 
@@ -642,7 +889,15 @@ func (v *Validator) tickLoop() {
 			now := clock.tick(v.cfg.TickEvery)
 			v.mu.Lock()
 			v.drv.Tick(now)
+			v.drv.Observe()
 			v.mu.Unlock()
+			// After the driver work, and outside the lock it just released:
+			// a node that has spent stallReportRounds rounds at one height
+			// with a reachable quorum says so once (stall.go). Logging is the
+			// only thing this does, and a blocked stderr must not hold mu.
+			if line, ok := v.stallReportOnce(); ok {
+				log.Print(line)
+			}
 		}
 	}
 }
@@ -651,16 +906,28 @@ func (v *Validator) tickLoop() {
 // from the tallest peer known to be ahead of us. It also prunes the dedup
 // seen-set below the committed height (audit N-7): Forget is bucket-grained,
 // so this is O(live heights) and the set cannot grow with the run.
+//
+// Every peerExchangeEveryWaves-th wave it also advertises this node's listening
+// address (PEER_EXCHANGE), which is what lets peers on the relay star find each
+// other directly. The cadence is a BOUND, not a nicety: an advertisement per
+// frame would make the message an amplifier, while a direct link is worth
+// forming within seconds rather than instantly (design decision 5: the mesh is
+// an optimization, the relay and the signed HELLO are the guarantees).
 func (v *Validator) waveLoop() {
 	defer v.wg.Done()
 	ticker := time.NewTicker(v.cfg.WaveEvery)
 	defer ticker.Stop()
+	waves := 0
 	for {
 		select {
 		case <-v.stop:
 			return
 		case <-ticker.C:
+			waves++
 			v.broadcastHello()
+			if waves%peerExchangeEveryWaves == 0 {
+				v.sendPeerExchange()
+			}
 			v.maybeCatchUp()
 			if v.dedup != nil {
 				v.dedup.Forget(v.ch.Height())
@@ -669,28 +936,81 @@ func (v *Validator) waveLoop() {
 	}
 }
 
-// broadcastHello puts this node's signed height on the wire. The signature is
-// domain-separated and carried so a receiver can refuse unvouched height
-// announcements; full peer authentication is a later milestone's work.
+// broadcastHello puts this node's signed height on the wire, ONE HELLO PER
+// CONNECTION (audit PX-2). The signature is domain-separated and covers the
+// receiver's per-connection challenge, so a HELLO is valid only on the socket
+// it was signed for: that is what makes a captured member HELLO useless to a
+// stranger replaying it on a hint-dialled socket. One signature per peer per
+// wave is the price; it is a few hundred microseconds of Ed25519 against a
+// 500 ms cadence.
+//
+// The peers iterated are PeerChallenges - every registered connection this
+// side may speak on, including a GATED learned dial. The latter is deliberate:
+// admission is mutual, so the peer this node dialled needs OUR HELLO to admit
+// US, exactly as this node needs ITS HELLO. Sending is not admission; the
+// connection still receives no Broadcast until its own HELLO arrives.
 func (v *Validator) broadcastHello() {
-	h := &wire.Hello{
-		ChainID:   v.g.ChainID,
-		Validator: v.pub,
-		Height:    v.ch.Height(),
+	height := v.ch.Height()
+	for peer, challenge := range v.ttp.PeerChallenges() {
+		h := &wire.Hello{
+			ChainID:   v.g.ChainID,
+			Validator: v.pub,
+			Height:    height,
+			Nonce:     challenge,
+		}
+		hh := helloHash(h)
+		h.Sig = crypto.Sign(v.priv, hh[:])
+		_ = v.ttp.Send(peer, wire.EncodeHello(h))
 	}
-	hh := helloHash(h)
-	h.Sig = crypto.Sign(v.priv, hh[:])
-	_ = v.ttp.Broadcast(wire.EncodeHello(h))
 }
 
 // helloHash is the HELLO signature's domain-separated hash, defined here (the
-// node layer owns the announcement policy; the wire layer only frames it).
+// node layer owns the announcement policy; the wire layer only frames it). The
+// nonce is inside the hash, so a HELLO cannot be moved to another connection
+// without invalidating the signature (audit PX-2).
 func helloHash(h *wire.Hello) [32]byte {
 	e := types.NewEncoder()
 	e.VarBytes([]byte(h.ChainID))
 	e.VarBytes(h.Validator)
 	e.U64(h.Height)
+	e.VarBytes(h.Nonce)
 	return crypto.HashParts([]byte("b10coin-hello"), e.Bytes())
+}
+
+// committeeMemberAt reports whether pub may participate in this node's
+// peer-to-peer traffic: it holds a seat in the committee that judges height,
+// OR it held a genesis seat, OR it holds one at our current head.
+//
+// THE UNION IS FOR THE ROTATION ITSELF, and it is deliberately not a single
+// height's set. Admission bounds who may send this node frames, and the
+// rotation creates two peers a single-height check would lock out:
+//
+//   - a validator whose seat ENDED at the boundary is absent from the new
+//     epoch's committee, so a strict check refuses its HELLO and it can never
+//     reconnect to follow the chain - the very node rotation produces;
+//   - a validator whose seat BEGAN after genesis is absent from the genesis
+//     set, so a peer still behind the boundary would refuse it;
+//   - a peer announcing a height whose deciding state we do not hold yet
+//     (ahead of an epoch boundary) cannot be checked at that height at all,
+//     and refusing it would refuse the pull that carries us across.
+//
+// The genesis and head sets cover all three. NOTHING HERE IS A SAFETY
+// DECISION: every frame still faces the router's per-height membership check,
+// and every block is adopted only through the certificate gate at its own
+// height. A peer admitted under the union cannot change this chain's state by
+// claiming a seat; it can at most waste bytes, which the transport's
+// per-connection admission and the BLOCK_SYNC rate limits bound.
+func committeeMemberAt(ch *chain.Chain, g *genesis.Genesis, pub []byte, height uint64) bool {
+	if genesis.SeatOfPubKey(g.Validators, pub) >= 0 {
+		return true
+	}
+	if vals, err := ch.CommitteeAt(height); err == nil && genesis.SeatOfPubKey(vals, pub) >= 0 {
+		return true
+	}
+	if vals, err := ch.CommitteeAt(ch.Height()); err == nil && genesis.SeatOfPubKey(vals, pub) >= 0 {
+		return true
+	}
+	return false
 }
 
 // observeHello records a peer's attested height, refusing announcements from
@@ -700,35 +1020,61 @@ func helloHash(h *wire.Hello) [32]byte {
 // heights" - was wrong on the code: a non-member is refused HERE, before
 // recordHeight, so the only actor who can inflate an entry is a signed
 // committee member. The rotation below (C-6) is what handles that member.
+//
+// Membership is per the height the HELLO announces (M5 rotation), through the
+// same committeeMemberAt the transport's admission uses: a rotated-in validator
+// becomes a pull target as soon as its epoch is derivable, and a rotated-out
+// genesis seat stays one (it still holds history, and it is the peer this node
+// may have to follow from). Without the per-height half the new epoch's seats
+// could never be selected.
 func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	if h.ChainID != v.g.ChainID {
 		return
 	}
-	member := false
-	for i := range v.g.Validators {
-		if bytes.Equal(v.g.Validators[i].PubKey, h.Validator) {
-			member = true
-			break
-		}
+	// The HELLO must be bound to THIS connection (audit PX-2): the receiver's
+	// challenge is the value this side generated for the socket the frame
+	// arrived on. Without this, `via` would move to whatever connection a
+	// replayed member HELLO was pushed down, and that connection would become
+	// the sync pull target. On a GATED connection (an accepted socket, or a
+	// learned dial) the same equality is also the admission proof the transport
+	// ran; on an OPERATOR-CONFIGURED one it is still the anti-replay binding,
+	// because a fresh per-connection challenge is the only thing a captured
+	// HELLO cannot supply. A relay connection has no peer challenge (nil), and
+	// its HELLOs must carry an empty nonce - which they do, because this node
+	// signs them with the nil challenge PeerChallenges reports for the relay.
+	ours, _, ok := v.ttp.ConnNonces(from)
+	if !ok || !bytes.Equal(h.Nonce, ours) {
+		return
 	}
-	if !member {
+	if bytes.Equal(h.Validator, v.pub) {
+		return // our own HELLO: already in the table, and not a peer's proof
+	}
+	if !committeeMemberAt(v.ch, v.g, h.Validator, h.Height) {
 		return
 	}
 	hh := helloHash(h)
 	if !crypto.Verify(h.Validator, hh[:], h.Sig) {
 		return
 	}
+	// A verified HELLO on this connection also proves any LEARNED address this
+	// connection belongs to: it has a real member behind it, so its maintainer
+	// must never be retired by the hint eviction clock (audit PX-1).
+	v.markHintProven(from)
 	// Keyed on the signed member identity, with the transport name kept only
 	// as the address a pull for this member is sent to (round 7, F1/F2).
 	v.recordHeight(string(h.Validator), from, h.Height)
 }
 
 // beginWave advances the catch-up wave counter. Every wave boundary moves the
-// window in which a peer's announcement expires and a demotion lapses.
+// window in which a peer's announcement expires, a demotion lapses, and a
+// learned address that has never completed a handshake is retired (audit
+// PX-1: the wave clock is the eviction clock).
 func (v *Validator) beginWave() {
 	v.peerHMu.Lock()
 	v.wave++
+	wave := v.wave
 	v.peerHMu.Unlock()
+	v.expireUnprovenHints(wave)
 }
 
 // recordHeight keeps a member's LATEST attestation (audit C-6) under its
@@ -771,15 +1117,20 @@ func (v *Validator) peerWindow() uint64 {
 // substantiated (audit C-6). It returns the member's signed key (who), the
 // transport name its HELLO arrived on (via, where the pull is sent), and the
 // height it is trusted up to. Selection is deterministic: ties break on the
-// lexicographically smaller key, never on map iteration order. An unproven
-// member is worth exactly one window - enough to try, never enough to dwarf a
-// member that has served real blocks. Because the key is the member identity,
-// demoting one member cannot skip the honest members sharing its relay name
-// (round 7, F1).
+// lexicographically smaller key, never on map iteration order. A member is
+// worth one window above the higher of our own head and what a pull from it
+// ever reached - enough to try, never enough to dwarf a member that has served
+// real blocks. The window is RELATIVE: anchored at zero (or at a high-water
+// mark our head has since passed), it falls at or below our head and the node
+// never pulls again - a validator behind by any amount past the first window
+// froze for good, restart included (test run 2026-10-30, H-1). Because the key
+// is the member identity, demoting one member cannot skip the honest members
+// sharing its relay name (round 7, F1).
 func (v *Validator) tallestPeer() (who string, via transport.PeerID, h uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
 	win := v.peerWindow()
+	mine := v.ch.Height()
 	for id, st := range v.peerH {
 		if st.seen+peerHeightTTL < v.wave {
 			continue // not refreshed within a few waves: expired
@@ -788,12 +1139,12 @@ func (v *Validator) tallestPeer() (who string, via transport.PeerID, h uint64) {
 			continue // a pull from this member proved nothing: rotate away
 		}
 		ch := st.height
-		if !st.proven {
-			if ch > win {
-				ch = win
-			}
-		} else if ch > st.substantiated+win {
-			ch = st.substantiated + win
+		base := st.substantiated
+		if base < mine {
+			base = mine
+		}
+		if ch > base+win {
+			ch = base + win
 		}
 		if ch > h || (ch == h && (who == "" || id < who)) {
 			who, via, h = id, st.via, ch
@@ -817,7 +1168,6 @@ func (v *Validator) demotePeer(who string, reached uint64) {
 		return
 	}
 	st.demoted = v.wave + peerDemoteWaves
-	st.proven = true
 	if reached > st.substantiated {
 		st.substantiated = reached
 	}
@@ -833,7 +1183,6 @@ func (v *Validator) substantiatePeer(who string, reached uint64) {
 	if st == nil {
 		return
 	}
-	st.proven = true
 	if reached > st.substantiated {
 		st.substantiated = reached
 	}

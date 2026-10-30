@@ -109,17 +109,84 @@ func minMax(hs []uint64) (min, max uint64) {
 // told apart from a merely slow run in the log it left behind. It reads only
 // exported, lock-guarded observables; nil slots are the validators a deferred
 // closeAll tolerates.
+//
+// THE SECOND HALF, added after that report still could not answer the question
+// it was written for. A stalled run at `heights [0 0 0]`, round 108, parked
+// false, syncdropped 0, adopted 0, peers 2 is consistent with four different
+// faults, and the first report named none of them:
+//
+//  1. FRAMES LOST IN DELIVERY - `frames=` counts verified consensus frames the
+//     node handed to its driver, and `router[refused/dup/unknown]` plus
+//     `drops[otherheight/early/late/...]` say where they went if they arrived.
+//     Zero frames against live peers is delivery; nonzero frames with empty
+//     tallies is judging.
+//  2. VOTES SHORT OF QUORUM - each round prints `prevote votes= power= quorum=`
+//     and the per-block-ID split, so "three live seats split two ways" is
+//     visible without a rerun.
+//  3. PROPOSALS ABSENT OR NIL-PREVOTED - each round prints `proposal=absent`
+//     or the block it accepted, `selfprevote=nil` (or the block this engine
+//     voted for), and its `step`.
+//  4. THE PROPOSER DRAW - each round names the drawn committee seat and marks
+//     it `(self)` or `(absent)`, so "the absent seat proposed everything" is
+//     checkable at a glance rather than re-derived by hand.
+//
+// The round history is a bounded ring (the driver's last diagRingRounds
+// entries), printed newest first; it never grows with the length of a run.
 func stallReport(vs []*Validator) string {
 	var b strings.Builder
 	b.WriteString("\n\tper validator [height round parked syncdropped adopted peers]:")
+	live := make(map[int]bool, len(vs))
+	for _, v := range vs {
+		if v != nil {
+			live[v.Seat()] = true
+		}
+	}
 	for i, v := range vs {
 		if v == nil {
 			fmt.Fprintf(&b, "\n\t%d: not started", i)
 			continue
 		}
-		fmt.Fprintf(&b, "\n\t%d: [%d %d %v %d %d %d]",
+		d := v.DiagCounters()
+		fmt.Fprintf(&b, "\n\t%d: [%d %d %v %d %d %d] seat=%d step=%s frames=%d quorum=%d/%d drops[otherheight=%d early=%d late=%d foreignprop=%d wrongprop=%d dupprop=%d dupvote=%d] router[refused=%d dup=%d unknown=%d]",
 			i, v.Height(), v.Round(), v.AppendRefused(),
-			v.SyncRequestsDropped(), v.BlocksAdopted(), v.PeerCount())
+			v.SyncRequestsDropped(), v.BlocksAdopted(), v.PeerCount(),
+			v.Seat(), v.Step(), v.FramesIn(), v.Quorum(), v.TotalPower(),
+			d.OtherHeightVotes, d.EarlyVotes, d.LateVotes,
+			d.ForeignProposals, d.WrongProposerProposals,
+			d.DuplicateProposals, d.DuplicateVotes,
+			v.RefusedBeforeVerify(), v.DuplicatesDropped(), v.UnknownDropped())
+		rounds := v.DiagRounds()
+		if len(rounds) == 0 {
+			b.WriteString("\n\t  (no round observed yet)")
+			continue
+		}
+		quorum := v.Quorum()
+		for j := len(rounds) - 1; j >= 0; j-- {
+			r := rounds[j]
+			who := fmt.Sprintf("seat%d", r.Proposer)
+			switch {
+			case r.Proposer == v.Seat():
+				who += "(self)"
+			case !live[r.Proposer]:
+				who += "(absent)"
+			}
+			prop := "absent"
+			if r.HasProposal {
+				prop = fmt.Sprintf("block=%x", r.ProposalID[:4])
+			}
+			self := "none"
+			switch {
+			case r.Prevote.OwnCast && r.Prevote.OwnID == ([32]byte{}):
+				self = "nil"
+			case r.Prevote.OwnCast:
+				self = fmt.Sprintf("block=%x", r.Prevote.OwnID[:4])
+			}
+			fmt.Fprintf(&b, "\n\t  r%d h%d proposer=%s proposal=%s %s %s selfprevote=%s step=%s",
+				r.Round, r.Height, who, prop,
+				stallTally("prevote", r.Prevote, quorum),
+				stallTally("precommit", r.Precommit, quorum),
+				self, r.Step)
+		}
 	}
 	return b.String()
 }

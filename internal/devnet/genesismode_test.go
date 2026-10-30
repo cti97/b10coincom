@@ -36,7 +36,9 @@ func committeeGenesisWithKeys(t *testing.T, chainID string, pubs []ed25519.Publi
 	t.Helper()
 	entries := make([]genesis.CommitteeEntry, 0, len(pubs))
 	for i, p := range pubs {
-		entries = append(entries, genesis.CommitteeEntry{Name: fmt.Sprintf("node-%d", i), PubKey: fmt.Sprintf("%x", []byte(p)), Power: 1})
+		// A seat's power IS its genesis bond and must clear MIN_STAKE (audit
+		// RT-2); the loader refuses a one-spark seat on an operator file.
+		entries = append(entries, genesis.CommitteeEntry{Name: fmt.Sprintf("node-%d", i), PubKey: fmt.Sprintf("%x", []byte(p)), Power: genesis.Devnet().Params.MinStakeSparks})
 	}
 	raw, err := json.Marshal(genesis.CommitteeFile{ChainID: chainID, Validators: entries})
 	if err != nil {

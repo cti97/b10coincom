@@ -27,26 +27,28 @@ invention (Tendermint-style BFT; implemented in M3 — see
 design's, stated honestly in §3: *permissionless + fairly distributed + no-PoW
 — pick two*. b10coin begins federated — a genesis committee of held public
 keys (`--genesis`/`--key`), or the public fixture set for development only —
-with staking-based admission on the roadmap. Where PoW does survive, in the M2
-faucet, it is only a rate limiter on coin claims — tuned so a Pi completes a
-claim in seconds — never a consensus mechanism.
+with staking-based admission from M5 (see [Staking](#staking)). Where PoW does
+survive, in the M2 faucet, it is only a rate limiter on coin claims — tuned so a
+Pi completes a claim in seconds — never a consensus mechanism.
 
 ## Quick start
 
 Requires a supported Go — the `go` directive in `go.mod` sets the language
-floor (currently **1.26**), and the `toolchain` line names a toolchain
-(currently **1.27.1**) which is the **minimum toolchain version the go
+floor (currently **1.26.0**), and the `toolchain` line names a toolchain
+(currently **1.27.3**) which is the **minimum toolchain version the go
 command switches to**, not an exact pin: an install older than it downloads
 and uses that toolchain automatically (GOTOOLCHAIN=auto, the default); an
 installed newer toolchain is kept. Two direct external
 dependencies: `lukechampine.com/blake3` (v1.4.1) and `golang.org/x/crypto`
-(v0.41.0, for Argon2id). From the repository root:
+(v0.58.0, for Argon2id). From the repository root:
 
 ```sh
 make build                                # go build -o bin/b10coin ./cmd/b10coin
 make test                                 # go test -count=1 ./...
 go run ./cmd/b10coin devnet --blocks 100  # the single-node acceptance check
 go run ./cmd/b10coin devnet --validators 4 --blocks 100  # the consensus acceptance check
+go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 \
+    --rotate-demo --plot-nakamoto         # the M5 rotation + Nakamoto acceptance check
 ```
 
 `devnet --blocks 100` builds a fresh local chain in a temporary directory,
@@ -62,7 +64,7 @@ It prints:
 ```text
 chain        b10coin-devnet-1
 height       102
-state root   12a643be48c13ffb35d1339e07f2e174346ec110c6c347e206d043a049b3cf54
+state root   98e5cf468ecf0b6ca9c148a4ef7e5056c14254dead11efaa1f2890631cdd11cc
 txs included 2
 claims paid  1 of 1 attempts, 100000000 sparks each
 double claims refused 1 (one claim per key per epoch)
@@ -71,7 +73,17 @@ faucet bal   5050000000 sparks (emitted 5150000000 sparks in total)
 OK
 ```
 
-and exits 0.
+and exits 0. The state root is the M5 figure. It moved once inside M5, from
+`3c1dae9ce528daa3377f3b040d7e0596f8488c9f8c1ebc87c62baa03cea8e93d` when the
+bond leaf began committing the bond's **unfunded** amount (audit ST-3: the
+devnet genesis seats one validator at `power: 1` with no balance behind it, so
+that bond's leaf changed even though no transaction did). It had already changed
+from the M4 figure
+`12a643be48c13ffb35d1339e07f2e174346ec110c6c347e206d043a049b3cf54` when
+`Bond`/`Unbond`/`Withdraw` became real transaction types and bonds became
+committed state — the second deliberate hard fork on this branch (the first was
+the chain identifier). It is reproducible: the command is deterministic, and a
+re-run prints the same root.
 
 The multi-validator acceptance command runs the same idea as a consensus
 committee: four validators, each with its own chain, driven to height 100 over
@@ -88,6 +100,46 @@ heights      v0=100 v1=100 v2=100 v3=100
 agreed       yes
 OK
 ```
+
+The M5 acceptance run is a real rotation: one seat unbonds through an ordinary
+`Unbond` transaction mid-epoch, leaves at the boundary at height 40 (6 seats
+become 5), and the Nakamoto coefficient is computed from committed state at
+each boundary. Seats and coefficient can both be read off the series; the run
+exits 0 only when every validator holds the same history:
+
+```text
+$ go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto
+chain        b10coin-simnet-6
+validators   6
+heights      v0=105 v1=105 v2=105 v3=105 v4=105 v5=105
+agreed       yes
+
+nakamoto coefficient across the run (smallest k whose k seats exceed 1/3 of committee power)
+  height  epoch  seats  k   top share
+       0      0      6  3   1 of 6 (16%)
+      40      1      5  2   1 of 5 (20%)
+      80      2      5  2   1 of 5 (20%)
+     105      2      5  2   1 of 5 (20%)
+OK
+```
+
+**Read that coefficient as committee composition, not as stake distribution.**
+The powers it is computed from are the SEATED committee's powers, i.e. after the
+one-quarter cap, and the cap is a fixed point over the seated total: whenever
+one seat dominates it is dragged DOWN rather than left at its stake — to the
+others' power on a four-seat committee, and to a quarter of the seated total on
+a larger one, with the floor seats sharing the other three quarters. Four seats
+at 10,000 / 1,000 / 1,000 / 1,000 b10 therefore all come out at a quarter of the
+committee each, so the three `MIN_STAKE` seats hold **3/4 between them and can
+commit alone**, while the plot prints `k=2` as if the committee were evenly
+distributed — although one party holds ~77% of the stake behind it.
+A seat therefore costs `MIN_STAKE` flat, stake above the cap buys no additional
+share, and the plotted coefficient OVERSTATES how distributed the stake is: it
+answers "how many keys must collude", never "how many b10 must collude". The
+uncapped stake is visible in `/account`'s `bonded` figures and in the
+derivation, not in this series. If a minimum power-per-seat ratio (or capping
+against the uncapped total stake) is wanted, it is a protocol change; the plan
+carries it as a proposal and nothing in this milestone implements it.
 
 ## Platforms and releases
 
@@ -164,8 +216,10 @@ platform can rot silently and none is verified-then-discarded.
 
 ## The CLI
 
-`cmd/b10coin` implements six subcommands. With no subcommand, or with an
-unknown one, it prints the usage text and exits with code 2.
+`cmd/b10coin` implements nine subcommands: `devnet`, `keygen`, `node`,
+`claim`, `stake`, `unstake`, `withdraw`, `version` and `help`. With no
+subcommand, or with an unknown one, it prints the usage text and exits with
+code 2.
 
 ### `b10coin devnet`
 
@@ -174,9 +228,12 @@ check (M0–M2), shared by the CLI and the test suite. Since M3 it is also the
 consensus acceptance check: `--validators N` swaps the single-node fixture for
 a committee of `N` consensus validators driven through the simulated network,
 reported per validator, and failing unless the validators hold one history.
-The faucet-claim scenario is the single-node path's proof — a committee
-accepts no transactions — so `--claims` alongside an explicit `--validators`
-is refused rather than silently dropped. The `--validators` committee is the
+`--claims` runs the **single-node** faucet scenario; the consensus run does not
+drive that scenario, so an explicit `--claims` alongside `--validators` is
+refused rather than silently dropped. (The committee itself does accept
+transactions — M5's rotation fixture submits an ordinary `Unbond` through a
+committee's mempool — but not through the `--claims` flag.) The `--validators`
+committee is the
 **fixture committee** (below): every seat's key is derivable from public
 seeds, which is exactly what makes these runs deterministic and reproducible
 — and what makes it development-only.
@@ -186,6 +243,9 @@ seeds, which is exactly what makes these runs deterministic and reproducible
 | `--blocks N` | `100` | number of blocks to produce (must be > 0) |
 | `--claims N` | `1` | faucet-claim attempts after the block loop (single-node run only); each paid claim is followed by the same key's same-epoch double claim, which must be refused (a run that sees the double claim applied fails) |
 | `--validators N` | *unset (single node)* | committee size; omitting the flag keeps the M0–M2 single-node run as it shipped, and any explicit value — `1` included — runs the consensus committee of that size |
+| `--epoch-blocks N` | `0` (the compiled-in length) | epoch length in blocks for **both** the committee epoch (0-based) and the faucet claim epoch (1-based), overridden in the genesis before hashing; `--dir` built at another length is refused by the store rather than silently reused. Use `40` with `--validators 6 --blocks 105` to cross two rotation boundaries in a short run |
+| `--rotate-demo` | `off` | rotation fixture (needs `--validators` ≥ 5, `--epoch-blocks` ≥ 4, `--blocks` > `--epoch-blocks`, not with `--claims`): one seat unbonds mid-epoch through an ordinary `Unbond` transaction and leaves at the boundary, so 6 seats become 5 and every validator must still hold one history |
+| `--plot-nakamoto` | `off` | print the Nakamoto coefficient per epoch boundary plus the head, computed from **committed state** (needs `--validators`; the threshold is 1/3, the BFT figure, not 1/2) |
 | `--dir PATH` | *fresh temporary directory* | data directory; a temporary one is deleted afterwards, an explicit path is kept (multi-validator runs lay out one chain per validator under `PATH/v0`, `PATH/v1`, …) |
 
 ### `b10coin keygen`
@@ -258,10 +318,55 @@ whose keys sign, and that is the security boundary:**
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
 | `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
-| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The node waits for the relay's **gate greeting** before sending it, then waits for the relay's **accepted** frame, so a relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — is refused WITHOUT ever being handed the secret, and the refusal is logged. Plaintext over TCP and replayable: see the relay section |
+| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The secret is **never sent**: the node waits for the relay's **gate greeting** and its per-connection **challenge** (32 fresh random bytes plus the relay's own address), answers `HMAC-SHA-256(token, challenge)`, and only then expects the relay's **accepted** frame. A relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — gets no proof at all and the refusal is logged; a stranger who drives the greeting through such a relay receives a MAC, never the token, and that MAC is useless on any other connection (audit PX-3). The token still travels in plaintext at the relay's end of the comparison: see the relay section |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
+| `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |
+
+**Peer exchange, and who it actually helps.** M5 adds `PEER_EXCHANGE`: a node
+that has a listener advertises its `IP:port` at most once every four waves
+(one frame per ~2 s at the default 500 ms wave), and a peer that receives the
+frame may dial it directly, through the same maintainer, backoff and
+committee-HELLO admission as any other peer. The message carries **listening
+addresses, the advertising member's key, the chain height it advertises at, and
+a signature over all three** (audit PX-1) — no vote and no chain state, and the
+relay still parses none of it, because it only ever forwards bytes. The
+receiver dials only if the signature verifies and the key held a seat at that
+height; a stranger on a token-less relay, or a relay sender replaying someone
+else's frame, is not a hint authority. A member that advertises junk addresses
+is bounded per member per wave, and a learned address whose handshake never
+completes is evicted rather than retried until restart. **A relay-only or NAT'd
+Pi advertises nothing and can be dialled by nobody**: a node with no `--listen`
+(and a `0.0.0.0`/unspecified listener counts as no address) sends no frame, so
+the mesh never gains a direct path *to* it and the relay remains its only
+inbound path. It can still *receive* hints and dial peers that do have a public
+listener, which bypasses the relay for those links — but the benefit is
+one-sided, and the mesh only forms among nodes that are directly reachable.
+This is design decision 5's honest limit, not a bug: `PEER_EXCHANGE` is a hint
+to dial, never an admission, and admission is still the signed committee HELLO.
+
+**Two limits found by the 2026-10-30 live run (audit M-2), both documented rather
+than hidden.** (1) *Private addresses need the flag.* A hint naming a loopback,
+private or link-local address is refused by default (`errHintLocal`), so a
+chain whose members all sit on a private range — a Docker bridge, a home LAN, a
+lab VLAN — exchanged no hints at all and stalled even though every member was
+reachable; `--allow-local-peer-hints` is the opt-in, and it is off unless the
+operator asks for it, because it lets a peer point this node at its own
+internal network. (2) *A `--peers` CHAIN does not become a mesh.* A member
+advertises **only its own listener**, never an address it learned, so a node can
+learn the address of a peer it is *already* connected to and never a
+second-hop one: the hint set equals the link set. A relay hides this, because
+every member is connected to the relay's link and one broadcast reaches all of
+them, which is why "listeners learned through the relay form a full mesh". With
+no relay and a chain (`b->a`, `c->b`, `d->c`), the graph stays a chain and the
+chain does not finalise — 4 validators stalled at height 0 in every variant
+tested. The fix, if one is wanted, is for an advertisement to carry the
+advertiser's *proven* neighbours as well as itself (one extra hop, and a
+re-eviction policy for addresses learned second-hand); until then this is a
+limitation of the message, not a defect in the dial path, and it is pinned by
+`TestPeerExchangeDoesNotMeshAChain`. Use `--relay`, or give every member every
+other member's address in `--peers`, for a topology that must mesh without one.
 
 Ctrl-C (or, on Unix, SIGTERM) stops block production and the HTTP server
 cleanly. The graceful stop listens for both through one cancellation
@@ -286,6 +391,98 @@ fresh key, and prints that key once — copy it out immediately if you plan a
 follow-up transfer, because it cannot be recovered later. (This is about the
 `claim` command only; validator keys are real files, see `keygen`.) The claim
 is only queued by this command; the node pays it when its next block applies it.
+
+### `b10coin stake`, `b10coin unstake`, `b10coin withdraw`
+
+Three clients over the **ordinary transaction path**. Each one reads the node's
+`/status` for the chain's genesis hash and stake parameters and
+`/account/{address}` for the nonce, balance and bond, signs with `--key`, and
+POSTs the canonical bytes to `/tx` — the same signing hash (bound to the genesis
+hash the node reports), the same fee rule and the same mempool admission a
+transfer uses. None of them opens the node's data directory: two processes
+appending to one store is not a client design.
+
+| Verb | Flags | Transaction |
+|---|---|---|
+| `stake` | `--node URL --key PATH --amount 1000 [--max-fee SPARKS] [--yes \| --dry-run]` | `Bond` (tag 3): moves `amount` b10 from the spendable balance into the key's bond, paying `min_fee_sparks` |
+| `unstake` | `--node URL --key PATH [--amount 1000] [--yes \| --dry-run]` | `Unbond` (tag 4): moves all (the default) or part of the bond into an unbonding record; a partial exit must leave at least `MIN_STAKE` bonded; fee 0 by consensus rule |
+| `withdraw` | `--node URL --key PATH [--yes \| --dry-run]` | `Withdraw` (tag 5): releases **every** matured unbonding record to the spendable balance; fee 0 by consensus rule |
+
+`--amount` is b10 as an exact decimal, parsed by integer arithmetic (no float
+ever holds an amount); the transaction carries sparks. `stake` refuses an amount
+below the node's `min_stake_sparks` and a bond the balance cannot cover, before
+submitting; `unstake` refuses more than is bonded, and refuses a partial exit
+that would leave a bond under `MIN_STAKE` — the state's candidacy floor, so the
+verb and the chain refuse the same remainders; `withdraw` refuses while no
+record has matured and names the next release height. None of the verbs waits
+for inclusion: a bond is a transaction, and a *seat* changes only at the next
+epoch boundary, so "nothing happened yet" is correct for up to an epoch.
+
+**Every verb builds the transaction, prints it, and only then signs — after a
+confirmation.** Type `yes` at the terminal prompt, or pass `--yes` when stdin
+is not a terminal (a script, cron, CI); a run with no terminal and no `--yes`
+prints the transaction and then refuses. `--dry-run` builds and prints, then
+stops: nothing is signed and nothing is posted. The preview is printed **from
+the bytes that get signed**: the hex on stdout is the unsigned canonical
+encoding, the POSTed bytes are exactly those bytes plus the signature, and the
+human-readable fields are decoded from the same bytes, so the summary cannot
+disagree with what was authorized.
+
+**The fee ceiling defaults to 1 spark.** That number is derived, not rounded:
+both shipped chains set `min_fee_sparks = 1` (`genesis.sharedParams`, which the
+devnet and testnet share), the mempool judges a fee only as "at least the
+state's minimum" and `Take` hands transactions to a block in arrival order (no
+fee market at this milestone, so a larger fee buys no earlier admission), and
+`state.applyBond` charges the fee to the sender without crediting anyone — the
+extra is burned. One spark is therefore the entire cost of admission and
+anything above it destroys value for nothing. `--max-fee SPARKS` raises the
+ceiling for a chain whose genesis really sets a higher minimum; a node asking
+for more is refused before any signature exists.
+
+What the ceiling does **not** fix: the nonce, balance, bond and genesis hash
+still come from the node the verb is pointed at, and the CLI has no independent
+copy of them. The preview makes them visible instead of silent — the nonce is
+labelled the node's claim, and with no `--amount` an unbond says its amount is
+*the whole bond as this node reports it*, with an under-report making it a
+partial exit. A lying node can therefore still delay a bond with a future
+nonce, turn a full exit into a partial one by under-reporting the bond (or
+refuse a full `--amount` exit by reporting a bond below it), or make the
+transaction invalid by misreporting the genesis hash. What it can no longer do
+is choose the fee: the default bounds that loss to one spark, and the
+confirmation shows the number before anything is signed.
+
+Example, from the live run in [Staking](#staking):
+
+```text
+$ b10coin stake --node http://127.0.0.1:8645 --key b10coin.key --amount 1000
+transaction to sign (built, not yet signed):
+  type        bond (3)
+  from        b10n6bx7wjzbjlw4xd5aqbo5jp27uq5yxhcziim7dy
+  public key  9f2c0e5a1d7b4386c9e2f0ab5d31c8e7a64b09df2c1e8a37b5d04f6c9a1e2b3d
+  nonce       0  (the node's claim)
+  fee         1 spark  (the node's claim; ceiling 1)
+  amount      100000000000 sparks (1000 b10)  (from --amount)
+  genesis     bb884a8c1a688674dd329b1effd4551fba01fbf277f37d73f45bdf0053515111  (the node's claim; the signature is bound to it)
+  bytes       03de98c0af74f66fcf8f2fbb7bd876ce6848b5b15c20595a3002843c7001986d530a75f3b22301018390eab909d88096b241c9c99f2d00000000000000000000000000000001000000174876e80000
+  nonce, fee and genesis above come from http://127.0.0.1:8645 and this CLI cannot check
+  them: a node reporting a future nonce builds a bond that applies later,
+  and one under-reporting the bond makes an exit partial. Only --amount
+  (when given) and the signing key are yours.
+Type "yes" to sign and post this transaction: yes
+txid        5586cdb24337ea3d0f1a9989777f0057bb74a3b6d66caeea1ef788f24bba47af
+the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every 1000 blocks), never mid-epoch.
+```
+
+**Where the stake comes from is a real limitation, not a footnote.** A bond
+must clear `MIN_STAKE` (1,000 b10 = 10^11 sparks), and **no shipped genesis gives
+an operator's key that much in spendable funds** — the verbs are usable only
+against a chain that already bonds a key (a genesis `power` at or above
+`MIN_STAKE`, which is locked stake and not spendable, or the devnet fixture
+account, which no shipped command turns into a key file). The faucet pays one
+claim per key per epoch and `claim` signs with an ephemeral key it never saves,
+so there is no shipped path from zero to a bond. The refusal messages say
+exactly that and point at [Staking](#staking), which carries the claim
+arithmetic.
 
 ### `b10coin-relay`
 
@@ -316,20 +513,25 @@ allowlists the validators' IPs — and why the relay also supports a
 **pre-shared access token** (`--access-token-file` on the relay,
 `--relay-access-token-file` on each node), which is the layer that works
 behind CGNAT where a source-IP allowlist cannot, and why the fixture
-committee must never reach a publicly reachable relay. The token is compared
-by length and byte equality and is opaque to the relay: the relay still
-decodes nothing. The exchange is three FIXED frames and no decoding anywhere:
-the relay announces gating (`b10coin-relay-gate-v1`), the node answers with the
-token, and the relay confirms with a second fixed frame — so a node refuses to
-send the secret to a relay that has not announced it gates, and a node whose
-token is REFUSED logs the handshake death instead of redialling in silence.
-The token must be at least 16 bytes on both ends (a shorter one is
-brute-forced by dialling: one byte falls in 256 attempts). **Two limits to
-know:** the token travels in **plaintext** over TCP, so a passive observer of
-the link reads it, and it is **replayable** — it is a constant compared per
-connection, neither challenged nor expired — so use it over a trusted path (a
-VPN) or accept that its compromise is a connection you must be able to absorb.
-It authenticates a connection, never a peer. If relay-only trust ever stops
+committee must never reach a publicly reachable relay. The token is used only
+as an HMAC key and is opaque to the relay: the relay still decodes nothing.
+The exchange is four frames and no decoding anywhere: the relay announces
+gating (`b10coin-relay-gate-v1`), sends a per-connection challenge (32 random
+bytes plus its own listening address), the node answers
+`HMAC-SHA-256(token, challenge)` — the token itself is NEVER written — and the
+relay confirms with a fixed accepted frame, comparing the answer in constant
+time (`subtle.ConstantTimeCompare`). So a node refuses to answer a relay that
+has not announced it gates, a node whose proof is REFUSED logs the handshake
+death instead of redialling in silence, and a stranger on a token-less relay
+who loops the greeting and a challenge of its own making harvests a MAC, not
+the token (audit PX-3). The token must be at least 16 bytes on both ends (a
+shorter one is brute-forced by dialling: one byte falls in 256 attempts).
+**One limit remains:** the challenge and the answer travel in **plaintext**
+over TCP, so a passive observer sees a proof that is valid for that one
+connection while it is live. A captured proof is worthless on any other
+connection, because the challenge is fresh per connection. Use the token over
+a trusted path (a VPN) or accept that its compromise is a connection you must
+be able to absorb. It authenticates a connection, never a peer. If relay-only trust ever stops
 being acceptable the answer is multiple relays and direct connections — never
 a smarter relay, because a relay that understood consensus would be a relay
 that could be wrong about it.
@@ -490,7 +692,9 @@ re-measured together on real hardware before any public testnet opens.
   premine, and the devnet fixture deliberately exceeds it: `genesis.Devnet`
   funds 1,000,000 b10 of test accounts on top of the realized series, and
   `Validate` has no premine-plus-emission rule (audit S-16). Testnet has no
-  premine, and a committee file cannot mint one.
+  premine, and a committee file cannot mint a **spendable** spark: its seats'
+  powers are unfunded genesis bonds, and unbonding one destroys the power
+  instead of releasing it (audit ST-3).
 - The **realized series lands at 20,999,997.48 b10** (2,099,999,748,000,000
   sparks): each halving's shift truncates, losing 252,000,000 sparks (2.52 b10)
   in total. The series therefore falls **2.52 b10 short of the cap** — and it
@@ -580,6 +784,28 @@ rather than in round still catches up through BLOCK_SYNC). The measured
 numbers and the choice of the linear ladder over the slower sub-linear
 alternatives are recorded in `internal/consensus/driver.go`.
 
+**A rolling restart is the everyday way to meet that limit.** Restarting a
+committee's validators one at a time leaves their rounds apart, and only the
+ladder closes the gap. In the 2026-10-30 Docker re-run a four-seat chain with
+one seat without a node sat at one head for 4 to 6.5 minutes after a rolling
+restart — twice — and recovered only once the nodes were restarted together.
+Recovery depends on the round the divergence reaches, not only on the gap:
+measured on the constructed three-of-four state (one live seat ahead), a
+one-round gap starting at round 40 commits after about 13 s and a five-round
+gap after about 27 minutes, both slower than the same gaps starting near round
+16. The gap comes from the restart itself: a restarted node resumes at the
+round it had reached before it stopped, behind a committee that kept climbing,
+and the jump that would pull it forward needs 2 of the 4 seats ahead — if the
+next node is already stopping, only one is. So restart the members within one
+block time of each other, or one at a time **waiting for the chain to advance
+before stopping the next**, or expect the wait; [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
+has the operator's version. A node that has spent eight rounds at one height
+while the seats it can reach hold a quorum now says so, once per height:
+`b10coin: no block for 8 rounds at height H (round R, step S): quorum reachable
+with P of T power (quorum Q), yet nothing commits; peers=…; tallies …` — with
+the per-round vote tallies and the peers it sees, so the stall is no longer
+silent.
+
 Three rules carry the safety, and all three are about the arithmetic of
 distrust:
 
@@ -611,11 +837,17 @@ distrust:
   whose claimed justification has no prevotes behind it is refused outright,
   not even nil-prevoted.
 
-The committee in this milestone is the genesis set: equal test validators with
-a fixed cap of one quarter of total power each — enforced, for committees of
-four or more, by configuration validation, while any smaller committee runs
-under a 1/1 cap, because below four equal holders no one-quarter share is
-satisfiable. Validator-set changes by stake arrive with M5.
+Since M5 the committee is **derived from stake**, not fixed at genesis: the top
+`committee_size` bonds by bonded stake, ties broken by public-key bytes, with
+each seat's power capped at one quarter of the seated total (applied in fixed
+point passes; committees below four seats run under a 1/1 cap, because no
+quarter share is satisfiable there). The set changes **only at an epoch
+boundary**: consensus for height `h` uses the committee of epoch
+`h/epoch_blocks`, derived from the state committed at `e*epoch_blocks − 1`, so
+a bond applied mid-epoch cannot move the set judging that epoch. Genesis seats
+are bonded by the genesis hash — a committee file's `power` *is* the seat's
+bond, not a balance — which is why height 0 carries stake no account funded.
+See [Staking](#staking) for the admission path and its funding limit.
 
 **How this is verified.** The `devnet --validators 4 --blocks 100` acceptance
 command above is the milestone's own check — four validators, one history, or
@@ -643,6 +875,193 @@ threat (a proposer stuffing a block with heavy faucet claims) is not exercised
 through consensus. None of these are defects in what the milestones built; they
 are the boundary of what they claim.
 
+## Staking
+
+**Stake is locked state, not a balance.** A bond is a record
+`(validator, amount, height)` in committed state, separate from the account's
+spendable balance. `Unbond` moves the amount into an unbonding record with
+`release_height` = **the epoch boundary at or after**
+`height + unbonding_epochs × epoch_blocks`; between those heights the coins are
+**neither spendable nor counted in the committee**, which is what makes the
+cooldown an economic delay rather than a formality. Rounding up is what binds the
+record count: an epoch's unbonds share one record, and records that have already
+matured are collapsed, so an address holds at most `unbonding_epochs + 2` records
+however many unbonds it sends, instead of one per block. The cost is stated
+plainly: a release is never earlier than the cooldown, and it can be later by up
+to one epoch minus a block (the time from a mid-epoch unbond to the next
+boundary). An unbond whose cooldown ends exactly on a boundary does not move.
+`Withdraw` releases every record at or below the current height, exactly once.
+The stake transitions move value between the three terms; the only value that
+leaves is a `Bond`'s fee, burned exactly as a transfer's is, and emission and
+faucet claims are chain-level. One exception, and it is the genesis seat: an
+`Unbond` of a genesis bond destroys that bond's unfunded part rather than
+recording it (`Bond.Unfunded`, audit ST-3), so a genesis grant never becomes
+spendable and the sum falls by exactly what the genesis created.
+
+**A bond is a seat, and the seat changes only at a boundary.** The committee is
+the top `committee_size` bonds by stake, ties broken by public-key bytes, with
+the one-quarter power cap applied after selection. Consensus for height `h`
+uses the committee of epoch `h/epoch_blocks`, derived from the state committed
+at `e*epoch_blocks − 1`, so a bond applied at height `h` is considered at the
+next boundary and never mid-epoch. Genesis seats are bonded by the genesis
+hash: a committee file's `power` **is** that seat's bond — an unfunded one, so
+it seats a vote and cannot be withdrawn (see the funding section below).
+
+**A bond is at least `MIN_STAKE` or it is not a bond.** Both transitions enforce
+the floor: `Bond` judges the *resulting* bond, and `Unbond` accepts a remainder
+of exactly zero or at least `MIN_STAKE` — a partial exit that would leave a
+positive bond under the floor is refused. That rule is a state invariant, not
+CLI politeness: any positive bond is a committee candidate, and the cap's fixed
+point equalises small seats with large ones, so a one-spark bond would be a
+one-spark **seat** carrying a full seat's power. Bond `MIN_STAKE`, unbond all but
+one spark, and three such seats hold three quarters of a four-seat committee —
+the vector is pinned in `internal/state/committee_test.go`. The carve-out is for
+a bond **already** below the floor, which a genesis seat on the devnet and
+simnet fixtures is (their validators carry `power: 1`): such a seat may exit,
+and only in full — exactly what the M5 rotation fixture does. The operator-facing
+path cannot create one: a committee file's `power` must be at least `MIN_STAKE`.
+
+**The cap is per key, not per operator.** Each seated key's power is capped at a
+quarter of the seated total, so on a committee of four or more seats no single
+key can hold more than 25% — and bonding far above the floor on one key buys no
+larger share than the cap allows. The cap does not merge keys: `k` keys that
+each hold the floor buy `k` seats, and on `N` equal-stake seats each holds `1/N`,
+so `k` colluding keys hold `k/N` of the committee's power. A seat therefore
+costs `MIN_STAKE` per key, and the count of keys — not only the stake behind
+each — is what the committee measures.
+
+That has a second consequence the whale side does not show. Because the cap is a
+FIXED POINT over the seated total, a dominant seat is not merely capped at 25%:
+it is dragged DOWN toward the others' power — on a four-seat committee all the
+way to it. One 10,000 b10 seat and three 1,000 b10 seats converge to four seats
+of one quarter each, so the three floor seats outvote the whale 3/4 to 1/4 and
+can commit alone; a seat costs `MIN_STAKE` flat, and on a small or unfilled
+committee a handful of floor seats is the cheapest route to a supermajority. The
+Nakamoto series the acceptance run prints is computed from these CAPPED powers,
+so it describes the committee's composition — how many keys must collude — and
+it overstates how distributed the stake is. This is §6.3's rule implemented
+exactly, documented here rather than changed: capping against the uncapped total
+stake, or a minimum power-per-seat ratio, would be a protocol change (see the
+plan's proposal).
+
+**The verbs** are `stake`, `unstake` and `withdraw` (see
+[The CLI](#the-cli)). They are ordinary signed transactions — same signature,
+same genesis-hash binding, same fee rule, same `/tx` admission as a transfer.
+The state machine, not the verb, is the authority: the verb only refuses early,
+with a readable reason, what the node would refuse at execution.
+
+**Where `MIN_STAKE` comes from — the honest answer.** `MIN_STAKE` is 1,000 b10
+(10^11 sparks), and the only in-protocol funding path is the faucet: **one claim
+per key per epoch**, at most **8 claims per block**, funded by emission at
+**0.5 b10 per block**. The binding constraint is the faucet's balance, not the
+per-key rule:
+
+- **2,000 blocks of emission** produce the 1,000 b10 that 1,000 b10 of claims
+  need (1,000 ÷ 0.5) before the faucet can pay them out;
+- the claims themselves are cheap: 1,000 claims of 1 b10 from 1,000 distinct
+  keys at 8 per block is **125 blocks**, and on the testnet parameters 10 claims
+  of 100 b10 is **2 blocks**;
+- the 1,000 separate balances must then be consolidated into one key by
+  transfers; a block carries up to 10,000 transactions, so that is about **one
+  more block**.
+
+| Chain parameters | Claim | Claims for 1,000 b10 | Faucet fill | Claim blocks | Total | At 2 s blocks |
+|---|---|---|---|---|---|---|
+| devnet, **and any operator committee file** (the file keeps the devnet fixture parameters) | 1 b10 | 1,000 (1,000 keys) | 2,000 | 125 | ~2,125 | ~71 min |
+| testnet (compiled in, but it names no validators — no chain runs on it) | 100 b10 | 10 (10 keys) | 2,000 | 2 | ~2,000 | ~67 min |
+
+The wall-clock column is an illustration at 2 s blocks, the single-node
+producer's default. **A consensus committee is not paced by
+`block_time_ms`**: that parameter is the spec's target and the basis of the
+Argon2 budget, while the driver's cadence is the round protocol's (a timeout is
+the failure path, not the rhythm). Measure it on the chain you care about —
+two `/status` readings a minute apart give blocks/second — and divide the
+~2,000 blocks by it. A faster committee shortens the wait; it does not loosen
+the one-claim-per-key-per-epoch rule.
+
+> **Correction (audit RT-2).** This table used to divide 1,000 claims by the
+> one-claim-per-key rule and report 1,000 epochs = 1,000,000 blocks ≈ 23 days.
+> That was wrong by a factor of about 470. The rule is per **key** per epoch, so
+> 1,000 distinct keys claim inside one epoch, and the 8-per-block bound plus the
+> faucet's 0.5 b10/block emission — not the epoch length — set the real floor.
+> The shipped CLI still cannot walk this path (see below); the numbers above are
+> what the *protocol* allows, which is what a reader sizing a deployment needs.
+
+Those figures assume a client that holds **1,000 keys** and can **transfer**
+their balances into one. `b10coin claim` does neither: it generates a fresh
+ephemeral key per run and never saves it, and there is no `transfer` verb, so a
+claimant's coins land at a new address each time and cannot be accumulated.
+**No shipped command reaches `MIN_STAKE` through the faucet** — the arithmetic
+above is what the protocol allows, not a path an operator can walk today.
+What does exist, stated so it is not mistaken for a path:
+
+- The **devnet fixture** premines one account — `b10coin-devnet-faucet-tester`,
+  returned by `genesis.DevAccountKey(0)` — with 1,000,000 b10 (1,000×
+  `MIN_STAKE`). Its private key is public by design (`deterministicKey`), no
+  CLI verb turns it into a key file, and it must never be used on a shared
+  chain. It is what the M5 end-to-end run below used, with a hand-built key
+  file, and that is **verification, not a shipped funding path**.
+- A **genesis bond**: a committee file's `power` is its seat's bond and must be
+  at least `MIN_STAKE` (the loader refuses less), so a genesis seat holds voting
+  power without any balance. It is **unfunded and not withdrawable** (audit
+  ST-3): no account paid for it, `unstake` leaves the committee and **destroys**
+  the power rather than recording it, and `withdraw` pays nothing for it.
+  `unstake` and `withdraw` are still exercisable with a zero balance (an exit is
+  free by consensus rule) — there is simply no money to release. A seat is a
+  grant of a vote in the federated era, not a premine: what a genesis operator
+  can withdraw is only what it funds itself through `stake`, which is recorded
+  as a funded bond and released like any other after one cooldown. A chain
+  therefore starts with `power` sparks of voting power outside
+  `TotalSupplySparks` and **zero withdrawable sparks** from genesis.
+
+**The operational consequence, for anyone deploying the recipe.** Genesis seats
+are at least `MIN_STAKE` each, and a newcomer that bonds at least the floor is
+ranked against them by stake, ties by key bytes — so with
+`committee_size == len(validators)` (the default) admission means eviction of
+one genesis seat. Give the file a spare seat (`committee_size` above the list,
+as the shipped example does) and a newcomer is seated beside them instead.
+
+If the key that bonds is **not** the key a running validator signs with, the new
+seat has no node behind it. What that costs depends on the committee size, and
+the honest answer is not "the chain stops" (audit M-3): the power cap and the
+quorum threshold decide it.
+
+- **Three seats: the chain stops at the boundary.** Below four seats the power
+  cap is 1/1 — no cap — so one seat may hold almost all of the power, and quorum
+  is *strictly more* than two thirds of the total. Two live seats out of three
+  therefore hold at most 2/3, which is exactly one spark short of quorum when all
+  three bonds are `MIN_STAKE` (`quorumFor(3·MIN_STAKE) = 2·MIN_STAKE + 1`), and
+  far less when the dead seat is a whale bond against one-spark fixture seats.
+  Nothing can commit; the chain halts at the epoch boundary.
+- **Four or more seats: the chain keeps committing without it.** At four seats
+  the one-quarter cap applies, so no seat holds more than 1/4 of the total power:
+  dropping the seat that has no signer leaves **at least 3/4 of the power**,
+  which is above the 2/3 threshold. At four seats that is exactly 3 of 4 power
+  (`quorumFor(4) = 3`, and three seats hold 3/4 > 2/3). With equal seats the
+  threshold needs at most `floor(2N/3)+1` of the N, and the `N-1` survivors
+  always supply that many for `N >= 4` — exactly at 4, 5 and 6 seats, with slack
+  above that. (Two silent seats are still fatal up to six seats: `(N-2)/N > 2/3`
+  needs `N >= 7`.) Only the node that lost its seat stops voting: it keeps its
+  links and can still adopt certified blocks, but it can no longer propose or
+  vote, and nothing waits for it.
+
+Either way the seat is wasted, and the deployment is one further failure from a
+stall — so stake only with the key whose node will run as that validator, and
+keep every genesis key's node running. The three-seat recipe halts; the
+four-seat recipes lose one seat's worth of safety margin and keep finalising.
+
+**The end-to-end run behind these claims** (one process, a devnet-parameter
+chain, the fixture key file described above): `stake --amount 1000` submitted a
+`Bond` that a block applied (bonded 10^11 sparks, nonce 1, balance down by the
+bond and the 1-spark fee); the seat changed at the epoch boundary; `unstake`
+submitted an `Unbond` (fee 0) of a **funded** bond, which created an unbonding
+record with a **release height** two epochs later, rounded up to the epoch
+boundary (audit ST-4); coins were unspendable until that height;
+`withdraw` submitted a `Withdraw` (fee 0) that returned them to the spendable
+balance. Every one of the three was admitted through `POST /tx` and appears in
+a block as an ordinary transaction, with the same signature binding a transfer
+has; a bond signed for another chain's genesis hash is refused there.
+
 ## Architecture
 
 Twenty Go packages under `internal/` (the simulated transport is one of them,
@@ -663,25 +1082,25 @@ by `cmd` alone.
 |---|---|
 | `internal/crypto` | BLAKE3 over length-prefixed, domain-separated parts (`HashParts`); order-sensitive binary Merkle root; Ed25519 key generation, signing, verification |
 | `internal/types` | Consensus structures (`Address`, `Tx`, `Header`, `Block`) and the canonical binary codec; the decoder rejects short buffers, trailing bytes, and non-minimal varints. A transaction's signed body carries its **fee** and is bound to a **chain identifier** (the genesis hash), so one transaction is not valid on two chains |
-| `internal/state` | Address → account state map; the transfer transition (chain-binding signature, nonce, minimum fee, balance rules, amount+fee overflow) applied atomically per block on a clone; the fee is burned; sorted-leaf Merkle state root; zero-value accounts pruned |
-| `internal/genesis` | Protocol parameters, genesis hash and validation, the devnet and testnet configurations, deterministic public dev fixtures, and the keyless faucet address |
+| `internal/state` | Address → account state map; the transfer transition (chain-binding signature, nonce, minimum fee, balance rules, amount+fee overflow) applied atomically per block on a clone; the fee is burned; sorted-leaf Merkle state root; zero-value accounts pruned. M5 adds locked stake as separate state — bonds and unbonding records, the `Bond`/`Unbond`/`Withdraw` transitions with their cooldown, and `Committee()`: the top `CommitteeSize` bonds, ties by public-key bytes, power capped at a quarter in fixed-point passes |
+| `internal/genesis` | Protocol parameters, genesis hash and validation, the devnet and testnet configurations, deterministic public dev fixtures, and the keyless faucet address. M5 adds `ParseB10`/`FormatB10`, the exact integer b10↔sparks conversion the staking verbs use (never a float), and the staking parameters in `Params` |
 | `internal/faucet` | The M2 faucet machinery: the Argon2id claim puzzle (`Solve`, digest construction, target comparison), the cheap BLAKE3 **outer puzzle** (`PreDigest`, `SolveClaim`) a node's mempool checks before paying for Argon2id, and the emission schedule (`Reward`, `SeriesTotal`) |
 | `internal/store` | Append-only block segment files (1,000 blocks per segment). EVERY log file (segments, lock log, round log, certificate log) begins with a **segment header**: the `b10coin-seg` magic and a big-endian format version, checked before a single record is framed, so a directory written by an older layout is refused as an unrecognised format — never as corruption with truncation advice, which would delete an intact chain. After the header each record is framed by a **checksummed fixed-width header** (length plus its CRC32C) and a trailing CRC32C over the length and payload; a torn trailing record is truncated on open, and a complete record whose checksum fails stops the scan and fails open, never silently dropped |
-| `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency |
+| `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency. M5 adds `CommitteeAt(h)`: the one per-height committee (an epoch's seats, memoised when its deciding state is committed), read by consensus, the certificate gate and the vote router |
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction. Admission is **stateful** against the head state a block would execute now (audit R-1): a faucet claim is refused for a wrong epoch, an already-spent claim marker, a wrong nonce or a missing cheap outer puzzle before any Argon2id evaluation; claims are capped in a sub-pool separate from transfers and per sender, and a claim `Take` keeps skipping ages out. A full pool refuses a new transaction rather than evicting an older one |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
-| `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size), `GET /block/{height}`, and `POST /tx` (hex-encoded canonical transaction bytes) |
+| `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size, and since M5 `genesis_hash`, `min_fee_sparks`, `min_stake_sparks`, `epoch_blocks`, `unbonding_epochs`, `committee_size` — fields are added, never renamed), `GET /block/{height}`, `GET /account/{address}` (balance, nonce, bonded, `bond_unfunded`, and each unbonding record's `amount` and `release_height`; the unbonding list takes `?limit=`/`?offset=` and reports `unbonding_total`, and no reply carries more than 256 records), and `POST /tx` (hex-encoded canonical transaction bytes) |
 | `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters. M4 adds BLOCK_SYNC catch-up and a certificate log: a commit certificate is persisted to the data directory, so a restarted validator still serves the evidence for blocks it adopted before it restarted |
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
 | `internal/transport/tcp` | The real TCP transport: a framed reader/writer with socket deadlines, direct dial/listen, a relay-aware dial mode registered under `relay:<addr>`, and reconnect backoff. Its per-connection frame-rate bucket (audit N-6, the bound that stops one flooder monopolising the single dispatch callback) is applied to DIRECT connections only: on a relay connection the connection is the shared link, not the sender, so the bucket would drop honest members' votes for a stranger's flood — the relay's own per-sender share is the bound that replaces it there |
-| `internal/relay` | The dumb frame forwarder (`cmd/b10coin-relay`): a peer registry, per-receiver byte- and frame-bounded queues, per-source-prefix connection caps, socket deadlines and an optional pre-shared access-token first frame; it decodes nothing beyond the length prefix |
-| `internal/wire` | The wire envelopes shared with the transport and the consensus syncer: HELLO and BLOCK_SYNC request/response codecs with their own signed hashes |
-| `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, catch-up and prefix-agreement assertions — the harness the eight seeded scenarios drive, and the multi-validator devnet with it |
-| `internal/devnet` | The in-process devnet driver used by both the CLI acceptance commands and the tests: the single-node transfer, claim and double-claim-refusal scenario with replay verification, the multi-validator committee run reporting per-validator heights and agreement, and the real-TCP node (`tcpnode.go`) the `node` command's committee mode runs |
+| `internal/relay` | The dumb frame forwarder (`cmd/b10coin-relay`): a peer registry, per-receiver byte- and frame-bounded queues, per-source-prefix connection caps, socket deadlines and an optional pre-shared access-token HMAC challenge-response gate; it decodes nothing beyond the length prefix |
+| `internal/wire` | The wire envelopes shared with the transport and the consensus syncer: HELLO and BLOCK_SYNC request/response codecs with their own signed hashes, and (M5) `PEER_EXCHANGE` — a bounded, canonical list of listening addresses inside a signed envelope (the advertising member's key, its height, and a signature over chain id, height and list; audit PX-1) |
+| `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, catch-up and prefix-agreement assertions — the harness the eight seeded scenarios drive, and the multi-validator devnet with it; M5 adds the rotation fixture's `Unbond` submission through a committee's mempool and per-height committee access |
+| `internal/devnet` | The in-process devnet driver used by both the CLI acceptance commands and the tests: the single-node transfer, claim and double-claim-refusal scenario with replay verification, the multi-validator committee run reporting per-validator heights and agreement, the M5 rotation fixture and the committed-state Nakamoto series (`nakamoto.go`), and the real-TCP node (`tcpnode.go`) the `node` command's committee mode runs |
 | `internal/keystore` | The versioned JSON validator key file `keygen` writes and `--key` loads: owner-only permissions, public key re-derived and checked against the file, refusing a group- or world-readable key |
 | `internal/version` | The semantic version constant (`0.1.0`) |
-| `cmd/b10coin` | CLI entrypoint: `devnet`, `node`, `keygen`, `claim`, `version`, `help` |
+| `cmd/b10coin` | CLI entrypoint: `devnet`, `node`, `keygen`, `claim`, `stake`, `unstake`, `withdraw`, `version`, `help` |
 
 ## Key design decisions
 
@@ -816,7 +1235,17 @@ One operational limit to know before the Pi run: the timeout ladder is
 unbounded, so an outage that leaves one live seat a round ahead can hold the
 chain effectively down for minutes (or, for a deep divergence, days) while the
 round gap closes. It is a liveness limit, not a safety one — see
-[Consensus](#consensus).
+[Consensus](#consensus). The everyday case is a **rolling restart**: restart
+the three Pis within one block time of each other (back-to-back `systemctl
+restart`, or reboot them together), because a one-at-a-time restart leaves
+their rounds apart and can keep the chain at one head for minutes — the
+2026-10-30 Docker re-run measured 4 to 6.5 minutes. If you must restart one
+at a time, wait for the chain to advance after each restart before stopping
+the next. A node now logs the stall once per height (`b10coin: no block for 8
+rounds at height …`) and, at startup, the round it resumes at (`consensus
+resuming height H at round R …`), and
+[`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
+has the operator's procedure.
 
 After the Pis are running, the acceptance run itself becomes one command:
 
@@ -857,11 +1286,11 @@ a valueless testnet.
 
 ## Checks
 
-`go test -count=1 ./...` and `go test -race ./...` are green across the test
+`go test -count=1 ./...` and `go test -race -count=1 ./...` are green across the test
 suite, and `go vet ./...`, `gofmt`, `staticcheck` and `govulncheck` are clean
 on this repository as committed. CI (`.github/workflows/ci.yml`) runs all
-three acceptance commands on every push and pull request as well, on the
-toolchain go.mod pins: currently Go 1.27.1 over language version 1.26.
+four acceptance commands on every push and pull request as well, on the
+toolchain go.mod pins: currently Go 1.27.3 over language version 1.26.0.
 
 | Check | Command |
 |---|---|
@@ -874,6 +1303,7 @@ toolchain go.mod pins: currently Go 1.27.1 over language version 1.26.
 | Acceptance check, default run | `go run ./cmd/b10coin devnet --blocks 100` |
 | Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
+| Acceptance check, M5 rotation + Nakamoto | `go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto` |
 
 Actions in CI are pinned to commit SHAs, not mutable tags, and the whole
 workflow's token is scoped to `contents: read`
@@ -889,7 +1319,7 @@ check).
 
 ## Status and roadmap
 
-Implemented — modules M0 through M4:
+Implemented — modules M0 through M5:
 
 - **M0** — repository skeleton, canonical encoding, crypto wrappers, CI.
 - **M1** — single-node chain: account state machine, block production,
@@ -915,16 +1345,30 @@ Implemented — modules M0 through M4:
   shared committee file (`keygen` / `--key` / `--genesis`), and reproducible
   release builds for all six OS/arch targets. The three-Pi deployment recipe
   is [`scripts/deploy/README.md`](scripts/deploy/README.md).
+- **M5** — staking, committee rotation, admission and `PEER_EXCHANGE`:
+  `Bond`/`Unbond`/`Withdraw` as ordinary signed transactions with a real
+  cooldown; a committee derived from bonded stake, re-derived only at an epoch
+  boundary (top `committee_size` by stake, ties by public-key bytes, 1/4 power
+  cap); genesis seats bonded by the genesis hash; `PEER_EXCHANGE` turning the
+  relay star into a mesh among reachable nodes; the Nakamoto coefficient
+  computed from committed state and plotted at each epoch boundary plus the
+  head (`--plot-nakamoto`; a step series, not one row per height);
+  `stake`/`unstake`/`withdraw` clients; and the deployment recipe's staking
+  section. Acceptance: the rotation run above (6 seats / k=3 → 5 seats / k=2 at
+  height 40) and the single-node root, which moved once inside M5 to
+  `98e5cf46…` when the bond leaf began committing the bond's unfunded amount
+  (audit ST-3). **The funding limit is stated in [Staking](#staking): no
+  shipped command reaches `MIN_STAKE` through the faucet.**
 
 Pending:
 
-- **M4 acceptance on real hardware** — three Raspberry Pis on separate home
+- **M4/M5 acceptance on real hardware** — three Raspberry Pis on separate home
   networks plus a relay VPS, checked end-to-end by
   `scripts/deploy/acceptance.sh`. The code and the recipe are in place; the
   deterministic simulator cannot catch real-network failures, so this run is
-  what validates the transport on real hardware.
-- **M5** — staking and committee rotation. **M6** — a wallet CLI with a
-  minimal explorer and faucet web UI.
+  what validates the transport on real hardware. M5's rotation is exercised by
+  the simulator and the CLI acceptance run, not on a Pi.
+- **M6** — a wallet CLI with a minimal explorer and faucet web UI.
 
 ## Documentation
 
@@ -942,5 +1386,9 @@ Pending:
 - `docs/plans/2026-10-04-m4-real-networking.md` — the M4 real-networking
   implementation plan: the TCP transport and relay, BLOCK_SYNC catch-up, the
   committee/key files and this milestone's acceptance gate.
+- `docs/plans/2026-10-11-m5-staking-rotation.md` — the M5 staking, committee
+  rotation, admission and `PEER_EXCHANGE` implementation plan: the staking
+  transaction types and state, the committee derivation and rotation, the
+  Nakamoto series, and this milestone's acceptance gate.
 - `scripts/deploy/README.md` — the three-Pi plus relay deployment recipe, and
   `scripts/deploy/acceptance.sh` — the end-to-end verdict it is checked with.
