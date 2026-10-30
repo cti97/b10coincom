@@ -14,9 +14,10 @@ package devnet
 // could not diagnose is that exact shape (see diag.go's header).
 //
 // WHAT IS REPORTED. A validator that has spent stallReportRounds rounds at one
-// height, while the voting power it can actually SEE (its own seat plus the
-// seats whose signed HELLOs it has heard within the wave TTL) is at least the
-// quorum, logs one line: the round and step it is in, the prevote/precommit
+// height, every one of them while the voting power it can actually SEE (its
+// own seat plus the seats whose signed HELLOs it has heard within the wave
+// TTL) is at least the quorum, logs one line (rounds climbed with the quorum
+// out of reach do not count; see stallWatch): the round and step it is in, the prevote/precommit
 // tallies with the quorum they are short of, and the peers it sees. "Sees
 // quorum" is the test for "a quorum should exist": a lone survivor of a
 // partitioned committee, or two live seats of three, cannot decide by
@@ -76,9 +77,24 @@ type stallPeer struct {
 
 // stallWatch is the reporter's once-per-height state. It is guarded by the
 // validator mutex, like every other read of the driver.
+//
+// The rounds counted are rounds WITH a reachable quorum, not the round number.
+// A node that climbed rounds while it could not reach a quorum - its peers
+// down for a restart - is in an expected stall, and the moment the quorum
+// comes back it is merely about to resync; counting from round 0 made it cry
+// stall at that instant (M5 network re-run, 2026-10-30: the line fired within
+// a second of every restart in a one-at-a-time sequence that then recovered in
+// seconds, its peers= still listing the node that had just been stopped).
+// reachFrom is the round from which the quorum has been reachable at every
+// observation; a fresh height starts counted from round 0, and any observation
+// without a reachable quorum disarms the count until one comes back.
 type stallWatch struct {
-	height uint64
-	fired  bool
+	height    uint64
+	fired     bool
+	observed  bool   // a round of this height has been observed
+	round     uint32 // the round last observed
+	reachable bool   // the quorum was reachable at every observation since reachFrom
+	reachFrom uint32
 }
 
 // stallTally renders one round's tally: how many validators the engine counted,
@@ -132,15 +148,40 @@ func (v *Validator) stallReportOnce() (string, bool) {
 	// engine it is looking at.
 	v.drv.Observe()
 	head, round := v.drv.Height(), v.drv.Round()
-	if v.stall.height != head {
-		v.stall.height = head
-		v.stall.fired = false
+	w := &v.stall
+	first := w.height != head || !w.observed
+	if first {
+		// A height first seen below the threshold is counted from round 0,
+		// which is where it began. One first seen AT or past it - a round
+		// restored from the store after a restart - is counted from where it
+		// was seen: the rounds before it were spent by an earlier process, or
+		// unobserved, and are no evidence of a reachable quorum failing.
+		*w = stallWatch{height: head, observed: true, round: round, reachable: true}
+		if round >= stallReportRounds {
+			w.reachFrom = round
+		}
 	}
-	if v.stall.fired || round < stallReportRounds {
+	if w.fired {
 		return "", false
 	}
+	// While the quorum is in reach, reachability is sampled once per round
+	// entered: a peer that drops out shows within a round, and a healthy tick
+	// loop does not pay for a table walk on every tick. While it is NOT in
+	// reach it is sampled every tick, so the count starts in the very round
+	// the quorum comes back (a walk over a committee-sized table).
+	if !first && round == w.round && w.reachable {
+		return "", false
+	}
+	w.round = round
 	power, quorum, total, peers, ok := v.stallQuorum(head + 1)
 	if !ok || power < quorum {
+		w.reachable = false
+		return "", false
+	}
+	if !w.reachable {
+		w.reachable, w.reachFrom = true, round
+	}
+	if round < w.reachFrom+stallReportRounds {
 		return "", false
 	}
 	v.stall.fired = true

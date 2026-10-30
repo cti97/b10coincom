@@ -117,6 +117,8 @@ func TestTheStallLineReArmsAtTheNextHeight(t *testing.T) {
 	for seat := 1; seat < 3; seat++ {
 		attestPeer(t, v, string(live[seat].pub), fmt.Sprintf("v%d", seat), 0)
 	}
+	// The tick loop sees every height from its round 0; so does this test.
+	v.stallReportOnce()
 	reachRound(t, live, stallReportRounds)
 	if _, ok := v.stallReportOnce(); !ok {
 		t.Fatalf("fixture: no stall line at the first height, so the re-arm cannot be tested")
@@ -144,6 +146,7 @@ func TestTheStallLineReArmsAtTheNextHeight(t *testing.T) {
 	}
 
 	// The same committee, one height later, stalls the same way.
+	v.stallReportOnce()
 	reachRound(t, live, stallReportRounds)
 	line, ok := v.stallReportOnce()
 	if !ok {
@@ -151,5 +154,77 @@ func TestTheStallLineReArmsAtTheNextHeight(t *testing.T) {
 	}
 	if !strings.Contains(line, "height 1 (round 8") {
 		t.Fatalf("the re-armed line names the wrong height:%s", line)
+	}
+}
+
+// TestAStallLineCountsOnlyRoundsWithAReachableQuorum is the false positive of
+// the M5 network re-run (2026-10-30): a node that climbed rounds while its
+// peers were down - an expected stall, its quorum unreachable - reported a
+// stall the instant a peer came back, because the round NUMBER was already
+// past the threshold. It then recovered in seconds. The rounds that count are
+// the ones entered with a reachable quorum.
+func TestAStallLineCountsOnlyRoundsWithAReachableQuorum(t *testing.T) {
+	vs := quietValidators(t, 4)
+	live := vs[:3]
+	v := live[0]
+	// The outage: nobody heard from, sixteen rounds climbed, every one observed.
+	for r := uint32(0); r <= 2*stallReportRounds; r += 4 {
+		reachRound(t, live, r)
+		if line, ok := v.stallReportOnce(); ok {
+			t.Fatalf("a node that could not reach a quorum reported a stall at round %d:%s", r, line)
+		}
+	}
+	// The peers come back. Round 16 is past the threshold by number, but no
+	// round has yet been spent with the quorum in reach.
+	for seat := 1; seat < 3; seat++ {
+		attestPeer(t, v, string(live[seat].pub), fmt.Sprintf("v%d", seat), 0)
+	}
+	if line, ok := v.stallReportOnce(); ok {
+		t.Fatalf("the node reported a stall the moment its quorum came back (round %d):%s", v.Round(), line)
+	}
+	from := v.Round()
+	reachRound(t, live, from+stallReportRounds-1)
+	if line, ok := v.stallReportOnce(); ok {
+		t.Fatalf("a stall was reported after %d rounds with a reachable quorum, threshold %d:%s", stallReportRounds-1, stallReportRounds, line)
+	}
+	reachRound(t, live, from+stallReportRounds)
+	line, ok := v.stallReportOnce()
+	if !ok {
+		t.Fatalf("%d rounds with a reachable quorum and no block, and the node said nothing", stallReportRounds)
+	}
+	if want := fmt.Sprintf("(round %d,", from+stallReportRounds); !strings.Contains(line, want) {
+		t.Fatalf("the line does not name round %d:%s", from+stallReportRounds, line)
+	}
+}
+
+// TestAPeerThatDropsOutRestartsTheStallCount: the quorum must be reachable at
+// EVERY round counted. A peer whose HELLO expires mid-count - the node being
+// stopped next in a one-at-a-time restart - disarms the count, and it starts
+// again from the round the quorum is back.
+func TestAPeerThatDropsOutRestartsTheStallCount(t *testing.T) {
+	vs := quietValidators(t, 4)
+	live := vs[:3]
+	v := live[0]
+	attest := func() {
+		for seat := 1; seat < 3; seat++ {
+			attestPeer(t, v, string(live[seat].pub), fmt.Sprintf("v%d", seat), 0)
+		}
+	}
+	attest()
+	v.stallReportOnce()
+	reachRound(t, live, stallReportRounds/2)
+	v.stallReportOnce()
+	// The peers' HELLOs expire: the waves move past the TTL with no refresh.
+	v.peerHMu.Lock()
+	v.wave += peerHeightTTL + 1
+	v.peerHMu.Unlock()
+	reachRound(t, live, stallReportRounds/2+1)
+	if line, ok := v.stallReportOnce(); ok {
+		t.Fatalf("a node whose peers had expired reported a stall:%s", line)
+	}
+	attest()
+	reachRound(t, live, stallReportRounds)
+	if line, ok := v.stallReportOnce(); ok {
+		t.Fatalf("the rounds before the peers dropped out were still counted (round %d):%s", v.Round(), line)
 	}
 }

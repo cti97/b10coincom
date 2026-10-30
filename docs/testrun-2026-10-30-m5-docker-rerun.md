@@ -125,8 +125,8 @@ What changed:
 - Upstream's `0ccfce9` and `b213aad` added the stall line and the "restart together" advice.
 - This follow-up adds a startup line that names the restored round (`consensus    resuming height H at round R …`) and documents a safe one-at-a-time procedure: wait for the chain to advance after each restart before stopping the next node. Verified in Docker over 3 trials (9 restarts): the chain advanced 6–33 s after every restart and never stalled afterwards.
 
-Observed while verifying, not changed:
-- Upstream's stall line also fires once at height 0 on every fresh chain, while the nodes are still starting.
-- It also fires during a planned outage. A just-stopped peer still counts as reachable until its HELLO expires, so the line claims a quorum is reachable when it isn't.
+Stall line false positives, fixed afterwards:
+- Startup: the line fires at height 0 on a fresh chain. On inspection this is **not** a false positive. Containers started a few seconds apart sat at height 0 for 13–43 s in all 4 trials, with diverged rounds: the same mechanism, and the slow start the verifier reported. It stays reported.
+- The restart burst **was** a false positive. A node that climbed rounds while it could not reach a quorum reported a stall the moment a peer came back, because the round number was already past 8. Its `peers=` even listed the node that had just been stopped, which still counted until its HELLO expired. Now only rounds spent with a reachable quorum count: a height first seen below round 8 is counted from round 0, and any round without a reachable quorum disarms the count until it returns. Two new tests pin this, and both fail on the old code. A Docker no-wait rolling restart that recovered in seconds now logs no stall lines, down from 2–3 per restart before.
 
 The 3-seat intermittent stall is still not diagnosed. Its committee jumps on 1 seat ahead, so this mechanism doesn't explain it.
