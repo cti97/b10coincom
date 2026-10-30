@@ -187,13 +187,12 @@ type ValidatorConfig struct {
 
 // peerAttestation is what one peer's HELLO leaves behind (audit C-6): the
 // height it last announced, the highest height a pull from it actually
-// reached, whether any pull has proven it at all, the wave it was last
-// refreshed in, the wave until which selection skips it, and the transport
-// name its latest HELLO arrived on (the address a pull is sent to).
+// reached, the wave it was last refreshed in, the wave until which selection
+// skips it, and the transport name its latest HELLO arrived on (the address a
+// pull is sent to).
 type peerAttestation struct {
 	height        uint64           // latest announced height
 	substantiated uint64           // highest height a pull from this peer reached (a HIGH-WATER mark: a transient failure never lowers it - F3)
-	proven        bool             // a pull from this peer has completed (successfully or not)
 	seen          uint64           // wave of the latest HELLO
 	demoted       uint64           // skip selection while demoted > the current wave
 	via           transport.PeerID // transport name the latest HELLO arrived on
@@ -1031,15 +1030,20 @@ func (v *Validator) peerWindow() uint64 {
 // substantiated (audit C-6). It returns the member's signed key (who), the
 // transport name its HELLO arrived on (via, where the pull is sent), and the
 // height it is trusted up to. Selection is deterministic: ties break on the
-// lexicographically smaller key, never on map iteration order. An unproven
-// member is worth exactly one window - enough to try, never enough to dwarf a
-// member that has served real blocks. Because the key is the member identity,
-// demoting one member cannot skip the honest members sharing its relay name
-// (round 7, F1).
+// lexicographically smaller key, never on map iteration order. A member is
+// worth one window above the higher of our own head and what a pull from it
+// ever reached - enough to try, never enough to dwarf a member that has served
+// real blocks. The window is RELATIVE: anchored at zero (or at a high-water
+// mark our head has since passed), it falls at or below our head and the node
+// never pulls again - a validator behind by any amount past the first window
+// froze for good, restart included (test run 2026-10-30, H-1). Because the key
+// is the member identity, demoting one member cannot skip the honest members
+// sharing its relay name (round 7, F1).
 func (v *Validator) tallestPeer() (who string, via transport.PeerID, h uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
 	win := v.peerWindow()
+	mine := v.ch.Height()
 	for id, st := range v.peerH {
 		if st.seen+peerHeightTTL < v.wave {
 			continue // not refreshed within a few waves: expired
@@ -1048,12 +1052,12 @@ func (v *Validator) tallestPeer() (who string, via transport.PeerID, h uint64) {
 			continue // a pull from this member proved nothing: rotate away
 		}
 		ch := st.height
-		if !st.proven {
-			if ch > win {
-				ch = win
-			}
-		} else if ch > st.substantiated+win {
-			ch = st.substantiated + win
+		base := st.substantiated
+		if base < mine {
+			base = mine
+		}
+		if ch > base+win {
+			ch = base + win
 		}
 		if ch > h || (ch == h && (who == "" || id < who)) {
 			who, via, h = id, st.via, ch
@@ -1077,7 +1081,6 @@ func (v *Validator) demotePeer(who string, reached uint64) {
 		return
 	}
 	st.demoted = v.wave + peerDemoteWaves
-	st.proven = true
 	if reached > st.substantiated {
 		st.substantiated = reached
 	}
@@ -1093,7 +1096,6 @@ func (v *Validator) substantiatePeer(who string, reached uint64) {
 	if st == nil {
 		return
 	}
-	st.proven = true
 	if reached > st.substantiated {
 		st.substantiated = reached
 	}
