@@ -105,7 +105,8 @@ type DiagCounters struct {
 	EarlyVotes uint64
 	// LateVotes is votes older than the retention window.
 	LateVotes uint64
-	// ForeignProposals is proposals for another height or round.
+	// ForeignProposals is proposals for another height, a round already left,
+	// or a round beyond the retention window ahead.
 	ForeignProposals uint64
 	// WrongProposerProposals is proposals that named a signer who is not the
 	// round's drawn proposer.
@@ -115,6 +116,12 @@ type DiagCounters struct {
 	DuplicateProposals uint64
 	// DuplicateVotes is votes already counted once in their round's set.
 	DuplicateVotes uint64
+	// EarlyProposals is proposals kept for a round ahead of the engine's own,
+	// to be adopted when it enters that round (roundSets.pending). Not a drop:
+	// a steadily climbing count is a validator joining every round after its
+	// peers - the phase lag that, before these were kept, stalled a three-seat
+	// committee with every one of them counted as foreign.
+	EarlyProposals uint64
 }
 
 // diagFill writes a snapshot of vs into d. own is the engine's own public key,
@@ -239,6 +246,7 @@ func (e *Engine) diagCounters() DiagCounters {
 		WrongProposerProposals: e.diag.wrongProposer,
 		DuplicateProposals:     e.diag.duplicateProposal,
 		DuplicateVotes:         e.diag.duplicateVote,
+		EarlyProposals:         e.diag.earlyProposal,
 	}
 }
 

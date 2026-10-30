@@ -249,6 +249,7 @@ type diagCounters struct {
 	wrongProposer     uint64
 	duplicateProposal uint64
 	duplicateVote     uint64
+	earlyProposal     uint64
 }
 
 // roundSets is one round's two tallies at this engine's height. Keeping them
@@ -268,6 +269,21 @@ type roundSets struct {
 	// engine could never recover from. The round window prunes this with the
 	// tallies, so retention is bounded by the same pastVoteRounds+1 rounds.
 	proposal *types.Block
+	// pending is a proposal that arrived for this round while the engine was
+	// still in an EARLIER one: verified on arrival (the round's own drawn
+	// proposer, its signature) and adopted by enterRound when the engine gets
+	// here. It exists because a proposal is broadcast once, when its proposer
+	// enters the round, and a validator that joins each round a little after
+	// its peers - every round, after a restart, since it joins by a timeout
+	// jump - would otherwise drop the one copy and never prevote anything
+	// (M5 network re-run, 2026-10-30: a three-seat committee stood still for
+	// minutes on exactly that). It is accepted only for rounds inside the
+	// futureVoteRounds window ahead, one per round, first one wins, and lives
+	// and is pruned with the round's tallies - so one left unadopted because a
+	// jump skipped its round is kept until the round falls out of the
+	// pastVoteRounds window behind (committedBlock can still serve it to a late
+	// quorum). At most futureVoteRounds + pastVoteRounds blocks are retained.
+	pending *Proposal
 }
 
 // errNoValidationSeam is what NewEngine's default seam returns. It is the
@@ -660,6 +676,22 @@ func (e *Engine) enterRound(round uint32) error {
 	if e.persistRound != nil {
 		e.persistRound(e.height, round)
 	}
+	// A proposal that reached this engine before it reached the round (see
+	// roundSets.pending) is adopted as if it arrived now, and judged now:
+	// maybePrevote runs the justification, the validation seam and the lock
+	// against it in this round. It goes BEFORE the buffered-vote decisions, in
+	// the order an on-time proposal takes, so a polka already buffered here
+	// locks with the block's bytes in hand (the proof-of-lock evidence).
+	if s := e.sets[round]; s != nil && s.pending != nil {
+		p := s.pending
+		s.pending = nil
+		e.proposal = &p.Block
+		e.proposalEn = p
+		s.proposal = e.proposal
+		if err := e.maybePrevote(); err != nil {
+			return err
+		}
+	}
 	if err := e.maybePrecommit(); err != nil {
 		return err
 	}
@@ -818,9 +850,12 @@ func (e *Engine) OnMessage(data []byte) error {
 }
 
 func (e *Engine) onProposal(p *Proposal) error {
+	if p.Height == e.height && p.Round > e.round && e.withinWindow(p.Round) {
+		return e.bufferProposal(p)
+	}
 	if p.Height != e.height || p.Round != e.round {
 		e.diag.foreignProposal++
-		return nil // another height or round: not ours to judge here
+		return nil // another height, a round already left, or one beyond the window
 	}
 	// A block whose header claims a height other than the envelope's own is a
 	// protocol error, refused here (audit C-1). Appending such a block is
@@ -859,6 +894,39 @@ func (e *Engine) onProposal(p *Proposal) error {
 	// needs these bytes to append. See roundSets.proposal.
 	e.setsFor(e.round).proposal = e.proposal
 	return e.maybePrevote()
+}
+
+// bufferProposal keeps a proposal for a round ahead of the engine's own, inside
+// the retention window, for enterRound to adopt (see roundSets.pending). It
+// runs the same checks the current-round path runs before it would keep a
+// proposal - the header's height, then the signer against the drawn proposer
+// of the round the proposal NAMES (membership before any Ed25519 work), then
+// the signature - and keeps the first such proposal per round. It judges
+// nothing: justification, block validity and the lock are all checked by
+// maybePrevote when the engine is IN the round, exactly as for a proposal that
+// arrived on time.
+func (e *Engine) bufferProposal(p *Proposal) error {
+	if p.Block.Header.Height != p.Height {
+		return fmt.Errorf("%w: header claims height %d, envelope names height %d",
+			ErrBadProposalHeight, p.Block.Header.Height, p.Height)
+	}
+	if string(p.Validator) != string(e.cfg.Proposer(e.height, p.Round, e.parent)) {
+		e.diag.wrongProposer++
+		return nil
+	}
+	// First proposal wins, as in the current round. Checked before Verify and
+	// without setsFor, so a second copy costs neither a signature check nor an
+	// allocation: the kept one was verified when it arrived.
+	if s := e.sets[p.Round]; s != nil && s.pending != nil {
+		e.diag.duplicateProposal++
+		return nil
+	}
+	if err := p.Verify(); err != nil {
+		return err
+	}
+	e.setsFor(p.Round).pending = p
+	e.diag.earlyProposal++
+	return nil
 }
 
 // noteFuture records, per member, the highest round at which that member has
@@ -1200,6 +1268,13 @@ func (e *Engine) committedBlock(id [32]byte) *types.Block {
 	}
 	if s := e.sets[e.commitRound]; s != nil && s.proposal != nil && s.proposal.ID() == id {
 		return s.proposal
+	}
+	// A commit quorum for a round ahead of the engine (commitAt adopts it)
+	// whose proposal arrived early sits in that round's pending slot, never
+	// adopted by enterRound; the quorum vouches for the ID, and Append
+	// re-validates the bytes.
+	if s := e.sets[e.commitRound]; s != nil && s.pending != nil && s.pending.Block.ID() == id {
+		return &s.pending.Block
 	}
 	if e.lockedBlock != nil && e.lockedBlock.ID() == id {
 		return e.lockedBlock
