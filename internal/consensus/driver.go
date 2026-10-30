@@ -99,6 +99,13 @@ type Driver struct {
 	// through HaltError so a stalled run is diagnosable rather than mute. The
 	// committed height is unaffected, exactly as for any other parked node.
 	haltErr error
+
+	// diagRounds is the bounded recent-round history a stalled run's report
+	// reads: the most recent diagRingRounds (height, round) observations,
+	// oldest first, updated in place by Observe. It is written only by the
+	// devnet harness (which calls Observe after each driver operation) and
+	// never read by a consensus decision. See diag.go.
+	diagRounds []DiagRound
 }
 
 // maxRoundEscalation is the STRIDE of one round-resync jump: jumpTarget

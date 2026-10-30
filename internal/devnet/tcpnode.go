@@ -275,6 +275,14 @@ type Validator struct {
 	// convergence test reads to prove the joiner ADOPTED rather than voted.
 	adopted atomic.Uint64
 
+	// framesIn counts verified consensus frames this node handed to its
+	// driver. It is the "did peer frames arrive at all" half of the stall
+	// report: a round with zero frames and a round whose frames were all
+	// dropped by the engine look the same from the committed height, and they
+	// are different faults. Read with atomic because route runs on several
+	// transport reader goroutines.
+	framesIn atomic.Uint64
+
 	// closing gates the dispatch path: Close sets it (under mu, so a reader
 	// goroutine already inside a driver operation finishes first), and every
 	// route() afterwards refuses to touch the engine, the router or the
@@ -640,6 +648,81 @@ func (v *Validator) PeerCount() int { return len(v.ttp.Peers()) }
 // the returning-weight assertions read.
 func (v *Validator) VotedHeights() []uint64 { return v.drvTP.VotedHeights() }
 
+// FramesIn reports how many verified consensus frames this validator handed to
+// its driver. Together with the router counters it separates "no frames
+// arrived" from "frames arrived and were refused, duplicated, or dropped by
+// the engine": a zero here on a node with peers is a delivery fault, a
+// nonzero here with zero tallied votes is a judging fault.
+func (v *Validator) FramesIn() uint64 { return v.framesIn.Load() }
+
+// Step reports the driver's current consensus step, read under the driver
+// mutex exactly as Round and AppendRefused are. On a stalled node "propose"
+// with no proposal received is a different fault from "prevote" with a tally
+// short of quorum.
+func (v *Validator) Step() consensus.Step {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return consensus.StepPropose
+	}
+	return v.drv.DiagStep()
+}
+
+// DiagRounds returns a copy of the driver's bounded recent-round history: the
+// proposer drawn, whether a proposal arrived, what the engine prevoted, and
+// the two tallies per round. See consensus.Driver.Observe.
+func (v *Validator) DiagRounds() []consensus.DiagRound {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return nil
+	}
+	// Fold the engine's CURRENT state into the ring before copying it. The
+	// harness observes after every operation, so this is normally a no-op;
+	// it guarantees a poll taken between two ticks never reports a round
+	// older than the engine it is looking at.
+	v.drv.Observe()
+	return v.drv.DiagRounds()
+}
+
+// DiagCounters reports the engine's frame-drop counters (per height).
+func (v *Validator) DiagCounters() consensus.DiagCounters {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return consensus.DiagCounters{}
+	}
+	return v.drv.DiagCounters()
+}
+
+// Quorum reports the quorum threshold at the height the engine is judging.
+func (v *Validator) Quorum() uint64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return 0
+	}
+	return v.drv.DiagQuorum()
+}
+
+// TotalPower reports the committee's total voting power at the height the
+// engine is judging; printed beside Quorum so a power sum means something.
+func (v *Validator) TotalPower() uint64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.drv == nil {
+		return 0
+	}
+	return v.drv.DiagTotalPower()
+}
+
+// Router counters. They are atomics on the router and safe to read from the
+// poll goroutine; the report prints them per validator because the refused and
+// duplicate counts are per node, not per committee.
+func (v *Validator) RefusedBeforeVerify() uint64 { return v.rt.RefusedBeforeVerify() }
+func (v *Validator) DuplicatesDropped() uint64   { return v.rt.DuplicatesDropped() }
+func (v *Validator) UnknownDropped() uint64      { return v.rt.UnknownDropped() }
+
 // route is the transport's OnMessage callback. It classifies by verified
 // decode and, for consensus frames, hands the message to the active driver
 // under mu - the serialisation that keeps the engine single-threaded across
@@ -657,7 +740,12 @@ func (v *Validator) route(m transport.Message) {
 		if v.closing.Load() {
 			return
 		}
+		v.framesIn.Add(1)
 		(*f)(m)
+		// Record what the engine retained after this frame. The observe call
+		// is diagnostic only and runs under the same lock as the driver
+		// operation, so it can never read a half-driven engine.
+		v.drv.Observe()
 	}
 }
 
@@ -689,6 +777,7 @@ func (v *Validator) tickLoop() {
 			now := clock.tick(v.cfg.TickEvery)
 			v.mu.Lock()
 			v.drv.Tick(now)
+			v.drv.Observe()
 			v.mu.Unlock()
 		}
 	}

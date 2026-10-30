@@ -230,6 +230,25 @@ type Engine struct {
 	// needs to know which round's votes are the evidence.
 	commitRound uint32
 	out         []Outbound
+
+	// diag counts the frames this engine refused on its own paths (other
+	// height, outside the round window, foreign or duplicate proposal). It is
+	// observation only - no decision reads it - and it is where a stalled
+	// run's report gets "the frames arrived but could not be judged" from.
+	// See diag.go.
+	diag diagCounters
+}
+
+// diagCounters is the engine-side half of the frame-loss count. See
+// DiagCounters for what each field means.
+type diagCounters struct {
+	otherHeight       uint64
+	early             uint64
+	late              uint64
+	foreignProposal   uint64
+	wrongProposer     uint64
+	duplicateProposal uint64
+	duplicateVote     uint64
 }
 
 // roundSets is one round's two tallies at this engine's height. Keeping them
@@ -800,6 +819,7 @@ func (e *Engine) OnMessage(data []byte) error {
 
 func (e *Engine) onProposal(p *Proposal) error {
 	if p.Height != e.height || p.Round != e.round {
+		e.diag.foreignProposal++
 		return nil // another height or round: not ours to judge here
 	}
 	// A block whose header claims a height other than the envelope's own is a
@@ -821,12 +841,14 @@ func (e *Engine) onProposal(p *Proposal) error {
 	// fully verified below - the reorder skips only the frames the very next
 	// check would drop anyway.
 	if string(p.Validator) != string(e.Proposer()) {
+		e.diag.wrongProposer++
 		return nil // not the proposer for this round (and not a member); ignore it
 	}
 	if err := p.Verify(); err != nil {
 		return err
 	}
 	if e.proposal != nil {
+		e.diag.duplicateProposal++
 		return nil // first proposal wins, so the choice is deterministic
 	}
 	e.proposal = &p.Block
@@ -868,9 +890,11 @@ func (e *Engine) noteFuture(idx int, v *Vote) {
 // tally, whether it names the current round, a buffered one, or one far ahead.
 func (e *Engine) onVote(v *Vote) error {
 	if v.Height != e.height {
+		e.diag.otherHeight++
 		return nil // another height: behind us or not reached, not ours to judge
 	}
 	if v.Round > e.round && !e.withinWindow(v.Round) {
+		e.diag.early++
 		// Outside the buffer, ahead of us: the vote is not retained, but the
 		// member's claim is still evidence the committee has moved on.
 		// Membership first (audit C-8): a free linear scan against a
@@ -881,6 +905,7 @@ func (e *Engine) onVote(v *Vote) error {
 		return nil
 	}
 	if !e.withinWindow(v.Round) {
+		e.diag.late++
 		return nil // older than the retained window: the committee has left it
 	}
 	s := e.setsFor(v.Round)
@@ -891,6 +916,7 @@ func (e *Engine) onVote(v *Vote) error {
 			return err
 		}
 		if !added {
+			e.diag.duplicateVote++
 			return nil // a duplicate: its weight is already counted
 		}
 		switch {
@@ -910,6 +936,7 @@ func (e *Engine) onVote(v *Vote) error {
 			return err
 		}
 		if !added {
+			e.diag.duplicateVote++
 			return nil
 		}
 		switch {
