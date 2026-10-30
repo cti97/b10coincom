@@ -1551,6 +1551,66 @@ func TestBackoffClampsAtMax(t *testing.T) {
 	}
 }
 
+// TestDefaultOptionsBackOffGrows pins the DEFAULT reconnection curve, not a
+// hand-built base/max pair: it is the zero-valued Options that devnet/tcpnode.go
+// passes, and the audit's M-1 was that the normaliser defaulted BackoffBase but
+// not BackoffMax, so the ceiling clamp raised max to the base and the curve was
+// a flat line at 50-100 ms forever (a node with a wrong relay token was
+// observed redialling the gate 792 times in 60 s). The "30 s ceiling" existed
+// only in the constant.
+//
+// The growth is CONSTRUCTED, never waited for: Backoff.Next is the pure
+// function the maintainer sleeps on, its jitter comes from a seeded rng, and
+// the documented window for attempt n is [floor(n)/2, floor(n)) with
+// floor(n) = base * 2^(n-1) clamped at max. So the assertion is the window
+// sequence a fixed seed produces - no socket, no sleep, milliseconds of test
+// time - while the reconnection test below already exercises the same curve
+// over a real dead address. Before the fix the first assertion fails: attempt
+// 1 and attempt 12 both land in [50ms, 100ms).
+func TestDefaultOptionsBackOffGrows(t *testing.T) {
+	opts := Options{LocalID: "defaults"}.withDefaults()
+	if opts.BackoffBase != DefaultBackoffBase {
+		t.Fatalf("default base is %v, want %v", opts.BackoffBase, DefaultBackoffBase)
+	}
+	if opts.BackoffMax != DefaultBackoffMax {
+		t.Fatalf("zero-valued Options normalised BackoffMax to %v, want the %v ceiling: a ceiling equal to the base is a flat 50-100 ms redial loop (M-1)", opts.BackoffMax, DefaultBackoffMax)
+	}
+	if opts.BackoffMax <= opts.BackoffBase {
+		t.Fatalf("default curve does not grow: base %v, max %v", opts.BackoffBase, opts.BackoffMax)
+	}
+
+	b := NewBackoff(opts.BackoffBase, opts.BackoffMax, rand.New(rand.NewSource(7)))
+	// floor(n) doubles from base, clamped at max; attempt 12's floor is
+	// 100ms<<11, past the 30 s ceiling.
+	prev := time.Duration(0)
+	for attempt := 1; attempt <= 12; attempt++ {
+		floor := opts.BackoffBase
+		for i := 1; i < attempt && floor < opts.BackoffMax; i++ {
+			floor *= 2
+		}
+		clamped := floor >= opts.BackoffMax
+		floor = min(floor, opts.BackoffMax)
+		d := b.Next(attempt)
+		if d < floor/2 || d >= floor {
+			t.Fatalf("attempt %d delay %v outside the documented window [%v, %v): the curve is not the configured one", attempt, d, floor/2, floor)
+		}
+		// Strict growth holds only while the curve is still doubling: every
+		// pre-clamp window ([b/2,b), [b,2b), [2b,4b), ...) lies strictly above
+		// the previous one. Past the ceiling all draws share one window and
+		// may not grow, by design.
+		if attempt > 1 && !clamped && d <= prev {
+			t.Fatalf("attempt %d delay %v did not grow past attempt %d's %v: the interval is not increasing", attempt, d, attempt-1, prev)
+		}
+		prev = d
+	}
+	// The ceiling is actually REACHED: the last attempt's window is
+	// [15s, 30s), which is the growth an operator waits for on a dead relay
+	// and the property the flat curve could never supply.
+	if prev < DefaultBackoffMax/2 {
+		t.Fatalf("attempt 12 waited %v; want at least half the %v ceiling - the curve never reaches its ceiling", prev, DefaultBackoffMax)
+	}
+}
+
 // TestAStrangerThroughTheRelayCannotSilenceAValidator is the audit's N-1
 // flagship, run as the attack describes it: a stranger connected to the
 // relay streams a validator's own name ("v0") forever, FROM BEFORE the

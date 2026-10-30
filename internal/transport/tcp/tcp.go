@@ -347,6 +347,15 @@ func (o Options) withDefaults() Options {
 	if o.BackoffBase <= 0 {
 		o.BackoffBase = DefaultBackoffBase
 	}
+	// BackoffMax has its OWN default, and it is not the base (audit M-1). A
+	// zero value used to fall through to the clamp below and become exactly
+	// the base, so every redial of a zero-valued Options - which is what
+	// devnet/tcpnode.go passes - waited 50-100 ms forever: a busy redial loop
+	// against a dead address, the one thing the curve exists to prevent.
+	// TestDefaultOptionsBackOffGrows pins the difference.
+	if o.BackoffMax <= 0 {
+		o.BackoffMax = DefaultBackoffMax
+	}
 	if o.BackoffMax < o.BackoffBase {
 		// A ceiling below the floor would make the curve a flat line at an
 		// arbitrary point; raise the ceiling to the floor instead.
