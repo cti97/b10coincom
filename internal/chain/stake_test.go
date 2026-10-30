@@ -147,11 +147,11 @@ func TestACommitteeFileGenesisSeatsAtTheFloor(t *testing.T) {
 
 // TestARealChainBondsThenUnbondsOnTheGenesisCooldown walks a real chain's
 // transition: a dev account bonds out of its spendable balance, then unbonds at
-// the chain's OWN epoch length. The release height asserted here is
+// the chain's OWN epoch length. The cooldown's floor is
 // height + UnbondingEpochs*EpochBlocks with the genesis values (1 +
-// 2*1,000 = 2,001 on the devnet), which is the cooldown the plan's derivation
-// names - and the assertion fails if any of the three parameters is left
-// unwired.
+// 2*1,000 = 2,001 on the devnet), and the release height is the epoch boundary
+// at or after it (3,000 on 1,000-block epochs, audit ST-4) - and the assertion
+// fails if any of the three parameters is left unwired.
 func TestARealChainBondsThenUnbondsOnTheGenesisCooldown(t *testing.T) {
 	c, _ := devChain(t)
 	g := c.Genesis()
@@ -193,10 +193,21 @@ func TestARealChainBondsThenUnbondsOnTheGenesisCooldown(t *testing.T) {
 		t.Fatalf("Unbond against the state the chain produced: %v", err)
 	}
 	recs := next.UnbondingOf(addr)
-	wantRelease := uint64(1) + g.Params.UnbondingEpochs*g.Params.EpochBlocks
+	// The cooldown's floor is 1 + 2*1,000 = 2,001; the release height is the
+	// EPOCH BOUNDARY at or after it (audit ST-4), which on the devnet's
+	// 1,000-block epochs is 3,000. Rounding is upward only: the release is never
+	// earlier than the cooldown.
+	floor := uint64(1) + g.Params.UnbondingEpochs*g.Params.EpochBlocks
+	wantRelease := uint64(3_000)
 	if len(recs) != 1 || recs[0].Amount != g.Params.MinStakeSparks || recs[0].ReleaseHeight != wantRelease {
-		t.Fatalf("unbonding = %+v, want one %d-spark record releasing at %d (1 + %d epochs x %d blocks)",
-			recs, g.Params.MinStakeSparks, wantRelease, g.Params.UnbondingEpochs, g.Params.EpochBlocks)
+		t.Fatalf("unbonding = %+v, want one %d-spark record releasing at %d (the epoch boundary at or after %d = 1 + %d epochs x %d blocks)",
+			recs, g.Params.MinStakeSparks, wantRelease, floor, g.Params.UnbondingEpochs, g.Params.EpochBlocks)
+	}
+	if recs[0].ReleaseHeight < floor {
+		t.Fatalf("release height %d is earlier than the cooldown floor %d", recs[0].ReleaseHeight, floor)
+	}
+	if recs[0].ReleaseHeight%g.Params.EpochBlocks != 0 {
+		t.Fatalf("release height %d is not an epoch boundary (%d-block epochs)", recs[0].ReleaseHeight, g.Params.EpochBlocks)
 	}
 	if got := next.Bonded(addr); got != 0 {
 		t.Fatalf("Bonded = %d after unbonding the whole bond, want 0", got)

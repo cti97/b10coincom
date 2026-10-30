@@ -46,8 +46,12 @@ type State struct {
 	bonds map[types.Address]Bond
 
 	// unbonding holds per address the records an Unbond created, each with the
-	// height that releases it. Records at one release height are merged, so
-	// spam is bounded by distinct heights rather than by transactions.
+	// height that releases it. Records merge at one release height, and every
+	// release height is an EPOCH BOUNDARY (audit ST-4), so an address holds at
+	// most UnbondingEpochs+1 UNMATURED records however many unbonds it sends,
+	// and at most UnbondingEpochs+2 in all once already-matured records are
+	// collapsed (applyUnbond's mergeUnbonding). Before the rounding it held one
+	// record per distinct height, i.e. one per block.
 	unbonding map[types.Address][]Unbonding
 
 	// params are the protocol values the claim rule verifies against. They
@@ -112,7 +116,9 @@ type Params struct {
 
 	// UnbondingEpochs is the cooldown length in EPOCHS, not blocks, so a chain
 	// that lengthens its epochs lengthens the cooldown with it. The release
-	// height is height + UnbondingEpochs*EpochBlocks (see releaseHeightFor).
+	// height is the epoch boundary at or after
+	// height + UnbondingEpochs*EpochBlocks (see releaseHeightFor), so the
+	// cooldown is a lower bound and one epoch's unbonds share a release height.
 	// It comes from genesis.Params.UnbondingEpochs.
 	UnbondingEpochs uint64
 
@@ -191,7 +197,7 @@ func (s *State) Clone() *State {
 		out.accounts[k] = v
 	}
 	for k, v := range s.bonds {
-		out.bonds[k] = Bond{Validator: slices.Clone(v.Validator), Amount: v.Amount, Height: v.Height}
+		out.bonds[k] = Bond{Validator: slices.Clone(v.Validator), Amount: v.Amount, Unfunded: v.Unfunded, Height: v.Height}
 	}
 	for k, v := range s.unbonding {
 		out.unbonding[k] = slices.Clone(v)
@@ -240,10 +246,14 @@ func sortedAddressKeys[V any](m map[types.Address]V) []types.Address {
 //
 // The account leaf covers all three account fields: a claim marker that was not
 // committed would not be consensus, and the one-claim-per-epoch rule would be
-// unenforceable across nodes. The bond leaf covers the seated key, the amount
-// and the height; the unbonding leaf covers the maturity schedule - the count,
-// then each (amount, releaseHeight) pair in release-height order - so changing
-// WHEN a record releases moves the root even when the amount does not.
+// unenforceable across nodes. The bond leaf covers the seated key, the amount,
+// the UNFUNDED amount and the height; the unbonding leaf covers the maturity
+// schedule - the count, then each (amount, releaseHeight) pair in
+// release-height order - so changing WHEN a record releases moves the root even
+// when the amount does. Unfunded is committed (audit ST-3) because it decides
+// whether an Unbond pays out or burns: two nodes that disagreed on it would
+// disagree on the balance at the release height while agreeing on every leaf
+// that did not carry it.
 func (s *State) Root() [32]byte {
 	addrs := sortedAddressKeys(s.accounts)
 	leaves := make([][32]byte, 0, len(addrs)+len(s.bonds)+len(s.unbonding))
@@ -263,6 +273,7 @@ func (s *State) Root() [32]byte {
 		c := types.NewEncoder()
 		c.VarBytes(b.Validator)
 		c.U64(b.Amount)
+		c.U64(b.Unfunded)
 		c.U64(b.Height)
 		leaves = append(leaves, crypto.HashParts([]byte("b10coin-bond"), a[:], c.Bytes()))
 	}

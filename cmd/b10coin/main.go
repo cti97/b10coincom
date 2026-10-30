@@ -484,13 +484,18 @@ type stakingStatus struct {
 	CommitteeSize   int    `json:"committee_size"`
 }
 
-// stakingAccount is GET /account/{address}'s body.
+// stakingAccount is GET /account/{address}'s body. BondUnfunded is the part of
+// Bonded that came from the genesis grant and is therefore not withdrawable
+// (audit ST-3); UnbondingTotal is how many records the node holds, so the
+// verb can tell a windowed reply from a complete one (audit ST-4).
 type stakingAccount struct {
-	Address   string                `json:"address"`
-	Balance   uint64                `json:"balance"`
-	Nonce     uint64                `json:"nonce"`
-	Bonded    uint64                `json:"bonded"`
-	Unbonding []stakingUnbondingRec `json:"unbonding"`
+	Address        string                `json:"address"`
+	Balance        uint64                `json:"balance"`
+	Nonce          uint64                `json:"nonce"`
+	Bonded         uint64                `json:"bonded"`
+	BondUnfunded   uint64                `json:"bond_unfunded"`
+	Unbonding      []stakingUnbondingRec `json:"unbonding"`
+	UnbondingTotal int                   `json:"unbonding_total"`
 }
 
 type stakingUnbondingRec struct {
@@ -590,6 +595,53 @@ func cooldownBlocks(st stakingStatus) (uint64, bool) {
 		return 0, false
 	}
 	return st.UnbondingEpochs * st.EpochBlocks, true
+}
+
+// ceilToEpoch rounds h UP to the next multiple of epochBlocks: the rule
+// state.releaseHeightFor applies to an unbond's release height, mirrored here
+// so the verb forecasts the height the chain will actually record (audit ST-4).
+// ok=false on a zero epoch length or an overflow; the caller then prints no
+// forecast rather than a wrong one.
+func ceilToEpoch(h, epochBlocks uint64) (uint64, bool) {
+	if epochBlocks == 0 {
+		return 0, false
+	}
+	rem := h % epochBlocks
+	if rem == 0 {
+		return h, true
+	}
+	add := epochBlocks - rem
+	if h > math.MaxUint64-add {
+		return 0, false
+	}
+	return h + add, true
+}
+
+// releaseForecast is the "release" line cmdUnstake prints, as a function so the
+// arithmetic and the genesis-bond case are testable without capturing stdout.
+//
+// amount <= bondUnfunded means the whole exit is the seat's unfunded genesis
+// power, which the state DESTROYS rather than records (audit ST-3): printing a
+// release height for it would promise a payout that cannot happen. Otherwise
+// the funded part is recorded, and its release height is the epoch boundary at
+// or after the earliest applying block (head+1) plus the cooldown.
+func releaseForecast(amount, bondUnfunded uint64, st stakingStatus, cooldown uint64) (string, bool) {
+	if amount <= bondUnfunded {
+		return fmt.Sprintf("nothing: all %d sparks of this exit are the seat's UNFUNDED genesis power, which an unbond destroys instead of releasing (audit ST-3)", amount), true
+	}
+	earliest := st.Height + 1
+	if earliest == 0 { // head was MaxUint64; a wrapped "earliest" would forecast the past
+		return "", false
+	}
+	if earliest > math.MaxUint64-cooldown {
+		return "", false
+	}
+	release, ok := ceilToEpoch(earliest+cooldown, st.EpochBlocks)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("height %d at the earliest (submitted at head %d; the cooldown is %d epochs x %d blocks = %d blocks, and the release height is the epoch boundary at or after head+1+cooldown)",
+		release, st.Height, st.UnbondingEpochs, st.EpochBlocks, cooldown), true
 }
 
 func cmdStake(args []string) error {
@@ -728,14 +780,22 @@ func cmdUnstake(args []string) error {
 	fmt.Printf("nonce       %d\n", t.account.Nonce)
 	fmt.Printf("fee         0 sparks (an exit is free by consensus rule)\n")
 	fmt.Printf("txid        %s\n", txid)
-	if cooldown, ok := cooldownBlocks(t.status); ok && t.status.Height < math.MaxUint64 {
+	if cooldown, ok := cooldownBlocks(t.status); ok {
 		// The applying block is at least head+1, so this is the EARLIEST
 		// release height; the block that actually applies the unbond sets the
 		// exact one. Stated as an estimate rather than as a receipt.
-		fmt.Printf("release     height %d at the earliest (submitted at head %d; the cooldown is %d epochs x %d blocks = %d blocks)\n",
-			t.status.Height+1+cooldown, t.status.Height, t.status.UnbondingEpochs, t.status.EpochBlocks, cooldown)
+		if line, ok := releaseForecast(amount, t.account.BondUnfunded, t.status, cooldown); ok {
+			fmt.Printf("release     %s\n", line)
+		}
 	}
-	fmt.Println("the coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then.")
+	if amount > t.account.BondUnfunded {
+		if t.account.BondUnfunded > 0 {
+			fmt.Printf("unfunded    %d sparks of this exit are the seat's unfunded genesis power and are destroyed, not released (audit ST-3)\n", t.account.BondUnfunded)
+		}
+		fmt.Println("the coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then.")
+	} else {
+		fmt.Println("the seat is gone from the committee and there is nothing to withdraw: a genesis grant was never funded (audit ST-3).")
+	}
 	return nil
 }
 
@@ -753,8 +813,15 @@ func cmdWithdraw(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A windowed reply must not be mistaken for a complete one: a matured
+	// record outside the window would be missed, and this verb signs one
+	// Withdraw for every matured record the STATE holds (not one per record it
+	// saw), so the count it reports has to come from the node's total.
+	if t.account.UnbondingTotal > len(t.account.Unbonding) {
+		return fmt.Errorf("the node reports %d unbonding record(s) but returned %d (a windowed reply; audit ST-4); this verb needs all of them - retry against a node whose reply is not truncated", t.account.UnbondingTotal, len(t.account.Unbonding))
+	}
 	if len(t.account.Unbonding) == 0 {
-		return fmt.Errorf("the account %s has no unbonding record; there is nothing to withdraw (a record is created by `b10coin unstake`)", t.addr)
+		return fmt.Errorf("the account %s has no unbonding record; there is nothing to withdraw (a record is created by `b10coin unstake`; a genesis seat's unfunded power is destroyed on unstake, not recorded)", t.addr)
 	}
 	// A transaction submitted now applies at head+1 at the earliest, so a
 	// record releasing at head+1 is mature by the time it executes. Testing

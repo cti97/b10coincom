@@ -117,9 +117,10 @@ func genesisState(g *genesis.Genesis) *state.State {
 		MinFee:      g.Params.MinFeeSparks,
 		// The staking rules' parameters (M5 Task 1). MinStake is the floor a
 		// Bond's RESULT must clear, UnbondingEpochs is the cooldown in epochs
-		// (the release height is height + UnbondingEpochs*EpochBlocks, which
-		// reuses the EpochBlocks wired above), and CommitteeSize is what the
-		// committee derivation will fill. Wiring them here is what makes them
+		// (the release height is the epoch boundary at or after
+		// height + UnbondingEpochs*EpochBlocks, which reuses the EpochBlocks
+		// wired above), and CommitteeSize is what the committee derivation
+		// will fill. Wiring them here is what makes them
 		// consensus behaviour on a real chain rather than values that exist
 		// only in states tests construct by hand.
 		MinStake:        g.Params.MinStakeSparks,
@@ -139,6 +140,12 @@ func genesisState(g *genesis.Genesis) *state.State {
 	// the acceptance root) moves in M5 Task 1: a bond is committed state, and
 	// before this task the state held no bonds at all.
 	//
+	// Unfunded = Power is what stops that from being a premine (audit ST-3):
+	// the seat's voting power is real, but state.applyUnbond DESTROYS the
+	// unfunded part instead of recording it for withdrawal, so no spark of it
+	// can ever become a balance. A genesis validator that wants withdrawable
+	// stake bonds its own funds on top, and those sparks are recorded funded.
+	//
 	// Amount is the genesis Validator.Power, unscaled: for a genesis seat the
 	// power IS its bond, and rescaling it would change every M3/M4 quorum and
 	// proposer draw for no milestone reason. Height 0 records that the stake
@@ -147,6 +154,7 @@ func genesisState(g *genesis.Genesis) *state.State {
 		st.SetBond(types.AddressFromPub(v.PubKey), state.Bond{
 			Validator: append([]byte(nil), v.PubKey...),
 			Amount:    v.Power,
+			Unfunded:  v.Power,
 			Height:    0,
 		})
 	}

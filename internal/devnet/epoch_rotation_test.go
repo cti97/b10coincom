@@ -179,6 +179,23 @@ func TestTheCommitteeRotatesAtAnEpochBoundaryEndToEnd(t *testing.T) {
 		return true
 	})
 
+	// AUDIT ST-3, on the acceptance fixture itself: the departing seat's bond
+	// is a GENESIS bond (this fixture seeds six seats at MIN_STAKE with no
+	// account behind them), so its exit is legal but pays nothing. No unbonding
+	// record exists to mature and no balance appears - the power leaves the
+	// committee without becoming money. Before ST-3 this fixture would have
+	// created a MIN_STAKE unbonding record that the departing operator could
+	// withdraw after one cooldown, free.
+	for _, v := range vs {
+		st := v.Chain().State()
+		if recs := st.UnbondingOf(departingAddr); len(recs) != 0 {
+			t.Fatalf("validator at %s recorded %+v: a genesis seat's power must not become withdrawable (audit ST-3)", v.Addr(), recs)
+		}
+		if got := st.Get(departingAddr).Balance; got != 0 {
+			t.Fatalf("validator at %s credits the departed seat %d sparks: the genesis bond was never funded", v.Addr(), got)
+		}
+	}
+
 	// The boundary the Unbond decides: its own epoch's end.
 	unbondHeight := blockContaining(t, vs[0], txID)
 	if unbondHeight == 0 {

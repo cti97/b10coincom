@@ -277,8 +277,11 @@ func TestUnbondingCoinsAreNeitherSpendableNorCounted(t *testing.T) {
 	if got, want := s.TotalUnbonding(), uint64(600*b10); got != want {
 		t.Fatalf("TotalUnbonding = %d, want %d", got, want)
 	}
-	if recs := s.UnbondingOf(addr); len(recs) != 1 || recs[0].Amount != 600*b10 || recs[0].ReleaseHeight != 5+stakeCooldown {
-		t.Fatalf("UnbondingOf = %+v, want one 600 b10 record releasing at %d", recs, 5+stakeCooldown)
+	// The cooldown is 20 blocks and the unbond is at height 5: 5+20 = 25,
+	// rounded UP to the next 10-block epoch boundary = 30 (audit ST-4).
+	const wantRelease = uint64(30)
+	if recs := s.UnbondingOf(addr); len(recs) != 1 || recs[0].Amount != 600*b10 || recs[0].ReleaseHeight != wantRelease {
+		t.Fatalf("UnbondingOf = %+v, want one 600 b10 record releasing at %d", recs, wantRelease)
 	}
 
 	// 2. Not spendable: the account holds zero spendable sparks, so a transfer
@@ -291,7 +294,7 @@ func TestUnbondingCoinsAreNeitherSpendableNorCounted(t *testing.T) {
 
 	// 3. And not spendable at ANY point before the release height: a Withdraw
 	// at R-1 is refused too, so the coins cannot be moved back early.
-	s.SetHeight(5 + stakeCooldown - 1)
+	s.SetHeight(wantRelease - 1)
 	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 2)); !errors.Is(err, ErrNothingToWithdraw) {
 		t.Fatalf("Withdraw one block early: err = %v, want ErrNothingToWithdraw", err)
 	}
@@ -304,12 +307,15 @@ func TestUnbondingCoinsAreNeitherSpendableNorCounted(t *testing.T) {
 func TestWithdrawReleasesOnlyMatured(t *testing.T) {
 	s, addr, pub, priv := bondedValidator(t, 2_000*b10, 0)
 
+	// Two unbonds in DIFFERENT epoch buckets, so they must stay separate
+	// records: height 5 -> 5+20 = 25 -> boundary 30; height 11 -> 31 ->
+	// boundary 40 (audit ST-4's rounding).
 	s.SetHeight(5)
-	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 400*b10)); err != nil { // releases at 25
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 400*b10)); err != nil { // releases at 30
 		t.Fatalf("first unbond: %v", err)
 	}
-	s.SetHeight(10)
-	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 2, 600*b10)); err != nil { // releases at 30
+	s.SetHeight(11)
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 2, 600*b10)); err != nil { // releases at 40
 		t.Fatalf("second unbond: %v", err)
 	}
 	if got := s.Bonded(addr); got != 1_000*b10 {
@@ -317,7 +323,7 @@ func TestWithdrawReleasesOnlyMatured(t *testing.T) {
 	}
 
 	// At the first record's release height only the first is mature.
-	s.SetHeight(5 + stakeCooldown)
+	s.SetHeight(30)
 	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 3)); err != nil {
 		t.Fatalf("Withdraw at the first release height: %v", err)
 	}
@@ -325,12 +331,12 @@ func TestWithdrawReleasesOnlyMatured(t *testing.T) {
 		t.Fatalf("balance = %d, want %d (only the first record is mature)", got, want)
 	}
 	recs := s.UnbondingOf(addr)
-	if len(recs) != 1 || recs[0].Amount != 600*b10 || recs[0].ReleaseHeight != 10+stakeCooldown {
-		t.Fatalf("remaining records = %+v, want the 600 b10 record releasing at %d", recs, 10+stakeCooldown)
+	if len(recs) != 1 || recs[0].Amount != 600*b10 || recs[0].ReleaseHeight != 40 {
+		t.Fatalf("remaining records = %+v, want the 600 b10 record releasing at 40", recs)
 	}
 
 	// The second matures at its own release height.
-	s.SetHeight(10 + stakeCooldown)
+	s.SetHeight(40)
 	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 4)); err != nil {
 		t.Fatalf("Withdraw at the second release height: %v", err)
 	}
@@ -340,9 +346,10 @@ func TestWithdrawReleasesOnlyMatured(t *testing.T) {
 }
 
 // TestWithdrawAtExactlyTheReleaseHeight is the cooldown arithmetic's sharp test:
-// R is the unbond height plus TWO epochs of blocks, a withdraw one block before
-// R is refused, at R it pays the exact amount, and a second attempt at R is
-// refused because the record is gone - the payout happens exactly once.
+// R is the epoch boundary at or after the unbond height plus TWO epochs of
+// blocks, a withdraw one block before R is refused, at R it pays the exact
+// amount, and a second attempt at R is refused because the record is gone - the
+// payout happens exactly once.
 func TestWithdrawAtExactlyTheReleaseHeight(t *testing.T) {
 	s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
 
@@ -351,12 +358,17 @@ func TestWithdrawAtExactlyTheReleaseHeight(t *testing.T) {
 	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, minStakeSparks)); err != nil {
 		t.Fatalf("Unbond: %v", err)
 	}
-	// The record's release height is derived, and pinned, as
-	// height + UnbondingEpochs*EpochBlocks: 7 + 2*10 = 27.
-	const wantRelease = unbondHeight + stakeCooldown
+	// The record's release height is derived, and pinned, as the epoch boundary
+	// at or after height + UnbondingEpochs*EpochBlocks: 7 + 2*10 = 27, rounded
+	// up to 30 because release heights are multiples of the 10-block epoch
+	// (audit ST-4). The cooldown is never shortened, so 30 >= 27.
+	const wantRelease = uint64(30)
+	if wantRelease < unbondHeight+stakeCooldown {
+		t.Fatalf("fixture error: wantRelease %d is earlier than the cooldown's floor %d", wantRelease, unbondHeight+stakeCooldown)
+	}
 	recs := s.UnbondingOf(addr)
 	if len(recs) != 1 || recs[0].ReleaseHeight != wantRelease {
-		t.Fatalf("release height = %+v, want %d = %d + 2 epochs x %d blocks",
+		t.Fatalf("release height = %+v, want %d = the epoch boundary at or after %d + 2 epochs x %d blocks",
 			recs, wantRelease, unbondHeight, stakeTestEpochBlocks)
 	}
 
@@ -428,8 +440,9 @@ func TestAStakeTransactionNeverChangesTheSupplySum(t *testing.T) {
 	}
 	check("unbond")
 
-	// Withdraw: unbonding -> spendable, free.
-	s.SetHeight(4 + stakeCooldown)
+	// Withdraw: unbonding -> spendable, free. 4 + 20 = 24, rounded up to the
+	// 10-block epoch boundary 30 (audit ST-4).
+	s.SetHeight(30)
 	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 3)); err != nil {
 		t.Fatalf("Withdraw: %v", err)
 	}
@@ -489,6 +502,19 @@ func TestTheStateRootCommitsToBondsAndUnbonding(t *testing.T) {
 	bondKey.SetBond(a, Bond{Validator: pubC, Amount: 500, Height: 0})
 	if bondA.Root() == bondKey.Root() {
 		t.Fatal("the state root does not commit to the seated public key")
+	}
+
+	// The UNFUNDED part is committed (audit ST-3). It decides whether an
+	// Unbond pays out or destroys the sparks, so two nodes that disagreed on it
+	// would disagree on the balance at the release height; a root that skipped
+	// it would let them agree on every leaf and still fork.
+	bondUnfunded := base.Clone()
+	bondUnfunded.SetBond(a, Bond{Validator: pubA, Amount: 500, Unfunded: 500, Height: 0})
+	if bondA.Root() == bondUnfunded.Root() {
+		t.Fatal("the state root does not commit to the bond's unfunded (non-withdrawable) part")
+	}
+	if bondUnfunded.Root() == bondKey.Root() {
+		t.Fatal("two different bonds hashed to one leaf")
 	}
 
 	// An unbonding record moves the root, and its RELEASE HEIGHT is committed:
@@ -608,7 +634,8 @@ func TestStakeTransactionsSpendTheNonce(t *testing.T) {
 	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 100*b10)); !errors.Is(err, ErrBadNonce) {
 		t.Fatalf("replayed Unbond: err = %v, want ErrBadNonce", err)
 	}
-	s.SetHeight(5 + stakeCooldown)
+	// 5 + 20 = 25, rounded up to the 10-block epoch boundary 30 (audit ST-4).
+	s.SetHeight(30)
 	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 2)); err != nil {
 		t.Fatalf("Withdraw: %v", err)
 	}
@@ -722,9 +749,10 @@ func TestUnbondRules(t *testing.T) {
 	}
 }
 
-// TestUnbondMergesRecordsAtOneReleaseHeight bounds unbond spam by distinct
-// heights rather than by transactions: two unbonds in one block produce ONE
-// record whose amount is their sum. The 1,500 b10 fixture keeps both exits
+// TestUnbondMergesRecordsAtOneReleaseHeight: two unbonds in one block produce
+// ONE record whose amount is their sum. Release heights are epoch boundaries
+// (audit ST-4), so unbonds in DIFFERENT blocks of one epoch merge too - which is
+// what bounds an address's live records. The 1,500 b10 fixture keeps both exits
 // above the audit ST-1 floor (1,200 then 1,000).
 func TestUnbondMergesRecordsAtOneReleaseHeight(t *testing.T) {
 	s, addr, pub, priv := bondedValidator(t, 1_500*b10, 0)
@@ -739,8 +767,75 @@ func TestUnbondMergesRecordsAtOneReleaseHeight(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("UnbondingOf returned %d records, want 1 (same release height merges)", len(recs))
 	}
-	if recs[0].Amount != 500*b10 || recs[0].ReleaseHeight != 5+stakeCooldown {
-		t.Fatalf("merged record = %+v, want 500 b10 releasing at %d", recs[0], 5+stakeCooldown)
+	// 5 + 20 = 25, rounded up to the 10-block epoch boundary 30.
+	if recs[0].Amount != 500*b10 || recs[0].ReleaseHeight != 30 {
+		t.Fatalf("merged record = %+v, want 500 b10 releasing at 30", recs[0])
+	}
+}
+
+// TestUnbondRecordsPerAddressAreBoundedByEpochBuckets is ST-4's growth bound at
+// the shape the audit describes: one one-spark unbond per block, at zero fee,
+// for eighty blocks spread over two unbond bursts. Before the fix that was one
+// record per block - each cloned on every ApplyBlock and Probe, hashed into the
+// root, replayed on Open and serialised by /account.
+//
+// Release heights are now epoch boundaries, so an epoch's unbonds share a
+// record (at most UnbondingEpochs+1 of them unmatured), and records that have
+// already matured are collapsed when the next unbond arrives (so the matured
+// ones cost one record, not one per epoch). The count is therefore bounded by
+// UnbondingEpochs+2 = 4 for the whole life of the address, whatever the number
+// of unbonds, and every spark is still accounted for.
+func TestUnbondRecordsPerAddressAreBoundedByEpochBuckets(t *testing.T) {
+	// A bond of MIN_STAKE + 80 leaves a floor-clearing remainder after every
+	// one-spark exit, so all eighty unbonds are legal.
+	s, addr, pub, priv := bondedValidator(t, minStakeSparks+80, 0)
+	const burst = 40
+	maxLive := uint64(2) + 2 // UnbondingEpochs + 2: the unmatured window plus one matured record
+	nonce := uint64(1)
+	unbonds := 0
+
+	unbondAt := func(height uint64) {
+		t.Helper()
+		s.SetHeight(height)
+		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, nonce, 1)); err != nil {
+			t.Fatalf("one-spark unbond at height %d: %v", height, err)
+		}
+		nonce++
+		unbonds++
+		if recs := s.UnbondingOf(addr); uint64(len(recs)) > maxLive {
+			t.Fatalf("at height %d the address holds %d live unbonding records, want at most %d (UnbondingEpochs+2): %+v",
+				height, len(recs), maxLive, recs)
+		}
+	}
+
+	// Burst one: consecutive blocks, the per-block spam.
+	for i := uint64(1); i <= burst; i++ {
+		unbondAt(i)
+	}
+	// A long gap with no unbond: records mature but are not withdrawn, and no
+	// new record is created (nothing grows without an unbond).
+	if got := len(s.UnbondingOf(addr)); got > int(maxLive) {
+		t.Fatalf("after a %d-block unbond burst the address holds %d records, want at most %d", burst, got, maxLive)
+	}
+	// Burst two, after 300 blocks: the matured records must be collapsed rather
+	// than accumulate one per epoch.
+	for i := uint64(301); i <= 300+burst; i++ {
+		unbondAt(i)
+	}
+
+	recs := s.UnbondingOf(addr)
+	var total uint64
+	for _, rec := range recs {
+		total += rec.Amount
+		if rec.ReleaseHeight%stakeTestEpochBlocks != 0 {
+			t.Fatalf("record %+v does not release on an epoch boundary of %d blocks", rec, stakeTestEpochBlocks)
+		}
+	}
+	if total != uint64(unbonds) {
+		t.Fatalf("the live records hold %d sparks, want all %d unbonded sparks (records must merge, not vanish)", total, unbonds)
+	}
+	if got, want := s.Bonded(addr), uint64(minStakeSparks); got != want {
+		t.Fatalf("Bonded = %d, want the floor %d left behind", got, want)
 	}
 }
 
@@ -856,19 +951,43 @@ func TestWithdrawPayoutAtMaxUint64IsRefusedNotWrapped(t *testing.T) {
 	}
 }
 
-// TestReleaseHeightArithmetic pins the cooldown derivation and both overflow
-// checks directly, so the arithmetic has a test of its own rather than only
-// reaching behaviour through a transition.
+// TestReleaseHeightArithmetic pins the cooldown derivation, the epoch rounding
+// and all three overflow checks directly, so the arithmetic has a test of its
+// own rather than only reaching behaviour through a transition.
 func TestReleaseHeightArithmetic(t *testing.T) {
-	// releaseHeight = height + UnbondingEpochs*EpochBlocks. Two epochs of ten
-	// blocks is twenty blocks: 7 + 2*10 = 27.
-	if got, err := releaseHeightFor(7, 2, 10); err != nil || got != 27 {
-		t.Fatalf("releaseHeightFor(7, 2, 10) = %d, %v; want 27", got, err)
+	// releaseHeight = the epoch boundary at or after
+	// height + UnbondingEpochs*EpochBlocks. Two epochs of ten blocks is twenty
+	// blocks: 7 + 2*10 = 27, rounded UP to 30 (audit ST-4). Never down: 27 is
+	// not a release height any more, because a release earlier than the
+	// cooldown would shorten it.
+	if got, err := releaseHeightFor(7, 2, 10); err != nil || got != 30 {
+		t.Fatalf("releaseHeightFor(7, 2, 10) = %d, %v; want 30 (27 rounded up)", got, err)
 	}
-	// One epoch would be 17: this is the value the "one EpochBlocks" mutant
-	// would produce, and it is pinned here so the two can never be confused.
-	if got, _ := releaseHeightFor(7, 1, 10); got == 27 {
-		t.Fatal("one epoch and two epochs produced the same release height")
+	// Both boundaries: a release that lands exactly on an epoch boundary does
+	// not move, and one block before it moves a single block.
+	if got, _ := releaseHeightFor(10, 2, 10); got != 30 { // 30, exact boundary
+		t.Fatalf("releaseHeightFor(10, 2, 10) = %d, want 30 (already a boundary)", got)
+	}
+	if got, _ := releaseHeightFor(11, 2, 10); got != 40 { // 31 -> 40
+		t.Fatalf("releaseHeightFor(11, 2, 10) = %d, want 40 (31 rounded up)", got)
+	}
+	// The rounding is a DELAY, never a discount: for a range of heights the
+	// release is at or after height + cooldown and strictly before one epoch
+	// later. This is the property the cooldown's meaning rests on.
+	for h := uint64(0); h < 100; h++ {
+		got, err := releaseHeightFor(h, 2, 10)
+		if err != nil {
+			t.Fatalf("releaseHeightFor(%d, 2, 10): %v", h, err)
+		}
+		floor := h + 2*10
+		if got < floor || got >= floor+10 {
+			t.Fatalf("releaseHeightFor(%d, 2, 10) = %d, want in [%d, %d)", h, got, floor, floor+10)
+		}
+	}
+	// One epoch is 17 rounded to 20: the "one EpochBlocks" mutant cannot hide
+	// behind the rounding.
+	if got, _ := releaseHeightFor(7, 1, 10); got != 20 {
+		t.Fatalf("releaseHeightFor(7, 1, 10) = %d, want 20", got)
 	}
 
 	// The product overflows 64 bits: MaxUint64*2 has a carry.
@@ -878,6 +997,15 @@ func TestReleaseHeightArithmetic(t *testing.T) {
 	// The addition overflows: MaxUint64 + 20.
 	if _, err := releaseHeightFor(math.MaxUint64, 2, 10); !errors.Is(err, ErrReleaseHeightOverflow) {
 		t.Fatalf("overflowing addition: err = %v, want ErrReleaseHeightOverflow", err)
+	}
+	// The ROUNDING overflows: MaxUint64-24 + 20 = MaxUint64-4, which rounds up
+	// by 9 past the end of the domain. A wrapped release would be in the past.
+	if _, err := releaseHeightFor(math.MaxUint64-24, 2, 10); !errors.Is(err, ErrReleaseHeightOverflow) {
+		t.Fatalf("overflowing rounding: err = %v, want ErrReleaseHeightOverflow", err)
+	}
+	// A zero epoch length cannot be rounded to and must not divide by zero.
+	if _, err := releaseHeightFor(7, 2, 0); !errors.Is(err, ErrStakeUnconfigured) {
+		t.Fatalf("zero epoch length: err = %v, want ErrStakeUnconfigured", err)
 	}
 }
 
@@ -972,31 +1100,42 @@ func TestUnbondBelowTheFloorIsRefused(t *testing.T) {
 // 600 b10 hand-set seat — because a one-spark bond has no expressible partial
 // exit and a 600 b10 one does.
 func TestASubMinimumGenesisSeatCanOnlyExitInFull(t *testing.T) {
-	t.Run("one-spark devnet seat exits in full", func(t *testing.T) {
+	// THE ST-1 / ST-3 INTERACTION, decided deliberately. ST-1's carve-out stays:
+	// a bond already under the floor may exit, and only in full - the rotation
+	// fixture depends on it. ST-3 changes only the PROCEEDS: a genesis seat's
+	// bond is unfunded, and an unbond destroys that part instead of recording
+	// it, so the exit is legal and pays nothing. Refusing the exit instead
+	// (to protect the premine) would freeze exactly the seat M5 rotates.
+	t.Run("one-spark devnet seat exits in full, and the spark is destroyed", func(t *testing.T) {
 		s := NewWithParams(stakingParams())
 		addr, pub, priv := keypair(t)
-		s.SetBond(addr, Bond{Validator: pub, Amount: 1, Height: 0})
+		// Exactly the genesis initial condition: Amount = Power = 1, and the
+		// Unfunded part says no balance paid for it (audit ST-3).
+		s.SetBond(addr, Bond{Validator: pub, Amount: 1, Unfunded: 1, Height: 0})
 		s.SetHeight(5)
 
 		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 0, 1)); err != nil {
 			t.Fatalf("a one-spark genesis seat must be able to exit (this is the M5 rotation fixture's seat): %v", err)
 		}
-		if recs := s.UnbondingOf(addr); len(recs) != 1 || recs[0].Amount != 1 {
-			t.Fatalf("unbonding = %+v, want one one-spark record", recs)
+		if _, ok := s.bonds[addr]; ok {
+			t.Fatal("the one-spark seat is still bonded after its full exit")
+		}
+		if recs := s.UnbondingOf(addr); len(recs) != 0 {
+			t.Fatalf("unbonding = %+v, want none: a genesis seat's power is not withdrawable (audit ST-3)", recs)
 		}
 		s.SetHeight(5 + stakeCooldown)
-		if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 1)); err != nil {
-			t.Fatalf("withdraw of the exited seat: %v", err)
+		if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 1)); !errors.Is(err, ErrNothingToWithdraw) {
+			t.Fatalf("withdraw of the exited genesis seat: err = %v, want ErrNothingToWithdraw", err)
 		}
-		if got := s.Get(addr).Balance; got != 1 {
-			t.Fatalf("balance = %d after the withdraw, want the one spark back", got)
+		if got := s.Get(addr).Balance; got != 0 {
+			t.Fatalf("balance = %d after the exit, want 0: the genesis power is destroyed, not released", got)
 		}
 	})
 
 	t.Run("600 b10 sub-floor seat cannot exit partially", func(t *testing.T) {
 		s := NewWithParams(stakingParams())
 		addr, pub, priv := keypair(t)
-		s.SetBond(addr, Bond{Validator: pub, Amount: 600 * b10, Height: 0})
+		s.SetBond(addr, Bond{Validator: pub, Amount: 600 * b10, Unfunded: 600 * b10, Height: 0})
 		s.SetHeight(5)
 		beforeRoot := s.Root()
 
@@ -1019,5 +1158,99 @@ func TestASubMinimumGenesisSeatCanOnlyExitInFull(t *testing.T) {
 		if got := s.Bonded(addr); got != 0 {
 			t.Fatalf("Bonded = %d after the full exit, want 0", got)
 		}
+		if recs := s.UnbondingOf(addr); len(recs) != 0 {
+			t.Fatalf("the full exit recorded %+v, want no record: the seat is unfunded (audit ST-3)", recs)
+		}
 	})
+}
+
+// TestAGenesisBondIsUnfundedAndUnbondingItReleasesNothing is ST-3's rule at its
+// simplest, constructed exactly as chain.genesisState builds a genesis seat: a
+// MIN_STAKE bond with Unfunded = Amount and no account behind it. The seat
+// leaves when it unbonds, the sparks do not follow it out, and the supply sum
+// falls by exactly the grant - the one transition that destroys value, and only
+// value the genesis created.
+func TestAGenesisBondIsUnfundedAndUnbondingItReleasesNothing(t *testing.T) {
+	s := NewWithParams(stakingParams())
+	addr, pub, priv := keypair(t)
+	s.SetBond(addr, Bond{Validator: pub, Amount: minStakeSparks, Unfunded: minStakeSparks, Height: 0})
+	before := supplySum(s)
+
+	s.SetHeight(5)
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 0, minStakeSparks)); err != nil {
+		t.Fatalf("a genesis seat must be able to unbond: %v", err)
+	}
+	if got := s.Bonded(addr); got != 0 {
+		t.Fatalf("Bonded = %d after the exit, want 0", got)
+	}
+	if got := s.TotalUnbonding(); got != 0 {
+		t.Fatalf("TotalUnbonding = %d, want 0: the unfunded grant must not become an unbonding record", got)
+	}
+	if recs := s.UnbondingOf(addr); len(recs) != 0 {
+		t.Fatalf("UnbondingOf = %+v, want none", recs)
+	}
+	if got, want := supplySum(s), before-minStakeSparks; got != want {
+		t.Fatalf("supply sum after the genesis exit = %d, want %d: exactly the grant is destroyed", got, want)
+	}
+
+	// No height ever pays it out, because no record exists to mature.
+	s.SetHeight(5 + stakeCooldown)
+	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 1)); !errors.Is(err, ErrNothingToWithdraw) {
+		t.Fatalf("withdraw at the would-be release height: err = %v, want ErrNothingToWithdraw", err)
+	}
+	if got := s.Get(addr).Balance; got != 0 {
+		t.Fatalf("balance = %d, want 0", got)
+	}
+}
+
+// TestAFundedTopUpOnAGenesisSeatStaysWithdrawable is why Bond.Unfunded exists
+// instead of a bare Height == 0 test. A genesis seat that bonds its own funds
+// must be able to get THOSE sparks back while the grant is destroyed; a rule
+// that burned the whole bond would destroy an operator's money, and one that
+// paid the whole bond would pay out the grant.
+func TestAFundedTopUpOnAGenesisSeatStaysWithdrawable(t *testing.T) {
+	s := NewWithParams(stakingParams())
+	addr, pub, priv := keypair(t)
+	// The devnet fixture's shape: a one-spark genesis seat ...
+	s.SetBond(addr, Bond{Validator: pub, Amount: 1, Unfunded: 1, Height: 0})
+	// ... funded with its own MIN_STAKE through an ordinary Bond.
+	s.Set(addr, Account{Balance: minStakeSparks + 1}) // +1: the bond's fee
+	if err := s.ApplyTx(bondTx(t, pub, priv, addr, 0, minStakeSparks, 1)); err != nil {
+		t.Fatalf("topping up a genesis seat: %v", err)
+	}
+	bond, ok := s.BondOf(addr)
+	if !ok || bond.Amount != minStakeSparks+1 || bond.Unfunded != 1 || bond.Height != 0 {
+		t.Fatalf("bond after the top-up = %+v, want Amount %d (the grant plus the funded MIN_STAKE), Unfunded 1, Height 0",
+			bond, minStakeSparks+1)
+	}
+
+	// The genesis spark goes first and is destroyed; the remaining bond is
+	// fully funded, which is the ST-1 floor's exact boundary (MIN_STAKE).
+	s.SetHeight(3)
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 1)); err != nil {
+		t.Fatalf("unbonding the unfunded spark: %v", err)
+	}
+	if recs := s.UnbondingOf(addr); len(recs) != 0 {
+		t.Fatalf("unbonding the genesis spark recorded %+v, want none", recs)
+	}
+	bond, _ = s.BondOf(addr)
+	if bond.Amount != minStakeSparks || bond.Unfunded != 0 {
+		t.Fatalf("bond = %+v, want the funded MIN_STAKE with Unfunded 0", bond)
+	}
+
+	// The funded part exits normally and IS withdrawable.
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 2, minStakeSparks)); err != nil {
+		t.Fatalf("unbonding the funded part: %v", err)
+	}
+	recs := s.UnbondingOf(addr)
+	if len(recs) != 1 || recs[0].Amount != minStakeSparks {
+		t.Fatalf("unbonding = %+v, want one funded MIN_STAKE record", recs)
+	}
+	s.SetHeight(recs[0].ReleaseHeight)
+	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 3)); err != nil {
+		t.Fatalf("withdraw of the funded part: %v", err)
+	}
+	if got := s.Get(addr).Balance; got != minStakeSparks {
+		t.Fatalf("balance = %d, want the funded MIN_STAKE back", got)
+	}
 }

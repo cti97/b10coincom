@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,18 +48,80 @@ type statusResponse struct {
 // sparks (uint64), never b10 and never a float.
 //
 // Unbonding is always a JSON list, never null: a client iterating it should
-// not have to special-case "no records".
+// not have to special-case "no records". UnbondingTotal is the number of
+// records that exist, so a client reading a windowed reply can tell whether it
+// saw them all; BondUnfunded is the part of Bonded that is a genesis grant and
+// therefore NOT withdrawable (audit ST-3), which the unstake verb reports so an
+// operator is not promised a payout that will not come.
 type accountResponse struct {
-	Address   string              `json:"address"`
-	Balance   uint64              `json:"balance"`
-	Nonce     uint64              `json:"nonce"`
-	Bonded    uint64              `json:"bonded"`
-	Unbonding []unbondingResponse `json:"unbonding"`
+	Address        string              `json:"address"`
+	Balance        uint64              `json:"balance"`
+	Nonce          uint64              `json:"nonce"`
+	Bonded         uint64              `json:"bonded"`
+	BondUnfunded   uint64              `json:"bond_unfunded"`
+	Unbonding      []unbondingResponse `json:"unbonding"`
+	UnbondingTotal int                 `json:"unbonding_total"`
 }
 
+// unbondingResponse is one record in that list.
 type unbondingResponse struct {
 	Amount        uint64 `json:"amount"`
 	ReleaseHeight uint64 `json:"release_height"`
+}
+
+const (
+	// defaultUnbondingLimit is the window a client gets without asking. It is
+	// far above the state's own bound (UnbondingEpochs+2, four records on the
+	// shipped params), so an ordinary read never sees a partial list.
+	defaultUnbondingLimit = 64
+	// maxUnbondingLimit bounds one reply. This endpoint is unauthenticated and
+	// outside the /tx limiter, so its reply size must not be a function of the
+	// state: a request may never ask for more than this, whatever it sends.
+	maxUnbondingLimit = 256
+)
+
+// unbondingWindow parses limit/offset. Absent values take the defaults; a
+// non-numeric, zero limit or an offset that is not a number is a client error
+// rather than a silently different window. A limit above maxUnbondingLimit is
+// clamped, not refused: the client asked for "as much as allowed".
+func unbondingWindow(q url.Values) (offset, limit int, err error) {
+	limit = defaultUnbondingLimit
+	if raw := q.Get("limit"); raw != "" {
+		v, perr := strconv.ParseUint(raw, 10, 31)
+		if perr != nil || v == 0 {
+			return 0, 0, errors.New("limit must be a positive integer")
+		}
+		if v > maxUnbondingLimit {
+			v = maxUnbondingLimit
+		}
+		limit = int(v)
+	}
+	if raw := q.Get("offset"); raw != "" {
+		v, perr := strconv.ParseUint(raw, 10, 31)
+		if perr != nil {
+			return 0, 0, errors.New("offset must be a non-negative integer")
+		}
+		offset = int(v)
+	}
+	return offset, limit, nil
+}
+
+// windowUnbonding returns the [offset, offset+limit) slice of recs and the
+// total it was taken from. The slice is always non-nil (an empty window
+// serialises as [], not null) and an offset past the end is an empty window,
+// not an error: "there is nothing after these" is a valid answer.
+func windowUnbonding(recs []unbondingResponse, offset, limit int) ([]unbondingResponse, int) {
+	total := len(recs)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total || end < offset {
+		end = total
+	}
+	out := make([]unbondingResponse, 0, end-offset)
+	out = append(out, recs[offset:end]...)
+	return out, total
 }
 
 type blockResponse struct {
@@ -238,6 +301,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // node. The address in the URL is echoed back so a client can check it is
 // reading the account it asked for.
 //
+// The unbonding list is WINDOWED (audit ST-4's "cap or paginate"): `limit` and
+// `offset` select a slice of it, `unbonding_total` reports how many records
+// exist, and no reply ever serialises more than maxUnbondingLimit records. The
+// state itself now bounds an address to UnbondingEpochs+2 records (the
+// unmatured window plus one collapsed matured record), so the window is a
+// backstop rather than the primary bound - but it is the backstop that keeps
+// this unauthenticated endpoint's reply size independent of any state a future
+// bug could build.
+//
 // The read is served from the chain's published state snapshot, which is
 // immutable until the next Append replaces it: no lock is held across the
 // JSON encode and a commit cannot interleave a half-updated account.
@@ -252,19 +324,27 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{"address must be a canonical b10 address"})
 		return
 	}
+	offset, limit, err := unbondingWindow(r.URL.Query())
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{err.Error()})
+		return
+	}
 	st := s.chain.State()
 	acc := st.Get(addr)
+	bond, _ := st.BondOf(addr)
 	recs := st.UnbondingOf(addr)
-	out := accountResponse{
-		Address:   addr.String(),
-		Balance:   acc.Balance,
-		Nonce:     acc.Nonce,
-		Bonded:    st.Bonded(addr),
-		Unbonding: make([]unbondingResponse, 0, len(recs)),
-	}
+	all := make([]unbondingResponse, 0, len(recs))
 	for _, rec := range recs {
-		out.Unbonding = append(out.Unbonding, unbondingResponse{Amount: rec.Amount, ReleaseHeight: rec.ReleaseHeight})
+		all = append(all, unbondingResponse{Amount: rec.Amount, ReleaseHeight: rec.ReleaseHeight})
 	}
+	out := accountResponse{
+		Address:      addr.String(),
+		Balance:      acc.Balance,
+		Nonce:        acc.Nonce,
+		Bonded:       bond.Amount,
+		BondUnfunded: bond.Unfunded,
+	}
+	out.Unbonding, out.UnbondingTotal = windowUnbonding(all, offset, limit)
 	writeJSON(w, http.StatusOK, out)
 }
 

@@ -64,7 +64,7 @@ It prints:
 ```text
 chain        b10coin-devnet-1
 height       102
-state root   3c1dae9ce528daa3377f3b040d7e0596f8488c9f8c1ebc87c62baa03cea8e93d
+state root   98e5cf468ecf0b6ca9c148a4ef7e5056c14254dead11efaa1f2890631cdd11cc
 txs included 2
 claims paid  1 of 1 attempts, 100000000 sparks each
 double claims refused 1 (one claim per key per epoch)
@@ -73,12 +73,17 @@ faucet bal   5050000000 sparks (emitted 5150000000 sparks in total)
 OK
 ```
 
-and exits 0. The state root is the M5 figure. It changed at M5 from the M4
-figure `12a643be48c13ffb35d1339e07f2e174346ec110c6c347e206d043a049b3cf54`
-because `Bond`/`Unbond`/`Withdraw` became real transaction types and bonds
-became committed state, which moved the transaction and state encodings — the
-second deliberate hard fork on this branch (the first was the chain identifier).
-It is reproducible: the suite re-runs the command and pins the root.
+and exits 0. The state root is the M5 figure. It moved once inside M5, from
+`3c1dae9ce528daa3377f3b040d7e0596f8488c9f8c1ebc87c62baa03cea8e93d` when the
+bond leaf began committing the bond's **unfunded** amount (audit ST-3: the
+devnet genesis seats one validator at `power: 1` with no balance behind it, so
+that bond's leaf changed even though no transaction did). It had already changed
+from the M4 figure
+`12a643be48c13ffb35d1339e07f2e174346ec110c6c347e206d043a049b3cf54` when
+`Bond`/`Unbond`/`Withdraw` became real transaction types and bonds became
+committed state — the second deliberate hard fork on this branch (the first was
+the chain identifier). It is reproducible: the command is deterministic, and a
+re-run prints the same root.
 
 The multi-validator acceptance command runs the same idea as a consensus
 committee: four validators, each with its own chain, driven to height 100 over
@@ -117,6 +122,24 @@ nakamoto coefficient across the run (smallest k whose k seats exceed 1/3 of comm
      105      2      5  2   1 of 5 (20%)
 OK
 ```
+
+**Read that coefficient as committee composition, not as stake distribution.**
+The powers it is computed from are the SEATED committee's powers, i.e. after the
+one-quarter cap, and the cap is a fixed point over the seated total: whenever
+one seat dominates it is dragged DOWN rather than left at its stake — to the
+others' power on a four-seat committee, and to a quarter of the seated total on
+a larger one, with the floor seats sharing the other three quarters. Four seats
+at 10,000 / 1,000 / 1,000 / 1,000 b10 therefore all come out at a quarter of the
+committee each, so the three `MIN_STAKE` seats hold **3/4 between them and can
+commit alone**, while the plot prints `k=2` as if the committee were evenly
+distributed — although one party holds ~77% of the stake behind it.
+A seat therefore costs `MIN_STAKE` flat, stake above the cap buys no additional
+share, and the plotted coefficient OVERSTATES how distributed the stake is: it
+answers "how many keys must collude", never "how many b10 must collude". The
+uncapped stake is visible in `/account`'s `bonded` figures and in the
+derivation, not in this series. If a minimum power-per-seat ratio (or capping
+against the uncapped total stake) is wanted, it is a protocol change; the plan
+carries it as a proposal and nothing in this milestone implements it.
 
 ## Platforms and releases
 
@@ -594,7 +617,9 @@ re-measured together on real hardware before any public testnet opens.
   premine, and the devnet fixture deliberately exceeds it: `genesis.Devnet`
   funds 1,000,000 b10 of test accounts on top of the realized series, and
   `Validate` has no premine-plus-emission rule (audit S-16). Testnet has no
-  premine, and a committee file cannot mint one.
+  premine, and a committee file cannot mint a **spendable** spark: its seats'
+  powers are unfunded genesis bonds, and unbonding one destroys the power
+  instead of releasing it (audit ST-3).
 - The **realized series lands at 20,999,997.48 b10** (2,099,999,748,000,000
   sparks): each halving's shift truncates, losing 252,000,000 sparks (2.52 b10)
   in total. The series therefore falls **2.52 b10 short of the cap** — and it
@@ -758,13 +783,23 @@ are the boundary of what they claim.
 **Stake is locked state, not a balance.** A bond is a record
 `(validator, amount, height)` in committed state, separate from the account's
 spendable balance. `Unbond` moves the amount into an unbonding record with
-`release_height = height + unbonding_epochs × epoch_blocks`; between those
-heights the coins are **neither spendable nor counted in the committee**, which
-is what makes the cooldown an economic delay rather than a formality.
+`release_height` = **the epoch boundary at or after**
+`height + unbonding_epochs × epoch_blocks`; between those heights the coins are
+**neither spendable nor counted in the committee**, which is what makes the
+cooldown an economic delay rather than a formality. Rounding up is what binds the
+record count: an epoch's unbonds share one record, and records that have already
+matured are collapsed, so an address holds at most `unbonding_epochs + 2` records
+however many unbonds it sends, instead of one per block. The cost is stated
+plainly: a release is never earlier than the cooldown, and it can be later by up
+to one epoch minus a block (the time from a mid-epoch unbond to the next
+boundary). An unbond whose cooldown ends exactly on a boundary does not move.
 `Withdraw` releases every record at or below the current height, exactly once.
 The stake transitions move value between the three terms; the only value that
 leaves is a `Bond`'s fee, burned exactly as a transfer's is, and emission and
-faucet claims are chain-level.
+faucet claims are chain-level. One exception, and it is the genesis seat: an
+`Unbond` of a genesis bond destroys that bond's unfunded part rather than
+recording it (`Bond.Unfunded`, audit ST-3), so a genesis grant never becomes
+spendable and the sum falls by exactly what the genesis created.
 
 **A bond is a seat, and the seat changes only at a boundary.** The committee is
 the top `committee_size` bonds by stake, ties broken by public-key bytes, with
@@ -772,7 +807,8 @@ the one-quarter power cap applied after selection. Consensus for height `h`
 uses the committee of epoch `h/epoch_blocks`, derived from the state committed
 at `e*epoch_blocks − 1`, so a bond applied at height `h` is considered at the
 next boundary and never mid-epoch. Genesis seats are bonded by the genesis
-hash: a committee file's `power` **is** that seat's bond.
+hash: a committee file's `power` **is** that seat's bond — an unfunded one, so
+it seats a vote and cannot be withdrawn (see the funding section below).
 
 **A bond is at least `MIN_STAKE` or it is not a bond.** Both transitions enforce
 the floor: `Bond` judges the *resulting* bond, and `Unbond` accepts a remainder
@@ -795,9 +831,21 @@ larger share than the cap allows. The cap does not merge keys: `k` keys that
 each hold the floor buy `k` seats, and on `N` equal-stake seats each holds `1/N`,
 so `k` colluding keys hold `k/N` of the committee's power. A seat therefore
 costs `MIN_STAKE` per key, and the count of keys — not only the stake behind
-each — is what the committee measures. The Nakamoto series the acceptance run
-prints is computed from these capped powers, so it describes the committee's
-composition, not the underlying stake distribution.
+each — is what the committee measures.
+
+That has a second consequence the whale side does not show. Because the cap is a
+FIXED POINT over the seated total, a dominant seat is not merely capped at 25%:
+it is dragged DOWN toward the others' power — on a four-seat committee all the
+way to it. One 10,000 b10 seat and three 1,000 b10 seats converge to four seats
+of one quarter each, so the three floor seats outvote the whale 3/4 to 1/4 and
+can commit alone; a seat costs `MIN_STAKE` flat, and on a small or unfilled
+committee a handful of floor seats is the cheapest route to a supermajority. The
+Nakamoto series the acceptance run prints is computed from these CAPPED powers,
+so it describes the committee's composition — how many keys must collude — and
+it overstates how distributed the stake is. This is §6.3's rule implemented
+exactly, documented here rather than changed: capping against the uncapped total
+stake, or a minimum power-per-seat ratio, would be a protocol change (see the
+plan's proposal).
 
 **The verbs** are `stake`, `unstake` and `withdraw` (see
 [The CLI](#the-cli)). They are ordinary signed transactions — same signature,
@@ -857,13 +905,17 @@ What does exist, stated so it is not mistaken for a path:
   chain. It is what the M5 end-to-end run below used, with a hand-built key
   file, and that is **verification, not a shipped funding path**.
 - A **genesis bond**: a committee file's `power` is its seat's bond and must be
-  at least `MIN_STAKE` (the loader refuses less), so a genesis seat holds real
-  stake without any balance, `unstake` and `withdraw` are exercisable
-  immediately, and a fresh `stake` still needs spendable funds. Note what that
-  implies: the file's powers are an **unfunded** genesis bond — no balance ever
-  paid for it, the same standing as the devnet fixture's premine, and audit ST-3
-  records the open question of whether such a bond should be withdrawable at
-  all — and `unstake` + `withdraw` release it after one cooldown.
+  at least `MIN_STAKE` (the loader refuses less), so a genesis seat holds voting
+  power without any balance. It is **unfunded and not withdrawable** (audit
+  ST-3): no account paid for it, `unstake` leaves the committee and **destroys**
+  the power rather than recording it, and `withdraw` pays nothing for it.
+  `unstake` and `withdraw` are still exercisable with a zero balance (an exit is
+  free by consensus rule) — there is simply no money to release. A seat is a
+  grant of a vote in the federated era, not a premine: what a genesis operator
+  can withdraw is only what it funds itself through `stake`, which is recorded
+  as a funded bond and released like any other after one cooldown. A chain
+  therefore starts with `power` sparks of voting power outside
+  `TotalSupplySparks` and **zero withdrawable sparks** from genesis.
 
 **The operational consequence, for anyone deploying the recipe.** Genesis seats
 are at least `MIN_STAKE` each, and a newcomer that bonds at least the floor is
@@ -880,8 +932,9 @@ will run as that validator, and keep every genesis key's node running.
 chain, the fixture key file described above): `stake --amount 1000` submitted a
 `Bond` that a block applied (bonded 10^11 sparks, nonce 1, balance down by the
 bond and the 1-spark fee); the seat changed at the epoch boundary; `unstake`
-submitted an `Unbond` (fee 0), which created an unbonding record with a
-**release height** two epochs later; coins were unspendable until that height;
+submitted an `Unbond` (fee 0) of a **funded** bond, which created an unbonding
+record with a **release height** two epochs later, rounded up to the epoch
+boundary (audit ST-4); coins were unspendable until that height;
 `withdraw` submitted a `Withdraw` (fee 0) that returned them to the spendable
 balance. Every one of the three was admitted through `POST /tx` and appears in
 a block as an ordinary transaction, with the same signature binding a transfer
@@ -914,7 +967,7 @@ by `cmd` alone.
 | `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency. M5 adds `CommitteeAt(h)`: the one per-height committee (an epoch's seats, memoised when its deciding state is committed), read by consensus, the certificate gate and the vote router |
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction. Admission is **stateful** against the head state a block would execute now (audit R-1): a faucet claim is refused for a wrong epoch, an already-spent claim marker, a wrong nonce or a missing cheap outer puzzle before any Argon2id evaluation; claims are capped in a sub-pool separate from transfers and per sender, and a claim `Take` keeps skipping ages out. A full pool refuses a new transaction rather than evicting an older one |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
-| `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size, and since M5 `genesis_hash`, `min_fee_sparks`, `min_stake_sparks`, `epoch_blocks`, `unbonding_epochs`, `committee_size` — fields are added, never renamed), `GET /block/{height}`, `GET /account/{address}` (balance, nonce, bonded, and each unbonding record's `amount` and `release_height`), and `POST /tx` (hex-encoded canonical transaction bytes) |
+| `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size, and since M5 `genesis_hash`, `min_fee_sparks`, `min_stake_sparks`, `epoch_blocks`, `unbonding_epochs`, `committee_size` — fields are added, never renamed), `GET /block/{height}`, `GET /account/{address}` (balance, nonce, bonded, `bond_unfunded`, and each unbonding record's `amount` and `release_height`; the unbonding list takes `?limit=`/`?offset=` and reports `unbonding_total`, and no reply carries more than 256 records), and `POST /tx` (hex-encoded canonical transaction bytes) |
 | `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters. M4 adds BLOCK_SYNC catch-up and a certificate log: a commit certificate is persisted to the data directory, so a restarted validator still serves the evidence for blocks it adopted before it restarted |
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
@@ -1169,8 +1222,9 @@ Implemented — modules M0 through M5:
   computed from committed state and plotted per height (`--plot-nakamoto`);
   `stake`/`unstake`/`withdraw` clients; and the deployment recipe's staking
   section. Acceptance: the rotation run above (6 seats / k=3 → 5 seats / k=2 at
-  height 40) and the unchanged single-node root, now
-  `3c1dae9c…`. **The funding limit is stated in [Staking](#staking): no
+  height 40) and the single-node root, which moved once inside M5 to
+  `98e5cf46…` when the bond leaf began committing the bond's unfunded amount
+  (audit ST-3). **The funding limit is stated in [Staking](#staking): no
   shipped command reaches `MIN_STAKE` through the faucet.**
 
 Pending:

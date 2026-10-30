@@ -1144,6 +1144,75 @@ func TestWithdrawVerbReleasesOnlyMaturedRecords(t *testing.T) {
 	}
 }
 
+// TestReleaseForecastRoundsToTheEpochBoundary: the unstake verb prints the
+// height the state will RECORD, not head+1+cooldown (audit ST-4). The cooldown
+// is a floor and the release height is the epoch boundary at or after it, so a
+// forecast that printed the raw sum would name a height that can never appear.
+func TestReleaseForecastRoundsToTheEpochBoundary(t *testing.T) {
+	st := stakingStatus{Height: 100, EpochBlocks: 1_000, UnbondingEpochs: 2}
+	line, ok := releaseForecast(1_000_000, 0, st, 2_000)
+	if !ok {
+		t.Fatal("no forecast for a funded exit")
+	}
+	// head+1+cooldown = 2,101; the next 1,000-block boundary is 3,000.
+	if !strings.Contains(line, "height 3000") {
+		t.Fatalf("the forecast does not name the epoch boundary: %q", line)
+	}
+	// A release that already lands on a boundary does not move.
+	st.Height = 999 // 1,000 + 2,000 = 3,000
+	line, ok = releaseForecast(1_000_000, 0, st, 2_000)
+	if !ok || !strings.Contains(line, "height 3000") {
+		t.Fatalf("an exact boundary moved: %q", line)
+	}
+}
+
+// TestReleaseForecastSaysAGenesisExitReleasesNothing is audit ST-3 in the verb:
+// when the whole exit is the seat's unfunded genesis power, the state destroys
+// it rather than recording it, so the verb must not print a release height that
+// promises a payout.
+func TestReleaseForecastSaysAGenesisExitReleasesNothing(t *testing.T) {
+	st := stakingStatus{Height: 5, EpochBlocks: 10, UnbondingEpochs: 2}
+	line, ok := releaseForecast(100, 100, st, 20)
+	if !ok {
+		t.Fatal("a genesis exit must still produce a message")
+	}
+	if !strings.Contains(line, "destroy") || !strings.Contains(line, "UNFUNDED") {
+		t.Fatalf("the genesis exit does not say the power is destroyed: %q", line)
+	}
+	if strings.Contains(line, "height") {
+		t.Fatalf("the genesis exit still forecasts a release height: %q", line)
+	}
+
+	// A funded exit from the same status still forecasts a height (5+1+20 = 26
+	// -> the next 10-block boundary, 30).
+	line, ok = releaseForecast(100, 0, st, 20)
+	if !ok || !strings.Contains(line, "height 30") {
+		t.Fatalf("the funded exit's forecast = %q, want height 30", line)
+	}
+}
+
+// TestWithdrawRefusesATruncatedUnbondingReply: /account is windowed (audit
+// ST-4), and a verb that signed on a partial list could report "nothing
+// matured" while the node holds a matured record. It refuses instead.
+func TestWithdrawRefusesATruncatedUnbondingReply(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Nonce: 1,
+		Unbonding:      []stakingUnbondingRec{{Amount: 1, ReleaseHeight: 8}},
+		UnbondingTotal: 5,
+	})
+	err := cmdWithdraw([]string{"--node", stub.url, "--key", keyPath})
+	if err == nil {
+		t.Fatal("a windowed (truncated) unbonding reply must be refused")
+	}
+	if !strings.Contains(err.Error(), "record") {
+		t.Errorf("the refusal should name the record count, got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+}
+
 // TestStakeRefusesABondTheAccountCannotCover: the balance check is the verb's
 // own, run before signing. Without it the operator learns "insufficient funds"
 // from the node instead of from the command that asked, and the funding note

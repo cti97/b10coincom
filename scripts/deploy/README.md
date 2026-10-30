@@ -479,10 +479,12 @@ sudo -u b10coin /opt/b10coin/b10coin unstake --node http://127.0.0.1:8645 \
     --key /var/lib/b10coin/b10coin.key
 # ... the output names the RELEASE HEIGHT: the coins are neither spendable
 # nor counted in the committee until that height. The cooldown is
-# unbonding_epochs x epoch_blocks = 2 x 1,000 blocks. How long that is in
-# wall time is this committee's cadence, not a constant: measure it from two
-# /status readings a minute apart (the driver's rhythm is the round protocol's;
-# `block_time_ms` is the spec's target, not a pacing timer).
+# unbonding_epochs x epoch_blocks = 2 x 1,000 blocks, and the release height is
+# the EPOCH BOUNDARY at or after it (audit ST-4): it can be up to one epoch
+# later than the raw sum, never earlier. How long that is in wall time is this
+# committee's cadence, not a constant: measure it from two /status readings a
+# minute apart (the driver's rhythm is the round protocol's; `block_time_ms` is
+# the spec's target, not a pacing timer).
 # Once the chain is at or past it:
 sudo -u b10coin /opt/b10coin/b10coin withdraw --node http://127.0.0.1:8645 \
     --key /var/lib/b10coin/b10coin.key
@@ -500,25 +502,27 @@ exit **only in full**, which is what `unstake` without `--amount` does.
 > the genesis bond (not rescaled: `power` is in sparks, so 1,000 b10 is
 > `100000000000`), and the loader refuses anything below `MIN_STAKE`, so the
 > three genesis seats start with 1,000 b10 bonded each, funded by no balance
-> (the genesis-hash bond; audit ST-3 records the open question about that being
-> an unfunded premine). The file mints no premine, so every *account* starts at
-> zero, and `stake` needs `MIN_STAKE` = 1,000 b10 (10^11 sparks) in **spendable
-> funds**. The only funding path is the faucet: **1 b10 per claim, one claim per
-> key per epoch, at most 8 claims per block**, funded by emission at **0.5 b10
-> per block**. The faucet's balance is the real constraint, not the epoch
-> length: **2,000 blocks** of emission produce the 1,000 b10, and 1,000 claims
-> from 1,000 distinct keys at 8 per block take **125 blocks** — about **2,125
-> blocks**, roughly 71 minutes at 2 s blocks (a healthy committee commits
-> faster; measure two `/status` readings a minute apart). This recipe used to
-> say "1,000 epochs, one million blocks, 23 days", which wrongly divided by the
-> one-claim-per-key rule instead of issuing one claim per key: the old figure was
-> about **470× too long**. It is still not a path this deployment can walk
-> today: `b10coin claim` signs with a fresh ephemeral key each run and never
-> saves it, and there is no `transfer` verb, so each claim lands at a new address
-> and cannot be accumulated. **No shipped command funds an operator's key with
-> `MIN_STAKE`**; the numbers above describe what the protocol allows a client
-> holding 1,000 keys and a transfer path. The arithmetic is in the repository
-> README's [Staking](../../README.md#staking) section.
+> (the genesis-hash bond). That bond is **unfunded and not withdrawable** (audit
+> ST-3): it seats a vote, and unbonding it DESTROYS the power rather than
+> releasing coins, so a seat is never a payout. The file mints no premine, so
+> every *account* starts at zero, and `stake` needs `MIN_STAKE` = 1,000 b10
+> (10^11 sparks) in **spendable funds**. The only funding path is the faucet:
+> **1 b10 per claim, one claim per key per epoch, at most 8 claims per block**,
+> funded by emission at **0.5 b10 per block**. The faucet's balance is the
+> real constraint, not the epoch length: **2,000 blocks** of emission produce
+> the 1,000 b10, and 1,000 claims from 1,000 distinct keys at 8 per block take
+> **125 blocks** — about **2,125 blocks**, roughly 71 minutes at 2 s blocks (a
+> healthy committee commits faster; measure two `/status` readings a minute
+> apart). This recipe used to say "1,000 epochs, one million blocks, 23 days",
+> which wrongly divided by the one-claim-per-key rule instead of issuing one
+> claim per key: the old figure was about **470× too long**. It is still not a
+> path this deployment can walk today: `b10coin claim` signs with a fresh
+> ephemeral key each run and never saves it, and there is no `transfer` verb,
+> so each claim lands at a new address and cannot be accumulated. **No shipped
+> command funds an operator's key with `MIN_STAKE`**; the numbers above
+> describe what the protocol allows a client holding 1,000 keys and a transfer
+> path. The arithmetic is in the repository README's
+> [Staking](../../README.md#staking) section.
 
 > **⚠️ A bond is a seat, and a seat without a node stops the chain.** A bond at
 > or above a genesis seat's power is ranked against it, ties by key bytes. With
@@ -531,13 +535,16 @@ exit **only in full**, which is what `unstake` without `--amount` does.
 > two-thirds quorum, and the chain halts at the boundary. Stake only with the
 > key the node runs, and keep every genesis key's node running.
 
-`unstake` and `withdraw` **are** usable here without any spendable funds,
-because §3.2 bonds every genesis seat with `power: 100000000000` (1,000 b10 =
-`MIN_STAKE`). The genesis bond satisfies the exit path, and the coins released
-by `withdraw` are real spendable balance — with which `stake` can then bond
-again, paying the 1-spark fee out of them. Decide the powers before the chain
-starts: the file is final once it has, because editing it changes the genesis
-hash and starts a different chain.
+`unstake` and `withdraw` **run** here without any spendable funds — an exit is
+free by consensus rule (§3.2 bonds every genesis seat with
+`power: 100000000000`, 1,000 b10 = `MIN_STAKE`) — but a genesis seat's exit
+**pays nothing**: the grant is unfunded, so `unstake` destroys its power and
+`withdraw` finds no record to release (audit ST-3, and `unstake` prints exactly
+that). The only sparks an operator can withdraw are the ones it funded itself
+through `stake`; those are recorded as a funded bond and released after one
+cooldown like any other. Decide the powers before the chain starts: the file is
+final once it has, because editing it changes the genesis hash and starts a
+different chain.
 
 Two limits to keep straight: the verbs act on the chain whose `genesis_hash`
 the node reports, so pointing one at a node on another chain produces a

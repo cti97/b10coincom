@@ -41,9 +41,15 @@ a number this project can graph instead of assert.
 
 1. **Stake is locked state, not a balance.** A bond is a record `(validator, amount,
    height)` in committed state, separate from the spendable balance. `Unbond` moves
-   the amount to an unbonding record with `releaseHeight = height + UNBONDING_BLOCKS`
-   and the coins are **neither spendable nor counted in the committee** in between —
-   that is what makes the cooldown a real economic delay rather than a formality.
+   the amount to an unbonding record with `releaseHeight` = the epoch boundary at or
+   after `height + UNBONDING_BLOCKS`, and the coins are **neither spendable nor counted
+   in the committee** in between — that is what makes the cooldown a real economic delay
+   rather than a formality. The rounding is audit ST-4's record bound: an epoch's
+   unbonds share a release height (at most `UnbondingEpochs+1` unmatured records), and
+   already-matured records collapse on the next unbond, so an address holds at most
+   `UnbondingEpochs+2` records for the life of the chain instead of one per block. A
+   release can be later than `height + UNBONDING_BLOCKS` by at most one epoch minus a
+   block, never earlier.
 2. **The committee is the top 21 by bonded stake, ties broken by public key bytes.**
    Deterministic, and the tie-break is by bytes rather than by address string so it
    cannot depend on formatting. §6.3 also caps any one validator at 1/4 of total
@@ -218,11 +224,12 @@ create or destroy a spark.
 type Bond struct {
 	Validator []byte // ed25519 public key: the identity the committee seats
 	Amount    uint64 // sparks, locked
+	Unfunded  uint64 // sparks in Amount that genesis created; destroyed on Unbond (ST-3)
 	Height    uint64 // the height at which it was recorded
 }
 type Unbonding struct {
 	Amount        uint64
-	ReleaseHeight uint64 // height + UnbondingEpochs*EpochBlocks
+	ReleaseHeight uint64 // the epoch boundary at or after height + UnbondingEpochs*EpochBlocks
 }
 
 func (s *State) Bonded(a types.Address) uint64
@@ -253,10 +260,13 @@ func (s *State) TotalUnbonding() uint64
 - `Unbond`: requires `Fee == 0`. This is deliberate and load-bearing: a validator may
   hold nothing spendable, and an exit that needs a coin is an exit an operator with a
   zero balance can never make, which would let a seat that must leave be
-  un-rotatable. `Amount > 0`, `Amount <= bonded`; the record's release height is
-  `s.height + UnbondingEpochs*EpochBlocks`, both factors overflow-checked; a record with
-  the same release height merges (so spam is bounded by distinct heights, not by
-  transactions); a zero remainder deletes the bond.
+  un-rotatable. `Amount > 0`, `Amount <= bonded`; the record's release height is the
+  epoch boundary at or after `s.height + UnbondingEpochs*EpochBlocks`, the product, the
+  sum and the rounding all overflow-checked; a record at the same release height merges,
+  already-matured records collapse into one, and the resulting bound is
+  `UnbondingEpochs+2` records per address (audit ST-4); a zero remainder deletes the
+  bond. The bond carries an `Unfunded` amount (audit ST-3): the genesis grant is
+  destroyed on unbond, not recorded, so no genesis spark is ever withdrawable.
 - `Withdraw`: requires `Fee == 0`; releases **every** unbonding record with
   `ReleaseHeight <= s.height` to the balance, in one transaction, and errors with
   `ErrNothingToWithdraw` if none is mature. `<=` is the rule: a record is releasable at
@@ -370,6 +380,24 @@ var ErrZeroCommittee = errors.New("state: CommitteeSize is zero")
 - After the fixed point the largest share is at most 1/4 — equality is allowed, because
   `consensus.Config.Validate` rejects only `> 1/4` — and therefore strictly below 1/3,
   which is the property the cap exists to buy.
+- **The cap's other face (audit ST-2), documented and not changed.** That bullet
+  describes the whale side. A fixed point over the seated total does more than cap a
+  dominant seat at 1/4: it drags it DOWN — to the others' power on a four-seat
+  committee, to a quarter of the seated total on a larger one (the floor seats then
+  share the other three quarters). Four seats at 10,000 / 1,000 / 1,000 / 1,000 b10
+  all converge to a quarter of the committee each, so the three `MIN_STAKE` seats hold
+  3/4 and can commit alone, and a seat costs `MIN_STAKE` flat.
+  The Nakamoto coefficient is computed on these capped powers, so it reports the
+  committee's composition — how many keys must collude — and OVERSTATES how
+  distributed the stake is (it prints k=2 for that four-seat state while one party
+  holds ~77% of the stake). This is §6.3's rule implemented exactly; the README states
+  the consequence next to the Nakamoto claim.
+- **Proposal, not implemented:** either cap against the UNCAPPED total stake
+  (`p_i = min(stake_i, sum(stake)/4)`, one pass, no fixed point) so extra stake above
+  the cap still dilutes a dominant seat, or require a minimum power-per-seat ratio
+  (`power_i >= MIN_STAKE` and `power_i` no more than, say, 10x the smallest seated
+  power) so a floor seat cannot be worth the same as a whale's quarter. Both are
+  protocol changes with their own review; neither is in this milestone.
 - Below four seats the cap does not apply: 1/4 is unsatisfiable there (the largest of
   fewer than four holders is at least a third), and `consensus.Config.Validate` already
   encodes exactly that escape. Use `1/1` for those committees rather than inventing a

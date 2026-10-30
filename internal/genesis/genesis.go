@@ -226,11 +226,29 @@ func (g *Genesis) Validate() error {
 	// it under a b10coin-simnet-N id) fund accounts so the transfer path is
 	// exercisable, and they exceed the README's cap by design. Enforcing the
 	// rule globally would reject every such fixture, and there is no
-	// principled way to tell a fixture premine from an operator's. The real
-	// chains are protected by the no-premine policy instead: Testnet has no
-	// dev accounts, and ParseCommitteeJSON refuses to mint any. See
-	// TestTheSupplyCapIsEmissionOnlyAndTheDevnetFixtureExceedsIt, which pins
-	// the arithmetic this comment describes rather than a validation.
+	// principled way to tell a fixture premine from an operator's.
+	//
+	// What protects a real chain is narrower than the "no premine" sentence this
+	// comment used to make, and audit ST-3 was right that it overstated it.
+	// Two separate rules apply, and only the first is a loader rule:
+	//   - No funded BALANCE: Testnet funds no account, and ParseCommitteeJSON's
+	//     schema carries no dev accounts, so the loader cannot mint spendable
+	//     sparks.
+	//   - No funded BOND: every genesis validator still gets a bond of
+	//     Amount = Power from no account (chain.genesisState, with
+	//     Bond.Unfunded = Power). That bond is VOTING POWER, not money:
+	//     state.applyUnbond DESTROYS the unfunded part instead of recording it
+	//     for withdrawal, so no spark of it can ever be sold or withdrawn. It
+	//     is a seat in the federated era, not a balance - which is what makes
+	//     "a committee file cannot mint a premine" true, not something this
+	//     function enforces.
+	// A genesis that funds a balance is still possible - the devnet fixture
+	// does - and nothing here refuses it; this function checks the emission
+	// relation, and the loader checks what the loader admits.
+	// See TestTheSupplyCapIsEmissionOnlyAndTheDevnetFixtureExceedsIt, which pins
+	// the arithmetic this comment describes rather than a validation, and
+	// TestAGenesisBondIsUnfundedAndUnbondingItReleasesNothing for the
+	// non-withdrawable genesis bond.
 	// A zero puzzle target is unsatisfiable: a claim verifies only if its
 	// Argon2id digest is strictly below the target, and no digest is strictly
 	// below zero, so every claim on such a chain would fail forever. Every

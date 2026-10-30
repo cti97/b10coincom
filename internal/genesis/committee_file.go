@@ -31,6 +31,12 @@ package genesis
 //     a fixture chain's committee is fixed and local, and its sub-floor seat is
 //     why state.applyUnbond still allows a bond already under the floor to
 //     exit in full.)
+//   - That bond is UNFUNDED, and therefore NOT WITHDRAWABLE (audit ST-3): no
+//     balance is charged for it, and state.applyUnbond destroys the unfunded
+//     part rather than recording it, so `unstake` + `withdraw` cannot turn a
+//     seat into spendable sparks. A seat is a vote, not a payout; an operator
+//     that wants withdrawable stake bonds its own funds to its validator key,
+//     and those sparks are funded and withdrawable as any other bond's are.
 //   - "committee_size" is optional. It is the number of seats the chain grows
 //     into, and it may exceed the number of listed validators: with a spare
 //     seat, a bonded newcomer is admitted WITHOUT evicting a genesis seat.

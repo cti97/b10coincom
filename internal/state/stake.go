@@ -24,6 +24,12 @@ import (
 // a transfer lowers the sum by exactly its fee, which is burned. Emission and
 // faucet claims are chain-level and move the sum as a whole.
 //
+// The one exception is the genesis bond (audit ST-3): the genesis state writes
+// it from no account, and an Unbond DESTROYS its unfunded part instead of
+// recording it, so the sum falls by exactly the sparks the genesis created.
+// That is deliberate - it is the only way a spark that no balance ever paid for
+// can leave the three terms without becoming somebody's money.
+//
 // The third term is worth NOTHING until its release height: an unbonding
 // record is not spendable (it is not in Account.Balance) and not counted (it is
 // not in the bond map, so it is not a committee candidate). That is what makes
@@ -32,27 +38,42 @@ import (
 //
 // GENESIS IS THE INITIAL CONDITION, not a double count: chain.genesisState
 // seats the genesis validators by writing a bond per genesis.Validator
-// (Amount = Power, Height = 0), funded by the genesis hash rather than by any
-// balance. Height 0 therefore has bonded stake that no balance ever paid for,
-// and the invariant above is about the TRANSITIONS, not about a chain starting
-// from zero in all three terms.
+// (Amount = Power, Unfunded = Power, Height = 0), funded by the genesis hash
+// rather than by any balance. Height 0 therefore has bonded stake that no
+// balance ever paid for, and the invariant above is about the TRANSITIONS, not
+// about a chain starting from zero in all three terms. The Unfunded part is
+// what keeps that initial condition from being money: see applyUnbond.
 
 // Bond is one validator's locked stake at one address. Validator is the
 // ed25519 public key the committee seats (an address is only a hash of it, so
 // the key cannot be recovered from the map key). Height is the height at which
 // the record was first created; a later Bond that adds to the same address
 // keeps the earliest height and the first-recorded key.
+//
+// Unfunded is the part of Amount that the genesis state created rather than a
+// balance funded. It is VOTING POWER, not money (audit ST-3): applyUnbond
+// destroys it instead of recording it for withdrawal, so a genesis seat can
+// leave the committee but its Power can never be drawn out. A bond a Bond
+// transaction created carries Unfunded 0 - every spark its operator paid in is
+// withdrawable - and a genesis seat that bonds its own funds on top keeps the
+// two parts separate, so its funded sparks stay withdrawable while the grant
+// does not. It is committed state (state.Root hashes it): whether an unbond
+// pays out is a consensus rule, not a local opinion.
 type Bond struct {
 	Validator []byte // ed25519 public key: the identity the committee seats
 	Amount    uint64 // sparks, locked
+	Unfunded  uint64 // sparks in Amount that genesis created; destroyed on Unbond
 	Height    uint64 // the height at which it was recorded
 }
 
 // Unbonding is a matured-by-height claim on sparks. Amount is released to the
 // spendable balance by a Withdraw at any height >= ReleaseHeight.
 type Unbonding struct {
-	Amount        uint64
-	ReleaseHeight uint64 // height + UnbondingEpochs*EpochBlocks
+	Amount uint64
+	// ReleaseHeight is the epoch boundary at or after
+	// height + UnbondingEpochs*EpochBlocks (see releaseHeightFor): never
+	// earlier than the cooldown, up to one epoch later.
+	ReleaseHeight uint64
 }
 
 var (
@@ -83,7 +104,8 @@ var (
 	// ErrReleaseHeightOverflow reports a release height that cannot be formed.
 	// The cooldown is UnbondingEpochs*EpochBlocks, both genesis-controlled
 	// uint64s, so the product is overflow-checked before it is added to the
-	// height - a wrapped release height would mature a record in the past.
+	// height, and the rounding up to the epoch boundary is checked too - a
+	// wrapped release height would mature a record in the past.
 	ErrReleaseHeightOverflow = errors.New("state: the unbonding release height would overflow")
 )
 
@@ -172,6 +194,10 @@ func (s *State) TotalUnbonding() uint64 {
 // the minimum stake, the balance and the overflow checks; a caller that writes
 // through here bypasses all of them. A zero amount prunes the record, exactly
 // as Set prunes a zero account.
+//
+// A genesis seat must also set Unfunded = Amount (chain.genesisState does);
+// that field is what makes its exit destroy the power instead of paying it out
+// (audit ST-3). Leaving it zero records a grant as if a balance had funded it.
 func (s *State) SetBond(a types.Address, b Bond) {
 	if b.Amount == 0 {
 		delete(s.bonds, a)
@@ -191,22 +217,50 @@ func (s *State) stakeConfigured() bool {
 
 // releaseHeightFor derives an unbonding record's release height:
 //
-//	releaseHeight = height + UnbondingEpochs * EpochBlocks
+//	releaseHeight = the epoch boundary at or after height + UnbondingEpochs*EpochBlocks
 //
 // The cooldown is TWO EPOCHS, not two blocks. Derivation: the shipped geneses
 // set UnbondingEpochs = 2 (genesis.sharedParams), and EpochBlocks is the
 // chain's epoch length in blocks - 1,000 on devnet, 10,000 on testnet - so the
-// cooldown is 2 x 1,000 = 2,000 devnet blocks and 2 x 10,000 = 20,000 testnet
-// blocks. It is deliberately expressed in EPOCHS so a chain that lengthens its
-// epochs lengthens the cooldown with it: "an epoch" is the unit the committee
-// and the faucet already turn on, and a cooldown measured in absolute blocks
-// would silently become a smaller fraction of a term as epochs grew.
+// cooldown is at least 2 x 1,000 = 2,000 devnet blocks and at least
+// 2 x 10,000 = 20,000 testnet blocks. It is deliberately expressed in EPOCHS so
+// a chain that lengthens its epochs lengthens the cooldown with it: "an epoch"
+// is the unit the committee and the faucet already turn on, and a cooldown
+// measured in absolute blocks would silently become a smaller fraction of a
+// term as epochs grew.
+//
+// ROUNDING UP TO THE EPOCH BOUNDARY IS THE RECORD BOUND (audit ST-4). Records
+// merge only at one release height, so before this rule one one-spark unbond
+// per block created one record per block - cloned on every ApplyBlock and
+// Probe, hashed into the root, replayed on Open and serialised by /account.
+// Every release height is now a multiple of EpochBlocks, so at any height an
+// address holds at most UnbondingEpochs+1 UNMATURED records: the release
+// heights in (height, height + cooldown + EpochBlocks - 1] are that many
+// multiples. Records that have already matured are collapsed when the next
+// funded unbond arrives (mergeUnbonding), which keeps the whole list at
+// UnbondingEpochs+2 - one matured record plus the unmatured window - for the
+// life of the address, however many unbonds it sends.
+//
+// The costs of the rounding, stated rather than hidden: a release is never
+// EARLIER than height + cooldown (rounding is upward), and it can be LATER by
+// up to EpochBlocks-1 blocks - just under one epoch - because the unbond lands
+// mid-epoch. An unbond whose cooldown ends exactly on a boundary (h + cooldown
+// a multiple of EpochBlocks) does not move at all. Withdrawability is therefore
+// delayed by 0..E-1 blocks, never advanced, and the cooldown's guarantee ("at
+// least UnbondingEpochs epochs") still holds.
 //
 // Both factors are genesis-controlled, so the product is overflow-checked
-// (bits.Mul64 reports the carry) before it is added to the height with a second
-// check. A wrapped release height would be a release in the past - an unbond
-// that pays out immediately, which is the one thing the cooldown must not do.
+// (bits.Mul64 reports the carry) before it is added to the height, and the
+// rounding is checked too. A wrapped release height would be a release in the
+// past - an unbond that pays out immediately, which is the one thing the
+// cooldown must not do.
 func releaseHeightFor(height, unbondingEpochs, epochBlocks uint64) (uint64, error) {
+	if epochBlocks == 0 {
+		// Unreachable through ApplyTx (stakeConfigured refuses it first), but
+		// this function now divides by it, so a caller mistake is an error and
+		// never a panic.
+		return 0, fmt.Errorf("%w: EpochBlocks is zero, so a release height cannot be rounded", ErrStakeUnconfigured)
+	}
 	hi, cooldown := bits.Mul64(unbondingEpochs, epochBlocks)
 	if hi != 0 {
 		return 0, fmt.Errorf("%w: %d epochs x %d blocks does not fit in 64 bits",
@@ -215,7 +269,16 @@ func releaseHeightFor(height, unbondingEpochs, epochBlocks uint64) (uint64, erro
 	if height > math.MaxUint64-cooldown {
 		return 0, fmt.Errorf("%w: height %d + cooldown %d", ErrReleaseHeightOverflow, height, cooldown)
 	}
-	return height + cooldown, nil
+	release := height + cooldown
+	if rem := release % epochBlocks; rem != 0 {
+		roundUp := epochBlocks - rem
+		if release > math.MaxUint64-roundUp {
+			return 0, fmt.Errorf("%w: rounding %d up to the next %d-block epoch boundary",
+				ErrReleaseHeightOverflow, release, epochBlocks)
+		}
+		release += roundUp
+	}
+	return release, nil
 }
 
 // applyBond moves sparks from the sender's spendable balance into a locked bond
@@ -282,9 +345,22 @@ func (s *State) applyBond(tx *types.Tx) error {
 }
 
 // applyUnbond moves sparks from the bond record into an unbonding record whose
-// release height is s.height + the cooldown. The coins leave the bond map -
-// they are no longer a committee candidate - and do not reach the balance, so
-// they are neither spendable nor counted until the release height.
+// release height is the epoch boundary at or after s.height + the cooldown.
+// The coins leave the bond map - they are no longer a committee candidate - and
+// do not reach the balance, so they are neither spendable nor counted until the
+// release height.
+//
+// THE UNFUNDED PART IS DESTROYED, NOT RECORDED (audit ST-3). A genesis seat's
+// bond was written from no account (chain.genesisState), so recording its exit
+// would turn a grant of voting power into withdrawable money: one cooldown
+// after a chain starts, the operator would hold Power sparks nobody paid for,
+// outside TotalSupplySparks. The exit itself must stay legal - a genesis seat
+// is exactly what the rotation fixture unbonds, and a seat that cannot leave is
+// a seat that can never rotate - so the split is on the PROCEEDS, not on the
+// verb: the unfunded part is burned, the funded part becomes an unbonding
+// record. Bond.Unfunded carries the split, so a genesis seat that bonds its own
+// funds on top still withdraws those funds; Height == 0 alone would conflate
+// the two.
 //
 // It is DELIBERATELY FREE. A validator may hold nothing spendable (its whole
 // balance may be bonded), and an exit that needs a coin is an exit a zero-balance
@@ -335,39 +411,98 @@ func (s *State) applyUnbond(tx *types.Tx) error {
 		return err
 	}
 
-	// Locate the record this amount merges into - a record at the SAME release
-	// height, which is what bounds unbond spam by distinct heights rather than
-	// by transactions - and check the merge for overflow BEFORE the first
-	// write. ApplyTx's contract is that a rejected transaction leaves the
-	// receiver untouched, and chain.SelectApplicable runs many candidates
-	// against one shared state on exactly that promise.
+	// ST-3's split. The unfunded sparks leave the bond and are destroyed; only
+	// the funded remainder is owed to the address. `unfundedOut` can be the
+	// whole amount (a pure genesis seat, the rotation fixture's case) or zero
+	// (every bond a Bond transaction created); a hand-built state can put
+	// Unfunded above Amount, which min() floors.
+	unfundedOut := min(tx.Amount, bond.Unfunded)
+	fundedOut := tx.Amount - unfundedOut
+
+	// The funded part's record list, with both normalisations applied and every
+	// sum checked BEFORE the first write. ApplyTx's contract is that a rejected
+	// transaction leaves the receiver untouched, and chain.SelectApplicable runs
+	// many candidates against one shared state on exactly that promise.
 	recs := s.unbonding[tx.From]
-	mergeAt := -1
-	for i := range recs {
-		if recs[i].ReleaseHeight == release {
-			if recs[i].Amount > math.MaxUint64-tx.Amount {
-				return fmt.Errorf("%w: unbonding %d + new %d", ErrBalanceOverflow, recs[i].Amount, tx.Amount)
-			}
-			mergeAt = i
-			break
+	if fundedOut > 0 {
+		var err error
+		if recs, err = mergeUnbonding(recs, s.height, release, fundedOut); err != nil {
+			return err
 		}
 	}
 
-	// Every validation has run; write.
+	// Every validation has run; write. The bond keeps the height and key it
+	// was first recorded with (genesis, for a genesis seat), and drops only the
+	// part that left - including from Unfunded, so a later unbond cannot burn
+	// the same grant twice.
+	bond.Unfunded -= unfundedOut
 	if remainder == 0 {
 		delete(s.bonds, tx.From)
 	} else {
 		bond.Amount = remainder
 		s.bonds[tx.From] = bond
 	}
-	if mergeAt >= 0 {
-		recs[mergeAt].Amount += tx.Amount
-	} else {
-		s.unbonding[tx.From] = append(recs, Unbonding{Amount: tx.Amount, ReleaseHeight: release})
+	if fundedOut > 0 {
+		s.unbonding[tx.From] = recs
 	}
 	from.Nonce++
 	s.Set(tx.From, from)
 	return nil
+}
+
+// mergeUnbonding is applyUnbond's record bookkeeping, kept separate so all of
+// it runs before the first write and so the bound is a property of one function.
+// Two normalisations, both sum-checked:
+//
+//  1. Every record ALREADY mature at height is collapsed into one record whose
+//     release height is the earliest of theirs and whose amount is their sum.
+//     This cannot change what a withdrawal pays: a Withdraw releases every
+//     record with ReleaseHeight <= the withdrawing block's height, height only
+//     grows, and all of these records are already <= height - so they are
+//     indistinguishable to every future Withdraw. It is what keeps the record
+//     count constant rather than growing by one per epoch for an address that
+//     never withdraws (audit ST-4).
+//  2. The new amount is merged into the record at its own release height, or
+//     appended as a new record when none is at that height.
+//
+// The caller has already checked that amount is a funded exit; a pure genesis
+// exit never reaches here, so it never rewrites other records.
+func mergeUnbonding(recs []Unbonding, height, release, amount uint64) ([]Unbonding, error) {
+	out := make([]Unbonding, 0, len(recs)+1)
+	matured := Unbonding{}
+	mergedMatured := false
+	for _, rec := range recs {
+		if rec.ReleaseHeight > height {
+			out = append(out, rec)
+			continue
+		}
+		if !mergedMatured {
+			matured = rec
+			mergedMatured = true
+			continue
+		}
+		if matured.Amount > math.MaxUint64-rec.Amount {
+			return nil, fmt.Errorf("%w: matured records %d + %d", ErrBalanceOverflow, matured.Amount, rec.Amount)
+		}
+		matured.Amount += rec.Amount
+		if rec.ReleaseHeight < matured.ReleaseHeight {
+			matured.ReleaseHeight = rec.ReleaseHeight
+		}
+	}
+	if mergedMatured {
+		out = append(out, matured)
+	}
+	for i := range out {
+		if out[i].ReleaseHeight != release {
+			continue
+		}
+		if out[i].Amount > math.MaxUint64-amount {
+			return nil, fmt.Errorf("%w: unbonding %d + new %d", ErrBalanceOverflow, out[i].Amount, amount)
+		}
+		out[i].Amount += amount
+		return out, nil
+	}
+	return append(out, Unbonding{Amount: amount, ReleaseHeight: release}), nil
 }
 
 // applyWithdraw releases EVERY unbonding record that has matured

@@ -374,7 +374,17 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 
 	// The joining node holds the same history as the committee it joined: its
 	// votes came from a chain that agrees, not from a fork of its own.
-	assertIdenticalHistory(t, all, joinerNode.Height())
+	//
+	// WAIT FOR EVERY PEER FIRST. The joiner is the height reference above, and
+	// it can be one block AHEAD of a follower under load: reading a height a
+	// peer has not stored yet fails as "store: height not found", which is a lag,
+	// not a safety violation. The 6->5 rotation test already waits this way
+	// (waitAllReach before assertIdenticalHistory); this test was missing it and
+	// flaked once on the race suite. The assertion itself is unchanged - only
+	// the data it reads is now guaranteed to be there.
+	through := joinerNode.Height()
+	waitAllReach(t, all, through, 120*time.Second)
+	assertIdenticalHistory(t, all, through)
 }
 
 // TestAStrangerIsStillRefusedAfterABoundary pins the other half of RT-1: the
