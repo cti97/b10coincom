@@ -661,6 +661,7 @@ relay with exponential backoff. Bandwidth is kilobytes per second.
 | `--write-timeout SECONDS` | `30` | per-connection write deadline, anchored to when the queue became non-empty: the backlog must drain to empty within it, so a never-reading sink **and** a slow-reading one are ended and their queued bytes and entry ring released |
 | `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |
 | `--keepalive SECONDS` | `15` | TCP keepalive probe period for every accepted connection; a half-open connection is reaped by the kernel after unanswered probes |
+| `--access-timeout SECONDS` | `5` | how long an accepted connection may take to answer the `--access-token-file` challenge before it is closed and its slot released (audit N-7); an honest client answers immediately, and a socket silent for this long is a scanner |
 
 Ctrl-C (or, on Unix, SIGTERM) stops the listener, closes every connection and
 joins every goroutine before the process exits. Same as the node command: one
@@ -967,8 +968,15 @@ before it reaches the grant, so a genesis seat that was topped up with `stake`
 returns those sparks through an ordinary partial exit — and keeps its seat if the
 remainder clears `MIN_STAKE` — while the grant is destroyed only once the exit
 goes past them. The total a bond can ever return is still exactly the funded
-sparks bonded into it; only the order changed, and it changed so an operator does
-not lose their money because they also received a grant.
+sparks bonded into it; what changed is whose coins leave first, so an operator
+does not lose their money because they also received a grant. **The order is a
+consensus rule, not a presentation detail**: it changes the post-state of any
+exit from a bond holding both a grant and a top-up, so C-1 is a hard fork with
+no in-band marker (no header carries a rule version). A chain that applied such
+an exit under the old order diverges on replay, and `Chain.Open` now names the
+C-1 rule change instead of reporting the log as corrupt; the deploy README's
+hard-fork callout carries the same warning. The fixtures cannot see this
+because their genesis seats are pure grants.
 
 **A bond is a seat, and the seat changes only at a boundary.** The committee is
 the top `committee_size` bonds by stake, ties broken by public-key bytes, with

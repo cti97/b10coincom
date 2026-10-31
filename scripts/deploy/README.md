@@ -209,12 +209,12 @@ failure 3.
 ```json
 {
   "chain_id": "example-testnet-1",
-  "note": "optional human annotation — never enters the genesis hash",
+  "note": "ten times MIN_STAKE per seat, not the floor (audit A-4); never enters the genesis hash",
   "committee_size": 4,
   "validators": [
-    { "name": "pi-0", "pubkey": "<Pi 0's public key hex>", "power": 100000000000 },
-    { "name": "pi-1", "pubkey": "<Pi 1's public key hex>", "power": 100000000000 },
-    { "name": "pi-2", "pubkey": "<Pi 2's public key hex>", "power": 100000000000 }
+    { "name": "pi-0", "pubkey": "<Pi 0's public key hex>", "power": 1000000000000 },
+    { "name": "pi-1", "pubkey": "<Pi 1's public key hex>", "power": 1000000000000 },
+    { "name": "pi-2", "pubkey": "<Pi 2's public key hex>", "power": 1000000000000 }
   ]
 }
 ```
@@ -231,9 +231,9 @@ anything less. That floor is audit RT-2: a one-spark seat is a bond below the
 candidacy floor, and on a full committee one `MIN_STAKE` bond then outranks it
 and holds about all of the power (10^11 of 10^11+2 on this three-seat shape).
 
-> **⚠️ What THIS file costs to capture (audit A-4).** Three seats at exactly
-> `100000000000` sparks with `committee_size` 4 let an attacker take the
-> committee with **three `MIN_STAKE` bonds** — `3 × 10^11 =
+> **⚠️ What a floor-powered committee costs to capture (audit A-4).** Three
+> seats at exactly `100000000000` sparks with `committee_size` 4 let an
+> attacker take the committee with **three `MIN_STAKE` bonds** — `3 × 10^11 =
 > 300,000,000,000` sparks, **3,000 b10** — plus **a few key-generation
 > attempts**. The mechanism: equal stakes are ordered by raw public-key bytes
 > (`state.compareCandidates`), so an attacker grinds each new key until it
@@ -243,20 +243,21 @@ and holds about all of the power (10^11 of 10^11+2 on this three-seat shape).
 > its own. At the README's ~71 minutes of faucet farming per `MIN_STAKE` that
 > is a few hours, and it needs no genesis key.
 >
-> **An operator can make this expensive.** Set every genesis `power` well
-> above the floor — `1000000000000` is 10,000 b10, ten times `MIN_STAKE`. A
-> floor bond then cannot tie the ranking, the three genesis seats keep their
-> seats, and only the one spare seat can be won, which the 1/4 cap holds to a
-> quarter. Three seats now cost `3 × (the lowest genesis power) + 3` sparks —
-> 30,000 b10 at ten times the floor — and the tie-break grind buys nothing.
+> **The checked example and the sample above set ten times the floor**
+> (`1000000000000` = 10,000 b10). A floor bond then cannot tie the ranking, the
+> three genesis seats keep their seats, and only the one spare seat can be
+> won, which the 1/4 cap holds to a quarter. Three seats now cost
+> `3 × (the lowest genesis power) + 3` sparks — 30,000 b10 at ten times the
+> floor — and the tie-break grind buys nothing. Do not lower the example's
+> powers back to `MIN_STAKE`; `TestTheShippedExampleCommitteeFileIsLoadable`
+> refuses the file if you do.
 > The grind itself cannot be removed here: equal-stake ordering is part of the
 > deterministic committee derivation every node must compute identically. The
 > structural alternative is a **fourth** genesis machine (`committee_size` 5
 > against 4 keys): three attacker seats are then 3/5, below the two-thirds
-> quorum, so the cheapest capture needs four bonds instead of three. This
-> example cannot do either for you — the powers and the seat count are yours to
-> choose before the chain starts (editing the file afterwards starts a
-> different chain).
+> quorum, so the cheapest capture needs four bonds instead of three. The powers
+> and the seat count are yours to choose before the chain starts (editing the
+> file afterwards starts a different chain).
 
 `committee_size` is optional and is **how many seats the chain has room for**.
 It must be at least the number of validators (a key the file publishes must be
@@ -438,16 +439,19 @@ interpose. No shared-secret gate without a relay identity closes that. Run it
 over a trusted path (a VPN), and treat disclosure of the token as a connection
 someone else can make.
 
-**The gate's own resource bounds, measured (audit D-5).** A token dial that
-answers nothing is closed `--access-timeout` seconds after accept (5 s default;
-measured at 5.0 s on the audit host, not the ~95 s the 2026-10-31 audit
-reported, because the two gate frames are under 300 bytes and fit the socket
-buffer even when the dialer never reads). A gate frame that cannot be written is
-a dying socket and is no longer counted `unauthorized`; only a wrong, short or
-absent answer is. Once a socket is gated, a HELLO-shaped frame costs one Ed25519
-verification before the per-wave hint window can be consulted - the window is
-keyed by the claimed validator key, and that key is not authenticated until the
-signature verifies, so the verify cannot safely move first. On a relay,
+**The gate's own resource bounds (audit D-5, N-7).** A token dial that answers
+nothing is closed by the relay's gate deadline — `--access-timeout`, 5 seconds
+by default — and its slot released. The deadline is the bound; the two gate
+frames are small enough to fit a socket buffer even when the dialer never
+reads, so the closure does not depend on the peer draining them. (Earlier
+notes here quoted a wall-clock figure for this; the closure is now a
+configured bound, and no measured number is claimed.) A gate frame that cannot
+be written is a dying socket and is no longer counted `unauthorized`; only a
+wrong, short or absent answer is. Once a socket is gated, a HELLO-shaped frame
+costs one Ed25519 verification before the per-wave hint window can be consulted
+- the window is keyed by the claimed validator key, and that key is not
+authenticated until the signature verifies, so the verify cannot safely move
+first. On a relay,
 `observePeerExchange` likewise spends one verification per frame before its
 window, because the frame names an unauthenticated signer. Both are single
 verifications (tens of microseconds), bounded by each connection's frame rate;
@@ -712,19 +716,33 @@ To update a binary: overwrite `/opt/b10coin/b10coin` (§2's `install`) and
 `sudo systemctl restart b10coin` on each machine — **all machines from the
 same build**, for the §3 reason.
 
-> **⚠️ A data directory written before the ST-3 change cannot be opened by this
-> build — it is a hard fork of the genesis state, not a compatible upgrade.**
-> Audit ST-3 made a genesis seat's bond carry `unfunded` sparks in the committed
+> **⚠️ Two changes in this branch are consensus hard forks with no in-band
+> marker: ST-3 and C-1. Run the same build on every machine, and do not carry a
+> directory written by an older one.**
+>
+> **ST-3** made a genesis seat's bond carry `unfunded` sparks in the committed
 > bond leaf, which changed the genesis **state root**; the genesis **hash** did
 > not change, because it covers the committee document and no derived state.
 > The consequences are easy to misread: `store.CheckGenesis` passes, the node
 > starts, replays, and fails at height 1 with "the first stored block does not
 > link this build's genesis block". That is version skew, not corruption —
-> nothing in the log needs repairing. **Upgrade all three Pis together and start
-> each on a FRESH `--dir`** (or resync the node from a peer on the same build);
-> do not try to keep a pre-ST-3 directory. The error now names the skew and the
-> ST-3 cause explicitly (audit C-2), so a pre-fix directory is not mistaken for a
-> damaged one.
+> nothing in the log needs repairing.
+>
+> **C-1** is the second: `applyUnbond` now consumes the **funded** part of a
+> bond before it reaches a genesis grant. The total a bond can return did not
+> change, but the **post-state** did for any exit from a bond holding both a
+> grant and a top-up, so a directory written by a build that ran the old order
+> diverges **at that unbond's height** — not at height 1, where the ST-3
+> message fires. A mixed-build committee forks at the first such exit.
+> Replay now reports it as a rule change and names C-1 explicitly (audit N-1),
+> so the error no longer sends you looking for a corrupt log, but the directory
+> still cannot be opened by the other build.
+>
+> For both: **upgrade all three Pis together and start each on a FRESH
+> `--dir`** (or resync the node from a peer on the same build); do not try to
+> keep a pre-ST-3 or pre-C-1 directory. The errors name the skew and the cause
+> explicitly (audit C-2 and N-1), so a directory from an older build is not
+> mistaken for a damaged one.
 
 > **⚠️ Restart the committee TOGETHER — a rolling reboot can hold the chain
 > down for minutes.** Each round at an undecided height is given

@@ -113,14 +113,15 @@ jobs:
       # Audit F-4: the two benchmarks that back the "allocates nothing" claims in
       # internal/consensus/diag.go and Chain.IsSeatedAt were never executed by
       # CI. They are opt-in by construction (`go test` skips benchmarks), so the
-      # claims rested on prose. This runs BOTH at a fixed 100 iterations, which
-      # measured 1.4 s on the audit host (0.38 s devnet + 0.25 s chain plus
-      # compilation; the devnet benchmark brings up four in-process validators).
-      # It is evidence in the log (0 B/op, 0 allocs/op on the steady paths), not
-      # a gate: the benchmark asserts no threshold, so a regression is visible
-      # but not red. Turning it into a gate would need an allocation assertion
-      # in the benchmark itself; that is deliberately not done here because
-      # allocs/op is a measurement, not a correctness property.
+      # claims rested on prose. This runs BOTH at a fixed 100 iterations; the
+      # run is short (a few seconds at most - it is dominated by compilation,
+      # and the devnet benchmark brings up four in-process validators), so no
+      # measured figure is quoted: the log's allocation line is the evidence,
+      # not a wall-clock number. It is a gate on nothing: the benchmark asserts
+      # no threshold, so a regression is visible but not red. Turning it into a
+      # gate would need an allocation assertion in the benchmark itself; that
+      # is deliberately not done here because allocs/op is a measurement, not a
+      # correctness property.
       - run: go test -run '^$' -bench 'Benchmark(HotPathObservers|CommitteeMembershipPerFrame)$' -benchmem -benchtime=100x ./internal/devnet ./internal/chain
       # The milestone acceptance commands must keep printing OK with exit 0.
       # The first is the default run — its --claims default makes it pay one
