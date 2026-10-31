@@ -276,6 +276,56 @@ func TestDecodeHelloBoundsTheConnectionNonce(t *testing.T) {
 	}
 }
 
+// TestHelloNonceWidthAgreesWithDecodeHello pins the allocation-free width walk
+// audit N-3's operator notice depends on: it must report exactly the Nonce
+// length DecodeHello reads, on every legal width, allocate nothing, and refuse
+// a frame that is not a HELLO or is too short to carry the prefix. It is a
+// diagnostic, never an admission decision, so agreeing with the decoder is the
+// whole contract.
+func TestHelloNonceWidthAgreesWithDecodeHello(t *testing.T) {
+	hello := func(n int) []byte {
+		e := types.NewEncoder()
+		e.U8(uint8(MsgHello))
+		e.VarBytes([]byte("b10coin-devnet"))
+		e.VarBytes(make([]byte, ed25519.PublicKeySize))
+		e.U64(7)
+		e.VarBytes(make([]byte, n))
+		e.VarBytes(nil)
+		return e.Bytes()
+	}
+	for _, n := range []int{0, connectionNonceWidthForTest, MaxHelloNonceBytes} {
+		frame := hello(n)
+		got, ok := HelloNonceWidth(frame)
+		if !ok {
+			t.Fatalf("a %d-byte HELLO nonce has no reported width", n)
+		}
+		dec, err := DecodeHello(frame)
+		if err != nil {
+			t.Fatalf("a %d-byte HELLO nonce did not decode: %v", n, err)
+		}
+		if got != len(dec.Nonce) || got != n {
+			t.Fatalf("HelloNonceWidth = %d, DecodeHello read %d, want %d", got, len(dec.Nonce), n)
+		}
+		if allocs := testing.AllocsPerRun(20, func() { _, _ = HelloNonceWidth(frame) }); allocs != 0 {
+			t.Fatalf("HelloNonceWidth allocated %v times: the notice must not allocate on the dispatch goroutine", allocs)
+		}
+	}
+	// Not a HELLO: the tag answers before any length is trusted.
+	if _, ok := HelloNonceWidth([]byte{0x81, 0, 0}); ok {
+		t.Fatal("a non-HELLO frame reported a HELLO nonce width")
+	}
+	// Truncated before the Nonce length prefix: the walk must fail rather than
+	// read a length out of the following byte.
+	prefix := types.NewEncoder()
+	prefix.U8(uint8(MsgHello))
+	prefix.VarBytes([]byte("b10coin-devnet"))
+	prefix.VarBytes(make([]byte, ed25519.PublicKeySize))
+	prefix.U64(7)
+	if _, ok := HelloNonceWidth(prefix.Bytes()); ok {
+		t.Fatal("a HELLO truncated before its Nonce prefix reported a width")
+	}
+}
+
 // connectionNonceWidthForTest is the width the transport uses; named here so the
 // wire test exercises the production size without importing the tcp package.
 const connectionNonceWidthForTest = 32

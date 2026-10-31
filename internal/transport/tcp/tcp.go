@@ -87,6 +87,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/wire"
 )
@@ -146,10 +147,21 @@ const (
 	// half after the sender's (wire.HelloBinding), so a captured member HELLO
 	// replayed on another socket fails an equality check before any signature
 	// work - and a member cannot launder a third node's challenge through the
-	// HELLO it makes this node sign (audit A-2). 2*32 is exactly
+	// HELLO it makes this node sign (audit A-2). The pair is fixed by
+	// commit-then-reveal (exchangeNonce): each end sends H(its challenge)
+	// before it may learn the peer's, so neither can choose its half after
+	// seeing the half a transplant would need. 2*32 is exactly
 	// wire.MaxHelloNonceBytes; 32 bytes is far beyond guessing and matches the
 	// width the relay gate's own challenge uses.
 	connectionNonceBytes = 32
+	// connectionCommitmentBytes is the width of the commitment each end sends
+	// before revealing its challenge (audit A-2): the 32-byte output of
+	// crypto.HashParts, domain-separated so a commitment cannot be mistaken for
+	// a challenge (or a challenge for a commitment) in any other role.
+	connectionCommitmentBytes = 32
+	// connectionCommitmentDomain separates a challenge commitment from every
+	// other 32-byte hash in the protocol, including the HELLO hash itself.
+	connectionCommitmentDomain = "b10coin-connection-nonce-commit"
 	// relayPeerIDPrefix names a RELAY connection in the registry: the
 	// connection's far end is the relay (which has no identity and reads
 	// nothing of the payload), so the name is the fixed prefix plus the
@@ -339,16 +351,26 @@ type Options struct {
 	//
 	// The helloBinding argument is the exact value this connection's HELLOs
 	// must carry in wire.Hello.Nonce: wire.HelloBinding(the PEER's challenge,
-	// THIS side's challenge), i.e. both 32-byte values the direct ID handshake
-	// exchanged, in that order (audit A-2). A policy that accepts a HELLO must
-	// compare the whole value against it. One challenge was not enough and is
-	// the A-2 hole: the peer CHOOSES the challenge it sends us, so a member
-	// could hand a third node's challenge to the member whose identity it
-	// wants and replay that signature there. The peer's own challenge is the
-	// half it cannot make a third node generate for it, which is why the
-	// binding covers both. The value is empty (nil) on a relay connection,
-	// where one socket carries every member's frames and there is no peer
-	// challenge to bind - the documented A-3 residual.
+	// THIS side's challenge), i.e. both 32-byte values exchanged by the direct
+	// commit-then-reveal handshake, in that order (audit A-2). A policy that
+	// accepts a HELLO must compare the whole value against it. One challenge
+	// was not enough and is the A-2 hole: the peer CHOOSES the challenge it
+	// sends us, so a member could hand a third node's challenge to the member
+	// whose identity it wants and replay that signature there. The peer's own
+	// challenge is the half it cannot make a third node generate for it, and
+	// commit-then-reveal is what stops a member on two sockets from choosing
+	// each half after seeing the other (see exchangeNonce). The value is empty
+	// (nil) on a relay connection, where one socket carries every member's
+	// frames and there is no peer challenge to bind - the documented A-3
+	// residual.
+	//
+	// WHAT THE BINDING DOES NOT PROVE, so a policy does not over-claim: it
+	// ties the HELLO to this socket's two challenges, NOT to the identity at
+	// the other end. A party that controls the byte stream - the relay, or a
+	// transparent proxy at an address the operator dialled - can carry a
+	// genuine handshake through and forward any frame it likes. The membership
+	// and signature checks below are what decide WHO may be admitted; the
+	// binding only decides WHICH socket the proof is presented on.
 	//
 	// Admit is supplied by the node layer (this package holds no keys and no
 	// chain identity) and is expected to require a signed HELLO from a
@@ -672,6 +694,9 @@ type conn struct {
 	// wire.HelloBinding(remoteNonce, localNonce), the exact value this side
 	// demands of the peer's HELLO, and wire.HelloBinding(localNonce,
 	// remoteNonce) is what this side signs into its own HELLOs to the peer.
+	// The pair is fixed by commit-then-reveal: each side's challenge is fixed
+	// by a commitment sent BEFORE the peer's commitment is read, so the two
+	// halves cannot be chosen to match a pair learned later (exchangeNonce).
 	// All three are written under the transport's mutex (the conn is already
 	// in the registry while the nonce exchange runs, so an unlocked write
 	// would race PeerChallenges/ConnNonces) and are read-only once ready is
@@ -680,6 +705,11 @@ type conn struct {
 	localNonce   []byte
 	remoteNonce  []byte
 	helloBinding []byte
+	// vintageNoted records that this connection has already produced its ONE
+	// binding-width notice (audit N-3). It is per-connection and dies with the
+	// connection, which is exactly the "once per connection" the diagnostic
+	// promises; a fresh connection gets a fresh notice.
+	vintageNoted atomic.Bool
 	// ready is set by start, after the connection's last handshake frame has
 	// been exchanged and immediately before its reader and writer begin. A
 	// connection that is admitted but not ready is still HANDSHAKING: Peers(),
@@ -816,6 +846,15 @@ type TcpTransport struct {
 	// refusedConns counts inbound dials closed at accept because the cap was
 	// full. The observable an operator checks when honest peers cannot get in.
 	refusedConns atomic.Uint64
+	// bindingVintages counts the connections that produced the N-3 notice: a
+	// HELLO whose socket-binding width is the OLD one-challenge form while the
+	// connection's is the current two-challenge form (a peer on the other side
+	// of the A-2 binding change). It is one per connection, so the count is
+	// connections, not frames, and a test can assert both the notice and its
+	// "once" property without reading the log. Both the gated path
+	// (noteBindingVintage) and the node layer (NoteBindingVintage, for an
+	// admitted connection) feed it.
+	bindingVintages atomic.Uint64
 	// maintainers counts the running maintainer goroutines. A registration
 	// and a goroutine are different things: RemovePeer deletes the former
 	// immediately, but the goroutine ends only when it observes the stop, and
@@ -1374,43 +1413,73 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*co
 }
 
 // exchangeNonce performs the per-connection challenge exchange that binds a
-// HELLO signature to one socket (audit PX-2). Both sides write their 32-byte
-// challenge before reading the peer's, mirroring the ID exchange, so neither
-// can block the other and the two frames never deadlock. A failed write or read
-// - including a peer that sends a frame of the wrong width - ends the
-// connection; the maintainer treats it as an ordinary failure and redials.
+// HELLO signature to one socket (audit PX-2). It is COMMIT-THEN-REVEAL (audit
+// A-2), four fixed-width frames in two round steps:
 //
-// BOTH challenges are in the HELLO binding (audit A-2). Each is 32 random bytes
-// from crypto/rand: the receiver's half proves the frame was signed for a
-// socket this node issued a challenge on, and the sender's half proves it is
-// the one socket whose two ends produced that pair. The receiver's half alone
-// was not enough: the peer chooses the challenge it sends us, so a member could
-// make another member sign a third node's challenge and replay it there. The
-// frames are plaintext, so an observer learns the values; freshness across
-// connections is what makes them useless elsewhere.
+//	-> commitment = H(domain, local challenge)     <- the peer's commitment
+//	-> local challenge                             <- the peer's challenge
+//
+// Each end sends its commitment BEFORE it reads the peer's, and reveals its
+// challenge only after holding the peer's commitment. It then refuses a reveal
+// that does not hash to the commitment (and closes the socket), so a challenge
+// cannot be substituted after the fact.
+//
+// WHY THE COMMITMENT, in one line: the old exchange wrote the local challenge
+// before reading the peer's, so a member M on two sockets could order the
+// handshakes - learn A's challenge first, present it to B, then send B's to A -
+// and make A sign the pair B checks. With the commitment, M's half at A is
+// fixed before it can learn A's challenge, and its half at B is fixed before
+// it can learn B's. A transplant needs M's half at A to BE B's challenge and
+// its half at B to BE A's challenge; each value would have to be known before
+// the other is learned, which is circular. M's choices degrade to an honest
+// per-socket challenge it cannot match to anything else.
+//
+// A failed read, a frame of the wrong width, a failed write, or a reveal that
+// does not match its commitment ends the connection; the maintainer treats it
+// as an ordinary failure and redials. ONE deadline (a fresh HandshakeTimeout)
+// covers the whole exchange, so the extra step adds frames, not time: no round
+// can wait past it. The frames are plaintext, so an observer learns the
+// values; freshness across connections is what makes them useless elsewhere,
+// and a party that CONTROLS the byte stream (relay, transparent proxy) can
+// still carry a genuine handshake through - the documented A-3 residual, not
+// something a challenge exchange can close.
 func (t *TcpTransport) exchangeNonce(nc net.Conn, c *conn) error {
 	local := make([]byte, connectionNonceBytes)
 	if _, err := cryptorand.Read(local); err != nil {
 		_ = nc.Close()
 		return fmt.Errorf("tcp: generating a connection nonce for %s: %w", c.addr, err)
 	}
-	if err := t.writeHandshakeFrame(nc, c.addr, local); err != nil {
+	// An absolute deadline, not a fresh one per step: the pre-fix exchange was
+	// bounded by ONE HandshakeTimeout and this one must be too (audit A-2: a
+	// handshake change must not add an unbounded wait).
+	deadline := time.Now().Add(t.opts.HandshakeTimeout)
+	commitment := ConnectionCommitment(local)
+	if err := writeNonceFrame(nc, c.addr, commitment[:], deadline); err != nil {
 		return err
 	}
-	if err := nc.SetReadDeadline(time.Now().Add(t.opts.HandshakeTimeout)); err != nil {
-		_ = nc.Close()
-		return err
-	}
-	remote, err := wire.ReadFrame(nc, connectionNonceBytes)
+	theirCommit, err := readNonceFrame(nc, c.addr, "connection nonce commitment", connectionCommitmentBytes, deadline)
 	if err != nil {
-		_ = nc.Close()
-		return fmt.Errorf("tcp: reading the connection nonce from %s: %w", c.addr, err)
+		return err
 	}
-	if len(remote) != connectionNonceBytes {
-		_ = nc.Close()
-		return fmt.Errorf("tcp: connection nonce from %s is %d bytes, want %d", c.addr, len(remote), connectionNonceBytes)
+	if err := writeNonceFrame(nc, c.addr, local, deadline); err != nil {
+		return err
 	}
+	remote, err := readNonceFrame(nc, c.addr, "connection nonce", connectionNonceBytes, deadline)
+	if err != nil {
+		return err
+	}
+	want := ConnectionCommitment(remote)
+	if !bytes.Equal(want[:], theirCommit) {
+		_ = nc.Close()
+		return fmt.Errorf("tcp: connection nonce from %s does not match the commitment it made before the exchange (audit A-2)", c.addr)
+	}
+	// The exchange is over: the reader arms its own deadline before every frame,
+	// and the writer does the same for writes, so neither inherits this one.
 	if err := nc.SetReadDeadline(time.Time{}); err != nil {
+		_ = nc.Close()
+		return err
+	}
+	if err := nc.SetWriteDeadline(time.Time{}); err != nil {
 		_ = nc.Close()
 		return err
 	}
@@ -1425,6 +1494,53 @@ func (t *TcpTransport) exchangeNonce(nc net.Conn, c *conn) error {
 	c.helloBinding = wire.HelloBinding(remote, local)
 	t.mu.Unlock()
 	return nil
+}
+
+// ConnectionCommitment is the commitment step of the per-connection exchange
+// (audit A-2): H(domain, challenge). It is exported so a test - or a conforming
+// implementation of the peer side - can play the exchange without re-deriving
+// the domain separator, and so the production path and the tests cannot drift
+// apart silently. The transport is the only producer of these frames in this
+// tree.
+func ConnectionCommitment(challenge []byte) [32]byte {
+	return crypto.HashParts([]byte(connectionCommitmentDomain), challenge)
+}
+
+// writeNonceFrame writes one fixed-width frame of the nonce exchange under the
+// exchange's single absolute deadline. It allocates nothing and interprets no
+// byte of the payload.
+func writeNonceFrame(nc net.Conn, addr string, frame []byte, deadline time.Time) error {
+	if err := nc.SetWriteDeadline(deadline); err != nil {
+		_ = nc.Close()
+		return err
+	}
+	if err := wire.WriteFrame(nc, frame); err != nil {
+		_ = nc.Close()
+		return fmt.Errorf("tcp: writing handshake to %s: %w", addr, err)
+	}
+	return nil
+}
+
+// readNonceFrame reads one fixed-width frame of the nonce exchange under the
+// exchange's single absolute deadline. The width is checked BEFORE the value is
+// used, so a short or long frame is a protocol failure rather than a value that
+// happens to compare unequal later; the read itself is bounded by `want`, so an
+// attacker-declared length cannot allocate more than one frame's fixed size.
+func readNonceFrame(nc net.Conn, addr, what string, want int, deadline time.Time) ([]byte, error) {
+	if err := nc.SetReadDeadline(deadline); err != nil {
+		_ = nc.Close()
+		return nil, err
+	}
+	frame, err := wire.ReadFrame(nc, want)
+	if err != nil {
+		_ = nc.Close()
+		return nil, fmt.Errorf("tcp: reading the %s from %s: %w", what, addr, err)
+	}
+	if len(frame) != want {
+		_ = nc.Close()
+		return nil, fmt.Errorf("tcp: %s from %s is %d bytes, want %d", what, addr, len(frame), want)
+	}
+	return frame, nil
 }
 
 // writeHello sends the local ID under the handshake write deadline - the
@@ -1946,6 +2062,7 @@ func (t *TcpTransport) reader(c *conn) {
 				// and the connection stays out of Peers() and off every
 				// Broadcast. A stranger cannot reach OnMessage at all.
 				c.gated.Add(1)
+				t.noteBindingVintage(c, payload)
 				continue
 			}
 			c.admitted.Store(true)
@@ -1953,6 +2070,82 @@ func (t *TcpTransport) reader(c *conn) {
 		t.dispatch(transport.Message{From: c.remote, Data: payload})
 	}
 	t.finish(c)
+}
+
+// noteBindingVintage makes the A-2 binding change LOUD once per connection
+// (audit N-3). The binding went from one 32-byte challenge to two 64-byte
+// challenges; a node on either side of that change never admits the other on a
+// gated socket and never becomes a catch-up source, and before this the only
+// observable was the GatedFrames counter - no line anywhere said why. A
+// mixed-version deployment that fails silently is worse than one that fails
+// loudly, so the first gated HELLO whose declared binding width is the OLD
+// form logs the two widths and the consequence, and the connection is marked so
+// a HELLO every wave cannot flood the log. A fresh connection gets a fresh
+// line: "once per connection", not once per process.
+//
+// It is deliberately narrow. It runs only on a GATED connection (needsAdmit:
+// accepted inbound or a learned dial), only after the admission policy has
+// already refused the frame, and only when wire.HelloNonceWidth says the frame
+// is a HELLO and its width differs. It reads length prefixes only - no
+// allocation, no key, no signature - and it makes no admission decision: the
+// refusal has already happened. An ADMITTED connection (a configured dial) never
+// passes through here; the node layer reports that case through
+// NoteBindingVintage when its own binding equality refuses the HELLO.
+//
+// A version byte in wire.Hello was considered and is NOT added: the decoder's
+// Done() refuses trailing bytes, so a new field is itself a vintage break an old
+// node cannot negotiate, and the width already identifies the one split that
+// exists. The loud line is the smaller fix.
+func (t *TcpTransport) noteBindingVintage(c *conn, frame []byte) {
+	if !c.needsAdmit || c.relayMode || c.vintageNoted.Load() {
+		return
+	}
+	width, ok := wire.HelloNonceWidth(frame)
+	if !ok {
+		return
+	}
+	t.noticeBindingVintage(c, width)
+}
+
+// NoteBindingVintage is the node layer's way of reporting the same N-3 notice
+// for an ADMITTED connection: the caller refused a HELLO on connection id
+// because its binding did not match, and width is the HELLO's declared Nonce
+// width. The transport owns the diagnosis because it owns the connection's own
+// binding width, the once-per-connection mark and the log line, so the gated and
+// admitted paths produce one kind of line and one counter. Unknown ids - a
+// connection that died between dispatch and this call - are ignored, and a
+// width that is not the old one-challenge form is not a vintage split and is not
+// logged.
+func (t *TcpTransport) NoteBindingVintage(id transport.PeerID, width int) {
+	t.mu.Lock()
+	c := t.conns[id]
+	t.mu.Unlock()
+	if c == nil {
+		return
+	}
+	t.noticeBindingVintage(c, width)
+}
+
+// noticeBindingVintage is the shared decision behind both entry points.
+func (t *TcpTransport) noticeBindingVintage(c *conn, width int) {
+	if c.relayMode || c.vintageNoted.Load() {
+		return
+	}
+	// Only the ONE-challenge form is a known older build. Any other width - an
+	// empty nonce copied off a relay, a hostile length - is a refused frame, not
+	// a vintage split, and must not be misdiagnosed as one.
+	if width != connectionNonceBytes || width == len(c.helloBinding) {
+		return
+	}
+	if !c.vintageNoted.CompareAndSwap(false, true) {
+		return
+	}
+	// The log call comes BEFORE the counter increment so the counter is a
+	// reliable ordering witness: a test (or an operator) that sees the count
+	// has already had the line written.
+	log.Printf("b10coin: %s: a HELLO carries a %d-byte socket binding (the pre-A-2 one-challenge form), but this connection's is %d: the peer is on the other side of the A-2 binding change and its HELLO cannot be accepted on this socket (audit N-3)",
+		c.remote, width, len(c.helloBinding))
+	t.bindingVintages.Add(1)
 }
 
 // paceRelay charges one relay frame to the connection's byte budget and waits
@@ -2196,6 +2389,15 @@ func (t *TcpTransport) Peers() []transport.PeerID {
 // the listener already held MaxConns accepted connections (audit N-3). It is
 // the observable an operator checks when an honest peer cannot get in.
 func (t *TcpTransport) RefusedConns() uint64 { return t.refusedConns.Load() }
+
+// BindingVintages reports how many connections produced the N-3 binding-width
+// notice: a HELLO whose socket binding has the old one-challenge width, which
+// is what a node on the other side of the A-2 binding change sends forever. It
+// counts CONNECTIONS, not frames - the notice is once per connection - so a
+// node that keeps redialling an old peer increments it once per attempt while
+// the log stays readable. A steady nonzero value with a healthy committee is a
+// mixed-version deployment, and the log line names the two widths.
+func (t *TcpTransport) BindingVintages() uint64 { return t.bindingVintages.Load() }
 
 // GatedFrames reports how many frames were dropped because their connection
 // had not passed Options.Admit (audit N-3/PX-2); RateLimitedFrames reports the

@@ -170,6 +170,18 @@ func (d *Decoder) Len() (int, error) {
 	return int(n), nil
 }
 
+// Skip advances past n bytes the caller does not need, so a walk that only
+// wants a LATER field's length does not have to allocate a copy of an earlier
+// one. It is bounds-checked exactly as a read would be: a skip past the end is
+// ErrShortBuffer, not a silently clamped offset.
+func (d *Decoder) Skip(n int) error {
+	if n < 0 || n > d.remaining() {
+		return ErrShortBuffer
+	}
+	d.off += n
+	return nil
+}
+
 func (d *Decoder) VarBytes() ([]byte, error) {
 	n, err := d.Len()
 	if err != nil {

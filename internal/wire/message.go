@@ -91,12 +91,67 @@ const MaxHelloNonceBytes = 64
 // attacker cannot transplant, because the third node never generated it and
 // will never accept a HELLO that quotes it.
 //
-// A relay link has neither challenge and passes nil for both; the binding is
-// then empty, which is the documented relay residual (audit A-3).
+// What makes the pair the SOCKET's own is the EXCHANGE that produces it, not
+// the concatenation (audit A-2): tcp.exchangeNonce is commit-then-reveal, so
+// each end sends a hash of its challenge BEFORE it may learn the peer's. The
+// attack this closes is an ORDERING, not a forgery: a member that could learn
+// A's challenge first and then present it to B could make A sign the pair B
+// checks. Committed first, the two constraints a successful transplant needs -
+// M's half at A must be B's challenge, and M's half at B must be A's challenge
+// - cannot both be met, because each value is fixed before the other is
+// learned. A reveal that does not match the commitment ends the socket, so the
+// substitution cannot be made after the fact either.
+//
+// WHAT THIS IS NOT, stated so it is not mistaken for identity binding: it ties
+// a HELLO to the two CHALLENGES of a socket, not to the identities at its ends.
+// A party that CONTROLS the byte stream - the relay, where one socket carries
+// every member's frames, or a transparent proxy at an address the operator
+// dialled - can carry a genuine handshake through and still forward whatever
+// frame it likes. That is the documented relay residual (audit A-3) and the
+// plaintext-TCP boundary; no challenge value can supply what the bytes cannot
+// authenticate. On such a link both halves are empty (nil), which is exactly
+// what tcp.PeerChallenges/ConnNonces report there.
 func HelloBinding(sender, receiver []byte) []byte {
 	out := make([]byte, 0, len(sender)+len(receiver))
 	out = append(out, sender...)
 	return append(out, receiver...)
+}
+
+// HelloNonceWidth reports the DECLARED width of h's socket binding without
+// decoding the message: it walks the canonical layout up to the Nonce length
+// prefix and returns that number. ok is false when the frame is not a HELLO or
+// is too short to carry the prefix. It allocates nothing and reads no byte past
+// the frame.
+//
+// It exists for ONE operator diagnostic (audit N-3): the binding changed width
+// from one challenge (32 bytes) to two (64) in the A-2 fix, and an old and a
+// new node never admit each other on a gated socket. The transport compares
+// this width with the width of the connection's own binding so it can say so
+// ONCE per connection instead of failing silently. It is not an admission
+// decision - callers must not accept or refuse a frame on it - and it is not a
+// second decoder: the width it reports is the width DecodeHello's bounded
+// VarBytesMax would read.
+func HelloNonceWidth(frame []byte) (int, bool) {
+	d := types.NewDecoder(frame)
+	raw, err := d.U8()
+	if err != nil || MsgType(raw) != MsgHello {
+		return 0, false
+	}
+	// ChainID and Validator: their lengths only, no copies.
+	for i := 0; i < 2; i++ {
+		n, err := d.Len()
+		if err != nil || d.Skip(n) != nil {
+			return 0, false
+		}
+	}
+	if _, err := d.U64(); err != nil { // Height
+		return 0, false
+	}
+	width, err := d.Len()
+	if err != nil {
+		return 0, false
+	}
+	return width, true
 }
 
 // Hello is the first message a connection speaks. It is not signed at this
@@ -107,9 +162,18 @@ func HelloBinding(sender, receiver []byte) []byte {
 // challenge followed by the receiver's (audit PX-2, A-2). The transport picks a
 // fresh 32-byte value per direct connection during the ID handshake, so a
 // HELLO signed for one socket does not verify on any other - the receiver
-// compares the whole binding, not one half of it. Empty means the connection
-// issued or demands no challenge (relay mode), not "check skipped": the check
-// is an equality against the value the transport recorded for that connection.
+// compares the whole binding, not one half of it. Each value is fixed by
+// commit-then-reveal (see HelloBinding), so neither end can choose its half
+// after learning the other's; that ordering is what closes A-2. Empty means
+// the connection issued or demands no challenge (relay mode), not "check
+// skipped": the check is an equality against the value the transport recorded
+// for that connection.
+//
+// There is deliberately no version field (audit N-3). Done() refuses trailing
+// bytes, so adding one is itself a vintage break that an older node cannot read
+// or negotiate; the binding width is what identifies the one split that exists,
+// and the transport reports it once per connection. A version belongs in a
+// negotiated handshake, not appended to a fixed message.
 type Hello struct {
 	ChainID   string
 	Validator []byte // Ed25519 public key

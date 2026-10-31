@@ -1,33 +1,36 @@
 package devnet
 
-// Audit A-2, BEFORE and AFTER, on the exact shape the finding names: a
-// committee member M collects a HELLO that ANOTHER member A signed, and
+// Audit A-2 (fix review, section 6 item 1), the REAL attacker order, kept as the
+// test that fails on the pre-fix transport and passes afterwards.
+//
+// A committee member M collects a HELLO that ANOTHER member A signed, and
 // presents it at a third node B on M's OWN socket. Once B admits that socket,
 // B records A's height `via` it, and every catch-up pull for A goes to M, which
 // answers nothing: A is demoted and is never a usable sync source at B.
 //
-// The state is CONSTRUCTED, never raced. B and A are quiet validators (one
-// wave an hour, no automatic ticks). M is a raw socket that performs the real
-// ID+challenge handshake:
+// The review's sequencing is an ORDER of handshakes, not a race:
 //
-//  1. M dials B, learns B's fresh challenge bL, and keeps that socket open;
-//  2. M makes A DIAL it (an operator-configured AddPeer, the same path an
-//     operator or a seated member's signed hint reaches), and sends bL as its
-//     OWN challenge on that link - the "as its own nonce, sends B's nonce" step;
-//  3. A's production broadcastHello signs a HELLO over that link's binding;
-//  4. M replays the captured frame to B on the socket from step 1.
+//  1. M has a socket to A (A dials it through an operator-configured AddPeer,
+//     the same path a seated member's signed hint reaches). Under the flawed
+//     exchange A wrote its challenge aL first; M learned it and held the socket
+//     mid-handshake. Under commit-then-reveal M must send a COMMITMENT before
+//     A reveals aL, so M fixes its own half blind - and it may still learn aL
+//     before revealing that half, which is the strongest ordering available;
+//  2. M dials B and presents aL as its own challenge. B's expected HELLO
+//     binding is now HelloBinding(aL, bL);
+//  3. M answers A with bL. On the pre-fix exchange A's signing binding becomes
+//     HelloBinding(aL, bL) and step 4 succeeds. Under commit-then-reveal A
+//     rejects that reveal: it does not hash to the commitment M made before it
+//     could know aL;
+//  4. A's production broadcastHello signs over aL||bL (pre-fix). M forwards the
+//     frame to B, which sees a matching binding, a member key and a valid
+//     signature, admits the socket as A and records A `via` it.
 //
-// BEFORE the fix the signed material was the receiver's challenge alone, which
-// on the A--M link IS bL: B's equality check passed, the frame was a valid
-// member signature, and the socket was admitted as A. AFTER the fix the signed
-// material is BOTH challenges (wire.HelloBinding: the sender's own, then the
-// receiver's), so A's frame carries aL||bL while B demands M's own challenge
-// followed by bL. aL is a value B never issued and that M cannot make B accept;
-// the relayed copy is therefore useless, and M's socket stays a gated stranger.
+// The previous version of this test committed a constant challenge to B before
+// it had seen A's - the reversed order - and so passed for the wrong reason.
 //
-// Both halves are shown: the replay is refused, and a genuinely bound HELLO
-// over a real A--B connection still admits A and becomes the pull target, so
-// the gate is not merely refusing everything.
+// The state is CONSTRUCTED: B and A are quiet validators (one wave an hour, no
+// automatic ticks); every HELLO is driven by hand.
 
 import (
 	"bufio"
@@ -36,6 +39,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cti97/b10coincom/internal/transport/tcp"
 	"github.com/cti97/b10coincom/internal/wire"
 )
 
@@ -59,47 +63,16 @@ func startQuietListener(t *testing.T, seat int) *Validator {
 	return v
 }
 
-// dialRawPeer completes the transport's handshake as the DIALER against a
-// listening node: it reads the node's announced ID, writes its own, reads the
-// node's 32-byte challenge, and writes the challenge it chooses. It returns the
-// socket, a reader positioned after the handshake, the node's challenge and the
-// value this side sent.
-func dialRawPeer(t *testing.T, addr, id string, wantNonce []byte) (net.Conn, *bufio.Reader, []byte, []byte) {
-	t.Helper()
-	c, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("raw dial %s: %v", addr, err)
-	}
-	br := bufio.NewReader(c)
-	if _, err := wire.ReadFrame(br, 4096); err != nil { // the listener's ID
-		t.Fatalf("reading the listener's ID: %v", err)
-	}
-	if err := wire.WriteFrame(c, []byte(id)); err != nil {
-		t.Fatalf("writing the raw ID: %v", err)
-	}
-	theirs, err := wire.ReadFrame(br, 64) // the listener's challenge
-	if err != nil {
-		t.Fatalf("reading the listener's challenge: %v", err)
-	}
-	ours := wantNonce
-	if ours == nil {
-		ours = bytes.Repeat([]byte{0x5a}, 32)
-	}
-	if err := wire.WriteFrame(c, ours); err != nil {
-		t.Fatalf("writing the raw challenge: %v", err)
-	}
-	return c, br, theirs, ours
-}
-
-// acceptRawPeer completes the same handshake as the LISTENER against a node
-// that dials it, choosing the challenge it sends. It is the attacker's socket
-// on the member-A side.
-func acceptRawPeer(t *testing.T, ln net.Listener, id string, challenge []byte) (net.Conn, *bufio.Reader, []byte) {
+// openDialedPeer accepts a node's dial and completes the ID exchange from the
+// raw side. It does NOT touch the challenge exchange, so the caller chooses
+// every step of it.
+func openDialedPeer(t *testing.T, ln net.Listener, id string) (net.Conn, *bufio.Reader) {
 	t.Helper()
 	c, err := ln.Accept()
 	if err != nil {
 		t.Fatalf("accepting the member's dial: %v", err)
 	}
+	t.Cleanup(func() { _ = c.Close() })
 	br := bufio.NewReader(c)
 	if _, err := wire.ReadFrame(br, 4096); err != nil { // the dialer's ID
 		t.Fatalf("reading the dialer's ID: %v", err)
@@ -107,44 +80,103 @@ func acceptRawPeer(t *testing.T, ln net.Listener, id string, challenge []byte) (
 	if err := wire.WriteFrame(c, []byte(id)); err != nil {
 		t.Fatalf("writing the raw ID: %v", err)
 	}
-	theirs, err := wire.ReadFrame(br, 64) // the dialer's challenge
+	return c, br
+}
+
+// openRawPeer dials a listening node and completes the ID exchange.
+func openRawPeer(t *testing.T, addr, id string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	c, err := net.Dial("tcp", addr)
 	if err != nil {
-		t.Fatalf("reading the dialer's challenge: %v", err)
+		t.Fatalf("raw dial %s: %v", addr, err)
 	}
+	t.Cleanup(func() { _ = c.Close() })
+	br := bufio.NewReader(c)
+	if _, err := wire.ReadFrame(br, 4096); err != nil { // the listener's ID
+		t.Fatalf("reading the listener's ID: %v", err)
+	}
+	if err := wire.WriteFrame(c, []byte(id)); err != nil {
+		t.Fatalf("writing the raw ID: %v", err)
+	}
+	return c, br
+}
+
+// commitChallenge sends H(challenge) - this side's committed half - and returns
+// the node's own commitment. challenge must already be fixed; that is the point
+// of the protocol.
+func commitChallenge(t *testing.T, c net.Conn, br *bufio.Reader, challenge []byte) []byte {
+	t.Helper()
+	sent := tcp.ConnectionCommitment(challenge)
+	if err := wire.WriteFrame(c, sent[:]); err != nil {
+		t.Fatalf("sending the challenge commitment: %v", err)
+	}
+	theirs, err := wire.ReadFrame(br, 64)
+	if err != nil {
+		t.Fatalf("reading the node's challenge commitment: %v", err)
+	}
+	if len(theirs) != len(sent) {
+		t.Fatalf("the node's commitment is %d bytes, want %d", len(theirs), len(sent))
+	}
+	return theirs
+}
+
+// readChallenge reads the node's revealed challenge and checks it against the
+// commitment the node made first.
+func readChallenge(t *testing.T, br *bufio.Reader, commitment []byte) []byte {
+	t.Helper()
+	theirs, err := wire.ReadFrame(br, 64)
+	if err != nil {
+		t.Fatalf("reading the node's challenge: %v", err)
+	}
+	want := tcp.ConnectionCommitment(theirs)
+	if !bytes.Equal(want[:], commitment) {
+		t.Fatalf("the node's reveal does not match its commitment: %x vs %x", theirs, commitment)
+	}
+	return theirs
+}
+
+// revealChallenge sends this side's committed challenge.
+func revealChallenge(t *testing.T, c net.Conn, challenge []byte) {
+	t.Helper()
 	if err := wire.WriteFrame(c, challenge); err != nil {
-		t.Fatalf("writing the chosen challenge: %v", err)
+		t.Fatalf("revealing the challenge: %v", err)
 	}
-	return c, br, theirs
 }
 
 func TestAMemberCannotBindAnotherMembersHelloToItsOwnSocket(t *testing.T) {
 	b := startQuietListener(t, 0) // the node that records the identity
 	a := startQuietListener(t, 1) // the member whose HELLO is stolen
 
-	// 1. M's own socket at B. It announces "m", learns B's challenge, and stays
-	// unadmitted: it has proved nothing yet.
-	connB, _, bLocal, mNonce := dialRawPeer(t, b.Addr(), "m", nil)
-	defer connB.Close()
-
-	// 2. M's socket at A. A is made to DIAL it (the operator-configured path;
-	// a seated member's signed hint reaches the same place). M's chosen
-	// challenge is bLocal - the value B will demand - which is the whole trick:
-	// the peer chooses the challenge it sends the member.
+	// 1. A's socket to M. A is made to DIAL M (the operator-configured path; a
+	// seated member's signed hint reaches the same place). M's half is fixed by
+	// a commitment BEFORE A reveals aL; it learns aL and still holds its reveal.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() { _ = ln.Close() })
 	if err := a.ttp.AddPeer(ln.Addr().String()); err != nil {
 		t.Fatalf("making A dial the attacker: %v", err)
 	}
-	connA, brA, aLocal := acceptRawPeer(t, ln, "m", bLocal)
-	defer connA.Close()
+	connA, brA := openDialedPeer(t, ln, "m")
+	blind := bytes.Repeat([]byte{0x11}, 32) // chosen before aL is known
+	aCommit := commitChallenge(t, connA, brA, blind)
+	aLocal := readChallenge(t, brA, aCommit) // the real order: aL first
+
+	// 2. M's own socket at B, presenting A's challenge as its own: B's expected
+	// binding is now aL||bL.
+	connB, brB := openRawPeer(t, b.Addr(), "m")
+	bCommit := commitChallenge(t, connB, brB, aLocal)
+	bLocal := readChallenge(t, brB, bCommit)
+	revealChallenge(t, connB, aLocal)
+
+	// 3. M's best remaining move on A's socket: reveal the half it committed to.
+	// A's HELLO is bound to aL||blind, NOT to the aL||bL pair B demands, and no
+	// later write can change that.
+	revealChallenge(t, connA, blind)
 	waitFor(t, "A to register the attacker's link", 5*time.Second, func() bool {
 		return hasPeer(a, "m")
 	})
-
-	// 3. A's production HELLO over that link, captured by M.
 	a.broadcastHello()
 	frame, err := wire.ReadFrame(brA, 1<<20)
 	if err != nil {
@@ -157,27 +189,23 @@ func TestAMemberCannotBindAnotherMembersHelloToItsOwnSocket(t *testing.T) {
 	if !bytes.Equal(stolen.Validator, a.pub) || stolen.Height != a.Height() {
 		t.Fatalf("the captured frame is not A's HELLO: %x at %d", stolen.Validator, stolen.Height)
 	}
-	// The frame names A's OWN challenge and then B's - A's real binding for the
-	// socket M chose to receive it on. B requires M's challenge, then B's own.
-	if !bytes.Equal(stolen.Nonce, wire.HelloBinding(aLocal, bLocal)) {
-		t.Fatalf("A's HELLO does not carry both challenges of its socket: got %x, want aLocal||bLocal", stolen.Nonce)
+	if !bytes.Equal(stolen.Nonce, wire.HelloBinding(aLocal, blind)) {
+		t.Fatalf("A's HELLO does not carry both challenges of its socket: got %x, want aLocal||blind", stolen.Nonce)
 	}
-	bDemands := wire.HelloBinding(mNonce, bLocal)
-	if bytes.Equal(stolen.Nonce, bDemands) {
-		t.Fatal("the captured frame is byte-for-byte what B demands: the test did not construct the misbinding")
+	if bytes.Equal(stolen.Nonce, wire.HelloBinding(aLocal, bLocal)) {
+		t.Fatal("A signed the aL||bL pair the attacker needed: the commitment did not fix M's half")
 	}
 
-	// 4. THE ATTACK: M presents A's HELLO on M's own socket at B.
+	// 4. THE ATTACK: M presents the one frame A would sign on M's socket at B.
 	gatedBefore := b.ttp.GatedFrames()
 	if err := wire.WriteFrame(connB, frame); err != nil {
 		t.Fatalf("replaying A's HELLO to B: %v", err)
 	}
-	// Wait for the replay to be CLASSIFIED (refused here, or - pre-fix - admitted),
-	// so the assertions below say which outcome happened rather than racing it.
+	// Wait for the replay to be CLASSIFIED so the assertions below say which
+	// outcome happened rather than racing it.
 	waitFor(t, "the replayed HELLO to be classified", 5*time.Second, func() bool {
 		return b.ttp.GatedFrames() > gatedBefore || hasPeer(b, "m")
 	})
-
 	if hasPeer(b, "m") {
 		t.Fatal("a member's stolen HELLO admitted the attacker's socket: B now speaks to M as A (audit A-2)")
 	}
@@ -194,7 +222,35 @@ func TestAMemberCannotBindAnotherMembersHelloToItsOwnSocket(t *testing.T) {
 		t.Fatal("the replayed frame was neither admitted nor counted as gated: it did not reach the admission gate")
 	}
 
-	// NOT REFUSE-EVERYTHING. B dials A for real; the two exchange each other's
+	// 5. THE REVIEW'S LITERAL STEP 3, shown refused. A second, separately
+	// configured socket: M commits one challenge and then answers A with B's.
+	// A must reject the reveal (it does not hash to the commitment) and close
+	// the socket without signing a HELLO. This is what makes the substitution
+	// impossible rather than merely mismatched.
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln2.Close() })
+	if err := a.ttp.AddPeer(ln2.Addr().String()); err != nil {
+		t.Fatalf("making A dial the attacker's second socket: %v", err)
+	}
+	connA2, brA2 := openDialedPeer(t, ln2, "n")
+	blind2 := bytes.Repeat([]byte{0x22}, 32)
+	aCommit2 := commitChallenge(t, connA2, brA2, blind2)
+	_ = readChallenge(t, brA2, aCommit2)
+	// The literal review step: "M sends B's challenge to A as its challenge".
+	if err := wire.WriteFrame(connA2, bLocal); err != nil {
+		t.Fatalf("substituting B's challenge for the committed one: %v", err)
+	}
+	_ = connA2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := wire.ReadFrame(brA2, 1<<20); err == nil {
+		t.Fatal("A signed a HELLO for a reveal that did not match its commitment: the challenge can be substituted after the commitment (audit A-2)")
+	} else if ne, isTimeout := err.(net.Error); isTimeout && ne.Timeout() {
+		t.Fatal("A did not CLOSE the socket after a reveal that did not match its commitment: the substitution was accepted and the handshake is still running (audit A-2)")
+	}
+
+	// NOT REFUSE EVERYTHING. B dials A for real; the two exchange each other's
 	// challenges, both production broadcastHello calls run, and A must be
 	// admitted and recorded on A's own socket ("v1"), not on the attacker's.
 	if err := b.ttp.AddPeer(a.Addr()); err != nil {

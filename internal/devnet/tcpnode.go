@@ -569,12 +569,15 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	//     is a VALID Ed25519 signature, so it fails here before membership or
 	//     verification work. helloBinding is the transport's pair: the PEER's
 	//     fresh 32-byte challenge followed by ours, the honest peer learned both
-	//     in the handshake and signed them into its HELLO. ONE challenge was not
-	//     enough (the PX-2 shape): the peer CHOOSES the challenge it sends this
-	//     node, so a member could send a third node's challenge, collect this
-	//     node's HELLO signed over it, and replay that signature onto the third
-	//     node's socket. The peer's own half is the one it cannot make a third
-	//     node generate for it;
+	//     in the commit-then-reveal handshake and signed them into its HELLO.
+	//     ONE challenge was not enough (the PX-2 shape): the peer CHOOSES the
+	//     challenge it sends this node, so a member could send a third node's
+	//     challenge, collect this node's HELLO signed over it, and replay that
+	//     signature onto the third node's socket. The peer's own half is the
+	//     one it cannot make a third node generate for it, and the handshake is
+	//     what stops a member on two sockets from choosing each half after
+	//     seeing the other (tcp.exchangeNonce): this equality is only as strong
+	//     as that ordering;
 	//   - the validator key must not be OUR OWN. The transport sends this node's
 	//     HELLO to a gated socket it dialled (the peer needs it to admit us), so
 	//     a hostile peer can echo it straight back. That frame verifies
@@ -590,6 +593,16 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// bound, never a safety gate: every admitted frame still faces the
 	// router's per-height membership, and every adopted block the certificate
 	// gate.
+	//
+	// THE RESIDUAL, beside the claim rather than elsewhere: this binding ties a
+	// HELLO to the two challenges of a socket, NOT to an identity. On a RELAY
+	// connection both halves are empty - one socket carries every member's
+	// frames - so any party can present any member's genuine HELLO, and
+	// recordHeight only limits that to "cannot lower". A party that controls the
+	// byte stream of a DIRECT socket (a transparent proxy at an address the
+	// operator dialled) can carry a genuine handshake through and forward
+	// whatever it likes, so its frames are indistinguishable from the peer's.
+	// No equality check can close either; both are the plaintext/relay boundary.
 	admitHello := func(frame []byte, helloBinding []byte) bool {
 		h, err := wire.DecodeHello(frame)
 		if err != nil {
@@ -682,8 +695,9 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		// The learned-address book starts empty; nothing is dialled from a hint
 		// until a peer advertises it through an attested connection.
 		hints: peerHints{
-			learned: make(map[string]*learnedHint),
-			sources: make(map[string]int),
+			learned:  make(map[string]*learnedHint),
+			sources:  make(map[string]int),
+			connKeys: make(map[transport.PeerID][]byte),
 		},
 		// A hint is a dial this node makes because a PEER chose the address, not
 		// the operator: AddLearnedPeer keeps the connection GATED until a signed
@@ -1013,12 +1027,17 @@ func (v *Validator) waveLoop() {
 
 // broadcastHello puts this node's signed height on the wire, ONE HELLO PER
 // CONNECTION (audit PX-2). The signature is domain-separated and covers the
-// socket's TWO challenges, this side's followed by the peer's (audit A-2), so a
-// HELLO is valid only on the socket it was signed for: that is what makes a
-// captured member HELLO useless to a stranger replaying it on a hint-dialled
-// socket, and what makes it useless to a member replaying ANOTHER member's
-// HELLO on its own socket. One signature per peer per wave is the price; it is
-// a few hundred microseconds of Ed25519 against a 500 ms cadence.
+// socket's TWO challenges, this side's followed by the peer's (audit A-2). Each
+// half is fixed by the commit-then-reveal handshake before either end may learn
+// the other's (tcp.exchangeNonce), so the pair is the socket's own: a captured
+// member HELLO replayed on a hint-dialled socket fails the receiver's equality,
+// and a member cannot launder ANOTHER member's HELLO through the socket it
+// makes this node sign. What it does NOT bind is an identity at the far end: a
+// party that controls the byte stream (the relay, or a transparent proxy at a
+// dialled address) can carry the genuine handshake through. See
+// wire.HelloBinding for the exact boundary. One signature per peer per wave is
+// the price; it is a few hundred microseconds of Ed25519 against a 500 ms
+// cadence.
 //
 // The peers iterated are PeerChallenges - every registered connection this
 // side may speak on, including a GATED learned dial. The latter is deliberate:
@@ -1044,9 +1063,11 @@ func (v *Validator) broadcastHello() {
 // node layer owns the announcement policy; the wire layer only frames it). The
 // binding is inside the hash, so a HELLO cannot be moved to another connection
 // without invalidating the signature (audit PX-2) and, because the binding
-// carries the SENDER's own challenge as well as the receiver's, a member cannot
-// transplant a HELLO another member signed on a socket the attacker controlled
-// (audit A-2).
+// carries both challenges and the handshake fixes them before either is
+// learned, a member cannot transplant a HELLO another member signed on a socket
+// the attacker controlled by reordering the exchanges (audit A-2). A party that
+// controls the byte stream outright - the relay, a transparent proxy - is the
+// documented residual, not what this hash claims to stop.
 func helloHash(h *wire.Hello) [32]byte {
 	e := types.NewEncoder()
 	e.VarBytes([]byte(h.ChainID))
@@ -1164,7 +1185,16 @@ func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	// residual, and recordHeight's high-water mark is what keeps it from being
 	// a way DOWN.
 	ours, theirs, ok := v.ttp.ConnNonces(from)
-	if !ok || !bytes.Equal(h.Nonce, wire.HelloBinding(theirs, ours)) {
+	if !ok {
+		return
+	}
+	if !bytes.Equal(h.Nonce, wire.HelloBinding(theirs, ours)) {
+		// A binding of the OLD one-challenge width is a peer on the other side of
+		// the A-2 change; the transport owns that diagnosis and says it once per
+		// connection (audit N-3). This path is the only one that sees the refusal
+		// on an ADMITTED connection (an operator-configured dial), where
+		// admission happened at install and there is no gate counter to notice.
+		v.ttp.NoteBindingVintage(from, len(h.Nonce))
 		return
 	}
 	if bytes.Equal(h.Validator, v.pub) {
@@ -1180,7 +1210,7 @@ func (v *Validator) observeHello(from transport.PeerID, h *wire.Hello) {
 	// A verified HELLO on this connection also proves any LEARNED address this
 	// connection belongs to: it has a real member behind it, so its maintainer
 	// must never be retired by the hint eviction clock (audit PX-1).
-	v.markHintProven(from)
+	v.markHintProven(from, h.Validator)
 	// Keyed on the signed member identity, with the transport name kept only
 	// as the address a pull for this member is sent to (round 7, F1/F2).
 	v.recordHeight(string(h.Validator), from, h.Height)

@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/relay"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/wire"
@@ -704,8 +705,45 @@ func TestReconnectUsesBackoff(t *testing.T) {
 	waitPeersIs(t, tp, "[srv]")
 }
 
+// rawAnswerChallenge completes the peer's side of the transport's
+// commit-then-reveal challenge exchange (audit A-2) over a socket whose ID
+// frames the caller has already handled: read the transport's commitment, send
+// ours, read its reveal, check that it hashes to the commitment, and send ours.
+// It returns the transport's revealed challenge - the value a HELLO's binding
+// must name. r must be the SAME reader the ID frame was read through (a fresh
+// bufio would strand a buffered frame). Nothing here allocates from a
+// peer-supplied length: both reads are bounded by fixed widths.
+func rawAnswerChallenge(c net.Conn, r io.Reader, challenge []byte) ([]byte, error) {
+	commit, err := wire.ReadFrame(r, connectionCommitmentBytes)
+	if err != nil {
+		return nil, fmt.Errorf("reading the transport's nonce commitment: %w", err)
+	}
+	if len(commit) != connectionCommitmentBytes {
+		return nil, fmt.Errorf("the transport's nonce commitment is %d bytes, want %d", len(commit), connectionCommitmentBytes)
+	}
+	ours := crypto.HashParts([]byte(connectionCommitmentDomain), challenge)
+	if err := wire.WriteFrame(c, ours[:]); err != nil {
+		return nil, fmt.Errorf("answering the transport's nonce commitment: %w", err)
+	}
+	theirs, err := wire.ReadFrame(r, connectionNonceBytes)
+	if err != nil {
+		return nil, fmt.Errorf("reading the transport's connection nonce: %w", err)
+	}
+	if len(theirs) != connectionNonceBytes {
+		return nil, fmt.Errorf("the transport's connection nonce is %d bytes, want %d", len(theirs), connectionNonceBytes)
+	}
+	want := crypto.HashParts([]byte(connectionCommitmentDomain), theirs)
+	if !bytes.Equal(want[:], commit) {
+		return nil, fmt.Errorf("the transport's connection nonce does not match the commitment it made first")
+	}
+	if err := wire.WriteFrame(c, challenge); err != nil {
+		return nil, fmt.Errorf("answering the transport's connection nonce: %w", err)
+	}
+	return theirs, nil
+}
+
 // rawHandshake reads the transport's ID frame and answers with "srv",
-// completing the handshake from the raw side.
+// completing the ID and commit-then-reveal exchanges from the raw side.
 func rawHandshake(c net.Conn) error {
 	br := bufio.NewReader(c)
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -717,45 +755,29 @@ func rawHandshake(c net.Conn) error {
 		return fmt.Errorf("unexpected ID %q", id)
 	}
 	// Answer the ID, then complete the per-connection challenge exchange (audit
-	// PX-2): the transport's 32-byte nonce is the next frame, and this side
-	// answers with one of its own. The SAME bufio must read both frames, or the
-	// second one may already be buffered and the connection would time out.
+	// PX-2, A-2): the transport commits to a nonce, then reveals it, and this
+	// side must mirror both steps through the SAME bufio.
 	if err := wire.WriteFrame(c, []byte("srv")); err != nil {
 		return err
 	}
-	nonce, err := wire.ReadFrame(br, connectionNonceBytes)
-	if err != nil {
-		return fmt.Errorf("reading the dialer's connection nonce: %w", err)
-	}
-	if len(nonce) != connectionNonceBytes {
-		return fmt.Errorf("the dialer's connection nonce is %d bytes, want %d", len(nonce), connectionNonceBytes)
-	}
-	if err := wire.WriteFrame(c, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); err != nil {
-		return fmt.Errorf("answering the dialer's connection nonce: %w", err)
+	if _, err := rawAnswerChallenge(c, br, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); err != nil {
+		return err
 	}
 	c.SetReadDeadline(time.Time{})
 	return nil
 }
 
-// rawAnswerNonce completes the transport's per-connection challenge exchange
-// from a raw socket (audit PX-2): the caller has already read the transport's
-// ID frame, so the nonce is the next one. r must be the SAME reader the ID was
-// read through (a fresh bufio would strand a buffered frame), or the conn
-// itself when no buffering was used. It returns the transport's nonce so a test
-// that builds a HELLO can echo the real value.
+// rawAnswerNonce is rawAnswerChallenge for a test that only needs the handshake
+// complete: the caller has already read the transport's ID frame, so the
+// commitment is the next one. It returns the transport's revealed nonce so a
+// test that builds a HELLO can name the real value.
 func rawAnswerNonce(t *testing.T, c net.Conn, r io.Reader) []byte {
 	t.Helper()
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-	nonce, err := wire.ReadFrame(r, connectionNonceBytes)
+	nonce, err := rawAnswerChallenge(c, r, bytes.Repeat([]byte{0x42}, connectionNonceBytes))
 	_ = c.SetReadDeadline(time.Time{})
 	if err != nil {
-		t.Fatalf("reading the transport's connection nonce: %v", err)
-	}
-	if len(nonce) != connectionNonceBytes {
-		t.Fatalf("the transport's connection nonce is %d bytes, want %d", len(nonce), connectionNonceBytes)
-	}
-	if err := wire.WriteFrame(c, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); err != nil {
-		t.Fatalf("answering the transport's connection nonce: %v", err)
+		t.Fatalf("%v", err)
 	}
 	return nonce
 }
@@ -1345,13 +1367,9 @@ func TestConcurrentSameIDHandshakesLeaveOneConnection(t *testing.T) {
 						fates <- f
 						return
 					}
-					nonce, herr := wire.ReadFrame(br, connectionNonceBytes)
-					if herr != nil || len(nonce) != connectionNonceBytes {
+					if _, herr := rawAnswerChallenge(nc, br, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); herr != nil {
 						f.eof = true
 						fates <- f
-						return
-					}
-					if werr := wire.WriteFrame(nc, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); werr != nil {
 						return
 					}
 					for {
@@ -1461,11 +1479,7 @@ func TestSupersededMaintainerRedialsAndHeals(t *testing.T) {
 				// Complete the connection-nonce exchange (audit PX-2) so this
 				// stand-in is a real peer, not a socket the handshake deadline
 				// reaps.
-				nonce, nerr := wire.ReadFrame(br, connectionNonceBytes)
-				if nerr != nil || len(nonce) != connectionNonceBytes {
-					return
-				}
-				if werr := wire.WriteFrame(nc, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); werr != nil {
+				if _, nerr := rawAnswerChallenge(nc, br, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); nerr != nil {
 					return
 				}
 				var sink [16]byte
@@ -1936,12 +1950,9 @@ func TestADuplicateRefusalHealsWhenTheSquatterLeaves(t *testing.T) {
 				// Complete the connection-nonce exchange (audit PX-2): the
 				// transport's nonce is the next frame, and this side answers.
 				_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
-				nonce, nerr := wire.ReadFrame(br, connectionNonceBytes)
+				_, nerr := rawAnswerChallenge(nc, br, bytes.Repeat([]byte{0x42}, connectionNonceBytes))
 				_ = nc.SetReadDeadline(time.Time{})
-				if nerr != nil || len(nonce) != connectionNonceBytes {
-					return
-				}
-				if werr := wire.WriteFrame(nc, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); werr != nil {
+				if nerr != nil {
 					return
 				}
 				buf := make([]byte, 64)
@@ -2354,12 +2365,12 @@ func TestAnUnadmittedSquatterCannotHoldAPeersName(t *testing.T) {
 	if _, err := wire.ReadFrame(hc, maxHandshakeIDBytes); err != nil {
 		t.Fatalf("the squatter's handshake greeting: %v", err)
 	}
-	// Read (and deliberately ignore) the connection challenge the transport
-	// sends next (audit PX-2): this squatter never answers it, so it stays
-	// unadmitted, and draining it here keeps waitClosedConn's "no data before
-	// the close" assertion about the CLOSE rather than about this frame.
-	if _, err := wire.ReadFrame(hc, connectionNonceBytes); err != nil {
-		t.Fatalf("the squatter's connection challenge: %v", err)
+	// Read (and deliberately ignore) the connection-nonce COMMITMENT the
+	// transport sends next (audit PX-2, A-2): this squatter never answers it,
+	// so it stays unadmitted, and draining it here keeps waitClosedConn's "no
+	// data before the close" assertion about the CLOSE rather than this frame.
+	if _, err := wire.ReadFrame(hc, connectionCommitmentBytes); err != nil {
+		t.Fatalf("the squatter's connection-nonce commitment: %v", err)
 	}
 	waitFor(t, "the unadmitted squatter to install", 5*time.Second, func() bool {
 		tp.mu.Lock()
@@ -2399,12 +2410,9 @@ func TestAnUnadmittedSquatterCannotHoldAPeersName(t *testing.T) {
 				// Complete the connection-nonce exchange (audit PX-2): the
 				// transport's nonce is the next frame, and this side answers.
 				_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
-				nonce, nerr := wire.ReadFrame(br, connectionNonceBytes)
+				_, nerr := rawAnswerChallenge(nc, br, bytes.Repeat([]byte{0x42}, connectionNonceBytes))
 				_ = nc.SetReadDeadline(time.Time{})
-				if nerr != nil || len(nonce) != connectionNonceBytes {
-					return
-				}
-				if werr := wire.WriteFrame(nc, bytes.Repeat([]byte{0x42}, connectionNonceBytes)); werr != nil {
+				if nerr != nil {
 					return
 				}
 				buf := make([]byte, 64)
