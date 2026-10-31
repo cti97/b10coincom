@@ -53,6 +53,16 @@ advisory is yours unless you prefer otherwise.
   strangers. Reports that the documented bounds are *wrong or bypassable* (a
   pinned slot that is never reaped, memory beyond the stated ceiling) are in
   scope and are exactly the class worth reporting.
+- **No slashing, by design.** No code path confiscates or reduces a bond: a
+  validator that equivocates, double-signs, or goes offline loses no stake. The
+  certificate gate and the tally are what stop a faulty node from contributing.
+  For the same fixed-boundary reason, an `Unbond` submitted mid-epoch does not
+  remove the seat or its voting duty until the next epoch boundary — the epoch's
+  committee is derived from the state at `epoch_blocks·e − 1` and memoised — so a
+  leaving validator serves the rest of the epoch with nothing bonded behind it.
+  Reports asking for a penalty, a forfeiture, or "the validator should lose its
+  stake" describe a protocol change the plan deliberately leaves out of scope;
+  the README's Staking section says so.
 - The claim command printing its ephemeral key to stdout: documented,
   operator-visible, intentionally.
 

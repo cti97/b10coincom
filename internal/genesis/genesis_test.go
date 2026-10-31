@@ -262,6 +262,36 @@ func TestMinFeeIsPinnedPerChainAndZeroIsRefused(t *testing.T) {
 	}
 }
 
+// MinStakeSparks and UnbondingEpochs are the staking parameters the state
+// machine checks in stakeConfigured. A zero in either makes EVERY Bond, Unbond
+// and Withdraw fail with ErrStakeUnconfigured - and because state treats zero as
+// "not parameterised" for legacy states, such a genesis would still open and
+// still commit blocks. The operator would learn only when a stake transaction
+// failed, on a chain that can no longer rotate. Refuse the zero at validation,
+// where the edit happened.
+func TestStakingParametersArePinnedPerChainAndZeroIsRefused(t *testing.T) {
+	for _, g := range []*Genesis{Devnet(), Testnet()} {
+		if got, want := g.Params.MinStakeSparks, uint64(1_000*SparksPerB10); got != want {
+			t.Fatalf("%s: MinStakeSparks = %d, want the pinned %d", g.ChainID, got, want)
+		}
+		if g.Params.UnbondingEpochs != 2 {
+			t.Fatalf("%s: UnbondingEpochs = %d, want the pinned 2", g.ChainID, g.Params.UnbondingEpochs)
+		}
+
+		zeroStake := *g
+		zeroStake.Params.MinStakeSparks = 0
+		if err := zeroStake.Validate(); !errors.Is(err, ErrBadGenesis) {
+			t.Fatalf("%s with MinStakeSparks 0 validated (%v), want ErrBadGenesis: every stake transaction would fail ErrStakeUnconfigured", g.ChainID, err)
+		}
+
+		zeroCooldown := *g
+		zeroCooldown.Params.UnbondingEpochs = 0
+		if err := zeroCooldown.Validate(); !errors.Is(err, ErrBadGenesis) {
+			t.Fatalf("%s with UnbondingEpochs 0 validated (%v), want ErrBadGenesis: every stake transaction would fail ErrStakeUnconfigured", g.ChainID, err)
+		}
+	}
+}
+
 func TestGenesisUsesBlake3Domain(t *testing.T) {
 	g := Devnet()
 	want := crypto.HashParts([]byte("b10coin-genesis"), g.Encode())

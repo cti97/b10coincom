@@ -944,6 +944,23 @@ exactly, documented here rather than changed: capping against the uncapped total
 stake, or a minimum power-per-seat ratio, would be a protocol change (see the
 plan's proposal).
 
+**There is no slashing, and a leaving seat keeps its seat until the boundary.**
+No code path confiscates or reduces a bond. A validator that equivocates, signs
+conflicting blocks, or simply goes offline loses **no stake**: the certificate
+gate and the tally refuse its blocks and votes, so it stops contributing, and
+that is the whole penalty. The only economic cost of leaving is the two-epoch
+cooldown, during which the coins are neither spendable nor counted. This is a
+documented scope decision, not an omission — slashing needs fault evidence every
+node can verify, a proof format, and a rule for what a proven fault forfeits,
+which is a protocol change — and it is also stated in `SECURITY.md`. The same
+fixed-boundary rule has a second consequence: the committee for epoch `e` is
+derived from the state committed at `e × epoch_blocks − 1` and **memoised**, so a
+validator that submits `Unbond` mid-epoch remains a seated voter, with the power
+it held at that boundary and with **nothing bonded behind it**, until the next
+boundary. It cannot be punished for the epoch it is still serving, and it cannot
+be replaced early; it simply leaves at the boundary, where the liveness rules
+above decide whether the remaining reachable seats can still commit.
+
 **The verbs** are `stake`, `unstake` and `withdraw` (see
 [The CLI](#the-cli)). They are ordinary signed transactions — same signature,
 same genesis-hash binding, same fee rule, same `/tx` admission as a transfer.

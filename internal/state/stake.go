@@ -115,6 +115,14 @@ var (
 // cooldown, and the accessor the committee derivation (M5 Task 2) uses.
 func (s *State) Bonded(a types.Address) uint64 { return s.bonds[a].Amount }
 
+// HasUnbonding reports whether the address holds ANY unbonding record, mature or
+// not. It is one map lookup, and it exists for the mempool's staking admission
+// (audit ST-5): a Withdraw from an address with no such record can never apply,
+// so the pool need not spend a slot and a signature check holding it. Maturity -
+// a height-dependent fact - is deliberately not decided here; execution still
+// judges it.
+func (s *State) HasUnbonding(a types.Address) bool { return len(s.unbonding[a]) > 0 }
+
 // BondOf returns a copy of the address's bond record and whether it holds one.
 // It is the record-level sibling of Bonded (which returns only the amount), for
 // callers that must show WHEN the stake was locked and WHICH key it seats - the

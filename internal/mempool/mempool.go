@@ -268,8 +268,13 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 				errs[i] = err
 				continue
 			}
-		case types.TxTransfer, types.TxBond, types.TxUnbond, types.TxWithdraw:
+		case types.TxTransfer:
 			if err := m.admitNonClaim(&tx, st); err != nil {
+				errs[i] = err
+				continue
+			}
+		case types.TxBond, types.TxUnbond, types.TxWithdraw:
+			if err := m.admitStake(&tx, st); err != nil {
 				errs[i] = err
 				continue
 			}
@@ -280,17 +285,19 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 }
 
 // admitNonClaim applies the stateful rules shared by every non-claim
-// transaction: a transfer, and (M5) the three staking types. The per-sender cap
-// is counted from the pool's own state, so it cannot be bypassed by sending more
-// transactions; the nonce floor refuses a transaction whose replay counter has
-// already been spent by the head state. A future nonce is still admitted: it
-// may become applicable when its predecessors land, and the block filter is
-// what evicts a transaction that never does.
+// transaction: a transfer, and (M5) the staking types, which add their own map
+// lookups in admitStake on top of this. The per-sender cap is counted from the
+// pool's own state, so it cannot be bypassed by sending more transactions; the
+// nonce floor refuses a transaction whose replay counter has already been spent
+// by the head state. A future nonce is still admitted: it may become applicable
+// when its predecessors land, and the block filter is what evicts a transaction
+// that never does.
 //
-// The staking types take exactly this admission and no more: their balance,
-// fee and minimum-stake rules are state-transition rules, judged at execution
-// like a transfer's balance, and duplicating them here would be a second copy
-// that could drift from apply.go's.
+// The transfer's balance rule is deliberately NOT duplicated here: a transfer
+// is admitted on its bytes and judged at execution. The staking types are the
+// exception because their admission is free (Unbond and Withdraw carry no fee
+// at all) and the facts that rule them out - no balance, no bond, no unbonding
+// record - are single map lookups (audit ST-5; see admitStake).
 func (m *Mempool) admitNonClaim(tx *types.Tx, st *state.State) error {
 	if m.pending[tx.From] >= MaxPendingTransfersPerSender {
 		return fmt.Errorf("%w: %d pending from %x", ErrSenderLimit, m.pending[tx.From], tx.From[:])
@@ -305,6 +312,66 @@ func (m *Mempool) admitNonClaim(tx *types.Tx, st *state.State) error {
 	if set := m.pendingNonces[tx.From]; set != nil {
 		if _, dup := set[tx.Nonce]; dup {
 			return fmt.Errorf("%w: nonce %d is already pending from %x", state.ErrBadNonce, tx.Nonce, tx.From[:])
+		}
+	}
+	return nil
+}
+
+// admitStake is the staking types' admission: the shared non-claim rules plus
+// the cheap stateful map lookups that make a stake transaction impossible
+// against the head state. It is the same shape as admitClaim, and for the same
+// reason: a staking transaction costs the pool a slot and a signature check, and
+// Unbond and Withdraw carry no fee at all, so nothing in the transaction itself
+// prices a flood from keys that hold nothing (audit ST-5).
+//
+// The lookups mirror the state machine's OWN refusals, with apply.go's errors,
+// so an admission refusal and an execution refusal are the same sentence:
+//
+//   - a state with no staking configuration fails every stake transaction with
+//     ErrStakeUnconfigured (state.stakeConfigured), so it refuses them here, as
+//     admitClaim refuses a claim when EpochBlocks is zero;
+//   - a Bond must be paid for out of the spendable balance: amount + fee over
+//     the balance is ErrInsufficientFunds, formed as a subtraction so it cannot
+//     wrap (applyBond's ErrBalanceOverflow arm is thereby also refused, not
+//     reproduced);
+//   - an Unbond cannot exceed the bond, so an address holding none is refused
+//     with ErrUnbondExceedsBond;
+//   - a Withdraw needs at least one unbonding record, mature or not: with none
+//     it can never apply, so it is refused with ErrNothingToWithdraw.
+//
+// These are the IMPOSSIBILITY facts, not a second copy of the transition: the
+// minimum-stake rule, the fee floor and maturity (a height-dependent fact) are
+// still judged only at execution.
+//
+// The cost, stated: a Bond submitted in the same batch as the transfer that
+// funds it is refused until that transfer lands, and an Unbond submitted
+// alongside the Bond that creates its bond is refused the same way, because
+// admission judges the head state. Transfers keep only the nonce rules, so the
+// funding transaction is admitted and a resubmission one block later succeeds.
+// The alternative - admitting stake transactions that cannot apply - is the
+// free flood this closes.
+func (m *Mempool) admitStake(tx *types.Tx, st *state.State) error {
+	if err := m.admitNonClaim(tx, st); err != nil {
+		return err
+	}
+	p := st.Params()
+	if p.MinStake == 0 || p.UnbondingEpochs == 0 || p.EpochBlocks == 0 {
+		return fmt.Errorf("%w: MinStake %d, UnbondingEpochs %d, EpochBlocks %d",
+			state.ErrStakeUnconfigured, p.MinStake, p.UnbondingEpochs, p.EpochBlocks)
+	}
+	switch tx.Type {
+	case types.TxBond:
+		acc := st.Get(tx.From)
+		if tx.Amount > acc.Balance || tx.Fee > acc.Balance-tx.Amount {
+			return fmt.Errorf("%w: balance %d, bond %d + fee %d", state.ErrInsufficientFunds, acc.Balance, tx.Amount, tx.Fee)
+		}
+	case types.TxUnbond:
+		if bonded := st.Bonded(tx.From); tx.Amount > bonded {
+			return fmt.Errorf("%w: unbond %d, bonded %d", state.ErrUnbondExceedsBond, tx.Amount, bonded)
+		}
+	case types.TxWithdraw:
+		if !st.HasUnbonding(tx.From) {
+			return fmt.Errorf("%w: %x holds no unbonding record", state.ErrNothingToWithdraw, tx.From[:])
 		}
 	}
 	return nil

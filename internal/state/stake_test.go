@@ -1254,3 +1254,173 @@ func TestAFundedTopUpOnAGenesisSeatStaysWithdrawable(t *testing.T) {
 		t.Fatalf("balance = %d, want the funded MIN_STAKE back", got)
 	}
 }
+
+// TestBondAndUnbondingLeafGoldenVectors freezes the exact bytes of the two M5
+// leaves and the root of a state that holds one of each (audit ST-8).
+//
+// This is the test the differential suite cannot be. Every stake-root test
+// before it compares two states that differ in ONE field; a state with the right
+// root under swap (A,B) and swap (B,A) is indistinguishable to them, so an
+// encoder that wrote Height before Amount would pass the whole suite. A fixed
+// vector names the order. It is captured ONCE, and the fields are chosen to be
+// pairwise distinct for exactly that reason:
+//
+//	bond      Validator 0xc0..0xdf, Amount 0x0102030405060708,
+//	          Unfunded 0x1112131415161718, Height 0x2122232425262728
+//	unbonding two records, each (Amount, ReleaseHeight) a distinct value
+//
+// The vector also pins the domains and the Merkle construction: the root is
+// taken from a state with no accounts, one bond and one unbonding record, so it
+// is H(0x01 || H(0x00 || bondLeaf) || H(0x00 || unbondingLeaf)) and nothing else.
+//
+// DO NOT re-capture these from a fresh run to make a failing test pass. A
+// changed value is a consensus-encoding change: look at what moved first.
+func TestBondAndUnbondingLeafGoldenVectors(t *testing.T) {
+	addr := types.Address{
+		0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9,
+		0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3,
+	}
+	validator := make([]byte, 32)
+	for i := range validator {
+		validator[i] = byte(0xc0 + i)
+	}
+	bond := Bond{
+		Validator: validator,
+		Amount:    0x0102030405060708,
+		Unfunded:  0x1112131415161718,
+		Height:    0x2122232425262728,
+	}
+	records := []Unbonding{
+		{Amount: 0x0102030405060708, ReleaseHeight: 0x3132333435363738},
+		{Amount: 0x4142434445464748, ReleaseHeight: 0x5152535455565758},
+	}
+
+	var wantBondLeaf = [32]byte{
+		0x57, 0x22, 0x40, 0xa5, 0xc2, 0x93, 0x3c, 0x62, 0x72, 0x8c, 0xb1, 0x3c, 0x68, 0x8a, 0x14, 0xd1,
+		0xd5, 0x2b, 0x2c, 0x51, 0xd5, 0xce, 0x5d, 0x1a, 0xdf, 0x82, 0x6a, 0x2e, 0xa8, 0xfc, 0xb0, 0x44,
+	}
+	if got := bondLeaf(addr, bond); got != wantBondLeaf {
+		t.Fatalf("bond leaf changed:\n got %x\nwant %x", got, wantBondLeaf)
+	}
+
+	var wantUnbondingLeaf = [32]byte{
+		0xa2, 0xb9, 0x77, 0xf1, 0x1d, 0xb9, 0x02, 0xa8, 0x68, 0x1e, 0xe1, 0x5c, 0xfa, 0xbe, 0x8e, 0x4d,
+		0x17, 0xf1, 0xb2, 0x15, 0x4c, 0x01, 0x0e, 0x44, 0x29, 0x48, 0x5f, 0x0f, 0x42, 0xfc, 0xea, 0xc7,
+	}
+	if got := unbondingLeaf(addr, records); got != wantUnbondingLeaf {
+		t.Fatalf("unbonding leaf changed:\n got %x\nwant %x", got, wantUnbondingLeaf)
+	}
+
+	// The root of a state whose ONLY leaves are those two: Root must use the
+	// same encoders, in the bond-then-unbonding order, under the same Merkle
+	// construction. Without this half a leaf helper could drift from Root
+	// without any test noticing (the "inert helper" mutant).
+	s := NewWithParams(stakingParams())
+	s.SetBond(addr, bond)
+	s.unbonding[addr] = records
+	var wantRoot = [32]byte{
+		0xa2, 0xaf, 0x35, 0x57, 0xcf, 0xb5, 0xaa, 0xfe, 0x0e, 0xc2, 0x29, 0x3b, 0xe8, 0x78, 0xb4, 0x13,
+		0x2a, 0xcf, 0xe1, 0xc6, 0xee, 0x71, 0x42, 0xcf, 0xc4, 0x98, 0x1a, 0xa1, 0xd4, 0x88, 0x8b, 0xce,
+	}
+	if got := s.Root(); got != wantRoot {
+		t.Fatalf("bond+unbonding golden root changed:\n got %x\nwant %x", got, wantRoot)
+	}
+}
+
+// TestAnUnbondAtEpochEndAndAtTheBoundarySharesOneReleaseHeight pins the rounding
+// rule at the two heights an epoch boundary creates (audit ST-9). With a
+// two-epoch cooldown and E-block epochs:
+//
+//	unbond at E-1: release = E-1 + 2E = 3E-1, rounded UP to 3E
+//	unbond at E:   release = E   + 2E = 3E,   already a boundary
+//
+// so the last block before a boundary is delayed by one block and the first
+// block of the new epoch is not delayed at all. That is the whole cost of ST-4's
+// record bound, and a "round down" or "round half up" mutant would separate
+// these two heights.
+func TestAnUnbondAtEpochEndAndAtTheBoundarySharesOneReleaseHeight(t *testing.T) {
+	const E = uint64(stakeTestEpochBlocks) // 10
+	wantRelease := 3 * E                   // 30
+	for _, tc := range []struct {
+		name   string
+		height uint64
+	}{
+		{"last block before the boundary (E-1, rounds up)", E - 1},
+		{"first block of the boundary (E, exact)", E},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+			s.SetHeight(tc.height)
+			if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, minStakeSparks)); err != nil {
+				t.Fatalf("unbond at height %d: %v", tc.height, err)
+			}
+			recs := s.UnbondingOf(addr)
+			if len(recs) != 1 {
+				t.Fatalf("unbonding = %+v, want one record", recs)
+			}
+			if recs[0].ReleaseHeight != wantRelease {
+				t.Fatalf("unbond at height %d releases at %d, want %d (3E: the cooldown rounded up)",
+					tc.height, recs[0].ReleaseHeight, wantRelease)
+			}
+			// The cooldown must never pay EARLIER than height + UnbondingEpochs*E:
+			// the E-1 record is the one the raw sum (29) would have released a
+			// block early.
+			if raw := tc.height + stakeCooldown; recs[0].ReleaseHeight < raw {
+				t.Fatalf("unbond at height %d releases at %d, earlier than the raw cooldown %d",
+					tc.height, recs[0].ReleaseHeight, raw)
+			}
+		})
+	}
+}
+
+// TestMergeUnbondingRefusesAnOverflow is the record bookkeeping's arithmetic
+// guard (audit ST-9). mergeUnbonding sums records twice:
+//
+//  1. already-matured records collapse into one, and their amounts are added;
+//  2. the new amount merges into the record at its release height.
+//
+// Every sum is checked BEFORE the first write, and a wrapped sum would be a
+// record that pays out fewer sparks than it holds while consuming both - a
+// silent loss, not a crash. No reachable state can hold such amounts (each was
+// debited from a balance), which is exactly why the guard needs a CONSTRUCTED
+// state and a test: it is the check that keeps a hand-built state from turning
+// the omission into money.
+func TestMergeUnbondingRefusesAnOverflow(t *testing.T) {
+	t.Run("two matured records whose amounts sum past MaxUint64", func(t *testing.T) {
+		s, addr, pub, priv := bondedValidator(t, minStakeSparks+1, 0)
+		s.SetHeight(20)
+		s.unbonding[addr] = []Unbonding{
+			{Amount: math.MaxUint64, ReleaseHeight: 10},
+			{Amount: 1, ReleaseHeight: 10},
+		}
+		beforeRoot := s.Root()
+
+		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 1)); !errors.Is(err, ErrBalanceOverflow) {
+			t.Fatalf("unbond over overflowing matured records: err = %v, want ErrBalanceOverflow", err)
+		}
+		if s.Root() != beforeRoot {
+			t.Fatal("a refused merge moved the state root")
+		}
+		if got := s.Bonded(addr); got != minStakeSparks+1 {
+			t.Fatalf("a refused merge changed the bond to %d, want %d", got, minStakeSparks+1)
+		}
+	})
+
+	t.Run("a new amount merged at an existing release height overflows", func(t *testing.T) {
+		s, addr, pub, priv := bondedValidator(t, minStakeSparks+1, 0)
+		s.SetHeight(20)
+		release, err := releaseHeightFor(20, 2, stakeTestEpochBlocks) // 40
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.unbonding[addr] = []Unbonding{{Amount: math.MaxUint64, ReleaseHeight: release}}
+		beforeRoot := s.Root()
+
+		if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 1)); !errors.Is(err, ErrBalanceOverflow) {
+			t.Fatalf("unbond merging into an overflowing record: err = %v, want ErrBalanceOverflow", err)
+		}
+		if s.Root() != beforeRoot {
+			t.Fatal("a refused merge moved the state root")
+		}
+	})
+}
