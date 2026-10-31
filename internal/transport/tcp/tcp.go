@@ -140,13 +140,15 @@ const (
 	// the handshake deadline. The bound is on the FRAME: no payload byte
 	// beyond the length is interpreted.
 	maxHandshakeIDBytes = 512
-	// connectionNonceBytes is the fixed width of the per-connection challenge
+	// connectionNonceBytes is the fixed width of each per-connection challenge
 	// both ends of a DIRECT connection exchange immediately after the ID frames
-	// (audit PX-2). It is the freshness binding a HELLO signature carries: the
-	// receiver's nonce goes into wire.Hello.Nonce, so a captured member HELLO
+	// (audit PX-2). Both challenges go into wire.Hello.Nonce, the receiver's
+	// half after the sender's (wire.HelloBinding), so a captured member HELLO
 	// replayed on another socket fails an equality check before any signature
-	// work. 32 bytes is far beyond guessing and matches the width the relay
-	// gate's own challenge uses.
+	// work - and a member cannot launder a third node's challenge through the
+	// HELLO it makes this node sign (audit A-2). 2*32 is exactly
+	// wire.MaxHelloNonceBytes; 32 bytes is far beyond guessing and matches the
+	// width the relay gate's own challenge uses.
 	connectionNonceBytes = 32
 	// relayPeerIDPrefix names a RELAY connection in the registry: the
 	// connection's far end is the relay (which has no identity and reads
@@ -335,13 +337,18 @@ type Options struct {
 	// connection is absent from Peers() and receives no Broadcast. The first
 	// frame Admit accepts admits the connection and is dispatched normally.
 	//
-	// The nonce argument is the connection's LOCAL challenge, the 32 bytes this
-	// side generated during the direct ID handshake and expects the peer's
-	// HELLO to echo (wire.Hello.Nonce). A policy that accepts a HELLO must
-	// compare it against this value, or a captured HELLO replayed on another
-	// socket admits a stranger - the PX-2 residual. It is nil on a relay
-	// connection, where one socket carries every member's frames and there is
-	// no peer nonce to bind.
+	// The helloBinding argument is the exact value this connection's HELLOs
+	// must carry in wire.Hello.Nonce: wire.HelloBinding(the PEER's challenge,
+	// THIS side's challenge), i.e. both 32-byte values the direct ID handshake
+	// exchanged, in that order (audit A-2). A policy that accepts a HELLO must
+	// compare the whole value against it. One challenge was not enough and is
+	// the A-2 hole: the peer CHOOSES the challenge it sends us, so a member
+	// could hand a third node's challenge to the member whose identity it
+	// wants and replay that signature there. The peer's own challenge is the
+	// half it cannot make a third node generate for it, which is why the
+	// binding covers both. The value is empty (nil) on a relay connection,
+	// where one socket carries every member's frames and there is no peer
+	// challenge to bind - the documented A-3 residual.
 	//
 	// Admit is supplied by the node layer (this package holds no keys and no
 	// chain identity) and is expected to require a signed HELLO from a
@@ -352,7 +359,7 @@ type Options struct {
 	// addresses a PEER chose; it is false now, and this is the corrected
 	// contract: an OPERATOR-CONFIGURED dial (Dial/AddPeer) is admitted at
 	// install, a LEARNED dial (AddLearnedPeer) is not.
-	Admit func(frame []byte, localNonce []byte) bool
+	Admit func(frame []byte, helloBinding []byte) bool
 	// RelayAccessToken, when non-empty, is the pre-shared credential a
 	// RELAY-mode dial answers the relay's gate challenge with (audit N-8,
 	// PX-3). The token itself is NEVER written: this end waits for the relay's
@@ -660,15 +667,19 @@ type conn struct {
 	// bytes caps that work without shedding an honest vote.
 	relayBudget *byteBucket
 	// localNonce is the 32-byte challenge THIS side generated for the
-	// connection, and the value the peer's HELLO must echo (wire.Hello.Nonce);
-	// remoteNonce is the challenge the PEER generated, and the value this side
-	// signs into its own HELLOs to it. Both are written under the transport's
-	// mutex (the conn is already in the registry while the nonce exchange runs,
-	// so an unlocked write would race PeerChallenges/ConnNonces) and are
-	// read-only once ready is set. They are nil on a relay connection, which has
-	// no peer handshake (audit PX-2).
-	localNonce  []byte
-	remoteNonce []byte
+	// connection, and remoteNonce is the challenge the PEER generated. THE
+	// HELLO CARRIES BOTH (audit A-2): helloBinding is
+	// wire.HelloBinding(remoteNonce, localNonce), the exact value this side
+	// demands of the peer's HELLO, and wire.HelloBinding(localNonce,
+	// remoteNonce) is what this side signs into its own HELLOs to the peer.
+	// All three are written under the transport's mutex (the conn is already
+	// in the registry while the nonce exchange runs, so an unlocked write
+	// would race PeerChallenges/ConnNonces) and are read-only once ready is
+	// set. They are nil on a relay connection, which has no peer handshake
+	// (audit PX-2/A-3).
+	localNonce   []byte
+	remoteNonce  []byte
+	helloBinding []byte
 	// ready is set by start, after the connection's last handshake frame has
 	// been exchanged and immediately before its reader and writer begin. A
 	// connection that is admitted but not ready is still HANDSHAKING: Peers(),
@@ -750,9 +761,9 @@ type outbound struct {
 	relay bool
 	// gated marks a learned dial (audit PX-2): the address came from a PEER's
 	// hint, not from the operator's configuration, so the connection is NOT
-	// admitted at install and must present a signed committee HELLO over the
-	// connection's nonce. A configured dial keeps the operator's intent and is
-	// admitted at install.
+	// admitted at install and must present a signed committee HELLO over this
+	// socket's binding (both challenges, audit A-2). A configured dial keeps the
+	// operator's intent and is admitted at install.
 	gated bool
 	// stop ends THIS maintainer and everything it holds. It is closed only by
 	// RemovePeer - the node's own peer policy retiring an address it decided
@@ -985,8 +996,9 @@ func (t *TcpTransport) AddPeer(addr string) error {
 // duplicate rules are identical; the ONE difference is admission. The
 // connection is GATED: it is not a peer at install, receives no Broadcast,
 // appears in no Peers(), and is admitted only when Options.Admit accepts a
-// frame from it - in the node layer, a committee HELLO whose signature is bound
-// to this connection's nonce. A stranger whose address reached the dial book
+// frame from it - in the node layer, a committee HELLO whose signature names
+// this socket's two challenges (audit PX-2, A-2). A stranger whose address
+// reached the dial book
 // therefore gets a socket that is maintained (so an honest peer at that address
 // can complete the link) and nothing else.
 func (t *TcpTransport) AddLearnedPeer(addr string) error {
@@ -1046,11 +1058,13 @@ func (t *TcpTransport) PeerAddr(id transport.PeerID) (string, bool) {
 }
 
 // ConnNonces returns the two per-connection challenges (audit PX-2) for the
-// connection registered under id: ours is the value the PEER's HELLOs must
-// echo, theirs is the value THIS side must echo in the HELLOs it sends to that
-// peer. ok is false for an unknown connection. Both are copies, so a caller
-// cannot mutate the handshake state; a relay-mode connection returns two nil
-// slices and true, because a relay link has no peer handshake.
+// connection registered under id: ours is the value THIS side generated, theirs
+// is the value the PEER generated. The A-2 binding a HELLO from the peer must
+// carry is wire.HelloBinding(theirs, ours); the value this side signs into its
+// own HELLOs to that peer is wire.HelloBinding(ours, theirs). ok is false for an
+// unknown connection. Both are copies, so a caller cannot mutate the handshake
+// state; a relay-mode connection returns two nil slices and true, because a
+// relay link has no peer handshake.
 func (t *TcpTransport) ConnNonces(id transport.PeerID) (ours, theirs []byte, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1061,22 +1075,27 @@ func (t *TcpTransport) ConnNonces(id transport.PeerID) (ours, theirs []byte, ok 
 	return append([]byte(nil), c.localNonce...), append([]byte(nil), c.remoteNonce...), true
 }
 
-// PeerChallenges returns, for every REGISTERED connection, the challenge this
-// side must echo in a HELLO sent to it - the HELLO's connection binding (audit
-// PX-2). Two kinds of connection are included for the same reason: a peer that
-// is already admitted must keep receiving our HELLO, and a GATED connection
-// this node DIALED (a learned hint) needs our HELLO to admit US - the bootstrap
-// is mutually gated, so both sides must offer their signed height before either
-// can become a peer. An accepted and still-unadmitted stranger is excluded:
-// the node did not choose it, and its frames have not been vouched for.
+// PeerChallenges returns, for every REGISTERED connection, the value this side
+// must echo in a HELLO sent to it - the HELLO's socket binding (audit PX-2, A-2).
+// It is wire.HelloBinding(ours, theirs): THIS side's challenge followed by the
+// peer's, the mirror image of the value the peer's own HELLO to us must carry
+// (see ConnNonces). Two kinds of connection are included for the same reason: a
+// peer that is already admitted must keep receiving our HELLO, and a GATED
+// connection this node DIALED (a learned hint) needs our HELLO to admit US - the
+// bootstrap is mutually gated, so both sides must offer their signed height
+// before either can become a peer. An accepted and still-unadmitted stranger is
+// excluded: the node did not choose it, and its frames have not been vouched
+// for.
 //
-// The value is nil on a relay connection, where one socket carries every
-// member's frames and there is no peer nonce; a HELLO sent there carries an
-// empty nonce, and every receiver behind the relay checks it against its own
-// relay connection's (empty) nonce. That is the documented PX-2 residual: over
-// a relay the connection is not a peer, `via` is the relay name for every
-// member, and PX-1 makes the SIGNATURE the hint authority, so replaying a
-// member HELLO there changes no decision except refreshing its height.
+// The value is EMPTY (len 0) on a relay connection, where one socket carries
+// every member's frames and there is no peer challenge; a HELLO sent there
+// carries an empty binding, and every receiver behind the relay checks it
+// against its own relay connection's (empty) binding. That is the documented
+// A-3 residual, and it is NOT harmless: replaying a member's old HELLO over the
+// relay can still refresh that member's entry in the receiver's peer table, so
+// the table keeps a high-water height (Validator.recordHeight) and a stale
+// replay cannot lower it. Freshness over a shared link cannot be had from a
+// challenge both the member and the replayer hold; see recordHeight.
 func (t *TcpTransport) PeerChallenges() map[transport.PeerID][]byte {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1088,7 +1107,7 @@ func (t *TcpTransport) PeerChallenges() map[transport.PeerID][]byte {
 		if !c.admitted.Load() && !(c.dialled && c.needsAdmit) {
 			continue
 		}
-		out[id] = append([]byte(nil), c.remoteNonce...)
+		out[id] = wire.HelloBinding(c.localNonce, c.remoteNonce)
 	}
 	return out
 }
@@ -1356,15 +1375,19 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*co
 
 // exchangeNonce performs the per-connection challenge exchange that binds a
 // HELLO signature to one socket (audit PX-2). Both sides write their 32-byte
-// nonce before reading the peer's, mirroring the ID exchange, so neither can
-// block the other and the two frames never deadlock. A failed write or read -
-// including a peer that sends a frame of the wrong width - ends the connection;
-// the maintainer treats it as an ordinary failure and redials.
+// challenge before reading the peer's, mirroring the ID exchange, so neither
+// can block the other and the two frames never deadlock. A failed write or read
+// - including a peer that sends a frame of the wrong width - ends the
+// connection; the maintainer treats it as an ordinary failure and redials.
 //
-// The nonces are 32 random bytes from crypto/rand: an attacker who observes
-// one connection's nonce (the frames are plaintext) cannot use it on another,
-// because each connection's value is fresh and the receiver checks equality
-// against the value IT generated.
+// BOTH challenges are in the HELLO binding (audit A-2). Each is 32 random bytes
+// from crypto/rand: the receiver's half proves the frame was signed for a
+// socket this node issued a challenge on, and the sender's half proves it is
+// the one socket whose two ends produced that pair. The receiver's half alone
+// was not enough: the peer chooses the challenge it sends us, so a member could
+// make another member sign a third node's challenge and replay it there. The
+// frames are plaintext, so an observer learns the values; freshness across
+// connections is what makes them useless elsewhere.
 func (t *TcpTransport) exchangeNonce(nc net.Conn, c *conn) error {
 	local := make([]byte, connectionNonceBytes)
 	if _, err := cryptorand.Read(local); err != nil {
@@ -1397,6 +1420,9 @@ func (t *TcpTransport) exchangeNonce(nc net.Conn, c *conn) error {
 	t.mu.Lock()
 	c.localNonce = local
 	c.remoteNonce = remote
+	// The peer's HELLO must name BOTH challenges, the peer's own first: that is
+	// the half a member cannot get a third node to generate for it (audit A-2).
+	c.helloBinding = wire.HelloBinding(remote, local)
 	t.mu.Unlock()
 	return nil
 }
@@ -1628,7 +1654,7 @@ func relayHandshakeFailed(addr string, err error) {
 // gated is ADMISSION INTENT (audit PX-2): false for a connection the OPERATOR
 // chose (Dial/AddPeer) and for a relay link; true for a dial made because a
 // PEER advertised the address (AddLearnedPeer), which must present a signed
-// committee HELLO over the connection's nonce before it is a peer. With a nil
+// committee HELLO over this socket's binding before it is a peer. With a nil
 // Admit there is no policy and every connection is admitted at install.
 //
 // relay is DIAL INTENT, not a fact about the peer: it is true only on the
@@ -1877,8 +1903,9 @@ func newcomerWins(local transport.PeerID, existing, newcomer *conn) bool {
 //   - the ADMISSION GATE (audit N-3/PX-2) holds a GATED connection - an accepted
 //     inbound socket and a hint-dialled one - out of Peers() and Broadcast until
 //     Options.Admit accepts a frame. The frame it is offered carries the
-//     connection's local nonce so the policy can require a HELLO bound to THIS
-//     socket.
+//     connection's HELLO binding - BOTH challenges, the peer's then ours (audit
+//     A-2) - so the policy can require a HELLO that names THIS socket's two
+//     ends.
 func (t *TcpTransport) reader(c *conn) {
 	for {
 		if err := c.nc.SetReadDeadline(time.Now().Add(t.opts.IdleReadTimeout)); err != nil {
@@ -1909,7 +1936,7 @@ func (t *TcpTransport) reader(c *conn) {
 			continue // the frame is consumed, so framing stays intact
 		}
 		if !c.admitted.Load() {
-			if t.opts.Admit == nil || !t.opts.Admit(payload, c.localNonce) {
+			if t.opts.Admit == nil || !t.opts.Admit(payload, c.helloBinding) {
 				// Not yet a peer: the frame is dropped, never dispatched,
 				// and the connection stays out of Peers() and off every
 				// Broadcast. A stranger cannot reach OnMessage at all.

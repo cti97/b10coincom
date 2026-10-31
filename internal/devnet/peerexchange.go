@@ -553,8 +553,8 @@ func (v *Validator) observePeerExchange(from transport.PeerID, p *wire.PeerExcha
 		//
 		// learned=true is audit PX-2's whole point: this dial exists because a
 		// PEER named the address, so the transport holds it out of Peers() and
-		// off every Broadcast until a signed committee HELLO bound to the
-		// connection's nonce arrives.
+		// off every Broadcast until a signed committee HELLO bound to this
+		// socket's two challenges arrives (audit PX-2, A-2).
 		if err := v.peerAdd(key, true); err != nil {
 			v.hintsRefused.Add(1)
 			continue

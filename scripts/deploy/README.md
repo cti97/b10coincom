@@ -231,6 +231,33 @@ anything less. That floor is audit RT-2: a one-spark seat is a bond below the
 candidacy floor, and on a full committee one `MIN_STAKE` bond then outranks it
 and holds about all of the power (10^11 of 10^11+2 on this three-seat shape).
 
+> **⚠️ What THIS file costs to capture (audit A-4).** Three seats at exactly
+> `100000000000` sparks with `committee_size` 4 let an attacker take the
+> committee with **three `MIN_STAKE` bonds** — `3 × 10^11 =
+> 300,000,000,000` sparks, **3,000 b10** — plus **a few key-generation
+> attempts**. The mechanism: equal stakes are ordered by raw public-key bytes
+> (`state.compareCandidates`), so an attacker grinds each new key until it
+> sorts ahead of the middle genesis key; the three keys then tie the genesis
+> powers, the ranking seats the three attacker keys **plus one** genesis seat,
+> and `applyPowerCap` makes all four seats a quarter each — 3/4 is a quorum on
+> its own. At the README's ~71 minutes of faucet farming per `MIN_STAKE` that
+> is a few hours, and it needs no genesis key.
+>
+> **An operator can make this expensive.** Set every genesis `power` well
+> above the floor — `1000000000000` is 10,000 b10, ten times `MIN_STAKE`. A
+> floor bond then cannot tie the ranking, the three genesis seats keep their
+> seats, and only the one spare seat can be won, which the 1/4 cap holds to a
+> quarter. Three seats now cost `3 × (the lowest genesis power) + 3` sparks —
+> 30,000 b10 at ten times the floor — and the tie-break grind buys nothing.
+> The grind itself cannot be removed here: equal-stake ordering is part of the
+> deterministic committee derivation every node must compute identically. The
+> structural alternative is a **fourth** genesis machine (`committee_size` 5
+> against 4 keys): three attacker seats are then 3/5, below the two-thirds
+> quorum, so the cheapest capture needs four bonds instead of three. This
+> example cannot do either for you — the powers and the seat count are yours to
+> choose before the chain starts (editing the file afterwards starts a
+> different chain).
+
 `committee_size` is optional and is **how many seats the chain has room for**.
 It must be at least the number of validators (a key the file publishes must be
 able to be seated) and may be larger: with one spare seat, a newcomer that

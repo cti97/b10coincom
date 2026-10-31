@@ -55,6 +55,19 @@ func TestADirectConnectionExchangesTwoDistinctAgreedChallenges(t *testing.T) {
 	if bytes.Equal(aOurs, bOurs) {
 		t.Fatal("both ends generated the SAME challenge: a captured HELLO would be replayable across the pair's directions")
 	}
+	// The A-2 binding is the whole pair, and the two ends must agree on it in
+	// opposite roles: what a DEMANDS of b's HELLO is what b SIGNS into it.
+	aDemands := wire.HelloBinding(aTheirs, aOurs)
+	bSigns := wire.HelloBinding(bOurs, bTheirs)
+	if !bytes.Equal(aDemands, bSigns) {
+		t.Fatalf("the two ends disagree on the HELLO binding: a demands %x, b signs %x", aDemands, bSigns)
+	}
+	if len(aDemands) != 2*connectionNonceBytes {
+		t.Fatalf("the binding is %d bytes, want both %d-byte challenges", len(aDemands), connectionNonceBytes)
+	}
+	if bytes.Equal(aDemands, aOurs) {
+		t.Fatal("the binding is one challenge: a member can make a third node sign a challenge it chose, which is the A-2 hole")
+	}
 
 	// And a fresh connection gets a fresh challenge, so a captured HELLO for the
 	// old socket is useless on the new one.
@@ -127,8 +140,19 @@ func TestOurHelloIsOfferedOnlyWhereItCanAdmitUs(t *testing.T) {
 	if !ok {
 		t.Fatalf("our HELLO is NOT offered to a gated learned dial: the link can never bootstrap (%v)", challenges)
 	}
-	if !bytes.Equal(got, learned.remoteNonce) {
-		t.Fatalf("the challenge offered to the learned dial is not the value the peer generated")
+	// The value is the A-2 binding: OUR challenge first, the peer's second. The
+	// receiver of this HELLO checks exactly wire.HelloBinding(theirs, ours).
+	want := wire.HelloBinding(learned.localNonce, learned.remoteNonce)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("the binding offered to the learned dial is not (our challenge || the peer's): got %x, want %x", got, want)
+	}
+	if len(got) != 2*connectionNonceBytes {
+		t.Fatalf("the HELLO binding is %d bytes, want the two %d-byte challenges", len(got), connectionNonceBytes)
+	}
+	// The wire bound must fit exactly the two challenges; a wider transport
+	// challenge would be silently truncated by the decoder's ceiling.
+	if 2*connectionNonceBytes > wire.MaxHelloNonceBytes {
+		t.Fatalf("two %d-byte challenges do not fit wire.MaxHelloNonceBytes = %d", connectionNonceBytes, wire.MaxHelloNonceBytes)
 	}
 	if _, ok := challenges["stranger"]; ok {
 		t.Fatal("the unadmitted accepted stranger is in PeerChallenges")
