@@ -183,3 +183,106 @@ func TestAHighWaterHeightCannotCaptureTheCatchUpSource(t *testing.T) {
 		t.Fatalf("a third wave pulled from %v: replaying the high HELLO cleared the demotion", picked)
 	}
 }
+
+// TestAReplayedCurrentHeightHelloOverTheRelayStillMovesVia is A-3's documented
+// residual, pinned as CURRENT behaviour (section 6 item 2). The review's desired
+// property - a replayed current-height member HELLO over the relay must not move
+// `via` off a nonce-bound direct connection - is not true today, and this test
+// says so rather than leaving a gap somebody could mistake for a fix.
+//
+// The state is built through the real paths, not a race: b dials a, both sides
+// broadcast their production HELLOs, a advances two blocks, and b records a's
+// current height via a's own socket ("v1"). Then b has a relay link (no peer
+// challenge, empty binding) and A's genuine current-height HELLO, replayed there,
+// ties the recorded height. recordHeight keeps the high-water height but moves
+// `via` on an EQUAL height, so the relay becomes the catch-up source. recordHeight
+// limits that to "cannot lower", not "cannot move": a direct nonce-bound
+// attestation does not yet outrank a relay one.
+func TestAReplayedCurrentHeightHelloOverTheRelayStillMovesVia(t *testing.T) {
+	b := startQuietListener(t, 0)
+	a := startQuietListener(t, 1)
+
+	// A genuine nonce-bound direct link. b dials a (the operator-configured
+	// path); both production broadcastHello calls run; b records a `via` "v1".
+	if err := b.ttp.AddPeer(a.Addr()); err != nil {
+		t.Fatalf("b dialling a: %v", err)
+	}
+	waitFor(t, "b to register its dial of a", 5*time.Second, func() bool {
+		return hasPeer(b, "v1")
+	})
+	b.broadcastHello()
+	waitFor(t, "a to admit b", 10*time.Second, func() bool {
+		return hasPeer(a, "v0")
+	})
+	a.broadcastHello()
+	waitFor(t, "b to record a via the direct socket", 10*time.Second, func() bool {
+		b.peerHMu.Lock()
+		defer b.peerHMu.Unlock()
+		st := b.peerH[string(a.pub)]
+		return st != nil && st.via == "v1"
+	})
+
+	// a advances two blocks and broadcasts its current height. The HELLO over
+	// the direct socket carries that socket's two challenges, so b records the
+	// CURRENT height `via` "v1" - the state the relay replay is about to move.
+	for i := 0; i < 2; i++ {
+		blk, err := a.Chain().Build(a.priv, nil, a.Chain().Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatalf("a building height %d: %v", a.Chain().Height()+1, err)
+		}
+		if err := a.Chain().Append(blk); err != nil {
+			t.Fatalf("a appending height %d: %v", blk.Header.Height, err)
+		}
+	}
+	a.broadcastHello()
+	waitFor(t, "b to record a's current height via the direct socket", 10*time.Second, func() bool {
+		b.peerHMu.Lock()
+		defer b.peerHMu.Unlock()
+		st := b.peerH[string(a.pub)]
+		return st != nil && st.height == a.Height() && st.via == "v1"
+	})
+
+	// b's relay link: one socket for every member, no peer challenge, so the
+	// HELLO that travels it carries the empty binding.
+	rl := relay.New(relay.Options{})
+	defer rl.Close()
+	if err := rl.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	relayName := tcp.RelayPeerName(rl.Addr().String())
+	if err := b.ConnectRelay(rl.Addr().String()); err != nil {
+		t.Fatalf("b connecting the relay: %v", err)
+	}
+	waitFor(t, "b's relay link to register", 5*time.Second, func() bool {
+		return hasPeer(b, relayName)
+	})
+
+	// THE REPLAY: a's genuine current-height HELLO, carrying the empty binding
+	// the relay path demands. Any holder of that frame - the relay, any stranger
+	// on a token-less relay - can present it.
+	replay := &wire.Hello{
+		ChainID:   b.g.ChainID,
+		Validator: a.pub,
+		Height:    a.Height(),
+		Nonce:     nil,
+	}
+	hh := helloHash(replay)
+	replay.Sig = crypto.Sign(a.priv, hh[:])
+	b.observeHello(relayName, replay)
+
+	b.peerHMu.Lock()
+	st := b.peerH[string(a.pub)]
+	b.peerHMu.Unlock()
+	if st == nil || st.height != a.Height() {
+		t.Fatalf("the replay changed the recorded height (entry %+v, want a's current %d)", st, a.Height())
+	}
+	// CURRENT BEHAVIOUR, and the residual: the equal height moved `via`. When
+	// this is fixed (a direct nonce-bound attestation outranking a relay one),
+	// this assertion flips and A-3's residual note goes with it.
+	if st.via != relayName {
+		t.Fatalf("the replayed current-height HELLO did not move `via` to the relay (got %q): this test pins the residual; if it is fixed, update it and A-3's record", st.via)
+	}
+	if who, via, h := b.tallestPeer(); who != string(a.pub) || via != relayName || h != a.Height() {
+		t.Fatalf("the relay replay did not become the pull target: who=%q via=%q h=%d, want a's key via the relay at %d", who, via, h, a.Height())
+	}
+}

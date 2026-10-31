@@ -320,9 +320,20 @@ func TestCommitteeFileSpareSeatsAreAConsensusParameter(t *testing.T) {
 
 // TestTheShippedExampleCommitteeFileIsLoadable pins the example file the deploy
 // recipe tells operators to copy. The audit's section 6 recorded "example file
-// untested", and RT-2's vector was exactly that file's "power": 1 — so the
+// untested", and RT-2's vector was exactly that file's "power": 1 - so the
 // checked-in example must parse, carry no sub-floor seat, and ask for at least
 // one spare seat (admission without eviction).
+//
+// Audit A-4's half: the file must also NOT ship the capturable shape. Three
+// seats at exactly MIN_STAKE with one spare seat are capturable for three
+// MIN_STAKE bonds plus a few key-generation attempts (equal powers are ordered
+// by raw key bytes, and applyPowerCap then makes the four seats a quarter
+// each), which is what the deploy README's callout says. The example therefore
+// carries ten times the floor, matching the README's recommendation; lowering it
+// back to the floor fails here. Note that this file feeds a genesis HASH (the
+// powers are part of the committee document): raising them starts a different
+// example chain, which is exactly why the recipe says to choose them before the
+// chain starts. No test pins that hash.
 func TestTheShippedExampleCommitteeFileIsLoadable(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/deploy/committee.example.json")
 	if err != nil {
@@ -333,9 +344,22 @@ func TestTheShippedExampleCommitteeFileIsLoadable(t *testing.T) {
 		t.Fatalf("scripts/deploy/committee.example.json does not load: %v", err)
 	}
 	minPower := Devnet().Params.MinStakeSparks
+	// The README's recommendation is "ten times the floor"; the floor itself is
+	// the shape the capture argument prices, so it is the line the example must
+	// clear, not merely reach.
+	capturablePower := minPower
+	recommended := 10 * minPower
 	for i, v := range g.Validators {
 		if v.Power < minPower {
 			t.Fatalf("the shipped example's validator %d carries power %d, under MIN_STAKE %d: it would ship RT-2's one-spark genesis seat", i, v.Power, minPower)
+		}
+		if v.Power <= capturablePower {
+			t.Fatalf("the shipped example's validator %d carries power %d, at or below the %d floor: three such seats are the capturable shape the deploy README prices at three MIN_STAKE bonds (audit A-4); set ten times the floor (%d)",
+				i, v.Power, capturablePower, recommended)
+		}
+		if v.Power < recommended {
+			t.Fatalf("the shipped example's validator %d carries power %d, below the README's recommended ten times the floor (%d): the file operators copy must match the advice beside it (audit A-4)",
+				i, v.Power, recommended)
 		}
 	}
 	if g.Params.CommitteeSize <= len(g.Validators) {

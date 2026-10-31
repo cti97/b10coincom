@@ -125,12 +125,19 @@ func TestATokenlessRelayForwardsNoProofOfTheToken(t *testing.T) {
 	// D-1: the node answered, but it must NOT install the link. The relay
 	// registered the node's socket before the gate ran (it has no token), so
 	// the count falls back to the stranger alone only when the node closes it.
-	if peers := tp.Peers(); len(peers) != 0 {
-		t.Fatalf("the node installed %v through a relay that never gated: a stranger's looped frames defeated the operator's \"only a gated relay\" intent (audit D-1)", peers)
-	}
+	//
+	// THE WAIT COMES FIRST (audit N-8). The old order asserted Peers() was empty
+	// before polling for the drop; at that instant the node had not yet read the
+	// stranger's bogus confirmation, so the assertion passed trivially and would
+	// have passed even if the node installed the link a moment later. Waiting for
+	// the socket to go means the gate has run and been refused, so the empty peer
+	// set is the real result.
 	waitFor(t, "the node to drop the ungated relay link", 10*time.Second, func() bool {
 		return rl.Stats().Conns == 1
 	})
+	if peers := tp.Peers(); len(peers) != 0 {
+		t.Fatalf("the node installed %v through a relay that never gated: a stranger's looped frames defeated the operator's \"only a gated relay\" intent (audit D-1)", peers)
+	}
 }
 
 // TestAGateProofIsNotReplayableOnAnotherConnection is the nonce's half of PX-3:

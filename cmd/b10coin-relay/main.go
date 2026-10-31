@@ -41,6 +41,7 @@ Usage:
                 [--write-queue-frames N]
                 [--write-timeout SECONDS] [--read-timeout SECONDS]
                 [--keepalive SECONDS] [--access-token-file PATH]
+                [--access-timeout SECONDS]
   b10coin-relay --help
 
 Every validator connects OUTBOUND to this relay (inbound to a home machine
@@ -164,6 +165,12 @@ enforce any of it)
   PLAINTEXT over TCP and is not expired, so run it over a trusted path such as
   a VPN, and treat its disclosure as a connection someone else can make. With
   no token the relay sends no greeting and behaves exactly as before.
+
+  --access-timeout (default 5) is how long an accepted connection may take to
+  answer the gate challenge before it is closed and its slot released (audit
+  N-7). An honest client answers immediately; a socket silent for this long is
+  a scanner. It is also the bound the deploy recipe quotes for a dial that
+  answers nothing, so the two cannot disagree.
 
 Operation: run one instance per validator star, behind the VPS firewall
 allowlisting the validator IPs where that is practical - and with
@@ -303,6 +310,7 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 	readTimeout := fs.Int("read-timeout", int(relay.DefaultReadTimeout/time.Second), "seconds one frame may take to arrive; expiry closes that connection and releases its slot")
 	keepAlive := fs.Int("keepalive", int(relay.DefaultKeepAlive/time.Second), "TCP keepalive probe period in seconds; half-open connections are reaped by the kernel after unanswered probes")
 	accessTokenFile := fs.String("access-token-file", "", "path to a file whose bytes are the pre-shared access token (audit N-8; at least 16 bytes). The relay announces the gate with a fixed first frame and a fresh random challenge; each connection must then answer HMAC-SHA-256(token, challenge) or be closed and counted unauthorized, and the relay confirms with HMAC-SHA-256(token, challenge || answer). The token is never sent, is bound to a fresh challenge (not replayable on another connection), and the relay decodes nothing; it still travels in plaintext, so run it over a trusted path")
+	accessTimeout := fs.Int("access-timeout", int(relay.DefaultAccessTimeout/time.Second), "seconds an accepted connection may take to answer the access-token challenge before it is closed and its slot released (audit N-7); an honest client answers immediately")
 
 	err := fs.Parse(args)
 	switch {
@@ -353,5 +361,6 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 		ReadTimeout:      time.Duration(*readTimeout) * time.Second,
 		KeepAlive:        time.Duration(*keepAlive) * time.Second,
 		AccessToken:      token,
+		AccessTimeout:    time.Duration(*accessTimeout) * time.Second,
 	}, nil
 }

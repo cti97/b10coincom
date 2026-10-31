@@ -511,6 +511,191 @@ func devPrivateKey(t *testing.T) ed25519.PrivateKey {
 	return priv
 }
 
+// TestAPreC1DirectoryDivergesWithAForkMessageNotACorruptLog is audit N-1's
+// constructed proof. C-1 changed applyUnbond's split to FUNDED FIRST, so an exit
+// from a bond holding BOTH a genesis grant and a top-up produces a different
+// post-state than the pre-C-1 order. A directory written by a build that ran the
+// old order therefore fails replay at that unbond's height, and the pre-fix
+// report was ErrGenesisReplay's "replay diverged from stored state root" - the
+// message for a corrupt log - because only the height-1 parent-link branch
+// (ST-3/C-2) had a diagnosis.
+//
+// This is CONSTRUCTED, not provoked: height 1 is built by the real chain, the
+// old-order post-state is recomputed here from that committed state with the old
+// split (grant first), and a second directory is built with the SAME transaction
+// under the current rule. The roots differ; the current directory reopens; the
+// old one must be reported as a RULE CHANGE, and specifically not as corruption.
+func TestAPreC1DirectoryDivergesWithAForkMessageNotACorruptLog(t *testing.T) {
+	g := genesis.Devnet()
+	g.ChainID = "b10coin-c1-rule-change"
+	g.Params.ChainID = g.ChainID
+	g.Params.EpochBlocks = 10
+	pub, priv := genesis.DevValidatorKey()
+	minStake := g.Params.MinStakeSparks
+	// A genesis seat at the floor (an unfunded grant), topped up with the
+	// operator's own MIN_STAKE - the exact bond shape whose exit C-1 moved.
+	g.Validators = []genesis.Validator{{PubKey: pub, Power: minStake}}
+	g.Params.CommitteeSize = 1
+	g.DevAccounts = []genesis.DevAccount{{PubKey: pub, BalanceSparks: minStake + g.Params.MinFeeSparks}}
+	if err := g.Validate(); err != nil {
+		t.Fatalf("fixture genesis: %v", err)
+	}
+	addr := types.AddressFromPub(pub)
+	bond := types.Tx{Type: types.TxBond, From: addr, PubKey: pub, Nonce: 0, Amount: minStake, Fee: g.Params.MinFeeSparks}
+	bs := bond.SigningHash(g.Hash())
+	bond.Sig = crypto.Sign(priv, bs[:])
+	unbond := types.Tx{Type: types.TxUnbond, From: addr, PubKey: pub, Nonce: 1, Amount: minStake}
+	us := unbond.SigningHash(g.Hash())
+	unbond.Sig = crypto.Sign(priv, us[:])
+
+	// openAndTopUp builds the SAME height-1 state (grant + funded top-up) in a
+	// fresh directory. Both directories below start from it.
+	openAndTopUp := func(dir string) *Chain {
+		t.Helper()
+		c, err := Open(g, dir)
+		if err != nil {
+			t.Fatalf("opening %s: %v", dir, err)
+		}
+		b, err := c.Build(priv, []types.Tx{bond}, g.Time+1)
+		if err != nil {
+			t.Fatalf("building the top-up bond: %v", err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatalf("appending the top-up bond: %v", err)
+		}
+		return c
+	}
+
+	// THE CURRENT RULE. Block 2 applies the unbond funded-first: the whole exit
+	// is recorded, the grant stays on the seat, and the block commits newRoot.
+	newDir := t.TempDir()
+	cNew := openAndTopUp(newDir)
+	pre := cNew.State().Clone()
+	parent := cNew.Head().ID()
+	ts := cNew.Head().Header.Timestamp + 1
+	bNew, err := cNew.Build(priv, []types.Tx{unbond}, ts)
+	if err != nil {
+		t.Fatalf("building the current-order unbond: %v", err)
+	}
+	if err := cNew.Append(bNew); err != nil {
+		t.Fatalf("appending the current-order unbond: %v", err)
+	}
+	newRoot := cNew.State().Root()
+	if err := cNew.Close(); err != nil {
+		t.Fatalf("closing the current-order chain: %v", err)
+	}
+
+	// THE OLD RULE, hand-replayed on the same pre-unbond state. d4ec076's split
+	// burned min(amount, Unfunded) and recorded the rest; here the exit equals
+	// the grant, so it burned all of it and recorded nothing - a different state
+	// from the funded-first rule above, from the same transaction.
+	old := pre.Clone()
+	old.SetHeight(2)
+	if reward := faucet.Reward(2, g.Params.InitialRewardSparks, g.Params.HalvingIntervalBlocks); reward > 0 {
+		acc := old.Get(g.FaucetAddress())
+		acc.Balance += reward
+		old.Set(g.FaucetAddress(), acc)
+	}
+	ob, ok := old.BondOf(addr)
+	if !ok || ob.Amount != 2*minStake || ob.Unfunded != minStake {
+		t.Fatalf("fixture bond after the top-up = %+v, want Amount %d, Unfunded %d", ob, 2*minStake, minStake)
+	}
+	oldUnfundedOut := min(unbond.Amount, ob.Unfunded)
+	oldFundedOut := unbond.Amount - oldUnfundedOut
+	if oldUnfundedOut != minStake || oldFundedOut != 0 {
+		t.Fatalf("fixture: the old split is %d burned / %d recorded, want the whole %d burned (the shape that diverges)",
+			oldUnfundedOut, oldFundedOut, minStake)
+	}
+	ob.Amount -= unbond.Amount
+	ob.Unfunded -= oldUnfundedOut
+	old.SetBond(addr, ob)
+	acc := old.Get(addr)
+	acc.Nonce++
+	old.Set(addr, acc)
+	oldRoot := old.Root()
+	if oldRoot == newRoot {
+		t.Fatal("the old and current orders produced the same root: the fixture does not exercise C-1's divergence")
+	}
+	t.Logf("same transactions, different rule: pre-C-1 root %x, C-1 root %x", oldRoot, newRoot)
+
+	// Write the block the OLD BUILD would have stored: same parent, same
+	// transaction, the old post-state root. The store accepts bytes; only
+	// Open's replay judges the meaning.
+	oldDir := t.TempDir()
+	cOld := openAndTopUp(oldDir)
+	if err := cOld.Close(); err != nil {
+		t.Fatalf("closing the pre-C-1 chain: %v", err)
+	}
+	blk := &types.Block{
+		Header: types.Header{
+			Height:     2,
+			ParentHash: parent,
+			StateRoot:  oldRoot,
+			TxRoot:     types.ComputeTxRoot([]types.Tx{unbond}),
+			Timestamp:  ts,
+			Proposer:   pub,
+		},
+		Txs: []types.Tx{unbond},
+	}
+	hs := blk.Header.SigningHash()
+	blk.Sig = crypto.Sign(priv, hs[:])
+	s, err := store.Open(oldDir)
+	if err != nil {
+		t.Fatalf("opening the pre-C-1 directory's store: %v", err)
+	}
+	if err := s.CheckGenesis(g.Hash()); err != nil {
+		t.Fatalf("recording this genesis: %v", err)
+	}
+	if err := s.Append(2, blk.Encode()); err != nil {
+		t.Fatalf("writing the old-rule block: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("closing the pre-C-1 store: %v", err)
+	}
+
+	// CONTROL: the CURRENT directory reopens at height 2 with the new root. The
+	// only difference between the two directories is the rule, not a bad block.
+	cOK, err := Open(g, newDir)
+	if err != nil {
+		t.Fatalf("the current-order directory does not reopen: %v", err)
+	}
+	if got := cOK.Height(); got != 2 {
+		t.Fatalf("the current-order directory reopens at height %d, want 2", got)
+	}
+	if got := cOK.State().Root(); got != newRoot {
+		t.Fatalf("the current-order directory reopens at root %x, want %x", got, newRoot)
+	}
+	if err := cOK.Close(); err != nil {
+		t.Fatalf("closing the reopened current-order chain: %v", err)
+	}
+
+	// THE FINDING: the old-order directory must be reported as a rule change.
+	c, err := Open(g, oldDir)
+	if err == nil {
+		_ = c.Close()
+		t.Fatal("Open accepted a directory whose unbond was applied under the pre-C-1 order")
+	}
+	if errors.Is(err, ErrGenesisReplay) {
+		t.Fatalf("the pre-C-1 directory is still reported with the corrupt-log error: %v", err)
+	}
+	if !errors.Is(err, ErrRuleChange) {
+		t.Fatalf("Open = %v, want an error wrapping ErrRuleChange", err)
+	}
+	for _, want := range []string{
+		"C-1",
+		"FUNDED-FIRST",
+		"NOTHING HERE IS CORRUPT",
+		"does not replay under this build's consensus rules",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the pre-C-1 directory's error does not say %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "replay diverged from stored state root") {
+		t.Fatalf("the pre-C-1 directory's error still reads as a corrupt log: %v", err)
+	}
+}
+
 // Emission must be credited exactly once per height, and only once - a second
 // application would inflate the supply.
 func TestEmissionIsCreditedOncePerBlock(t *testing.T) {
@@ -1236,4 +1421,36 @@ func TestHeadSnapshotIsConsistentUnderAppends(t *testing.T) {
 	}
 	close(stop)
 	<-checked
+}
+
+// TestOpenRefusesAGenesisWhoseEpochZeroPowerSumOverflows is audit N-5's
+// section-6 item 5: the failure must be REPORTED at Open, not discovered later
+// as a chain that refuses every block. The bound lives in genesis.Validate, so
+// Open returns it before the store is touched; the message names the epoch-0
+// committee, which is the mechanism, rather than only the arithmetic.
+func TestOpenRefusesAGenesisWhoseEpochZeroPowerSumOverflows(t *testing.T) {
+	g := genesis.Devnet()
+	g.ChainID = "b10coin-power-sum-open"
+	g.Params.ChainID = g.ChainID
+	g.Validators = make([]genesis.Validator, 2)
+	for i := range g.Validators {
+		h := crypto.HashParts([]byte("b10coin-power-sum-open-key"), []byte{byte(i)})
+		pub := ed25519.NewKeyFromSeed(h[:]).Public().(ed25519.PublicKey)
+		g.Validators[i] = genesis.Validator{PubKey: pub, Power: 1 << 63}
+	}
+	g.Params.CommitteeSize = len(g.Validators)
+
+	c, err := Open(g, t.TempDir())
+	if err == nil {
+		_ = c.Close()
+		t.Fatal("Open accepted a genesis whose epoch-0 power sum overflows: the chain opens and then refuses every block")
+	}
+	if !errors.Is(err, genesis.ErrBadGenesis) {
+		t.Fatalf("Open = %v, want an error wrapping genesis.ErrBadGenesis", err)
+	}
+	for _, want := range []string{"overflow uint64", "epoch-0 committee"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Open's refusal does not say %q: %v", want, err)
+		}
+	}
 }

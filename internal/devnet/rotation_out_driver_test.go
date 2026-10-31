@@ -32,8 +32,11 @@ package devnet
 // different driver (the stale one is gone), and no peer was demoted.
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"fmt"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,10 +174,24 @@ func TestARotatedOutPostGenesisNodeRebuildsItsDriver(t *testing.T) {
 	// epoch), not the peer's answer, so the adoption must still count and the
 	// member must keep its standing. Constructed by replacing the validator's
 	// per-height source; the live driver holds its own copy of the config.
+	//
+	// The log capture starts HERE (audit N-8): this is the first failure of the
+	// episode, and the notices below count what the latch suppressed, not what
+	// happened before the test started listening.
+	var logs bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
 	rebuilt := v.drv
-	v.cfgC.CommitteeFor = func(h uint64) ([]genesis.Validator, error) {
+	origCommitteeFor := v.cfgC.CommitteeFor
+	undeducible := func(h uint64) ([]genesis.Validator, error) {
 		return nil, fmt.Errorf("constructed: no committee for height %d", h)
 	}
+	v.cfgC.CommitteeFor = undeducible
 	v.recordHeight(string(evictorPub), "vK", 9)
 	v.pull = func(from uint64) error {
 		if from != 9 {
@@ -201,5 +218,47 @@ func TestARotatedOutPostGenesisNodeRebuildsItsDriver(t *testing.T) {
 	v.peerHMu.Unlock()
 	if demoted != 0 {
 		t.Fatalf("the member was demoted for a rebuild failure caused by this node's own undeducible committee (until wave %d)", demoted)
+	}
+
+	// N-8: that failure is not silent any more, and it is logged ONCE per
+	// episode rather than once per wave. Two further failed rebuilds (heights 10
+	// and 11) must produce exactly one line; a successful rebuild re-arms the
+	// notice, so the next failure produces one more.
+	pullNext := func(want uint64) {
+		t.Helper()
+		v.recordHeight(string(evictorPub), "vK", want)
+		v.pull = func(from uint64) error {
+			if from != want {
+				return fmt.Errorf("pull asked for height %d, want %d", from, want)
+			}
+			b, err := ch.Build(evictor, nil, ch.Head().Header.Timestamp+1)
+			if err != nil {
+				return err
+			}
+			return ch.Append(b)
+		}
+		v.maybeCatchUp()
+		if got := v.Chain().Height(); got != want {
+			t.Fatalf("the pull did not adopt height %d (chain at %d)", want, got)
+		}
+	}
+	pullNext(10)
+	pullNext(11)
+	if got := strings.Count(logs.String(), "could not rebuild the consensus driver"); got != 1 {
+		t.Fatalf("the refused rebuild was logged %d times over three failed waves, want once per episode: %q", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "stale engine keeps judging height 8") {
+		t.Fatalf("the rebuild notice does not name the height the stale engine is stuck on: %q", logs.String())
+	}
+
+	// Re-armed by success: restore the real per-height source, adopt height 12
+	// (the rebuild succeeds), then make it underivable again and watch a FOURTH
+	// failed rebuild log its own line.
+	v.cfgC.CommitteeFor = origCommitteeFor
+	pullNext(12)
+	v.cfgC.CommitteeFor = undeducible
+	pullNext(13)
+	if got := strings.Count(logs.String(), "could not rebuild the consensus driver"); got != 2 {
+		t.Fatalf("the rebuild notice was logged %d times after a successful rebuild re-armed it, want 2: %q", got, logs.String())
 	}
 }

@@ -342,6 +342,15 @@ type Validator struct {
 	// this bug's - the fix is to stop dispatching before closing).
 	closing atomic.Bool
 
+	// rebuildFailLogged is the once-per-failure-episode latch for the
+	// post-adoption driver rebuild (audit N-8). A head+1 committee that cannot
+	// be derived makes rebuildDriver fail on EVERY later wave, and the stale
+	// engine keeps ticking at the pre-pull height until it can be rebuilt; the
+	// first failure is the fact worth a log line, a line per wave is noise.
+	// Guarded by mu, the lock rebuildDriver and this latch share; a successful
+	// rebuild clears it so a later failure is reported again.
+	rebuildFailLogged bool
+
 	// stall is the once-per-height stall reporter's memory (stall.go): the
 	// height it last reported and whether it has reported there. Guarded by mu,
 	// the same lock the driver it describes runs under.
@@ -1426,6 +1435,19 @@ func (v *Validator) maybeCatchUp() {
 			// and a later wave retries it (the next pull re-enters this
 			// branch); NewDriver no longer refuses a rotated-out post-genesis
 			// key, so the case this branch used to hit is gone.
+			//
+			// LOG ONCE PER EPISODE (audit N-8): without this line the node kept
+			// a stale engine ticking silently, emitting nil prevotes for the old
+			// height and never saying why. The condition is retried every wave,
+			// so the line is latched and cleared by the next successful rebuild.
+			v.mu.Lock()
+			first := !v.rebuildFailLogged
+			v.rebuildFailLogged = true
+			v.mu.Unlock()
+			if first {
+				log.Printf("b10coin: adopted height %d but could not rebuild the consensus driver over it (the stale engine keeps judging height %d until a later wave retries): %v",
+					after, before, rerr)
+			}
 			return
 		}
 	}
@@ -1496,6 +1518,9 @@ func (v *Validator) rebuildDriver() error {
 	}
 	d.CommitWitness = v.sy.RecordCommit
 	v.drv = d
+	// Re-arm the N-8 notice: this failure episode is over, so a future one is
+	// reported again. mu is held by this method's caller-visible contract.
+	v.rebuildFailLogged = false
 	return nil
 }
 

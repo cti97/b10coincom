@@ -106,6 +106,12 @@ const acceptRetryDelay = 100 * time.Millisecond
 // bounded by Options.ReadTimeout, which is far too long to hold a handshake.
 const accessTokenTimeout = 5 * time.Second
 
+// DefaultAccessTimeout is the exported name for the gate's answer deadline, so
+// the command's --access-timeout default cannot drift from the package's
+// (audit N-7: the deploy README documented a flag that did not exist, and the
+// value was already a field).
+const DefaultAccessTimeout = accessTokenTimeout
+
 const (
 	// DefaultMaxFrameBytes bounds a frame at 1 MiB, the same bound the TCP
 	// transport defaults to: one number for every wire participant, so no

@@ -493,3 +493,103 @@ func TestAProposerFromAnotherEpochIsRefused(t *testing.T) {
 		t.Fatalf("height after the seated proposer's block = %d, want %d", cs[0].Height(), current)
 	}
 }
+
+// TestAPostGenesisProposedBlockSurvivesReopenAndAFurtherAppend is A-1's replay
+// path, section 6 item 8. The proposer rule reads the epoch committee, and
+// Open rebuilds every committee from the replayed blocks; this test constructs a
+// post-genesis-proposed block, closes the directory, reopens it, and appends
+// ANOTHER block over it. The append after the reopen is the load-bearing half:
+// it fails unless replay rebuilt the same seats at the same deciding heights.
+//
+// The committee is a single post-genesis seat, so the next proposer is
+// necessarily the joiner - no genesis key is left to fill the height for it.
+func TestAPostGenesisProposedBlockSurvivesReopenAndAFurtherAppend(t *testing.T) {
+	g, keys, joiner := a1Genesis(t)
+	joinerPub := joiner.Public().(ed25519.PublicKey)
+	dir := t.TempDir()
+	c, err := chain.Open(g, dir)
+	if err != nil {
+		t.Fatalf("opening the fixture chain: %v", err)
+	}
+	appendTo := func(c *chain.Chain, priv ed25519.PrivateKey, txs []types.Tx) *types.Block {
+		t.Helper()
+		b := a1Build(t, c, priv, txs)
+		if err := c.Append(b); err != nil {
+			t.Fatalf("appending height %d: %v", b.Header.Height, err)
+		}
+		return b
+	}
+
+	// Height 1 seats the joiner; height 2 exits every genesis bond in full;
+	// height 3 commits the state that decides epoch 1. That state holds the
+	// joiner's bond and nothing else.
+	bond := a1Sign(g, joiner, types.Tx{
+		Type:   types.TxBond,
+		From:   types.AddressFromPub(joinerPub),
+		PubKey: joinerPub,
+		Nonce:  0,
+		Amount: g.Params.MinStakeSparks,
+		Fee:    g.Params.MinFeeSparks,
+	})
+	appendTo(c, keys[0], []types.Tx{bond})
+	var exits []types.Tx
+	for i := range keys {
+		pub := keys[i].Public().(ed25519.PublicKey)
+		exits = append(exits, a1Sign(g, keys[i], types.Tx{
+			Type:   types.TxUnbond,
+			From:   types.AddressFromPub(pub),
+			PubKey: pub,
+			Nonce:  0,
+			Amount: g.Params.MinStakeSparks,
+		}))
+	}
+	appendTo(c, keys[0], exits)
+	appendTo(c, keys[0], nil)
+
+	vals, err := c.CommitteeAt(a1EpochBlocks)
+	if err != nil || len(vals) != 1 || !bytes.Equal(vals[0].PubKey, joinerPub) {
+		t.Fatalf("fixture: the epoch-1 committee is %v (%v), want exactly the post-genesis key", vals, err)
+	}
+
+	// Height 4: the first block only a post-genesis seat may propose.
+	first := appendTo(c, joiner, nil)
+	if !bytes.Equal(first.Header.Proposer, joinerPub) {
+		t.Fatalf("the block at height %d names proposer %x, want the joining key %x", first.Header.Height, first.Header.Proposer, joinerPub)
+	}
+	heightBefore, idBefore, rootBefore := c.Height(), c.Head().ID(), c.State().Root()
+	if err := c.Close(); err != nil {
+		t.Fatalf("closing before the reopen: %v", err)
+	}
+
+	// REOPEN: replay must rebuild the epoch-1 committee that admitted height 4.
+	c2, err := chain.Open(g, dir)
+	if err != nil {
+		t.Fatalf("reopening after a post-genesis-proposed block: %v", err)
+	}
+	defer c2.Close()
+	if got := c2.Height(); got != heightBefore {
+		t.Fatalf("reopened at height %d, want %d", got, heightBefore)
+	}
+	if got := c2.Head().ID(); got != idBefore {
+		t.Fatalf("reopened at head %x, want %x", got, idBefore)
+	}
+	if got := c2.State().Root(); got != rootBefore {
+		t.Fatalf("reopened at root %x, want %x", got, rootBefore)
+	}
+	next := heightBefore + 1
+	if !c2.IsSeatedAt(next, joinerPub) {
+		t.Fatalf("after reopening, the post-genesis seat is not seated at height %d: replay did not rebuild the committee", next)
+	}
+	if !c2.EverSeated(joinerPub) {
+		t.Fatal("after reopening, the post-genesis seat has no ever-seated record")
+	}
+
+	// AND A FURTHER APPEND over the replayed committee.
+	second := appendTo(c2, joiner, nil)
+	if got := c2.Height(); got != next {
+		t.Fatalf("height after appending over the reopened chain = %d, want %d", got, next)
+	}
+	if !bytes.Equal(second.Header.Proposer, joinerPub) {
+		t.Fatalf("the block after the reopen names proposer %x, want the post-genesis key %x", second.Header.Proposer, joinerPub)
+	}
+}

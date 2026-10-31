@@ -25,6 +25,20 @@ var (
 	ErrNotValidator    = errors.New("chain: proposer does not hold a seat at the block's height")
 	ErrGenesisReplay   = errors.New("chain: replay diverged from stored state root")
 	ErrUnknownProposer = errors.New("chain: cannot determine proposer key")
+	// ErrRuleChange reports a stored block whose transactions replay to a
+	// DIFFERENT state root than its header commits. It is deliberately NOT
+	// ErrGenesisReplay: the block's height, parent link and bytes all matched,
+	// so nothing about the log is structurally wrong. The usual cause is a
+	// build whose CONSENSUS RULES differ at that height - the genesis document
+	// hash covers no derived state and no header carries a rule version, so a
+	// rule change presents exactly like this. The known cases are ST-3 (the
+	// bond leaf began committing Bond.Unfunded; its genesis-root change usually
+	// fails the height-1 parent-link check first) and C-1 (the FUNDED-FIRST
+	// unbond order, which changes the post-state of an exit from a bond holding
+	// both a genesis grant and a top-up and therefore diverges at the unbond's
+	// own height). An operator sent to look for corruption would apply the
+	// wrong remedy; the message names the rule change instead.
+	ErrRuleChange = errors.New("chain: stored chain does not replay under this build's consensus rules")
 	// ErrWrongGenesis reports a data directory whose recorded genesis hash
 	// differs from the genesis the node was started with (audit O-5). It is
 	// deliberately distinct from ErrGenesisReplay: a wrong genesis is a
@@ -332,9 +346,18 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 		if err := c.applyValidated(blk); err != nil {
 			return nil, fmt.Errorf("%w at height %d: %v", ErrGenesisReplay, h, err)
 		}
-		// The stored header's root must equal what we just recomputed.
-		if c.state.Root() != blk.Header.StateRoot {
-			return nil, fmt.Errorf("%w at height %d", ErrGenesisReplay, h)
+		// The stored header's root must equal what we just recomputed. THIS IS
+		// THE C-1 DIVERGENCE POINT (audit N-1). The block's height, parent link
+		// and bytes matched, so the log is not structurally damaged; what
+		// differs is what its transactions DO to the state. A build that ran
+		// the old grant-first unbond order writes a different post-state for
+		// any exit from a bond holding both a genesis grant and a top-up, and a
+		// mixed-build committee forks at that unbond. Reporting it with
+		// ErrGenesisReplay's "replay diverged" text sent the operator looking
+		// for corruption; ErrRuleChange says which rule changed and what to do.
+		if root := c.state.Root(); root != blk.Header.StateRoot {
+			return nil, fmt.Errorf("%w at height %d: this block's transactions replay to state root %x, but the stored header commits %x. Height, parent link and block bytes all matched, so NOTHING HERE IS CORRUPT: the usual cause is a DIFFERENT BUILD of b10coin whose CONSENSUS RULES differ at this height (the genesis hash covers no derived state and a header carries no rule version). Two known cases: ST-3's bond-leaf change (which moves the genesis state root and normally fails the height-1 link check first), and C-1's FUNDED-FIRST unbond order, which changes the post-state of an exit from a bond holding both a genesis grant and a top-up and therefore diverges at that unbond's height. A mixed-build committee forks here. Start a fresh --dir, or resync this node from a peer on this build; do not attempt a repair",
+				ErrRuleChange, h, root[:8], blk.Header.StateRoot[:8])
 		}
 	}
 	owned = true

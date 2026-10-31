@@ -1899,14 +1899,22 @@ func TestPullRefusesAResponseWithTooManyUnits(t *testing.T) {
 }
 
 // C-17: the certificate gate builds its VoteSet from a bare Config, so it does
-// not inherit the node's startup Config.Validate. A genesis whose validator
-// powers sum past 2^64 (Genesis.Validate does not check the sum) must be
-// refused by the GATE itself, as a sub-quorum certificate, instead of letting
-// Config.Quorum run on a wrapped total. The wrapped total is 0, whose Quorum is
-// 1, so ONE validator's precommit would otherwise pass the gate - the vote is
-// therefore carried, making the refusal the overflow check and nothing else.
+// not inherit the node's startup Config.Validate. A committee whose validator
+// powers sum past 2^64 must be refused by the GATE itself, as a sub-quorum
+// certificate, instead of letting Config.Quorum run on a wrapped total. The
+// wrapped total is 0, whose Quorum is 1, so ONE validator's precommit would
+// otherwise pass - the vote is therefore carried, making the refusal the
+// overflow check and nothing else.
+//
+// N-5 CHANGED WHERE THE INPUT CAN COME FROM: genesis.Validate now refuses a
+// validator power sum that does not fit, so chain.Open rejects such a document
+// and a *chain.Chain can no longer hand an overflowing committee to
+// verifyCertificate. The earlier refusal is pinned here, and the gate's guard is
+// pinned at the unit it consults (totalPower) plus the wrapped quorum it exists
+// to prevent; it is defence in depth now that the chain layer cannot produce the
+// input through any construction.
 func TestCertificateGateRefusesAnOverflowingCommittee(t *testing.T) {
-	pub0, priv0, err := crypto.GenerateKey()
+	pub0, _, err := crypto.GenerateKey()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1920,21 +1928,25 @@ func TestCertificateGateRefusesAnOverflowingCommittee(t *testing.T) {
 		{PubKey: pub1, Power: 1 << 63}, // 1<<63 + 1<<63 wraps uint64
 	}
 	g.Params.CommitteeSize = 2
-	ch, err := chain.Open(g, t.TempDir())
-	if err != nil {
-		t.Fatalf("fixture: the overflowing genesis no longer opens: %v", err)
+	if _, err := chain.Open(g, t.TempDir()); !errors.Is(err, genesis.ErrBadGenesis) {
+		t.Fatalf("an overflowing genesis was not refused at Open (%v), want genesis.ErrBadGenesis: the chain can then not carry it to the gate", err)
 	}
-	defer ch.Close()
 
-	s := NewSyncer(ch, &recordingTransport{Transport: silentInner{}}, priv0)
-	blk := &types.Block{Header: types.Header{Height: 1}}
-	// A genuine, correctly placed precommit: without the overflow guard the
-	// wrapped quorum of 1 admits it.
-	v := &Vote{Type: MsgPrecommit, Height: 1, Round: 0, BlockID: blk.ID(), Validator: pub0}
-	vh := v.SigningHash()
-	v.Sig = crypto.Sign(priv0, vh[:])
-	if err := s.verifyCertificate(blk, 0, []*Vote{v}); !errors.Is(err, ErrBadSyncCommit) {
-		t.Fatalf("a certificate gate over a wrapping committee admitted one precommit (%v), want ErrBadSyncCommit from the overflow guard", err)
+	// THE GATE'S GUARD. verifyCertificate runs this before certVoteSet, precisely
+	// because the bare Config does not validate. If totalPower accepted the wrap,
+	// the gate would build a VoteSet whose Quorum is 1 and one precommit would
+	// admit the certificate.
+	if _, ok := totalPower(g.Validators); ok {
+		t.Fatal("totalPower accepted 2^63 + 2^63: the certificate gate's overflow guard can never fire")
+	}
+	bare := Config{Committee: g.Validators}
+	if got := bare.TotalPower(); got != 0 {
+		t.Fatalf("the wrapped committee's TotalPower = %d, want the wrapped 0 the guard exists to catch", got)
+	}
+	// Quorum 1 is the hazard: one carried precommit would satisfy it, which is
+	// why the gate must refuse the committee BEFORE building its VoteSet.
+	if got := bare.Quorum(); got != 1 {
+		t.Fatalf("a bare Config over the wrapping committee has quorum %d, want the wrapped 1 that one precommit would satisfy", got)
 	}
 }
 

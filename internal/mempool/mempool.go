@@ -163,6 +163,26 @@ type Mempool struct {
 	// included, staking included - a proposer handed two Bonds from one key at
 	// one nonce would build a block whose second transaction cannot apply. (M5)
 	pendingNonces map[types.Address]map[uint64]struct{}
+	// pendingUnbonded is the summed spark amount of the TxUnbond transactions
+	// already pending from one sender (audit N-4). An Unbond's remainder is a
+	// fact about the state the transaction will EXECUTE against, not about the
+	// head: a sender with a 1,500 bond may submit unbond 500 (leaving the
+	// 1,000 floor) and then unbond 1,000 (a full exit after the first). Judged
+	// against the head alone the second leaves 500 - below the floor - and is
+	// refused although it is legal once its predecessor applies. The pool
+	// already counts pending transactions per sender (pending, pendingNonces),
+	// so the missing fact was only their AMOUNT; this map carries it and
+	// forget releases it with every Take, Remove or ageing drop.
+	//
+	// It is a SUM, not a nonce-ordered ledger. That admits the pipeline the CLI
+	// and a hand-built submitter produce (submission order is nonce order) and
+	// leaves one narrow refusal: a later nonce submitted BEFORE the earlier
+	// unbond it depends on is judged against a head bond the earlier has not
+	// consumed yet. Such a pair could not execute in that order anyway - its
+	// first transaction already left a sub-floor remainder - so the refusal is
+	// correct for the order it arrived in; resubmitting after the first lands
+	// works. See admitStake.
+	pendingUnbonded map[types.Address]uint64
 }
 
 // New builds a pool of max transactions for the chain identified by
@@ -178,15 +198,16 @@ func New(max int, genesisHash [32]byte, head HeadView) *Mempool {
 		max = 0
 	}
 	return &Mempool{
-		max:           max,
-		maxClaims:     claimCapacity(max),
-		genesisHash:   genesisHash,
-		head:          head,
-		preTarget:     faucet.PreTarget(),
-		seen:          make(map[[32]byte]struct{}),
-		pending:       make(map[types.Address]int),
-		pendingClaims: make(map[types.Address]int),
-		pendingNonces: make(map[types.Address]map[uint64]struct{}),
+		max:             max,
+		maxClaims:       claimCapacity(max),
+		genesisHash:     genesisHash,
+		head:            head,
+		preTarget:       faucet.PreTarget(),
+		seen:            make(map[[32]byte]struct{}),
+		pending:         make(map[types.Address]int),
+		pendingClaims:   make(map[types.Address]int),
+		pendingNonces:   make(map[types.Address]map[uint64]struct{}),
+		pendingUnbonded: make(map[types.Address]uint64),
 	}
 }
 
@@ -370,8 +391,22 @@ func (m *Mempool) admitStake(tx *types.Tx, st *state.State, headHeight uint64) e
 			return fmt.Errorf("%w: balance %d, bond %d + fee %d", state.ErrInsufficientFunds, acc.Balance, tx.Amount, tx.Fee)
 		}
 	case types.TxUnbond:
+		// Judge the remainder against the bond that will REMAIN when this
+		// transaction executes, not the head bond alone (audit N-4): unbonds
+		// already admitted from this sender will consume their part of the bond
+		// first. The sum is an upper bound on what can execute ahead of this
+		// transaction, so a transaction whose remainder under it is legal (zero
+		// or at least MIN_STAKE) is one a block can apply.
 		bonded := st.Bonded(tx.From)
-		if tx.Amount > bonded {
+		pending := m.pendingUnbonded[tx.From]
+		if pending > bonded {
+			pending = bonded // hand-built bookkeeping can never leave a negative bond
+		}
+		effective := bonded - pending
+		if tx.Amount > effective {
+			if pending > 0 {
+				return fmt.Errorf("%w: unbond %d, bonded %d with %d already pending", state.ErrUnbondExceedsBond, tx.Amount, bonded, pending)
+			}
 			return fmt.Errorf("%w: unbond %d, bonded %d", state.ErrUnbondExceedsBond, tx.Amount, bonded)
 		}
 		// THE CANDIDACY FLOOR, MIRRORED (audit C-3). applyUnbond refuses a
@@ -379,9 +414,18 @@ func (m *Mempool) admitStake(tx *types.Tx, st *state.State, headHeight uint64) e
 		// would leave one can never apply: admitting it only parks a slot that
 		// SelectApplicable then rejects on every block. Same rule, same sentence
 		// as the state's, one subtraction here so it costs no transition.
-		if remainder := bonded - tx.Amount; remainder != 0 && remainder < p.MinStake {
+		//
+		// A LEGITIMATE PIPELINE USED TO BE REFUSED HERE (audit N-4): a bond of
+		// 1,500, an unbond of 500 (leaving the 1,000 floor), then an unbond of
+		// 1,000 that is a full exit after the first. Against the head bond the
+		// second left 500 and was refused although it is legal once the first
+		// applies. The pending-unbond sum above makes the second one's effective
+		// bond 1,000, so this is now a full exit (remainder zero). The sum still
+		// refuses a pair whose combined exit would leave a sub-floor bond, which
+		// no execution order could apply.
+		if remainder := effective - tx.Amount; remainder != 0 && remainder < p.MinStake {
 			return fmt.Errorf("%w: unbond %d of %d would leave %d bonded, below the minimum %d; exit in full or leave at least the minimum",
-				state.ErrStakeBelowMinimum, tx.Amount, bonded, remainder, p.MinStake)
+				state.ErrStakeBelowMinimum, tx.Amount, effective, remainder, p.MinStake)
 		}
 	case types.TxWithdraw:
 		// A record MATURE AT THE NEXT BLOCK (audit C-3). This used to accept any
@@ -467,6 +511,9 @@ func (m *Mempool) insert(tx types.Tx, id [32]byte, sender types.Address) {
 		}
 		set[tx.Nonce] = struct{}{}
 	}
+	if tx.Type == types.TxUnbond {
+		m.pendingUnbonded[sender] += tx.Amount
+	}
 	if tx.Type == types.TxFaucetClaim {
 		m.claims++
 		m.pendingClaims[sender]++
@@ -487,6 +534,13 @@ func (m *Mempool) forget(e entry) {
 			if len(set) == 0 {
 				delete(m.pendingNonces, e.sender)
 			}
+		}
+	}
+	if e.tx.Type == types.TxUnbond {
+		if n := m.pendingUnbonded[e.sender]; n <= e.tx.Amount {
+			delete(m.pendingUnbonded, e.sender)
+		} else {
+			m.pendingUnbonded[e.sender] = n - e.tx.Amount
 		}
 	}
 	if e.tx.Type == types.TxFaucetClaim {
