@@ -4,7 +4,6 @@
 package chain
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -23,7 +22,7 @@ var (
 	ErrBadHeight       = errors.New("chain: height is not head+1")
 	ErrBadStateRoot    = errors.New("chain: computed state root does not match header")
 	ErrBadProposerSig  = errors.New("chain: proposer signature is missing or invalid")
-	ErrNotValidator    = errors.New("chain: proposer is not in the validator set")
+	ErrNotValidator    = errors.New("chain: proposer does not hold a seat at the block's height")
 	ErrGenesisReplay   = errors.New("chain: replay diverged from stored state root")
 	ErrUnknownProposer = errors.New("chain: cannot determine proposer key")
 	// ErrWrongGenesis reports a data directory whose recorded genesis hash
@@ -253,6 +252,17 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 	if vals, err := st.Committee(); err == nil {
 		c.committees[0] = vals
 	}
+	// The genesis state is COMMITTED AT HEIGHT 0, so it also decides the epoch
+	// that begins at height 1. Under the shipped epoch lengths that epoch is
+	// epoch 0 (already recorded above) and memoCommitteeLocked(st, 0) writes
+	// nothing; under EpochBlocks == 1 it is epoch 1, and this call is the only
+	// place its seats can be recorded - the only block whose commit would decide
+	// them is the genesis block, which is never appended. Without it a
+	// one-block-epoch chain could not judge its FIRST block: every proposer
+	// would be reported unseated at height 1. The gap predates audit A-1 - the
+	// old genesis-only proposer check never asked for a committee - but the fix
+	// makes the append path ask, so the deciding state must be recorded.
+	c.memoCommitteeLocked(st, 0)
 
 	// Compare the genesis BEFORE replaying a single block (audit O-5). A data
 	// directory belongs to one chain; opening it with a different genesis
@@ -393,12 +403,25 @@ func (c *Chain) CommitteeAt(h uint64) ([]genesis.Validator, error) {
 // CommitteeAt returns, so a caller can only ever be told exactly what
 // CommitteeAt would have contained at that height.
 func (c *Chain) IsSeatedAt(h uint64, pub []byte) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.seatedAtLocked(h, pub)
+}
+
+// seatedAtLocked is IsSeatedAt's body. The caller must ALREADY hold c.mu, for
+// reading or writing.
+//
+// It exists because IsSeatedAt cannot be called from validateLocked: Append
+// calls validateLocked under the WRITE lock, and a nested RLock blocks while a
+// writer is pending (Go's RWMutex is not reentrant), so calling the exported
+// method there would deadlock the append path on itself. validateLocked reads
+// the memoised map directly through this helper, under the lock it already
+// holds, and gets exactly the answer IsSeatedAt would give.
+func (c *Chain) seatedAtLocked(h uint64, pub []byte) bool {
 	blocks := c.gen.Params.EpochBlocks
 	if blocks == 0 {
 		return false
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	for i := range c.committees[h/blocks] {
 		if string(c.committees[h/blocks][i].PubKey) == string(pub) {
 			return true
@@ -478,16 +501,6 @@ func (c *Chain) HeadSnapshot() (height uint64, id [32]byte, stateRoot [32]byte) 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.head.Header.Height, c.head.ID(), c.head.Header.StateRoot
-}
-
-// isValidator reports whether pub is in the genesis validator set.
-func (c *Chain) isValidator(pub []byte) bool {
-	for _, v := range c.gen.Validators {
-		if bytes.Equal(v.PubKey, pub) {
-			return true
-		}
-	}
-	return false
 }
 
 // creditEmissionLocked pays the block's emission into the faucet account. It
@@ -731,7 +744,8 @@ func (c *Chain) memoCommitteeLocked(st *state.State, height uint64) {
 // validators can only disagree about the chain, never about the rules.
 //
 // The checks, in Append's order: parent link, head+1 height, block structure
-// (types), proposer membership, proposer signature, then the whole state
+// (types), the proposer's seat at this block's height (the epoch committee,
+// not genesis - audit A-1), proposer signature, then the whole state
 // transition through advanceLocked - height set, emission credited,
 // transactions applied - whose recomputed root must equal the header's claim.
 // That last check is the state-root probe: the same Probe-style transition a
@@ -758,8 +772,39 @@ func (c *Chain) validateLocked(b *types.Block) (*state.State, error) {
 		return nil, fmt.Errorf("%w: block timestamp %d is not after parent timestamp %d",
 			ErrBadTimestamp, b.Header.Timestamp, c.head.Header.Timestamp)
 	}
-	if !c.isValidator(b.Header.Proposer) {
-		return nil, ErrNotValidator
+	// THE PROPOSER'S SEAT, AT THIS BLOCK'S HEIGHT (audit A-1). This used to scan
+	// c.gen.Validators - the GENESIS list - while consensus draws the proposer
+	// from the epoch committee that judges this height (Driver.configFor ->
+	// Chain.CommitteeAt, then Config.Proposer). A key bonded after genesis was
+	// therefore drawn, built a block, and had it refused here by EVERY
+	// validator, itself included, while its own prevote seam ran this same
+	// check: every round it was drawn was burned, and a committee whose genesis
+	// seats had all exited could never append again. Catch-up could not repair
+	// it because Syncer.PullAndAdopt ends in this Append. RT-1's rotation-in
+	// made that mismatch routinely reachable; this is the correction.
+	//
+	// The rule is now exactly the committee that drew the block: seated at
+	// b.Header.Height means seated by the epoch h/EpochBlocks committee, which
+	// is memoised from the state at that epoch's deciding height. No genesis
+	// fallback is needed, and none would be safe to add casually: for every
+	// genesis chain.Open accepts, the epoch-0 committee derived from the genesis
+	// state is EXACTLY the genesis validator set (genesis.Validate requires
+	// CommitteeSize >= len(Validators) and every Power > 0; state.Committee
+	// clamps powers but never drops a seat, and clamps at seats >= 4 only, where
+	// a positive total over at least four seats gives a nonzero quarter), so
+	// epoch 0 is unchanged. Pinned by
+	// TestTheGenesisCommitteeIsTheEpochZeroCommittee.
+	//
+	// SAFETY: this cannot admit a proposer that was not entitled to propose.
+	// "Entitled" IS this membership: the proposer draw (Config.Proposer) selects
+	// from the same CommitteeAt(height) set the router checks every frame
+	// against, and the certificate gate re-tallies the commit with it. A key
+	// outside the epoch committee is refused here, so the only way a block
+	// passes is the way an honest one does - a key the committee for its own
+	// height seats. In particular EverSeated is NOT used: "was seated once" is
+	// an authorisation widening (RT-3) and would admit a rotated-out proposer.
+	if !c.seatedAtLocked(b.Header.Height, b.Header.Proposer) {
+		return nil, fmt.Errorf("%w at height %d", ErrNotValidator, b.Header.Height)
 	}
 	if b.Sig == nil {
 		return nil, ErrBadProposerSig
