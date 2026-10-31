@@ -143,10 +143,28 @@ func TestAPeerHintMustBeALiteralIPPort(t *testing.T) {
 		// The devnet acceptance exception relaxes only the local-range rule.
 		{"loopback allowed", "127.0.0.1:1", true, "127.0.0.1:1", nil},
 		{"private allowed", "10.0.0.5:9", true, "10.0.0.5:9", nil},
+		// Ranges the standard library's predicates do not cover (audit PX-7).
+		// Every one of these is a real un-dialable target, not a public peer.
+		{"CGNAT 100.64/10", "100.64.0.1:9", false, "", errHintLocal},
+		{"CGNAT upper edge", "100.127.255.254:9", false, "", errHintLocal},
+		{"this-network 0/8", "0.1.2.3:9", false, "", errHintLocal},
+		{"IETF 192.0.0.0/24", "192.0.0.1:9", false, "", errHintLocal},
+		{"benchmark 198.18/15", "198.18.0.1:9", false, "", errHintLocal},
+		{"benchmark upper edge", "198.19.255.254:9", false, "", errHintLocal},
+		{"reserved 240/4", "240.0.0.1:9", false, "", errHintLocal},
+		{"broadcast", "255.255.255.255:9", false, "", errHintLocal},
+		{"IPv6 site-local", "[fec0::1]:9", false, "", errHintLocal},
+		{"NAT64-embedded loopback", "[64:ff9b::7f00:1]:9", false, "", errHintLocal},
+		{"NAT64-embedded CGNAT", "[64:ff9b::6440:1]:9", false, "", errHintLocal},
+		// One target, one spelling: the zone names an interface on the
+		// SENDER's machine, so it is dropped, not carried into the budget key.
+		{"zoned link-local", "[fe80::1%25en0]:9", false, "", errHintLocal},
+		{"zoned public", "[2001:db8::7%25en0]:6002", false, "[2001:db8::7]:6002", nil},
+		{"zoned public, other zone", "[2001:db8::7%en1]:6002", false, "[2001:db8::7]:6002", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := validatePeerHint(tc.raw, own, tc.allowLocal)
+			got, err := validatePeerHint(tc.raw, own, nil, tc.allowLocal)
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) {
 					t.Fatalf("validatePeerHint(%q) = (%v, %v), want %v", tc.raw, got, err, tc.wantErr)

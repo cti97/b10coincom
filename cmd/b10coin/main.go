@@ -81,6 +81,7 @@ Usage:
   b10coin keygen [--out PATH]                                            Generate this validator's key file (owner-only permissions; refuses to overwrite)
   b10coin node   --dir PATH [--http ADDR] [--block-time DURATION]
                  [--peers ADDR,...] [--relay ADDR] [--listen ADDR]       Run the single-node devnet producer, or — with --peers/--relay/--listen — a consensus validator
+                 [--advertise IP:PORT]                                  (the address peers should dial when --listen binds a wildcard, e.g. a forwarded port)
                  [--allow-local-peer-hints]                              (accept loopback/private peer hints: private-range and single-host networks only)
                  --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
@@ -1202,6 +1203,13 @@ func cmdNode(args []string) error {
 	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
 	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8; at least 16 bytes). Sent only after the relay announces its gate with a fixed first frame, so a relay without a token never receives it; a refused token is logged and retried. Plaintext over TCP and replayable: use it over a trusted path")
 	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
+	// The advertisement override (audit PX-8). A port-forwarded home node listens
+	// on 0.0.0.0:7001, which names no endpoint a peer can dial, so PEER_EXCHANGE
+	// used to advertise nothing and the operator had no clue why. --advertise is
+	// the address the router forwards to; it must be a literal IP:port (a
+	// hostname would move the target after a peer's checks) and it means nothing
+	// without a listener to receive the dial it asks for.
+	advertise := fs.String("advertise", "", "address PEER_EXCHANGE should advertise when --listen binds a wildcard (e.g. the public IP:port of a forwarded port); literal IP:port, requires --listen")
 	// The PEER_EXCHANGE admission exception (audit M-2). A hint naming a
 	// loopback, private or link-local address is refused by default, which is
 	// the right policy for a network whose members have public listeners - and
@@ -1219,7 +1227,7 @@ func cmdNode(args []string) error {
 	networked := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "peers", "relay", "listen", "validators", "index", "genesis":
+		case "peers", "relay", "listen", "advertise", "validators", "index", "genesis":
 			networked = true
 		}
 	})
@@ -1235,6 +1243,9 @@ func cmdNode(args []string) error {
 			// that silently accepted a security-relevant switch it never
 			// consults would be a flag that lies.
 			return fmt.Errorf("--allow-local-peer-hints relaxes PEER_EXCHANGE admission, which only a networked node runs: give --peers, --relay or --listen together with it, or drop it")
+		}
+		if *advertise != "" {
+			return fmt.Errorf("--advertise names what PEER_EXCHANGE should advertise, which only a networked node runs: give --listen together with it, or drop it")
 		}
 		return runProducerNode(*dir, *addr, *blockTime)
 	}
@@ -1258,7 +1269,13 @@ func cmdNode(args []string) error {
 				*relayTokenPath, len(relayToken), wire.MinRelayAccessTokenBytes)
 		}
 	}
-	return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints)
+	if *advertise != "" && *listen == "" {
+		// A node with no listener cannot receive the dial an advertisement asks
+		// for; accepting the flag would advertise an endpoint that refuses every
+		// peer. The devnet layer refuses it too (it is the library entry point).
+		return fmt.Errorf("--advertise names the address peers should dial, but this node has no --listen to receive them: give --listen ADDR (e.g. 0.0.0.0:7001) together with it")
+	}
+	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints)
 }
 
 // runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
@@ -1380,7 +1397,7 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 //
 // --block-time is refused with networking: a committee's cadence is its
 // round-timeout ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool) error {
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool) error {
 	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -1483,9 +1500,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 	var v *devnet.Validator
 	var err error
 	if g != nil {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
 	} else {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
 	}
 	if err != nil {
 		return err

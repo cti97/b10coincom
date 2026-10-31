@@ -574,6 +574,14 @@ type conn struct {
 	// newcomerWins for why both ends must agree on which copy of a
 	// duplicated peer connection survives.
 	dialled bool
+	// learned records that this connection exists because a PEER advertised
+	// the address (AddLearnedPeer), not because the operator configured it
+	// (--peers or the relay). It is dialled && gated: gated alone also covers
+	// an accepted socket, which is not a hint. A learned connection is a
+	// squatter's cheapest shape - the peer chose the address AND the name it
+	// announces on it - so the duplicate rule never lets one hold a peer's
+	// name against a non-learned connection (audit PX-5, install).
+	learned bool
 	// dead is closed exactly once, by finish, when the connection is over.
 	// A connection's maintainer goroutine sleeps on it.
 	dead chan struct{}
@@ -1646,6 +1654,7 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled, relay, gated b
 		dead:       make(chan struct{}),
 		addr:       addr,
 		dialled:    dialled,
+		learned:    dialled && gated,
 		inbound:    !dialled,
 		relayMode:  relay,
 		needsAdmit: gated && t.opts.Admit != nil,
@@ -1714,6 +1723,31 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled, relay, gated b
 		//
 		// The rank itself is untouched for two ADMITTED candidates, which is
 		// where the cross-dial agreement it exists for actually lives.
+		//
+		// Admission alone is not enough (audit PX-5). Admission happens when
+		// the reader accepts a frame, which is AFTER install, so both rules
+		// above can only help a newcomer that was ALREADY admitted somewhere
+		// - and a connection refused here never gets the chance. A
+		// hint-dialled squatter that announces a predictable validator name
+		// ("v1") therefore holds that name while it is unadmitted: the genuine
+		// peer's inbound is refused by the rank (we dialled the squatter, it
+		// dialled us, and at the smaller-ID end the dial wins), and every
+		// redial is refused the same way. The relay link survives, so the mesh
+		// degrades rather than partitions - the PX-5 shape. The two learned
+		// cases close it: a connection that exists only because a PEER named
+		// its address never outranks one the operator configured or that the
+		// peer itself dialled.
+		//
+		// The learned bit is asymmetric between the two ends (only the side
+		// that learned the address knows it), so it is not part of the
+		// cross-dial rank that newcomerWins keeps identical at both ends. That
+		// is deliberate and bounded: a squatter's socket has NO counterpart at
+		// the peer it impersonates - the genuine peer's own dial is a
+		// different socket - so there is no agreement to keep; and where a
+		// learned address IS the genuine peer (a hint that named its real
+		// address), the learned side yields to the peer's own dial, a
+		// disagreement that costs one backoff interval and converges, because
+		// the learned retry keeps losing and the peer's dial keeps winning.
 		newcomerAdmitted := c.admitted.Load()
 		switch {
 		case !existing.admitted.Load() && newcomerAdmitted:
@@ -1722,6 +1756,26 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled, relay, gated b
 			t.mu.Unlock()
 			nc.Close()
 			return nil, fmt.Errorf("%w (%q on %s)", ErrDuplicatePeer, id, addr)
+		case c.learned && !existing.learned:
+			// A learned (hint-dialled) connection never displaces one that is
+			// not, whichever of the two is admitted: a learned address must
+			// never outrank an operator's peer or an admitted link. This is the
+			// EVICTION half of PX-5: the squatter's hint-dial arrives while the
+			// genuine peer's inbound is still mid-handshake, and the rank alone
+			// would have given the squatter the name.
+			t.mu.Unlock()
+			nc.Close()
+			return nil, fmt.Errorf("%w (%q on %s)", ErrDuplicatePeer, id, addr)
+		case !c.learned && existing.learned && !existing.admitted.Load():
+			// The SQUAT half of PX-5: a learned incumbent that has never
+			// delivered an accepted frame - typically a squatter claiming an
+			// honest peer's name - never refuses a non-learned newcomer. An
+			// ADMITTED learned link keeps its name here, because an unadmitted
+			// newcomer must not evict an admitted incumbent (the rule above,
+			// audit F4): a proven link to the same peer is not a squatter, and
+			// swapping it for the peer's other, still-unadmitted socket would
+			// regress exactly what F4 closed. Fall through to the replacement
+			// below.
 		case !newcomerWins(t.opts.LocalID, existing, c):
 			// The incumbent outranks the newcomer: the newcomer loses, the
 			// incumbent stays EXACTLY as it was (still installed, still

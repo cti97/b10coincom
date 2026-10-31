@@ -317,9 +317,10 @@ whose keys sign, and that is the security boundary:**
 | `--genesis PATH` | *unset* | shared committee file listing the validators' public keys; giving it runs the consensus committee that file names |
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
-| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
+| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1). The address itself is **reserved against peer hints** (audit PX-6): a hint may not name the relay this node dials, or the node would open a second, direct-mode connection to it. Literal IP:port relay addresses are compared as parsed, canonical addresses, so a different spelling of the same endpoint is still refused |
 | `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The secret is **never sent**: the node waits for the relay's **gate greeting** and its per-connection **challenge** (32 fresh random bytes plus the relay's own address), answers `HMAC-SHA-256(token, challenge)`, and only then expects the relay's **accepted** frame. A relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — gets no proof at all and the refusal is logged; a stranger who drives the greeting through such a relay receives a MAC, never the token, and that MAC is useless on any other connection (audit PX-3). The token still travels in plaintext at the relay's end of the comparison: see the relay section |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
+| `--advertise IP:PORT` | *unset* | the address `PEER_EXCHANGE` should advertise when `--listen` binds a **wildcard** address (`0.0.0.0:7001`, `[::]:7001`), which names no endpoint a peer can dial. This is the port-forwarded home node's flag: `--listen 0.0.0.0:7001 --advertise <public IP>:7001` (audit PX-8). It must be a literal IP:port, not unspecified or multicast, and it requires `--listen`. Without it a wildcard-bind node advertises nothing and says so **once** in the log |
 | `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |
@@ -336,13 +337,29 @@ receiver dials only if the signature verifies and the key held a seat at that
 height; a stranger on a token-less relay, or a relay sender replaying someone
 else's frame, is not a hint authority. A member that advertises junk addresses
 is bounded per member per wave, and a learned address whose handshake never
-completes is evicted rather than retried until restart. **A relay-only or NAT'd
+completes is evicted rather than retried until restart. The address policy is
+refused, not merely discouraged: loopback, RFC 1918 private, link-local,
+CGNAT `100.64/10`, `0.0.0.0/8`, `192.0.0.0/24`, `198.18/15`, `240/4` (including
+the broadcast address), IPv6 site-local `fec0::/10` and NAT64-embedded local
+IPv4 (`64:ff9b::/96`), plus this node's own listener, its advertised address,
+the configured relay's own address and the `relay:` name. A zone suffix is
+dropped before the budget is charged, so one target costs one slot however it
+is spelled (audit PX-7). A connection this node dialled because a peer named
+the address also never outranks one the operator configured or that the peer
+itself dialled, so a hint cannot hold an honest peer's transport name by
+announcing it (audit PX-5). **A relay-only or NAT'd
 Pi advertises nothing and can be dialled by nobody**: a node with no `--listen`
-(and a `0.0.0.0`/unspecified listener counts as no address) sends no frame, so
-the mesh never gains a direct path *to* it and the relay remains its only
-inbound path. It can still *receive* hints and dial peers that do have a public
-listener, which bypasses the relay for those links — but the benefit is
-one-sided, and the mesh only forms among nodes that are directly reachable.
+(and a `0.0.0.0`/unspecified listener counts as no address unless `--advertise`
+names the public one) sends no frame, so the mesh never gains a direct path
+*to* it and the relay remains its only inbound path. It can still *receive*
+hints and dial peers that do have a public listener, which bypasses the relay
+for those links — but the benefit is one-sided, and the mesh only forms among
+nodes that are directly reachable. A **port-forwarded** node is the case that
+used to fail silently: it listens on `0.0.0.0:7001`, which is not an address a
+peer can dial, so it advertised nothing while the operator believed the
+forwarded port was enough. `--listen 0.0.0.0:7001 --advertise <public
+IP>:7001` advertises the address the router forwards; a wildcard bind with
+neither advertises nothing and now logs one line saying so (audit PX-8).
 This is design decision 5's honest limit, not a bug: `PEER_EXCHANGE` is a hint
 to dial, never an admission, and admission is still the signed committee HELLO.
 

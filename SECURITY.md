@@ -53,6 +53,32 @@ advisory is yours unless you prefer otherwise.
   strangers. Reports that the documented bounds are *wrong or bypassable* (a
   pinned slot that is never reaped, memory beyond the stated ceiling) are in
   scope and are exactly the class worth reporting.
+- **The relay gate authenticates a ROLE, not an owner.** A node with
+  `--relay-access-token-file` reads the relay's greeting, answers an HMAC over
+  the relay's per-connection challenge, and expects the accepted frame before
+  it registers the link. That defends against a relay started **without** a
+  token, and it never puts the token on the wire (a replay of the answer is
+  worthless on another connection). It does **not** defend against an attacker
+  who controls the endpoint `--relay` names: the node reads frames, not
+  provenance, so that endpoint can play the greeting, a challenge of its own and
+  the accepted frame, and then keep a link that was never gated. "The relay is
+  gated" describes this node's configuration, not who owns the address. The
+  gate answer is read under a fixed 32-byte bound (`wire.RelayGateMACBytes`),
+  never the 1 MiB frame bound, and the relay still decodes nothing on that path.
+  (Audit PX-9: the *frame bound* item is fixed; the endpoint-trust boundary is
+  the documented residual.)
+- **HELLO admission is a union, and a rotated-out genesis seat keeps it.** A
+  transport connection becomes a peer when a signed committee HELLO arrives on
+  it; membership is checked against the **union** of genesis, the committee at
+  the announced height and the committee at this node's head. The union is what
+  lets a rotated-in key reach a node that is still behind the boundary, and a
+  peer one boundary behind reach this node; the price is that a **genesis** seat
+  that rotation removed keeps *admission* for the life of the node — it can open
+  a connection and send bounded traffic forever. It cannot change state: every
+  frame still faces the router's per-height membership, and every block is
+  adopted only through the certificate gate for its own height. Reports asking
+  for a penalty or for "the evicted seat should be disconnected" describe a
+  policy this branch documents rather than implements (audit PX-9, RT-3).
 - **No slashing, by design.** No code path confiscates or reduces a bond: a
   validator that equivocates, double-signs, or goes offline loses no stake. The
   certificate gate and the tally are what stop a faulty node from contributing.

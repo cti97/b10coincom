@@ -436,6 +436,7 @@ thing with `sudo -u b10coin` for first contact):
 | `--key` | THIS machine's key file (§3.1) — unique per Pi; a key not listed in the committee file **refuses to start** rather than signing as a foreign seat |
 | `--http` (default `127.0.0.1:8645`) | RPC status endpoint, loopback-only by default. Read it via SSH (§7) rather than opening it to your LAN |
 | `--listen`, `--peers` | optional **direct** peer connections (same-LAN or port-forwarded setups). With the relay star they stay off; a dial list is already complete via `--relay` |
+| `--advertise IP:PORT` | with `--listen`, the address peers should dial. Required for a **port-forwarded** node: `--listen` binds `0.0.0.0:7001` (a wildcard names no endpoint), and without `--advertise` the node advertises nothing and logs one line saying so (§5) |
 
 **The seat is derived, not configured.** A node's seat is the position of its
 public key inside the shared committee file, so there is no `--index` here
@@ -571,9 +572,14 @@ transaction that chain rejects — never one it accepts; and a `--relay`-only Pi
 (no `--listen`) advertises no direct address, so `PEER_EXCHANGE` gives the
 mesh no path to it (see the repository README's `b10coin node` section).
 **This recipe's three nodes are all relay-only** (§3.3, §5), so on this
-deployment `PEER_EXCHANGE` is inert: it only helps a node given `--listen` at
-an address the other validators can reach (a forwarded port or a public host),
-and then only for the links to such nodes.
+deployment `PEER_EXCHANGE` is inert. It only helps a node with BOTH a
+`--listen` a peer can reach and a way to name it: a wildcard bind
+(`--listen 0.0.0.0:7001`, which is what a forwarded port looks like) advertises
+**nothing** on its own, because `0.0.0.0:7001` is not an address a peer can
+dial. Such a node must also pass `--advertise PUBLIC_IP:7001` — the address the
+router forwards to — or bind the concrete public address directly. Binding a
+forwarded port is not enough by itself, and without `--advertise` the node now
+logs one line at the first advertisement saying exactly that.
 
 ## 6. The systemd units (what runs after the first contact test)
 
