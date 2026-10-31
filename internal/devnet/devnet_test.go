@@ -168,6 +168,29 @@ func TestDevnetClaimsFromTheFaucet(t *testing.T) {
 	}
 }
 
+// TestClaimsWithOneBlockEpochsStillRefuseTheDoubleClaim is audit CL-4's last
+// observation, which suspected that --epoch-blocks 1 breaks the scenario's
+// same-epoch double claim. It does not: the claim epoch is head+1's epoch, and
+// after the paid claim the head has advanced by one block, so the double claim
+// still carries the epoch the admission path calls "current". The refusal is
+// ErrClaimTooSoon, exactly as with a longer epoch.
+func TestClaimsWithOneBlockEpochsStillRefuseTheDoubleClaim(t *testing.T) {
+	s, err := Run(Options{Dir: t.TempDir(), Blocks: 10, Claims: 2, EpochBlocks: 1})
+	if err != nil {
+		t.Fatalf("Run with a one-block epoch: %v", err)
+	}
+	if s.Claimed != 2 {
+		t.Fatalf("claimed = %d, want 2", s.Claimed)
+	}
+	if s.DoubleClaimsRefused != s.Claimed {
+		t.Fatalf("refused double claims = %d, claim paid = %d; a one-block epoch must still refuse one same-epoch double claim per paid claim",
+			s.DoubleClaimsRefused, s.Claimed)
+	}
+	if want := 10 + s.Claimed + s.DoubleClaimsRefused; s.Height != want {
+		t.Fatalf("height = %d, want %d", s.Height, want)
+	}
+}
+
 // Emission is the only thing that funds the faucet, so the credits must exactly
 // account for what was paid out: emitted - claimed*amount == the faucet balance.
 // A claim paid from nowhere - or a miscounted emission - would break this

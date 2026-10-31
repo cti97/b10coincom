@@ -270,12 +270,7 @@ func (s *State) Root() [32]byte {
 		if b.Amount == 0 {
 			continue
 		}
-		c := types.NewEncoder()
-		c.VarBytes(b.Validator)
-		c.U64(b.Amount)
-		c.U64(b.Unfunded)
-		c.U64(b.Height)
-		leaves = append(leaves, crypto.HashParts([]byte("b10coin-bond"), a[:], c.Bytes()))
+		leaves = append(leaves, bondLeaf(a, b))
 	}
 	for _, a := range sortedAddressKeys(s.unbonding) {
 		live := make([]Unbonding, 0, len(s.unbonding[a]))
@@ -288,13 +283,41 @@ func (s *State) Root() [32]byte {
 			continue
 		}
 		slices.SortFunc(live, compareUnbonding)
-		c := types.NewEncoder()
-		c.Len(len(live))
-		for _, rec := range live {
-			c.U64(rec.Amount)
-			c.U64(rec.ReleaseHeight)
-		}
-		leaves = append(leaves, crypto.HashParts([]byte("b10coin-unbonding"), a[:], c.Bytes()))
+		leaves = append(leaves, unbondingLeaf(a, live))
 	}
 	return crypto.MerkleRoot(leaves)
+}
+
+// bondLeaf is the "b10coin-bond" leaf Root commits to: the address, then the
+// seated key, the amount, the unfunded amount and the height, in that order.
+// It is a separate function rather than an inline loop SO THAT the fixed vector
+// in stake_test.go can pin its exact bytes (audit ST-8): every stake-root test
+// before it was differential, and two states that differ in one field still
+// agree when the encoder swaps two fields that are both present. A fixed leaf
+// makes the field order itself testable.
+//
+// Amount and Height are deliberately distinct in the vector (so a swap moves the
+// bytes), as are Unfunded and every other field.
+func bondLeaf(a types.Address, b Bond) [32]byte {
+	c := types.NewEncoder()
+	c.VarBytes(b.Validator)
+	c.U64(b.Amount)
+	c.U64(b.Unfunded)
+	c.U64(b.Height)
+	return crypto.HashParts([]byte("b10coin-bond"), a[:], c.Bytes())
+}
+
+// unbondingLeaf is the "b10coin-unbonding" leaf: the address, then the COUNT of
+// records, then each (amount, releaseHeight) pair. Callers pass live (non-zero
+// amounts) sorted by compareUnbonding, exactly as Root's loop builds it. The
+// count is part of the encoding, so a record with a zero amount cannot be
+// inserted or removed without moving the leaf.
+func unbondingLeaf(a types.Address, live []Unbonding) [32]byte {
+	c := types.NewEncoder()
+	c.Len(len(live))
+	for _, rec := range live {
+		c.U64(rec.Amount)
+		c.U64(rec.ReleaseHeight)
+	}
+	return crypto.HashParts([]byte("b10coin-unbonding"), a[:], c.Bytes())
 }

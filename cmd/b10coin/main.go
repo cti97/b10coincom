@@ -81,6 +81,7 @@ Usage:
   b10coin keygen [--out PATH]                                            Generate this validator's key file (owner-only permissions; refuses to overwrite)
   b10coin node   --dir PATH [--http ADDR] [--block-time DURATION]
                  [--peers ADDR,...] [--relay ADDR] [--listen ADDR]       Run the single-node devnet producer, or — with --peers/--relay/--listen — a consensus validator
+                 [--advertise IP:PORT]                                  (the address peers should dial when --listen binds a wildcard, e.g. a forwarded port)
                  [--allow-local-peer-hints]                              (accept loopback/private peer hints: private-range and single-host networks only)
                  --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
@@ -146,7 +147,11 @@ them. The printed transaction makes them visible instead of silent, so a lying
 node can still delay a bond with a future nonce, turn a full exit into a
 partial one by under-reporting the bond, or make the transaction invalid by
 misreporting the genesis hash - but it can no longer choose the fee, and the
-default ceiling bounds that loss to one spark.
+default ceiling bounds that loss to one spark. There is deliberately no
+--chain-id expectation: the genesis hash IS the chain binding, so a signature
+made for a different node's chain is useless there and invalid on the chain
+the operator meant - useless, not dangerous. HTTP redirects are refused for
+the same reason.
 `)
 }
 
@@ -341,7 +346,18 @@ func cmdKeygen(args []string) error {
 
 // claimHTTP bounds RPC round trips for the claim command; the puzzle itself
 // is solved locally before anything is sent.
-var claimHTTP = &http.Client{Timeout: 15 * time.Second}
+//
+// Redirects are REFUSED (audit CL-4). net/http follows up to ten by default,
+// so a node - or an on-path party that can answer the configured address -
+// could move the staking verbs' /status and /account reads to a different
+// server and back a preview with another node's claims. The configured URL is
+// the trust boundary; a redirect is a request to leave it, so it fails closed.
+var claimHTTP = &http.Client{
+	Timeout: 15 * time.Second,
+	CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("the RPC endpoint redirected to %s; refusing to follow a redirect (the staking verbs sign what the configured node reports)", req.URL)
+	},
+}
 
 // claimPuzzleAttempts bounds the local solve. The reference claimant solves the
 // cheap outer puzzle (16 leading zero bits) as well as the devnet's easy
@@ -630,6 +646,11 @@ func connectStakingNode(nodeURL, keyPath string) (*stakingTarget, error) {
 type txProvenance struct {
 	amount string // where a bond/unbond Amount came from
 	note   string // an optional node-supplied fact worth showing (a withdraw payout)
+	// effect is what the transaction will do once applied, shown BEFORE the
+	// confirmation so an irreversible bond or exit is understood, not merely
+	// authorised (audit CL-2). It is derived from the node's reported
+	// parameters, so the preview labels it a forecast where it depends on them.
+	effect string
 }
 
 // builtTx is one fully built transaction, read back from its own canonical
@@ -698,6 +719,9 @@ func (b *builtTx) print(w io.Writer, genesisHash [32]byte, node string, prov txP
 	if prov.note != "" {
 		fmt.Fprintf(w, "  node says   %s\n", prov.note)
 	}
+	if prov.effect != "" {
+		fmt.Fprintf(w, "  effect      %s\n", prov.effect)
+	}
 	fmt.Fprintf(w, "  genesis     %x  (the node's claim; the signature is bound to it)\n", genesisHash)
 	fmt.Fprintf(w, "  bytes       %x\n", b.raw)
 	if b.tx.Type == types.TxBond {
@@ -708,6 +732,8 @@ func (b *builtTx) print(w io.Writer, genesisHash [32]byte, node string, prov txP
 	fmt.Fprintf(w, "  check them: a node reporting a future nonce builds a bond that applies later,\n")
 	fmt.Fprintf(w, "  and one under-reporting the bond makes an exit partial. Only --amount\n")
 	fmt.Fprintf(w, "  (when given) and the signing key are yours.\n")
+	fmt.Fprintf(w, "  The signature cannot be withdrawn: once a node accepts these bytes this CLI\n")
+	fmt.Fprintf(w, "  cannot cancel or replace the transaction, and a bond or exit is irreversible.\n")
 }
 
 // errNoAnswer means the confirmation question had no answer: stdin is not an
@@ -916,7 +942,7 @@ func cmdStake(args []string) error {
 	fs := flag.NewFlagSet("stake", flag.ExitOnError)
 	nodeURL := fs.String("node", "http://127.0.0.1:8645", "URL of the node's HTTP RPC")
 	keyPath := fs.String("key", "", "key file to sign with (b10coin keygen); the bond seats THIS key")
-	amountB10 := fs.String("amount", "", "amount to bond, in b10 as an exact decimal (at least MIN_STAKE, 1000 b10)")
+	amountB10 := fs.String("amount", "", "amount to bond, in b10 as an exact decimal (the bond AFTER adding it must be at least MIN_STAKE, 1000 b10; a top-up below that is legal when the existing bond makes the result clear the floor)")
 	maxFee := fs.Uint64("max-fee", defaultMaxFeeSparks, maxFeeHelp)
 	yes, dryRun := addTxConfirmationFlags(fs)
 	if err := fs.Parse(args); err != nil {
@@ -976,17 +1002,19 @@ func cmdStake(args []string) error {
 		Fee:    t.status.MinFeeSparks,
 		Amount: amount,
 	}
-	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: *maxFee, yes: *yes, dryRun: *dryRun}, txProvenance{amount: "from --amount"})
+	// The consequence is part of the preview, not a receipt printed after the
+	// irreversible POST (audit CL-2): the operator sees that the seat changes
+	// only at a boundary before choosing "yes".
+	effect := "the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary, never mid-epoch"
+	if t.status.EpochBlocks > 0 {
+		effect = fmt.Sprintf("the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every %d blocks as this node reports it), never mid-epoch", t.status.EpochBlocks)
+	}
+	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: *maxFee, yes: *yes, dryRun: *dryRun}, txProvenance{amount: "from --amount", effect: effect})
 	if err != nil {
 		return err
 	}
 	if posted {
 		fmt.Printf("txid        %s\n", txid)
-	}
-	if t.status.EpochBlocks > 0 {
-		fmt.Printf("the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every %d blocks), never mid-epoch.\n", t.status.EpochBlocks)
-	} else {
-		fmt.Println("the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary.")
 	}
 	return nil
 }
@@ -1056,30 +1084,32 @@ func cmdUnstake(args []string) error {
 		Fee:    0,
 		Amount: amount,
 	}
+	// The consequence is part of the preview, not a receipt printed after the
+	// irreversible POST (audit CL-2). The applying block is at least head+1, so
+	// the height is the EARLIEST release; the block that applies the unbond
+	// sets the exact one, which is why the line says "at the earliest".
+	var effect string
+	if amount > t.account.BondUnfunded {
+		effect = "the coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then"
+		if t.account.BondUnfunded > 0 {
+			effect = fmt.Sprintf("%d sparks of this exit are the seat's unfunded genesis power and are destroyed, not released (audit ST-3); ", t.account.BondUnfunded) + effect
+		}
+		if cooldown, ok := cooldownBlocks(t.status); ok {
+			if line, ok := releaseForecast(amount, t.account.BondUnfunded, t.status, cooldown); ok {
+				effect = line + "; " + effect
+			}
+		}
+	} else {
+		effect = "the seat is gone from the committee and there is nothing to withdraw: a genesis grant was never funded (audit ST-3)"
+	}
 	// An exit carries fee 0 by consensus, so its ceiling is 0: any non-zero
 	// fee this verb somehow built would be refused rather than signed.
-	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{amount: amountSource})
+	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{amount: amountSource, effect: effect})
 	if err != nil {
 		return err
 	}
 	if posted {
 		fmt.Printf("txid        %s\n", txid)
-	}
-	if cooldown, ok := cooldownBlocks(t.status); ok {
-		// The applying block is at least head+1, so this is the EARLIEST
-		// release height; the block that actually applies the unbond sets the
-		// exact one. Stated as an estimate rather than as a receipt.
-		if line, ok := releaseForecast(amount, t.account.BondUnfunded, t.status, cooldown); ok {
-			fmt.Printf("release     %s\n", line)
-		}
-	}
-	if amount > t.account.BondUnfunded {
-		if t.account.BondUnfunded > 0 {
-			fmt.Printf("unfunded    %d sparks of this exit are the seat's unfunded genesis power and are destroyed, not released (audit ST-3)\n", t.account.BondUnfunded)
-		}
-		fmt.Println("the coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then.")
-	} else {
-		fmt.Println("the seat is gone from the committee and there is nothing to withdraw: a genesis grant was never funded (audit ST-3).")
 	}
 	return nil
 }
@@ -1202,6 +1232,13 @@ func cmdNode(args []string) error {
 	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
 	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8; at least 16 bytes). Sent only after the relay announces its gate with a fixed first frame, so a relay without a token never receives it; a refused token is logged and retried. Plaintext over TCP and replayable: use it over a trusted path")
 	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
+	// The advertisement override (audit PX-8). A port-forwarded home node listens
+	// on 0.0.0.0:7001, which names no endpoint a peer can dial, so PEER_EXCHANGE
+	// used to advertise nothing and the operator had no clue why. --advertise is
+	// the address the router forwards to; it must be a literal IP:port (a
+	// hostname would move the target after a peer's checks) and it means nothing
+	// without a listener to receive the dial it asks for.
+	advertise := fs.String("advertise", "", "address PEER_EXCHANGE should advertise when --listen binds a wildcard (e.g. the public IP:port of a forwarded port); literal IP:port, requires --listen")
 	// The PEER_EXCHANGE admission exception (audit M-2). A hint naming a
 	// loopback, private or link-local address is refused by default, which is
 	// the right policy for a network whose members have public listeners - and
@@ -1219,7 +1256,7 @@ func cmdNode(args []string) error {
 	networked := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "peers", "relay", "listen", "validators", "index", "genesis":
+		case "peers", "relay", "listen", "advertise", "validators", "index", "genesis":
 			networked = true
 		}
 	})
@@ -1235,6 +1272,9 @@ func cmdNode(args []string) error {
 			// that silently accepted a security-relevant switch it never
 			// consults would be a flag that lies.
 			return fmt.Errorf("--allow-local-peer-hints relaxes PEER_EXCHANGE admission, which only a networked node runs: give --peers, --relay or --listen together with it, or drop it")
+		}
+		if *advertise != "" {
+			return fmt.Errorf("--advertise names what PEER_EXCHANGE should advertise, which only a networked node runs: give --listen together with it, or drop it")
 		}
 		return runProducerNode(*dir, *addr, *blockTime)
 	}
@@ -1258,7 +1298,13 @@ func cmdNode(args []string) error {
 				*relayTokenPath, len(relayToken), wire.MinRelayAccessTokenBytes)
 		}
 	}
-	return runNetworkedNode(fs, *dir, *addr, *listen, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints)
+	if *advertise != "" && *listen == "" {
+		// A node with no listener cannot receive the dial an advertisement asks
+		// for; accepting the flag would advertise an endpoint that refuses every
+		// peer. The devnet layer refuses it too (it is the library entry point).
+		return fmt.Errorf("--advertise names the address peers should dial, but this node has no --listen to receive them: give --listen ADDR (e.g. 0.0.0.0:7001) together with it")
+	}
+	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints)
 }
 
 // runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
@@ -1380,7 +1426,7 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 //
 // --block-time is refused with networking: a committee's cadence is its
 // round-timeout ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool) error {
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool) error {
 	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -1483,9 +1529,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, peers, relay, key
 	var v *devnet.Validator
 	var err error
 	if g != nil {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
 	} else {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
 	}
 	if err != nil {
 		return err

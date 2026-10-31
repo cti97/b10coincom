@@ -1787,3 +1787,100 @@ func TestStakeRefusesAZeroReportedFee(t *testing.T) {
 		t.Errorf("the verb posted %d transaction(s) despite refusing", len(stub.posts))
 	}
 }
+
+// TestGetJSONRefusesARedirect is audit CL-4: net/http follows redirects by
+// default, so a node (or an on-path party answering the configured address)
+// could move the staking verbs' /status and /account reads to another server.
+// The configured URL is the trust boundary, so a redirect must fail closed.
+func TestGetJSONRefusesARedirect(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"height":7}`))
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer redirect.Close()
+
+	var out struct {
+		Height uint64 `json:"height"`
+	}
+	err := getJSON(redirect.URL+"/status", &out)
+	if err == nil {
+		t.Fatal("getJSON followed a redirect; the configured node must be the only server read")
+	}
+	if !strings.Contains(err.Error(), "redirect") {
+		t.Errorf("the refusal should name the redirect, got: %v", err)
+	}
+	if out.Height != 0 {
+		t.Errorf("the redirect target's body was decoded (height %d), so the redirect was followed", out.Height)
+	}
+}
+
+// TestBondPreviewNamesItsEffectBeforeTheSignature is audit CL-2. CL-1 added the
+// preview, --yes and --dry-run, but the consequence ("the seat changes only at
+// a boundary") and the fact that a posted transaction cannot be cancelled used
+// to print after POST /tx. The preview must carry both before the bytes that
+// get signed - the dry run proves they are visible even when nothing is sent.
+func TestBondPreviewNamesItsEffectBeforeTheSignature(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	stub := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 0,
+	})
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdStake([]string{"--node", stub.url, "--key", keyPath, "--amount", "1000", "--yes"})
+	})
+	if err != nil {
+		t.Fatalf("cmdStake: %v", err)
+	}
+	effect := strings.Index(out, "effect      the bond is applied")
+	bytesAt := strings.Index(out, "bytes       ")
+	txidAt := strings.Index(out, "txid        ")
+	if effect < 0 {
+		t.Fatalf("the preview does not state the bond's effect:\n%s", out)
+	}
+	if bytesAt < 0 || txidAt < 0 || !(effect < bytesAt && bytesAt < txidAt) {
+		t.Fatalf("the effect must be previewed before the signed bytes and the post (effect=%d bytes=%d txid=%d):\n%s",
+			effect, bytesAt, txidAt, out)
+	}
+	if !strings.Contains(out, "cannot cancel or replace") {
+		t.Errorf("the preview does not say the transaction is irreversible:\n%s", out)
+	}
+
+	// A dry run prints the same effect and signs nothing: the operator can see
+	// what would happen before deciding to run it for real.
+	dry := newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: 5_000 * genesis.SparksPerB10, Nonce: 0,
+	})
+	out2 := captureStdout(t, func() {
+		err = cmdStake([]string{"--node", dry.url, "--key", keyPath, "--amount", "1000", "--dry-run"})
+	})
+	if err != nil {
+		t.Fatalf("cmdStake --dry-run: %v", err)
+	}
+	if !strings.Contains(out2, "effect      the bond is applied") || !strings.Contains(out2, "cannot cancel or replace") {
+		t.Errorf("the dry-run preview omits the effect or the irreversibility:\n%s", out2)
+	}
+}
+
+// TestReleaseForecastRefusesAHostileOverflow is audit CL-4's unstake display
+// line. The node reports epoch_blocks and unbonding_epochs; their product,
+// head+1+cooldown and the round-up to a boundary must all be overflow-checked,
+// and an unrepresentable height must print no forecast rather than a wrapped
+// one. The guards predate this round; this test pins them.
+func TestReleaseForecastRefusesAHostileOverflow(t *testing.T) {
+	const maxUint64 = ^uint64(0)
+	if _, ok := cooldownBlocks(stakingStatus{EpochBlocks: maxUint64, UnbondingEpochs: 2}); ok {
+		t.Fatal("cooldownBlocks accepted an epoch_blocks x unbonding_epochs product that overflows uint64")
+	}
+	if _, ok := releaseForecast(1, 0, stakingStatus{Height: maxUint64, EpochBlocks: 1, UnbondingEpochs: 1}, 1); ok {
+		t.Fatal("releaseForecast accepted head+1 wrapping to zero")
+	}
+	if _, ok := releaseForecast(1, 0, stakingStatus{Height: 1, EpochBlocks: 1, UnbondingEpochs: 1}, maxUint64); ok {
+		t.Fatal("releaseForecast accepted head+1+cooldown that overflows uint64")
+	}
+	if _, ok := releaseForecast(1, 0, stakingStatus{Height: maxUint64 - 1, EpochBlocks: maxUint64 - 1, UnbondingEpochs: 1}, 0); ok {
+		t.Fatal("releaseForecast accepted a round-up to the next boundary that overflows uint64")
+	}
+}

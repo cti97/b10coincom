@@ -56,6 +56,8 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"log"
+	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -157,13 +159,25 @@ type ValidatorConfig struct {
 	// Listen is the P2P listen address; empty means "dial only". A node
 	// behind NAT with a relay has no listener by design.
 	Listen string
+	// Advertise is the address PEER_EXCHANGE should advertise when Listen is a
+	// wildcard bind ("0.0.0.0:7001", "[::]:7001") that names no reachable
+	// endpoint (audit PX-8). It must be a literal IP:port - a hostname would
+	// move the target after the receiver's policy has run - and it must not be
+	// an unspecified or multicast address. A private or loopback address is
+	// accepted: advertising it is the operator's statement about their own
+	// network, and the RECEIVER's policy decides whether to dial it. Empty means
+	// "advertise Listen, when Listen is concrete".
+	Advertise string
 	// Relay is the relay address (or addresses) to dial. Each is maintained
 	// through the transport's relay mode - no ID read, registered under
 	// tcp.RelayPeerName(addr) - so a stranger's frames through the relay can
 	// neither name the connection nor silence it (audit N-1). Kept separate
 	// from the direct peer list because the two dial modes differ by
 	// construction; an address given as both a peer and a relay keeps
-	// whichever registration it got first.
+	// whichever registration it got first. A literal relay address is ALSO
+	// reserved against peer hints (audit PX-6): a hint may not name the relay
+	// this node dials, or the node would open a second, direct-mode connection
+	// to it.
 	Relay []string
 	// RelayAccessToken, when non-empty, is the pre-shared first frame sent on
 	// every relay dial (audit N-8): the credential a relay started with
@@ -275,6 +289,17 @@ type Validator struct {
 	// at install.
 	hints   peerHints
 	peerAdd func(addr string, learned bool) error
+	// relayMu guards relayAddrs: the PARSED addresses of the relays this node
+	// dials (audit PX-6). ConnectRelay may be called after StartValidator, so
+	// the receive path reads a copy under this mutex rather than a field that
+	// can grow underneath it.
+	relayMu    sync.Mutex
+	relayAddrs []netip.AddrPort
+	// advertise is the --advertise override, already parsed and canonical
+	// (audit PX-8); empty means "derive from the listener". advertiseWarned
+	// makes the "listening but advertising nothing" line print once.
+	advertise       string
+	advertiseWarned atomic.Bool
 	// peerRemove retires the maintainer for a learned address whose handshake
 	// never completed (audit PX-1). It is a field for the same reason peerAdd
 	// is: the policy test must be able to count retirements without a
@@ -408,6 +433,32 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		return nil, fmt.Errorf("devnet: fixture committee size must be 1..255 and the seat in range, got size %d seat %d", cfg.Validators, cfg.Index)
 	}
 	n := len(g.Validators)
+	// --advertise (audit PX-8): what PEER_EXCHANGE says when the listener is a
+	// wildcard bind. It is validated HERE as well as in the CLI because this is
+	// the function a library caller reaches; the same rules apply - a literal
+	// IP:port, a real port, not unspecified, not multicast - and a node with no
+	// listener has nothing to receive the dial the advertisement asks for.
+	advertise := ""
+	if cfg.Advertise != "" {
+		if cfg.Listen == "" {
+			return nil, fmt.Errorf("devnet: advertise %q names the address peers should dial, but this node has no listener to receive them: give Listen as well", cfg.Advertise)
+		}
+		ap, err := netip.ParseAddrPort(strings.TrimSpace(cfg.Advertise))
+		if err != nil {
+			return nil, fmt.Errorf("devnet: advertise %q is not a literal IP:port (a hostname would move the target after a peer checked it): %w", cfg.Advertise, err)
+		}
+		ip := canonicalHintAddr(ap.Addr())
+		if ap.Port() == 0 {
+			return nil, fmt.Errorf("devnet: advertise %q has port 0; give the port a peer should dial", cfg.Advertise)
+		}
+		if ip.IsUnspecified() {
+			return nil, fmt.Errorf("devnet: advertise %q names an unspecified address, which is exactly what it is meant to replace", cfg.Advertise)
+		}
+		if ip.IsMulticast() {
+			return nil, fmt.Errorf("devnet: advertise %q names a multicast address, which no peer can dial", cfg.Advertise)
+		}
+		advertise = netip.AddrPortFrom(ip, ap.Port()).String()
+	}
 	if cfg.TickEvery <= 0 {
 		cfg.TickEvery = defaultTickEvery
 	}
@@ -639,6 +690,7 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		peerH:      make(map[string]*peerAttestation),
 		syncQ:      make(chan transport.Message, syncQueueDepth),
 		stop:       make(chan struct{}),
+		advertise:  advertise,
 	}
 	// A BLOCK_SYNC request is answered by the bounded worker pool, never on
 	// the transport's dispatch goroutine (audit C-4): serving one costs disk
@@ -652,6 +704,17 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// it runs on the transport's dispatch goroutine, so it stays bounded - see
 	// observePeerExchange.
 	rt.OnPeerExchange = v.observePeerExchange
+	// The configured relays, registered BEFORE any hint can arrive: their
+	// parsed addresses are reserved against hints (audit PX-6) and their
+	// maintainers start here. Doing it in this order means the window between
+	// "listening for peers" and "knows its own relay" does not exist.
+	if len(cfg.Relay) > 0 {
+		if err := v.ConnectRelay(cfg.Relay...); err != nil {
+			_ = tp.Close()
+			_ = ch.Close()
+			return nil, err
+		}
+	}
 	for i := 0; i < syncWorkers; i++ {
 		v.syncWG.Add(1)
 		go v.syncWorker()
@@ -681,12 +744,16 @@ func (v *Validator) Connect(addrs ...string) error {
 // backoff as Connect, but through the transport's RELAY dial mode - the
 // connection announces the local ID, never reads one back, and is named
 // relay:<addr>, so no frame the relay forwards can be mistaken for the
-// peer's identity (audit N-1). The CLI's --relay lands here.
+// peer's identity (audit N-1). The CLI's --relay lands here. Each address is
+// also RESERVED against peer hints (audit PX-6), and the reservation is taken
+// BEFORE the dial: no hint racing this call can name the relay and open a
+// second, direct-mode connection to it.
 func (v *Validator) ConnectRelay(addrs ...string) error {
 	for _, a := range addrs {
 		if a == "" {
 			continue
 		}
+		v.reserveRelayAddr(a)
 		if err := v.ttp.AddRelay(a); err != nil {
 			return err
 		}
@@ -1000,14 +1067,53 @@ func helloHash(h *wire.Hello) [32]byte {
 // height. A peer admitted under the union cannot change this chain's state by
 // claiming a seat; it can at most waste bytes, which the transport's
 // per-connection admission and the BLOCK_SYNC rate limits bound.
+//
+// THE PRICE, stated so it is not mistaken for a bug (audit PX-9): genesis is in
+// the union UNCONDITIONALLY, so a genesis seat that rotation removed keeps
+// admission for the life of the node. It cannot vote (the router's per-height
+// membership refuses its frames) and cannot serve a block (the certificate gate
+// checks the height's committee), but it can open a connection, send HELLOs and
+// BLOCK_SYNC requests, and cost this node bounded work forever. Bounding it
+// would need a genesis-seat expiry tied to committed rotation state - the
+// admission path deliberately has no chain-state write and no notion of "when
+// did this key leave" - so the residual is accepted and documented rather than
+// guessed at here. The same union is what lets a rotated-in key and a peer one
+// boundary behind talk to this node at all.
 func committeeMemberAt(ch *chain.Chain, g *genesis.Genesis, pub []byte, height uint64) bool {
 	if genesis.SeatOfPubKey(g.Validators, pub) >= 0 {
 		return true
 	}
-	if vals, err := ch.CommitteeAt(height); err == nil && genesis.SeatOfPubKey(vals, pub) >= 0 {
+	if ch.IsSeatedAt(height, pub) {
 		return true
 	}
-	if vals, err := ch.CommitteeAt(ch.Height()); err == nil && genesis.SeatOfPubKey(vals, pub) >= 0 {
+	if ch.IsSeatedAt(ch.Height(), pub) {
+		return true
+	}
+	// EVER SEATED (audit RT-3). A validator that joined after genesis and
+	// later rotated out is in NONE of the sets above once the committee moves
+	// on: not genesis, not the committee at its lagging head, not the
+	// committee at the peers' head. Without this term its HELLO is refused,
+	// the connection is never admitted, its BLOCK_SYNC requests never reach
+	// the router, and the process is frozen: its engine is inert and its
+	// catch-up is refused, so it can neither follow nor re-announce. That is
+	// the state `4972883` recorded as open.
+	//
+	// THE WIDENING, stated exactly: this term admits any key that has ever
+	// held a seat on THIS node's committed chain, forever, including after it
+	// unbonds and withdraws. Genesis keys already had that permanence (they
+	// are the first term above); the change is that a post-genesis seat now
+	// gets the same treatment instead of freezing when it ends. It admits NO
+	// key that never held a seat, and it is an authorisation (DoS-budget) gate
+	// only: the router still checks the committee at the frame's own height,
+	// and the certificate gate still re-tallies every adopted block against
+	// the seats of ITS epoch, so a rotated-out key that is admitted here
+	// cannot vote, propose or authorise anything (audit RT-7). There is no
+	// cheap narrowing to state beside it: this term is the minimum that names
+	// a rotated-out member at all, and a time-bounded version would re-freeze
+	// that member after a long outage while the genesis keys keep their
+	// unbounded permanence. Bounding THOSE is the separate change RT-7
+	// describes, not something this set makes cheaper.
+	if ch.EverSeated(pub) {
 		return true
 	}
 	return false

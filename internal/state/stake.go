@@ -18,11 +18,14 @@ import (
 //
 //	spendable (Account.Balance) + bonded (bonds) + unbonding (unbonding)
 //
-// is conserved by every stake transaction. `Bond` moves sparks from the first
-// term to the second, `Unbond` from the second to the third, and `Withdraw`
-// from the third back to the first. No transaction creates or destroys a spark:
-// a transfer lowers the sum by exactly its fee, which is burned. Emission and
-// faucet claims are chain-level and move the sum as a whole.
+// is conserved exactly by `Unbond` and `Withdraw`: `Unbond` moves sparks from
+// the second term to the third, and `Withdraw` from the third back to the
+// first. `Bond` moves only its Amount from the first term to the second; it
+// also pays its fee out of the first term and BURNS it (applyBond), so a Bond
+// lowers the sum by exactly its fee, just as a transfer does. Unbond and
+// Withdraw carry fee 0 by consensus and are the only stake transactions that
+// conserve the sum. The fee burn is the only per-transaction destruction;
+// emission and faucet claims are chain-level and move the sum as a whole.
 //
 // The one exception is the genesis bond (audit ST-3): the genesis state writes
 // it from no account, and an Unbond DESTROYS its unfunded part instead of
@@ -114,6 +117,14 @@ var (
 // counted here, which is the "unbonding coins are not counted" half of the
 // cooldown, and the accessor the committee derivation (M5 Task 2) uses.
 func (s *State) Bonded(a types.Address) uint64 { return s.bonds[a].Amount }
+
+// HasUnbonding reports whether the address holds ANY unbonding record, mature or
+// not. It is one map lookup, and it exists for the mempool's staking admission
+// (audit ST-5): a Withdraw from an address with no such record can never apply,
+// so the pool need not spend a slot and a signature check holding it. Maturity -
+// a height-dependent fact - is deliberately not decided here; execution still
+// judges it.
+func (s *State) HasUnbonding(a types.Address) bool { return len(s.unbonding[a]) > 0 }
 
 // BondOf returns a copy of the address's bond record and whether it holds one.
 // It is the record-level sibling of Bonded (which returns only the amount), for
@@ -667,6 +678,22 @@ type committeeCandidate struct {
 // equal keys and equal amounts would then hash an arbitrary map order, so the
 // address makes the order total and the derivation deterministic for every
 // state, not merely every reachable one.
+//
+// THE KEY TIE-BREAK IS GRINDABLE, and that is accepted rather than hidden
+// (audit RT-8). Among candidates with EQUAL bonded stake, the seat boundary
+// runs through raw public-key bytes, and a key's owner chooses those bytes
+// when it generates the key: an attacker who wants to outrank an equally
+// staked honest candidate - or to win the last free seat - can generate keys
+// until its key sorts first, at the cost of keygen attempts and one bond per
+// try. Nothing here makes that impossible, and nothing safety-critical rests
+// on the order: the order decides WHO holds a seat among equally staked
+// candidates, never whether the derivation is deterministic (every node sorts
+// the same bytes identically) or how much power a seat carries (the cap is a
+// function of the seated total). The alternative - ordering by address - is
+// just as grindable (an address is a key hash), and a secret or committee-voted
+// tie-break would put a non-state input into a pure function of committed
+// state. Grinding also competes for seats at a cost of MIN_STAKE per attempt,
+// and ST-1's floor plus the epoch cooldown bound how fast seats can be retried.
 func compareCandidates(x, y committeeCandidate) int {
 	switch {
 	case x.amount > y.amount:

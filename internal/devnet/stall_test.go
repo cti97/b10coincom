@@ -326,7 +326,12 @@ func TestStallReportIsRaceSafeWhileDriversTick(t *testing.T) {
 			}
 		}
 	}()
-	deadline := time.Now().Add(300 * time.Millisecond)
+	// A DEADLINE, not a fixed 300 ms window (audit TS-1). The driver ticks
+	// every 2 ms, but a loaded or race-instrumented host can take far longer
+	// to schedule the first tick; the old window made the test fail for being
+	// slow rather than for being wrong. A dead driver still fails here, just
+	// after 30 s instead of 300 ms.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) && vs[0].Round() == 0 && vs[1].Round() == 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -359,7 +364,8 @@ func TestStallReportWouldHaveAnsweredTheCIShape(t *testing.T) {
 		"proposal=absent",
 		"prevote votes=0 power=0 quorum=3",
 		"selfprevote=nil",
-		"r85 h1", // the oldest round the 24-entry ring holds
+		"r85 h1",                 // the oldest round the 24-entry ring holds
+		"proposer=seat3(absent)", // the absent seat is named as the drawn proposer
 	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("the reconstructed CI shape is not self-explaining (%q missing):%s", want, msg)
@@ -370,8 +376,5 @@ func TestStallReportWouldHaveAnsweredTheCIShape(t *testing.T) {
 	}
 	if len(live[0].DiagRounds()) != 24 {
 		t.Fatalf("the recent-round ring holds %d entries, want 24", len(live[0].DiagRounds()))
-	}
-	if !strings.Contains(msg, "proposer=seat3(absent)") {
-		t.Logf("note: no draw in rounds 85..108 landed on the absent seat; earlier draws still name the seats")
 	}
 }

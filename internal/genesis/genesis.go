@@ -284,6 +284,20 @@ func (g *Genesis) Validate() error {
 	if p.MinFeeSparks == 0 {
 		return fmt.Errorf("%w: MinFeeSparks must be at least 1 (a zero minimum is the free-transaction regime the fee exists to end)", ErrBadGenesis)
 	}
+	// The two staking parameters below are the same kind of rule as
+	// MinFeeSparks, and worse when zero: state.stakeConfigured treats a zero
+	// MinStake or UnbondingEpochs as "staking is not parameterised", so every
+	// Bond, Unbond and Withdraw fails with ErrStakeUnconfigured FOREVER. Such a
+	// genesis still opens and still commits blocks, so a hand-edited file
+	// would silently ship a chain on which no bond can be created and no seat
+	// can rotate - a failure that surfaces only when someone tries to stake.
+	// Refuse it at validation, where the operator who edited the file sees it.
+	if p.MinStakeSparks == 0 {
+		return fmt.Errorf("%w: MinStakeSparks must be at least 1 (a zero floor is the unparameterised-staking regime in which every stake transaction fails)", ErrBadGenesis)
+	}
+	if p.UnbondingEpochs == 0 {
+		return fmt.Errorf("%w: UnbondingEpochs must be at least 1 (a zero cooldown makes every stake transaction fail with staking unconfigured, so no seat could ever rotate)", ErrBadGenesis)
+	}
 	// The Argon2id cost bounds (audit S-5). A zero-valued tuning is rejected
 	// cleanly by the state machine - applyFaucetClaim guards before calling
 	// argon2.IDKey, which would panic - but a genesis that validates with a
@@ -336,6 +350,21 @@ func (g *Genesis) Validate() error {
 	// fixture committee enforce, is malformed.
 	if p.CommitteeSize < 0 || p.CommitteeSize > maxCommitteeSize {
 		return fmt.Errorf("%w: CommitteeSize is %d, want 0..%d", ErrBadGenesis, p.CommitteeSize, maxCommitteeSize)
+	}
+	// A genesis must not name more validators than its committee can seat
+	// (audit RT-9). CommitteeSize caps the TOP-N selection the stake
+	// derivation performs, while the node entry point and chain.Append admit
+	// EVERY key in g.Validators: a crafted genesis with CommitteeSize below
+	// the list therefore ships keys that are authorised to sign blocks and to
+	// start a node but can never hold a seat, silently raising the quorum bar
+	// for the seats that do exist. The committee-file loader already refuses
+	// this (ParseCommitteeJSON requires committee_size >= len(validators)), so
+	// this is the general contract chain.Open enforces, one layer down; it
+	// costs one comparison and removes the "unreachable through the loader"
+	// caveat rather than resting on it.
+	if p.CommitteeSize < len(g.Validators) {
+		return fmt.Errorf("%w: CommitteeSize is %d but the genesis names %d validators, so %d listed key(s) could never hold a seat (committee_size must be at least the validator count; a LARGER number leaves spare seats)",
+			ErrBadGenesis, p.CommitteeSize, len(g.Validators), len(g.Validators)-p.CommitteeSize)
 	}
 	// The genesis timestamp is the height-0 block's timestamp and obeys the
 	// same rule every later block does (types.ValidateStructure: Timestamp > 0).

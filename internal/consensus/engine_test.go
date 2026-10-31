@@ -1502,6 +1502,78 @@ func TestANonMemberEngineReturnsAnErrorInsteadOfPanicking(t *testing.T) {
 	}
 }
 
+// RT-10: the corrected half of "emits nothing, enters no round". An engine
+// whose key holds no seat that receives NO proposal returns ErrNotValidator
+// from the nil-prevote branch and does not enter the next round (the test
+// above). But a round-0 PROPOSAL moves it off StepPropose before that branch
+// can run - maybePrevote records the step, its own emitVote is refused by
+// CheckMembership - so the next timeout skips the nil-prevote branch and the
+// engine DOES enter round 1. If the round's prevotes reach a polka it locks
+// and persists a lock for a height where it holds no seat. That is harmless
+// (a promise by a non-seat cannot prevent any vote it could cast, and the
+// lock is pruned once the height commits) but it is a state transition, and
+// the comment on OnTimeout used to deny it. What remains true: it emits
+// nothing, ever.
+func TestAnUnseatedEngineWithAProposalEntersRoundOneAndLocks(t *testing.T) {
+	cfg := evenCommittee(t, 4, 1)
+	parent := crypto.HashParts([]byte("rt10-parent"))
+	h := round0ProposerHeight(t, cfg, 1, false, parent)
+
+	_, stranger, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lockWrites int
+	e := NewEngine(cfg, h, parent, stranger, nil)
+	e.SetValidate(func(*types.Block) error { return nil }) // the block's chain validity is not this test's subject
+	e.persistLock = func(uint64, uint32, [32]byte) { lockWrites++ }
+	e.Drain()
+
+	blk := testProposer(t, cfg, h, 0, parent)
+	prop := &Proposal{Height: h, Round: 0, Block: blk, ValidRound: -1, Validator: cfg.Proposer(h, 0, parent)}
+	prop.Sig = signProposal(t, cfg, prop)
+	if err := e.OnMessage(EncodeProposal(prop)); !errors.Is(err, ErrNotValidator) {
+		t.Fatalf("an unseated engine's proposal gave %v, want ErrNotValidator from its own refused prevote", err)
+	}
+	if e.Step() == StepPropose {
+		t.Fatal("the proposal left the engine at StepPropose; the RT-10 shape needs the step it actually takes")
+	}
+
+	// The committee's round-0 polka for that block: 3 of the 4 seats. The
+	// final prevote completes the polka and the engine LOCKS (step and lock
+	// are written before the emission), then tries to precommit and is
+	// refused: that refused emission is ErrNotValidator, not a failure.
+	for i := 0; i < 3; i++ {
+		if err := e.OnMessage(EncodeVote(voteFrom(t, cfg, i, MsgPrevote, h, 0, blk.ID()))); err != nil && !errors.Is(err, ErrNotValidator) {
+			t.Fatalf("prevote %d: %v", i, err)
+		}
+	}
+	if !e.Locked() {
+		t.Fatal("an unseated engine tallied a prevote polka but did not lock; the lock path does not check membership")
+	}
+	if lockWrites != 1 {
+		t.Fatalf("the unseated engine persisted %d lock(s), want 1 (the lock it holds at a height it has no seat at)", lockWrites)
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("an unseated engine emitted %d message(s); it must sign nothing", len(left))
+	}
+
+	// And it ENTERS round 1: the nil-prevote branch is skipped because the
+	// step is no longer StepPropose, so no error is owed.
+	if err := e.OnTimeout(TimeoutEvent{Height: h, Round: 0}); err != nil {
+		t.Fatalf("a timeout after a proposal gave %v; the engine enters the next round and emits nothing", err)
+	}
+	if got := e.Round(); got != 1 {
+		t.Fatalf("the unseated engine is at round %d after one timeout, want 1", got)
+	}
+	if !e.Locked() {
+		t.Fatal("entering the next round dropped the lock the engine had already persisted")
+	}
+	if left := e.Drain(); len(left) != 0 {
+		t.Fatalf("entering round 1 emitted %d message(s) from an unseated engine", len(left))
+	}
+}
+
 // C-12's decision, pinned: nil prevotes are tallied but have NO protocol
 // effect. A whole committee's nil prevotes at the current round do not
 // precommit, lock, commit, or advance the round; only OnTimeout leaves it. The

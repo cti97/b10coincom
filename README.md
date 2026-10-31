@@ -317,9 +317,10 @@ whose keys sign, and that is the security boundary:**
 | `--genesis PATH` | *unset* | shared committee file listing the validators' public keys; giving it runs the consensus committee that file names |
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
-| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1) |
+| `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1). The address itself is **reserved against peer hints** (audit PX-6): a hint may not name the relay this node dials, or the node would open a second, direct-mode connection to it. Literal IP:port relay addresses are compared as parsed, canonical addresses, so a different spelling of the same endpoint is still refused |
 | `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The secret is **never sent**: the node waits for the relay's **gate greeting** and its per-connection **challenge** (32 fresh random bytes plus the relay's own address), answers `HMAC-SHA-256(token, challenge)`, and only then expects the relay's **accepted** frame. A relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — gets no proof at all and the refusal is logged; a stranger who drives the greeting through such a relay receives a MAC, never the token, and that MAC is useless on any other connection (audit PX-3). The token still travels in plaintext at the relay's end of the comparison: see the relay section |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
+| `--advertise IP:PORT` | *unset* | the address `PEER_EXCHANGE` should advertise when `--listen` binds a **wildcard** address (`0.0.0.0:7001`, `[::]:7001`), which names no endpoint a peer can dial. This is the port-forwarded home node's flag: `--listen 0.0.0.0:7001 --advertise <public IP>:7001` (audit PX-8). It must be a literal IP:port, not unspecified or multicast, and it requires `--listen`. Without it a wildcard-bind node advertises nothing and says so **once** in the log |
 | `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |
@@ -336,13 +337,29 @@ receiver dials only if the signature verifies and the key held a seat at that
 height; a stranger on a token-less relay, or a relay sender replaying someone
 else's frame, is not a hint authority. A member that advertises junk addresses
 is bounded per member per wave, and a learned address whose handshake never
-completes is evicted rather than retried until restart. **A relay-only or NAT'd
+completes is evicted rather than retried until restart. The address policy is
+refused, not merely discouraged: loopback, RFC 1918 private, link-local,
+CGNAT `100.64/10`, `0.0.0.0/8`, `192.0.0.0/24`, `198.18/15`, `240/4` (including
+the broadcast address), IPv6 site-local `fec0::/10` and NAT64-embedded local
+IPv4 (`64:ff9b::/96`), plus this node's own listener, its advertised address,
+the configured relay's own address and the `relay:` name. A zone suffix is
+dropped before the budget is charged, so one target costs one slot however it
+is spelled (audit PX-7). A connection this node dialled because a peer named
+the address also never outranks one the operator configured or that the peer
+itself dialled, so a hint cannot hold an honest peer's transport name by
+announcing it (audit PX-5). **A relay-only or NAT'd
 Pi advertises nothing and can be dialled by nobody**: a node with no `--listen`
-(and a `0.0.0.0`/unspecified listener counts as no address) sends no frame, so
-the mesh never gains a direct path *to* it and the relay remains its only
-inbound path. It can still *receive* hints and dial peers that do have a public
-listener, which bypasses the relay for those links — but the benefit is
-one-sided, and the mesh only forms among nodes that are directly reachable.
+(and a `0.0.0.0`/unspecified listener counts as no address unless `--advertise`
+names the public one) sends no frame, so the mesh never gains a direct path
+*to* it and the relay remains its only inbound path. It can still *receive*
+hints and dial peers that do have a public listener, which bypasses the relay
+for those links — but the benefit is one-sided, and the mesh only forms among
+nodes that are directly reachable. A **port-forwarded** node is the case that
+used to fail silently: it listens on `0.0.0.0:7001`, which is not an address a
+peer can dial, so it advertised nothing while the operator believed the
+forwarded port was enough. `--listen 0.0.0.0:7001 --advertise <public
+IP>:7001` advertises the address the router forwards; a wildcard bind with
+neither advertises nothing and now logs one line saying so (audit PX-8).
 This is design decision 5's honest limit, not a bug: `PEER_EXCHANGE` is a hint
 to dial, never an admission, and admission is still the signed committee HELLO.
 
@@ -409,9 +426,11 @@ appending to one store is not a client design.
 | `withdraw` | `--node URL --key PATH [--yes \| --dry-run]` | `Withdraw` (tag 5): releases **every** matured unbonding record to the spendable balance; fee 0 by consensus rule |
 
 `--amount` is b10 as an exact decimal, parsed by integer arithmetic (no float
-ever holds an amount); the transaction carries sparks. `stake` refuses an amount
-below the node's `min_stake_sparks` and a bond the balance cannot cover, before
-submitting; `unstake` refuses more than is bonded, and refuses a partial exit
+ever holds an amount); the transaction carries sparks. `stake` refuses a bond
+that would end below the node's `min_stake_sparks` — the floor is on the
+RESULTING bond, so a top-up may itself be smaller than the floor — and a bond
+the balance cannot cover, before submitting; `unstake` refuses more than is
+bonded, and refuses a partial exit
 that would leave a bond under `MIN_STAKE` — the state's candidacy floor, so the
 verb and the chain refuse the same remainders; `withdraw` refuses while no
 record has matured and names the next release height. None of the verbs waits
@@ -451,6 +470,19 @@ transaction invalid by misreporting the genesis hash. What it can no longer do
 is choose the fee: the default bounds that loss to one spark, and the
 confirmation shows the number before anything is signed.
 
+There is deliberately **no `--chain-id` flag**. The genesis hash *is* the chain
+binding, and the signature covers the hash the node reports: a transaction
+built against a different chain's node is therefore only valid on that other
+chain and invalid on the chain the operator meant — **useless, not dangerous**,
+because it cannot move a spark on the intended chain. The preview prints that
+hash so the operator can compare it. The CLI also refuses HTTP redirects, since
+a redirect would move these reads outside the node the operator named.
+
+Sparks cross the HTTP API as **JSON numbers, not strings** (`uint64`). Every
+on-chain amount is bounded by the 2.1e15-spark supply cap, below 2^53, so an
+IEEE-754 reader represents each value exactly; a client that does arithmetic on
+them should still use 64-bit integers rather than doubles.
+
 Example, from the live run in [Staking](#staking):
 
 ```text
@@ -462,15 +494,17 @@ transaction to sign (built, not yet signed):
   nonce       0  (the node's claim)
   fee         1 spark  (the node's claim; ceiling 1)
   amount      100000000000 sparks (1000 b10)  (from --amount)
+  effect      the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every 1000 blocks as this node reports it), never mid-epoch
   genesis     bb884a8c1a688674dd329b1effd4551fba01fbf277f37d73f45bdf0053515111  (the node's claim; the signature is bound to it)
   bytes       03de98c0af74f66fcf8f2fbb7bd876ce6848b5b15c20595a3002843c7001986d530a75f3b22301018390eab909d88096b241c9c99f2d00000000000000000000000000000001000000174876e80000
   nonce, fee and genesis above come from http://127.0.0.1:8645 and this CLI cannot check
   them: a node reporting a future nonce builds a bond that applies later,
   and one under-reporting the bond makes an exit partial. Only --amount
   (when given) and the signing key are yours.
+  The signature cannot be withdrawn: once a node accepts these bytes this CLI
+  cannot cancel or replace the transaction, and a bond or exit is irreversible.
 Type "yes" to sign and post this transaction: yes
 txid        5586cdb24337ea3d0f1a9989777f0057bb74a3b6d66caeea1ef788f24bba47af
-the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every 1000 blocks), never mid-epoch.
 ```
 
 **Where the stake comes from is a real limitation, not a footnote.** A bond
@@ -944,6 +978,23 @@ exactly, documented here rather than changed: capping against the uncapped total
 stake, or a minimum power-per-seat ratio, would be a protocol change (see the
 plan's proposal).
 
+**There is no slashing, and a leaving seat keeps its seat until the boundary.**
+No code path confiscates or reduces a bond. A validator that equivocates, signs
+conflicting blocks, or simply goes offline loses **no stake**: the certificate
+gate and the tally refuse its blocks and votes, so it stops contributing, and
+that is the whole penalty. The only economic cost of leaving is the two-epoch
+cooldown, during which the coins are neither spendable nor counted. This is a
+documented scope decision, not an omission — slashing needs fault evidence every
+node can verify, a proof format, and a rule for what a proven fault forfeits,
+which is a protocol change — and it is also stated in `SECURITY.md`. The same
+fixed-boundary rule has a second consequence: the committee for epoch `e` is
+derived from the state committed at `e × epoch_blocks − 1` and **memoised**, so a
+validator that submits `Unbond` mid-epoch remains a seated voter, with the power
+it held at that boundary and with **nothing bonded behind it**, until the next
+boundary. It cannot be punished for the epoch it is still serving, and it cannot
+be replaced early; it simply leaves at the boundary, where the liveness rules
+above decide whether the remaining reachable seats can still commit.
+
 **The verbs** are `stake`, `unstake` and `withdraw` (see
 [The CLI](#the-cli)). They are ordinary signed transactions — same signature,
 same genesis-hash binding, same fee rule, same `/tx` admission as a transfer.
@@ -1166,8 +1217,11 @@ by `cmd` alone.
 
 Two configurations ship in `genesis/`, mirroring the design's devnet and
 testnet chains. The Go constructors in `internal/genesis` (`genesis.Devnet`,
-`genesis.Testnet`) are the source of truth the node runs from — nothing parses
-the JSON at runtime, so JSON never enters a hashed path. The JSON files are
+`genesis.Testnet`) are the source of truth the node runs from: the node never
+reads these two JSON files at runtime, so their text never enters a hashed
+path. (An operator's `--genesis` **committee file** is JSON and *is* parsed at
+runtime by `genesis.LoadCommitteeJSON`; its values are re-encoded canonically
+before hashing, so the file's bytes do not.) The JSON files are
 **checked records**: `TestGenesisJSONRecordsMatchTheGoConstructors` unmarshals
 each one and requires it to agree field-for-field with the corresponding
 constructor (`chain_id`, validator and dev-account counts, every `params`
@@ -1305,9 +1359,12 @@ toolchain go.mod pins: currently Go 1.27.3 over language version 1.26.0.
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
 | Acceptance check, M5 rotation + Nakamoto | `go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto` |
 
-Actions in CI are pinned to commit SHAs, not mutable tags, and the whole
-workflow's token is scoped to `contents: read`
-(`.github/workflows/ci.yml`); Dependabot watches Go modules and GitHub
+Actions in CI are pinned to commit SHAs, not mutable tags. The workflow defaults
+the token to `contents: read`; two jobs narrow that further and grant exactly
+one extra permission each: `lint` has `issues: write` (the scheduled
+toolchain-chore step) and the scheduled `report` job has `issues: write` (it
+files the issue for any failed job). `test`, `release` and `cross` remain
+read-only (`.github/workflows/ci.yml`); Dependabot watches Go modules and GitHub
 Actions weekly (`.github/dependabot.yml`).
 
 Makefile targets: `make test`, `make race`, `make build` (produces

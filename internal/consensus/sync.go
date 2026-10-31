@@ -433,9 +433,10 @@ func syncReqHash(req *wire.BlockSyncReq) [32]byte {
 	return crypto.HashParts([]byte("b10coin-sync-req"), e.Bytes())
 }
 
-// syncSeatsAt returns the validator set a BLOCK_SYNC participant is authorised
-// against at height h: the committee that judges h, the genesis seats, and the
-// seats of this node's current head.
+// syncSeated returns the AUTHORISATION predicate a BLOCK_SYNC participant is
+// judged by at height h: a key is admitted when it is a genesis seat, a seat
+// at h (the committee that judges the range's first height), a seat at this
+// node's current head, or a key that has ever held a seat on this chain.
 //
 // WHY MORE THAN ONE SET. BLOCK_SYNC membership is an authorisation (a DoS
 // bound on who may spend this node's disk and CPU), never a safety decision:
@@ -450,54 +451,67 @@ func syncReqHash(req *wire.BlockSyncReq) [32]byte {
 //     epoch);
 //   - a validator whose seat BEGAN after genesis is not in the genesis set,
 //     so a restart at the boundary would be refused by peers that are still
-//     on its own epoch.
+//     on its own epoch;
+//   - a validator that JOINED after genesis and later rotated out is in
+//     neither genesis nor any set at a height near the head (audit RT-3).
+//     Only "has ever held a seat" names it. Before that term existed the node
+//     could not even be admitted as a peer, so its pull was never answered and
+//     it stayed frozen for good; the end-to-end proof is
+//     TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain.
 //
-// Both are members of a set this node knows: genesis for the first, the
-// current head's committee for the second. A stranger is in neither and is
-// still refused, which is the property the relay-stranger tests pin.
-func (s *Syncer) syncSeatsAt(h uint64) []genesis.Validator {
-	genesisSeats := s.chain.Genesis().Validators
-	out := make([]genesis.Validator, len(genesisSeats))
-	copy(out, genesisSeats)
-	add := func(vals []genesis.Validator) {
-		for _, v := range vals {
-			member := false
-			for i := range out {
-				if bytes.Equal(out[i].PubKey, v.PubKey) {
-					member = true
-					break
-				}
-			}
-			if !member {
-				out = append(out, v)
-			}
+// The predicate is a KEY-BY-KEY test rather than a built union. The union form
+// copied and linearly deduplicated every set per request and per response -
+// O(N^2) with up to 255 seats (audit RT-6). Each term below is a linear scan of
+// an immutable memo and allocates nothing.
+//
+// WHAT THIS ADMITS (audit RT-7), stated precisely rather than implied: any key
+// that has EVER held a seat on this node's chain may spend this node's sync
+// budget forever, including after it has unbonded and withdrawn; and because
+// the range's height is the asker's own choice, such a key may authorise a pull
+// by naming a height in an epoch it once held (or, through the genesis term,
+// any height at all). That is the price of never freezing a member the
+// rotation itself created, and it is authorisation-only. It is NOT widened
+// further by RT-3 than "ever seated": a key that never bought a seat is in
+// none of the four terms and is still refused by name.
+//
+// RT-3's ever-seated set does NOT make a cheap narrowing of this available,
+// and that is stated rather than left to look like an oversight. It replaces
+// the genesis key's "admitted forever" with the same rule for every key that
+// ever bought a seat; it does not add a second, wider class. Bounding the term
+// by a time window, or by the epoch the key last held, needs new derived state
+// (a last-seated epoch) and would re-freeze exactly the member RT-3 is about
+// after an outage longer than the window - and a node whose process restarted
+// is refused by the entry point (RT-1's rule, deliberately unchanged), so the
+// window would buy nothing. The genesis term itself is RT-7's accepted
+// residual, unchanged.
+func (s *Syncer) syncSeated(h uint64) func(pub []byte) bool {
+	return func(pub []byte) bool {
+		if genesis.SeatOfPubKey(s.chain.Genesis().Validators, pub) >= 0 {
+			return true
 		}
+		if s.chain.IsSeatedAt(h, pub) {
+			return true
+		}
+		if s.chain.IsSeatedAt(s.chain.Height(), pub) {
+			return true
+		}
+		// RT-3: the rotated-out post-genesis seat. See the predicate's
+		// documentation above for exactly what this widens.
+		return s.chain.EverSeated(pub)
 	}
-	if vals, err := s.chain.CommitteeAt(h); err == nil {
-		add(vals)
-	}
-	if vals, err := s.chain.CommitteeAt(s.chain.Height()); err == nil {
-		add(vals)
-	}
-	return out
 }
 
 // verifySyncReq authenticates a request the way consensus messages are
-// authenticated: a signature that verifies, bound to a key in the validator
-// set. It takes the validator list rather than a Config because the syncer is
-// built from a chain, and the chain is where the genesis set lives.
-func verifySyncReq(req *wire.BlockSyncReq, vals []genesis.Validator) error {
+// authenticated: a signature that verifies, bound to a key the caller's
+// AUTHORISATION PREDICATE admits (see syncSeated; tests pass seatedIn over a
+// fixed fixture set). It takes the predicate rather than a validator list so
+// the production gate can test four sets - genesis, the height's committee,
+// the head's committee and the ever-seated set - without copying any of them.
+func verifySyncReq(req *wire.BlockSyncReq, seated func([]byte) bool) error {
 	if len(req.Requester) == 0 {
 		return fmt.Errorf("%w: missing requester key", ErrBadSyncAuth)
 	}
-	member := false
-	for i := range vals {
-		if bytes.Equal(vals[i].PubKey, req.Requester) {
-			member = true
-			break
-		}
-	}
-	if !member {
+	if !seated(req.Requester) {
 		return fmt.Errorf("%w: requester is not in the validator set", ErrBadSyncAuth)
 	}
 	h := syncReqHash(req)
@@ -549,8 +563,10 @@ func signSyncResp(priv ed25519.PrivateKey, req *wire.BlockSyncReq, resp *wire.Bl
 // It refuses, before any unit is looked at:
 //
 //   - a response with no responder key (ErrBadSyncRespAuth);
-//   - a responder that is not a committee member (ErrBadSyncRespAuth) - the
-//     stranger case, which needs no committee key of its own to be excluded;
+//   - a responder that is not admitted by the caller's authorisation predicate
+//     (ErrBadSyncRespAuth) - the stranger case, which needs no committee key
+//     of its own to be excluded; the predicate is syncSeated, the same one the
+//     request gate uses;
 //   - a responder other than expect, when expect is set (ErrBadSyncRespAuth) -
 //     the member-pin case, which is what a relay needs: every member shares the
 //     transport name, so the signature is the only attribution;
@@ -561,18 +577,11 @@ func signSyncResp(priv ed25519.PrivateKey, req *wire.BlockSyncReq, resp *wire.Bl
 // on what may be adopted; this gate only decides who may ANSWER. A refusal
 // here is silence (Receive drops the frame), which the pull already reads as
 // "nothing came back".
-func verifySyncResp(req *wire.BlockSyncReq, resp *wire.BlockSyncResp, expect ed25519.PublicKey, vals []genesis.Validator) error {
+func verifySyncResp(req *wire.BlockSyncReq, resp *wire.BlockSyncResp, expect ed25519.PublicKey, seated func([]byte) bool) error {
 	if len(resp.Responder) == 0 {
 		return fmt.Errorf("%w: response carries no responder key", ErrBadSyncRespAuth)
 	}
-	member := false
-	for i := range vals {
-		if bytes.Equal(vals[i].PubKey, resp.Responder) {
-			member = true
-			break
-		}
-	}
-	if !member {
+	if !seated(resp.Responder) {
 		return fmt.Errorf("%w: responder %s is not in the validator set", ErrBadSyncRespAuth, requesterLabel(resp.Responder))
 	}
 	if len(expect) > 0 && !bytes.Equal(resp.Responder, expect) {
@@ -616,17 +625,52 @@ func (s *Syncer) allowRequest(req *wire.BlockSyncReq) bool {
 	return true
 }
 
-// noteRequest records a served (requester, nonce) and reports false when the
-// same signed request has already been served within SeenTTL. This is the
-// replay gate: the nonce makes each request's frame unique, and this set makes
-// a duplicate inert instead of a second full answer's work.
-func (s *Syncer) noteRequest(req *wire.BlockSyncReq) bool {
+// seenTTL is the replay window this syncer remembers served requests for.
+func (s *Syncer) seenTTL() time.Duration {
 	ttl := s.SeenTTL
 	if ttl <= 0 {
 		ttl = DefaultSyncSeenTTL
 	}
+	return ttl
+}
+
+// seenEntry is the replay-set key of one signed request: the requester key and
+// the request's own nonce. The signature binds both, so two different senders
+// cannot collide on one entry.
+func seenEntry(req *wire.BlockSyncReq) seenKey {
+	return seenKey{who: string(req.Requester), nonce: req.Nonce}
+}
+
+// checkReplay reports true when this signed request has NOT been served within
+// SeenTTL. It RECORDS NOTHING and mutates nothing: it is the read half of the
+// replay gate, split from the write half so Answer can check before charging
+// the rate bucket (audit RT-5). Because it writes nothing, a frame that later
+// fails the bucket leaves no trace and cannot evict another member's served
+// nonce.
+func (s *Syncer) checkReplay(req *wire.BlockSyncReq) bool {
+	ttl := s.seenTTL()
 	now := s.now()
-	k := seenKey{who: string(req.Requester), nonce: req.Nonce}
+	k := seenEntry(req)
+	s.seenMu.Lock()
+	defer s.seenMu.Unlock()
+	t, ok := s.seen[k]
+	return !ok || now.Sub(t) >= ttl
+}
+
+// recordRequest records a served (requester, nonce) and reports false when the
+// same signed request has already been served within SeenTTL. This is the write
+// half of the replay gate and the ONLY place the set grows, which is what makes
+// "a refused request costs no memory" true: Answer calls it strictly after the
+// rate bucket admits (audit RT-5).
+//
+// The nonce makes each request's frame unique, and this set makes a duplicate
+// inert instead of a second full answer's work. Its size is capped so a member
+// spending a full budget for a whole TTL cannot grow it without bound; the
+// eviction below is reached only by ADMITTED requests, never by refused ones.
+func (s *Syncer) recordRequest(req *wire.BlockSyncReq) bool {
+	ttl := s.seenTTL()
+	now := s.now()
+	k := seenEntry(req)
 	s.seenMu.Lock()
 	defer s.seenMu.Unlock()
 	if s.seen == nil {
@@ -832,11 +876,15 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 	// validator whose seat ENDED at From needs most: it is no longer a member
 	// at its head, so every peer would refuse its catch-up and the follower
 	// rotation creates would be frozen out of the chain it is trying to
-	// follow. syncSeatsAt widens the seat to the committee that judges the
+	// follow. syncSeated widens the seat to the committee that judges the
 	// height, the genesis seats (a seat that has since ended still needs - and
-	// may serve - history) and this node's current head's seats (a seat that
-	// began after genesis). From 0 has no head below it; the genesis committee
-	// is then the right answer and CommitteeAt(0) gives it.
+	// may serve - history), this node's current head's seats (a seat that
+	// began after genesis), and - audit RT-3 - every key that has ever held a
+	// seat, so a validator that joined after genesis and later rotated out can
+	// still pull (and re-announce through the node's HELLO gate). From 0 has no
+	// head below it; the genesis committee is then the right answer and
+	// IsSeatedAt(0) gives it. The predicate allocates nothing; see its comment
+	// for what admission widened and what it deliberately does not touch.
 	//
 	// This is an AUTHORISATION gate, not a safety gate: nothing a requester
 	// sends can move this chain. The safety is the certificate gate on every
@@ -845,22 +893,39 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 	if askerHead > 0 {
 		askerHead--
 	}
-	if err := verifySyncReq(req, s.syncSeatsAt(askerHead)); err != nil {
+	if err := verifySyncReq(req, s.syncSeated(askerHead)); err != nil {
 		return nil, err
 	}
-	// The resource gates come before any allocation or disk read. The REPLAY
-	// check runs first (review, audit fix round 4): a captured signed request
-	// replayed to this node is refused by the seen set, and charging the rate
-	// bucket for it first let a passive observer drain a member's whole
-	// catch-up budget for free - the member's own honest pulls then saw
-	// ErrSyncRateLimited, and the attacker paid nothing but the bytes of one
-	// captured frame. A replay is no work, so it costs no token. The order of
-	// the remaining gates is unchanged.
-	if !s.noteRequest(req) {
+	// The resource gates come before any allocation or disk read. The order is
+	// the AUDIT RT-5 fix, and it has three steps for a reason:
+	//
+	//  1. CHECK the replay set (a read, recording nothing). A captured signed
+	//     request replayed to this node is refused here, and charging the rate
+	//     bucket for it first let a passive observer drain a member's whole
+	//     catch-up budget for free - the member's own honest pulls then saw
+	//     ErrSyncRateLimited, and the attacker paid nothing but the bytes of one
+	//     captured frame (review, audit fix round 4).
+	//  2. CHARGE the per-requester bucket. This is the only bound on how many
+	//     DISTINCT nonces one authenticated member can make this node remember.
+	//  3. RECORD the served (requester, nonce) only if the bucket admitted it.
+	//     Recording before the charge - the pre-fix order - let an
+	//     authenticated member send distinct nonces past its own budget for
+	//     free, and every one of them was recorded, evicting other members'
+	//     served entries from the fixed 4,096-entry set until the replay drain
+	//     the reorder closed came back. A nonce the bucket refused bought no
+	//     work, so it must buy no memory either. This is the same no-poisoning
+	//     shape as PX-4: the cheap check reads, and only an admitted frame
+	//     writes.
+	if !s.checkReplay(req) {
 		return nil, fmt.Errorf("%w: nonce %d was already served", ErrSyncReplayed, req.Nonce)
 	}
 	if !s.allowRequest(req) {
 		return nil, fmt.Errorf("%w: %s", ErrSyncRateLimited, requesterLabel(req.Requester))
+	}
+	if !s.recordRequest(req) {
+		// Two concurrent copies of one signed frame raced between the check and
+		// the record; the second did no work, so it is the replay it is.
+		return nil, fmt.Errorf("%w: nonce %d was already served", ErrSyncReplayed, req.Nonce)
 	}
 	// Refusals come before the first make(): nothing is allocated for a
 	// request this syncer has already decided not to answer. The comparison
@@ -986,7 +1051,7 @@ func (s *Syncer) Receive(from transport.PeerID, data []byte) {
 	if len(resp.Units) == 0 && respHeight > 0 {
 		respHeight--
 	}
-	if verifySyncResp(w.req, resp, w.expect, s.syncSeatsAt(respHeight)) != nil {
+	if verifySyncResp(w.req, resp, w.expect, s.syncSeated(respHeight)) != nil {
 		// The authentication check: an unsigned envelope, a non-member's, a
 		// different member's, or a signature that does not cover exactly this
 		// request and these bytes. Dropped, never filed.

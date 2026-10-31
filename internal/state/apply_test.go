@@ -246,6 +246,72 @@ func TestApplyTxLeavesNoPartialWriteOnEveryFailurePath(t *testing.T) {
 			s.Set(to, Account{Balance: math.MaxUint64})
 			return s, transfer(t, pub, priv, from, 0, 1, to)
 		}, ErrBalanceOverflow},
+
+		// The staking transitions (audit ST-9). They are rows in THIS table, not
+		// only in their own tests, because the promise ApplyTx makes is one
+		// promise: every validation before the first write, for every type.
+		// A staking failure that wrote a bond, an unbonding record or a nonce
+		// before noticing would pass a per-test check that only looked at the
+		// balance; the root comparison below sees the two new maps too.
+		{"bond: fee below the minimum", func(t *testing.T) (*State, *types.Tx) {
+			s := NewWithParams(stakingParams())
+			addr, pub, priv := keypair(t)
+			s.Set(addr, Account{Balance: minStakeSparks + 10})
+			return s, bondTx(t, pub, priv, addr, 0, minStakeSparks, 0)
+		}, ErrFeeTooLow},
+		{"bond: insufficient funds (the final amount check before any write)", func(t *testing.T) (*State, *types.Tx) {
+			s := NewWithParams(stakingParams())
+			addr, pub, priv := keypair(t)
+			s.Set(addr, Account{Balance: minStakeSparks}) // one spark short of bond+fee
+			return s, bondTx(t, pub, priv, addr, 0, minStakeSparks, 1)
+		}, ErrInsufficientFunds},
+		{"bond: resulting bond below the minimum", func(t *testing.T) (*State, *types.Tx) {
+			s := NewWithParams(stakingParams())
+			addr, pub, priv := keypair(t)
+			s.Set(addr, Account{Balance: minStakeSparks + 10})
+			return s, bondTx(t, pub, priv, addr, 0, minStakeSparks-1, 1)
+		}, ErrStakeBelowMinimum},
+		{"unbond: carries a fee", func(t *testing.T) (*State, *types.Tx) {
+			s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+			s.SetHeight(5)
+			return s, stakeTx(t, types.TxUnbond, pub, priv, addr, 1, 100, 1)
+		}, ErrStakeCarriesFee},
+		{"unbond: exceeds the bond", func(t *testing.T) (*State, *types.Tx) {
+			s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+			s.SetHeight(5)
+			return s, unbondTx(t, pub, priv, addr, 1, minStakeSparks+1)
+		}, ErrUnbondExceedsBond},
+		{"unbond: leaves a sub-minimum remainder", func(t *testing.T) (*State, *types.Tx) {
+			s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+			s.SetHeight(5)
+			return s, unbondTx(t, pub, priv, addr, 1, minStakeSparks-1)
+		}, ErrStakeBelowMinimum},
+		{"unbond: nonce does not match", func(t *testing.T) (*State, *types.Tx) {
+			s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+			s.SetHeight(5)
+			return s, unbondTx(t, pub, priv, addr, 99, 1)
+		}, ErrBadNonce},
+		{"withdraw: carries a fee", func(t *testing.T) (*State, *types.Tx) {
+			s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+			s.SetHeight(5)
+			return s, stakeTx(t, types.TxWithdraw, pub, priv, addr, 1, 0, 1)
+		}, ErrStakeCarriesFee},
+		{"withdraw: nothing matured", func(t *testing.T) (*State, *types.Tx) {
+			s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+			s.SetHeight(5)
+			return s, withdrawTx(t, pub, priv, addr, 1)
+		}, ErrNothingToWithdraw},
+		{"withdraw: nonce does not match", func(t *testing.T) (*State, *types.Tx) {
+			s, addr, pub, priv := bondedValidator(t, minStakeSparks, 0)
+			s.SetHeight(5)
+			return s, withdrawTx(t, pub, priv, addr, 99)
+		}, ErrBadNonce},
+		{"stake: the state is not configured", func(t *testing.T) (*State, *types.Tx) {
+			s := New()
+			addr, pub, priv := keypair(t)
+			s.Set(addr, Account{Balance: minStakeSparks + 1})
+			return s, bondTx(t, pub, priv, addr, 0, minStakeSparks, 1)
+		}, ErrStakeUnconfigured},
 		{"claim: carries a fee", func(t *testing.T) (*State, *types.Tx) {
 			pub, priv, err := crypto.GenerateKey()
 			if err != nil {
@@ -317,6 +383,7 @@ func TestApplyTxLeavesNoPartialWriteOnEveryFailurePath(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s, tx := tc.build(t)
+			beforeRoot := s.Root()
 			before := snapshotOf(s)
 			err := s.ApplyTx(tx)
 			if !errors.Is(err, tc.want) {
@@ -330,6 +397,12 @@ func TestApplyTxLeavesNoPartialWriteOnEveryFailurePath(t *testing.T) {
 				if got, ok := after[a]; !ok || got != want {
 					t.Fatalf("a rejected transaction changed account %x: %+v -> %+v (present %v)", a[:], want, got, ok)
 				}
+			}
+			// The root covers the two stake maps as well as the accounts, so a
+			// partial write to a bond or an unbonding record fails HERE even
+			// though snapshotOf cannot see it.
+			if afterRoot := s.Root(); afterRoot != beforeRoot {
+				t.Fatalf("a rejected transaction moved the state root:\n before %x\n after  %x", beforeRoot, afterRoot)
 			}
 		})
 	}

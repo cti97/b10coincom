@@ -89,6 +89,31 @@ type Chain struct {
 	// a future epoch needs does not exist yet, and inventing one from the head
 	// would be the very bug above. It is an error naming the missing height.
 	committees map[uint64][]genesis.Validator
+
+	// everSeated is DERIVED STATE: every validator key that has EVER held a
+	// seat on this chain - genesis seats included - whether or not it holds
+	// one at the head. Like committees it is rebuilt from committed blocks on
+	// Open and never written to the store; the two are filled at the same
+	// place (memoCommitteeLocked), so a key enters this set at exactly the
+	// height whose state DECIDES the epoch that seats it, i.e. before its
+	// seat begins.
+	//
+	// WHAT IT IS FOR (audit RT-3): a validator that joined after genesis and
+	// later rotated out is seated in no set that outlives its epoch - not
+	// genesis, not the committee at its own (lagging) head, not the committee
+	// at the committee's head - so HELLO admission and BLOCK_SYNC
+	// authorisation used to refuse it forever, leaving a live process that
+	// could not follow the chain. This set is the "has ever been a member"
+	// term those two AUTHORISATION gates consult. It never feeds a consensus
+	// decision: a rotated-out key is still refused membership at any height
+	// by the router, the tally and the certificate gate, because those ask
+	// the committee for the height they are judging, not this set.
+	//
+	// It is deliberately monotone and permanent. A key that ever bought a seat
+	// stays a permitted peer forever, exactly as a genesis key already did
+	// (audit RT-7); see committeeMemberAt's comment for what that admits and
+	// what it does not. Guarded by mu like committees.
+	everSeated map[string]struct{}
 }
 
 // genesisState builds the state that block 1 builds upon. It applies the
@@ -203,7 +228,18 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 		}
 	}()
 	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st), faucet: g.FaucetAddress(),
-		committees: make(map[uint64][]genesis.Validator)}
+		committees: make(map[uint64][]genesis.Validator),
+		everSeated: make(map[string]struct{}, len(g.Validators))}
+	// The genesis seats are seats: every one of them has "ever been seated"
+	// from height 0, so the authorisation set is complete even on a chain
+	// whose genesis committee cannot be derived (CommitteeSize zero) and on
+	// the empty chain before replay. Adding them is not a widening - the
+	// genesis list is already an explicit term in every gate that reads this
+	// set - it keeps one definition of the set: the keys that have held a
+	// seat.
+	for _, v := range g.Validators {
+		c.everSeated[string(v.PubKey)] = struct{}{}
+	}
 	// Epoch 0's committee is the one derived from the GENESIS state (height
 	// -1 does not exist; the genesis state is its stand-in). It is recorded
 	// here for the same reason every later epoch is recorded at its deciding
@@ -305,7 +341,10 @@ func (c *Chain) Height() uint64 {
 // boundary's parent is the set that judges the boundary.
 //
 // The returned slice - and every validator key in it - is a COPY: the memo is
-// derived state that a caller must not be able to mutate through.
+// derived state that a caller must not be able to mutate through. A caller
+// that only needs to know WHETHER A KEY IS SEATED must call IsSeatedAt
+// instead: the copy is a slice plus one allocation per seat (audit RT-6), and
+// the router asks this question for every vote and every proposal.
 func (c *Chain) CommitteeAt(h uint64) ([]genesis.Validator, error) {
 	blocks := c.gen.Params.EpochBlocks
 	if blocks == 0 {
@@ -338,6 +377,53 @@ func (c *Chain) CommitteeAt(h uint64) ([]genesis.Validator, error) {
 		out[i] = genesis.Validator{PubKey: append([]byte(nil), vals[i].PubKey...), Power: vals[i].Power}
 	}
 	return out, nil
+}
+
+// IsSeatedAt reports whether pub holds a seat at height h, WITHOUT copying the
+// committee (audit RT-6). It answers false both for "not seated" and for "this
+// chain cannot derive a committee at h"; a caller that must distinguish those
+// two - a diagnostic, never a membership gate - asks CommitteeAt.
+//
+// This is the hot path's membership test. The router asks it for every vote
+// and every proposal before any signature verification, and BLOCK_SYNC asks it
+// per request and per response; CommitteeAt's defensive deep copy is a slice
+// plus one allocation per seat (up to 255 on a full committee) and nothing on
+// these paths mutates the returned seats. Safety is unchanged: the answer is
+// read under the same read lock from the same memoised, immutable epoch set
+// CommitteeAt returns, so a caller can only ever be told exactly what
+// CommitteeAt would have contained at that height.
+func (c *Chain) IsSeatedAt(h uint64, pub []byte) bool {
+	blocks := c.gen.Params.EpochBlocks
+	if blocks == 0 {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for i := range c.committees[h/blocks] {
+		if string(c.committees[h/blocks][i].PubKey) == string(pub) {
+			return true
+		}
+	}
+	return false
+}
+
+// EverSeated reports whether pub has EVER held a seat on this chain - genesis
+// seats included - and is the authorisation term audit RT-3 adds for a
+// validator that joined after genesis and later rotated out.
+//
+// READ THE WIDENING THIS IS (audit RT-3/RT-7): this is not "is a member now".
+// It is true forever for every key that was ever seated, including one that has
+// since unbonded and withdrawn, and it is used ONLY by the two AUTHORISATION
+// gates (HELLO admission in the node, BLOCK_SYNC request/response membership in
+// the syncer). Consensus does not read it: votes, proposals and certificates
+// are judged against CommitteeAt(height), so a rotated-out key can resync and
+// re-announce but cannot vote, propose, count toward a quorum or authorise a
+// block. Membership in this set is a DoS-budget question, never a safety one.
+func (c *Chain) EverSeated(pub []byte) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.everSeated[string(pub)]
+	return ok
 }
 
 // Head returns the current head block. Append retains the caller's
@@ -595,6 +681,22 @@ func (c *Chain) applyValidatedLocked(b *types.Block) error {
 // reports when someone asks. Refusing an otherwise-valid block because the
 // following epoch has no candidates would halt a chain one block early for a
 // reason the block itself does not carry. The caller holds mu.
+//
+// WHO CHOOSES THE NEXT COMMITTEE (audit RT-8), stated because the answer is not
+// "the stake holders alone": epoch e's seats are a pure function of the state
+// at height e*E-1, so they are decided by whichever bond and unbond
+// TRANSACTIONS that block carries. Its proposer draws the block from the
+// mempool and is free to include or defer any transaction it holds (subject
+// only to validity and the mempool's own admission rules), so the proposer of
+// the deciding block chooses, within the transactions available to it, which
+// bonded stakes are in the state the epoch is derived from. That is a
+// liveness/fairness lever, not a safety one: the derivation is identical on
+// every node for the state that block commits, a proposer cannot change a
+// bond's amount or key, and a block it withholds is a block no one commits.
+// Anyone can also land a bond early to be safely inside the deciding state. The
+// ordering among EQUAL stakes is the other half of RT-8: see
+// state.compareCandidates - it breaks ties on raw public-key bytes, which a
+// key's owner can grind at generation time.
 func (c *Chain) memoCommitteeLocked(st *state.State, height uint64) {
 	blocks := c.gen.Params.EpochBlocks
 	if blocks == 0 {
@@ -607,6 +709,14 @@ func (c *Chain) memoCommitteeLocked(st *state.State, height uint64) {
 	epoch := next / blocks
 	if vals, err := st.Committee(); err == nil {
 		c.committees[epoch] = vals
+		// The same state that decides this epoch's seats also says who may
+		// ever be treated as a member for AUTHORISATION from now on. Filling
+		// it here - and only here - is what makes the set replay-identical:
+		// Open replays every stored block through this function, so a restart
+		// rebuilds exactly the keys a live run recorded (audit RT-3).
+		for i := range vals {
+			c.everSeated[string(vals[i].PubKey)] = struct{}{}
+		}
 	}
 }
 

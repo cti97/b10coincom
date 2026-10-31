@@ -1,5 +1,12 @@
 # Test run report: M5 branch, Docker-only re-run (2026-10-30)
 
+> **Correction, 2026-10-31.** This is a snapshot of `dcd2ede`; its status rows
+> are left exactly as written. Three rows were fixed later on `m5-plan`: **M-1**
+> by `88e70a8` (default the reconnect ceiling), **M-3** by `b531c08` (correct
+> the four-seat displacement text), and **L-3** by `f566f79` (correct the CI
+> timeout and its comment). Read those rows as history, not as the branch's
+> current state.
+
 **Commit under test:** `dcd2ede` on `m5-plan` (it contains the H-1/H-2 fix `235d33e` and the upstream staking commits `063cc60`, `4972883` and `34e6d86`)
 **Previous run:** [testrun-2026-10-30-m5-docker.md](testrun-2026-10-30-m5-docker.md), on `9ea1cb8`
 **Environment:** Windows 11, Docker Desktop 29.9.2. Every check ran in containers: `golang:1.27.3-bookworm` (go1.27.3 linux/amd64), `koalaman/shellcheck-alpine:v0.10.0`, and a `debian:bookworm-slim` runtime image built from statically linked binaries. Each container cloned the repo from a read-only mount, so it worked from LF sources. Keys and committee files lived in named volumes.

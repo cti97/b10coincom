@@ -45,7 +45,11 @@ type statusResponse struct {
 
 // accountResponse is the /account/{address} view: the spendable account plus
 // the two locked-stake records the staking verbs must know about. Amounts are
-// sparks (uint64), never b10 and never a float.
+// sparks (uint64), never b10 and never a float. They travel as JSON NUMBERS,
+// not strings, to keep the wire contract additive; every on-chain amount is
+// below 2^53 because the supply cap is 2.1e15, so an IEEE-754 reader holds each
+// one exactly, but a client doing arithmetic must use 64-bit integers (audit
+// CL-4).
 //
 // Unbonding is always a JSON list, never null: a client iterating it should
 // not have to special-case "no records". UnbondingTotal is the number of
@@ -106,22 +110,20 @@ func unbondingWindow(q url.Values) (offset, limit int, err error) {
 	return offset, limit, nil
 }
 
-// windowUnbonding returns the [offset, offset+limit) slice of recs and the
-// total it was taken from. The slice is always non-nil (an empty window
-// serialises as [], not null) and an offset past the end is an empty window,
-// not an error: "there is nothing after these" is a valid answer.
-func windowUnbonding(recs []unbondingResponse, offset, limit int) ([]unbondingResponse, int) {
-	total := len(recs)
+// unbondingBounds clamps the [offset, offset+limit) window to a list of total
+// records. It is bounds arithmetic only, so the handler can convert JUST the
+// window instead of copying every record into a response struct and copying the
+// page again (audit ST-10). An offset past the end is an empty window, not an
+// error: "there is nothing after these" is a valid answer.
+func unbondingBounds(total, offset, limit int) (lo, hi int) {
 	if offset > total {
 		offset = total
 	}
-	end := offset + limit
-	if end > total || end < offset {
-		end = total
+	hi = offset + limit
+	if hi > total || hi < offset {
+		hi = total
 	}
-	out := make([]unbondingResponse, 0, end-offset)
-	out = append(out, recs[offset:end]...)
-	return out, total
+	return offset, hi
 }
 
 type blockResponse struct {
@@ -239,13 +241,19 @@ type Server struct {
 	chain     *chain.Chain
 	mempool   *mempool.Mempool
 	txLimiter *sourceLimiter
+	// genesisHash is the chain's immutable genesis identifier, computed once
+	// at construction (audit CL-4): /status used to re-hash the whole genesis
+	// on every request. Genesis cannot change under a running chain, so the
+	// hash cannot either.
+	genesisHash [32]byte
 }
 
 func NewServer(c *chain.Chain, mp *mempool.Mempool) *Server {
 	return &Server{
-		chain:     c,
-		mempool:   mp,
-		txLimiter: newSourceLimiter(txRateBurst, txRatePerSecond, txRateMaxSources),
+		chain:       c,
+		mempool:     mp,
+		txLimiter:   newSourceLimiter(txRateBurst, txRatePerSecond, txRateMaxSources),
+		genesisHash: c.Genesis().Hash(),
 	}
 }
 
@@ -272,10 +280,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	// One snapshot, one lock (audit O-8): reading Head() then Height()
 	// separately let a commit in between pair the new height with the old
-	// head's hash and root. Genesis is immutable, so it needs no such care.
+	// head's hash and root. Genesis is immutable, so it needs no such care,
+	// and its hash is cached at construction (audit CL-4).
 	height, headID, stateRoot := s.chain.HeadSnapshot()
 	g := s.chain.Genesis()
-	genesisHash := g.Hash()
+	genesisHash := s.genesisHash
 	writeJSON(w, http.StatusOK, statusResponse{
 		ChainID:   g.ChainID,
 		Height:    height,
@@ -310,6 +319,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // this unauthenticated endpoint's reply size independent of any state a future
 // bug could build.
 //
+// ONE bounded clone-and-sort remains, and it is the accessor's contract rather
+// than waste (audit ST-10): UnbondingOf returns a sorted COPY so the reply is
+// ordered by release height and a caller cannot mutate committed state through
+// it. It is O(UnbondingEpochs+2), not O(state): at most four records on the
+// shipped parameters. What this handler no longer does is copy the whole list a
+// SECOND time into response structs and then copy the page again; it converts
+// only the records inside the window, so the per-request work is the sort plus
+// at most maxUnbondingLimit conversions.
+//
 // The read is served from the chain's published state snapshot, which is
 // immutable until the next Append replaces it: no lock is held across the
 // JSON encode and a commit cannot interleave a half-updated account.
@@ -333,10 +351,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 	acc := st.Get(addr)
 	bond, _ := st.BondOf(addr)
 	recs := st.UnbondingOf(addr)
-	all := make([]unbondingResponse, 0, len(recs))
-	for _, rec := range recs {
-		all = append(all, unbondingResponse{Amount: rec.Amount, ReleaseHeight: rec.ReleaseHeight})
-	}
+	lo, hi := unbondingBounds(len(recs), offset, limit)
 	out := accountResponse{
 		Address:      addr.String(),
 		Balance:      acc.Balance,
@@ -344,7 +359,11 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 		Bonded:       bond.Amount,
 		BondUnfunded: bond.Unfunded,
 	}
-	out.Unbonding, out.UnbondingTotal = windowUnbonding(all, offset, limit)
+	out.Unbonding = make([]unbondingResponse, 0, hi-lo)
+	for _, rec := range recs[lo:hi] {
+		out.Unbonding = append(out.Unbonding, unbondingResponse{Amount: rec.Amount, ReleaseHeight: rec.ReleaseHeight})
+	}
+	out.UnbondingTotal = len(recs)
 	writeJSON(w, http.StatusOK, out)
 }
 

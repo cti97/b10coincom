@@ -436,6 +436,7 @@ thing with `sudo -u b10coin` for first contact):
 | `--key` | THIS machine's key file (§3.1) — unique per Pi; a key not listed in the committee file **refuses to start** rather than signing as a foreign seat |
 | `--http` (default `127.0.0.1:8645`) | RPC status endpoint, loopback-only by default. Read it via SSH (§7) rather than opening it to your LAN |
 | `--listen`, `--peers` | optional **direct** peer connections (same-LAN or port-forwarded setups). With the relay star they stay off; a dial list is already complete via `--relay` |
+| `--advertise IP:PORT` | with `--listen`, the address peers should dial. Required for a **port-forwarded** node: `--listen` binds `0.0.0.0:7001` (a wildcard names no endpoint), and without `--advertise` the node advertises nothing and logs one line saying so (§5) |
 
 **The seat is derived, not configured.** A node's seat is the position of its
 public key inside the shared committee file, so there is no `--index` here
@@ -571,9 +572,14 @@ transaction that chain rejects — never one it accepts; and a `--relay`-only Pi
 (no `--listen`) advertises no direct address, so `PEER_EXCHANGE` gives the
 mesh no path to it (see the repository README's `b10coin node` section).
 **This recipe's three nodes are all relay-only** (§3.3, §5), so on this
-deployment `PEER_EXCHANGE` is inert: it only helps a node given `--listen` at
-an address the other validators can reach (a forwarded port or a public host),
-and then only for the links to such nodes.
+deployment `PEER_EXCHANGE` is inert. It only helps a node with BOTH a
+`--listen` a peer can reach and a way to name it: a wildcard bind
+(`--listen 0.0.0.0:7001`, which is what a forwarded port looks like) advertises
+**nothing** on its own, because `0.0.0.0:7001` is not an address a peer can
+dial. Such a node must also pass `--advertise PUBLIC_IP:7001` — the address the
+router forwards to — or bind the concrete public address directly. Binding a
+forwarded port is not enough by itself, and without `--advertise` the node now
+logs one line at the first advertisement saying exactly that.
 
 ## 6. The systemd units (what runs after the first contact test)
 
@@ -780,8 +786,8 @@ directory's format.
 | 1 | **Committee-file / binary mismatch** — one node runs a different (or hand-edited) `committee.json`, or an older binary | `journalctl -u b10coin \| grep listening` — the `chain …` part of the banner **differs** between Pis (the chain ID comes from the shared file §3.2; an older binary that cannot read `--genesis` exits before any banner). Nodes on different chains never object; they just ignore each other forever | Stop the odd node; start it from the **same binary build** with the same **committee.json bytes** the others run (§3.2). No other remedy exists — a changed committee file is a different chain |
 | 2 | **Relay unreachable** — relay not running, VPS address wrong, port 7001 closed in the cloud firewall, or this Pi's source IP missing from the ufw allowlist | All chain IDs **match**, but from a Pi: `timeout 3 bash -c '</dev/tcp/example.com/7001' && echo open` prints nothing. On the VPS: `systemctl status b10coin-relay` and `ss -tlnp \| grep 7001` tell you whether it listens at all; `sudo ufw status numbered` tells you whose access was refused | Start the relay (`systemctl enable --now b10coin-relay`), open TCP 7001 in the security group, and add the **allowlist line for this Pi's current IP** (§4 — a bare open port is the audit finding, never the remedy). Nodes redial with backoff; nothing to restart on the Pis |
 | 3 | **One identity, two machines** — the same key file on two Pis, so both act as the same seat | Chain IDs all match, relay reachable, yet heights stall. `journalctl -u b10coin \| grep consensus` shows **the same `seat N` on two Pis** — with genesis-file mode the seat is derived from the key, so two machines sharing `b10coin.key` share every signature they make. A related loud case: a node whose key is NOT in the committee file **exits at startup** with `refusing to start … not listed` | `b10coin keygen` on the offending Pi (its old key file must be renamed away first — keygen refuses to overwrite), add the NEW public key to the committee file and redistribute it — remembering a committee-file edit changes the chain identity, so this is for bring-up, not for a chain history that already exists |
-| 5 | **A data directory written before the `b10coin-seg` format marker** — the node was upgraded over a chain written by an older build | The node exits at startup naming the directory: `unrecognised data-directory format … Do NOT truncate it`. Nothing is corrupt; the files are intact in the older layout, which this build cannot read | Point `--dir` at a **new, empty** directory and let the node catch up from a peer, or keep running the older binary. Do **not** truncate the files the message names — before this marker existed the same failure printed a hint that said to truncate at offset 0, which deletes the chain |
 | 4 | **Wrong-architecture binary** — e.g. the ARM64 relay copied onto a standard amd64 (x86_64) VPS, or either binary onto a 32-bit OS | The binary refuses to start at all: running it directly prints `Exec format error` / `cannot execute binary file`, and systemd's log (`journalctl -u b10coin-relay`) shows the same with exit `status=203/EXEC`. Confirm with `file /opt/b10coin/b10coin-relay` — the architecture it names must match what `uname -m` prints on that machine | Rebuild for the machine's own architecture (§2's `uname -m` step: the VPS almost always wants `b10coin-relay-linux-amd64`, from `scripts/deploy/build.sh linux/amd64`), reinstall with `install -m 0755`, and nothing on the Pis changes |
+| 5 | **A data directory written before the `b10coin-seg` format marker** — the node was upgraded over a chain written by an older build | The node exits at startup naming the directory: `unrecognised data-directory format … Do NOT truncate it`. Nothing is corrupt; the files are intact in the older layout, which this build cannot read | Point `--dir` at a **new, empty** directory and let the node catch up from a peer, or keep running the older binary. Do **not** truncate the files the message names — before this marker existed the same failure printed a hint that said to truncate at offset 0, which deletes the chain |
 
 Quick disambiguation: the binary will not start (`Exec format error`) → 4;
 startup names an `unrecognised data-directory format` → 5; chain IDs differ

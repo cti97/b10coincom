@@ -659,14 +659,13 @@ func TestAccountUnbondingWindow(t *testing.T) {
 	}
 }
 
-// TestWindowUnbondingIsBoundedByTheLimit is the reply-size bound directly: the
+// TestTheUnbondingWindowIsBoundedByTheLimit is the reply-size bound directly: the
 // handler never serialises more than maxUnbondingLimit records, whatever the
-// state holds and whatever the client asks for.
-func TestWindowUnbondingIsBoundedByTheLimit(t *testing.T) {
-	all := make([]unbondingResponse, 300)
-	for i := range all {
-		all[i] = unbondingResponse{Amount: uint64(i + 1), ReleaseHeight: uint64(1000 * (i + 1))}
-	}
+// state holds and whatever the client asks for. It exercises the bounds
+// arithmetic that replaced the second full-list copy (audit ST-10), so the
+// number of records CONVERTED is bounded too, not merely the number kept.
+func TestTheUnbondingWindowIsBoundedByTheLimit(t *testing.T) {
+	const total = 300
 
 	offset, limit, err := unbondingWindow(url.Values{"limit": {"999999"}})
 	if err != nil {
@@ -675,23 +674,24 @@ func TestWindowUnbondingIsBoundedByTheLimit(t *testing.T) {
 	if limit != maxUnbondingLimit {
 		t.Fatalf("limit = %d, want it clamped to %d", limit, maxUnbondingLimit)
 	}
-	page, total := windowUnbonding(all, offset, limit)
-	if total != len(all) || len(page) != maxUnbondingLimit {
-		t.Fatalf("window = %d of %d, want %d of %d", len(page), total, maxUnbondingLimit, len(all))
+	lo, hi := unbondingBounds(total, offset, limit)
+	if lo != 0 || hi != maxUnbondingLimit {
+		t.Fatalf("window = [%d,%d), want [0,%d)", lo, hi, maxUnbondingLimit)
 	}
-	if page[0].Amount != all[0].Amount || page[len(page)-1].Amount != all[maxUnbondingLimit-1].Amount {
-		t.Fatal("the window is not the prefix it claims to be")
+	if hi-lo > maxUnbondingLimit {
+		t.Fatalf("the window converts %d records, above the %d bound", hi-lo, maxUnbondingLimit)
 	}
 
 	// Offset arithmetic, including an offset past the end.
-	page, total = windowUnbonding(all, 295, 64)
-	if total != 300 || len(page) != 5 || page[0].Amount != all[295].Amount {
-		t.Fatalf("offset window = %d records from offset 295 of %d, want 5", len(page), total)
+	lo, hi = unbondingBounds(total, 295, 64)
+	if lo != 295 || hi != total {
+		t.Fatalf("offset window = [%d,%d), want [295,%d)", lo, hi, total)
 	}
-	page, total = windowUnbonding(all, 400, 64)
-	if total != 300 || len(page) != 0 || page == nil {
-		t.Fatalf("past-the-end window = %d of %d (nil %v), want an empty, non-nil window", len(page), total, page == nil)
+	lo, hi = unbondingBounds(total, 400, 64)
+	if lo != total || hi != total {
+		t.Fatalf("past-the-end window = [%d,%d), want [%d,%d)", lo, hi, total, total)
 	}
+
 	// No limit can make the reply larger than the bound.
 	for _, ask := range []string{"1", "64", "256", "257", "999999999"} {
 		_, limit, err := unbondingWindow(url.Values{"limit": {ask}})
@@ -700,6 +700,9 @@ func TestWindowUnbondingIsBoundedByTheLimit(t *testing.T) {
 		}
 		if limit > maxUnbondingLimit {
 			t.Fatalf("limit %s parsed to %d, above the %d bound", ask, limit, maxUnbondingLimit)
+		}
+		if got := limit; got < 1 {
+			t.Fatalf("limit %s parsed to %d, want at least 1", ask, got)
 		}
 	}
 }
