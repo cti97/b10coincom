@@ -840,6 +840,27 @@ with P of T power (quorum Q), yet nothing commits; peers=…; tallies …` — w
 the per-round vote tallies and the peers it sees, so the stall is no longer
 silent.
 
+**That stall and the 3-seat stall are two different faults, and the difference
+is worth keeping straight.** The 3-seat one (fixed by `5af2174`, pinned in
+`internal/consensus/future_proposal_test.go`) was an ENGINE fault: a proposal
+for a round the engine had not entered yet arrived one round early and was
+dropped, so a restarted validator could never prevote the block the survivors
+were locked on; buffering the early proposal closed it, and 50 Docker cycles
+afterwards saw zero stalls. The 4-seat one is not that and does not involve a
+lost frame at all: it is **round divergence among exactly-quorum live seats** —
+every live seat is in a different round, so no round can gather a quorum, and
+nothing is dropped. Two closers exist and only one can act: the round-resync
+jump requires `total − quorum + 1` of the power to be ahead (2 on a four-seat
+committee), which one ahead seat cannot supply, so the **timeout ladder** is
+the whole recovery — which is why the wait grows with the round the divergence
+starts at. The networked Docker evidence is the re-run report; the mechanism is
+covered deterministically by
+`internal/simnet/round_divergence_test.go`, which constructs 4, 5 and 6 seats
+with one seat powered off (live power exactly the quorum), sets one live seat a
+few rounds ahead through the durable round record, and asserts the chain
+finalises again on one history. It is not a wall-clock reproduction of the
+4-to-6-minute stall and does not claim to be: an in-process restart is instant.
+
 Three rules carry the safety, and all three are about the arithmetic of
 distrust:
 
@@ -930,7 +951,14 @@ leaves is a `Bond`'s fee, burned exactly as a transfer's is, and emission and
 faucet claims are chain-level. One exception, and it is the genesis seat: an
 `Unbond` of a genesis bond destroys that bond's unfunded part rather than
 recording it (`Bond.Unfunded`, audit ST-3), so a genesis grant never becomes
-spendable and the sum falls by exactly what the genesis created.
+spendable and the sum falls by exactly what the genesis created. **The operator's
+own coins leave first** (audit C-1): an exit consumes the funded part of the bond
+before it reaches the grant, so a genesis seat that was topped up with `stake`
+returns those sparks through an ordinary partial exit — and keeps its seat if the
+remainder clears `MIN_STAKE` — while the grant is destroyed only once the exit
+goes past them. The total a bond can ever return is still exactly the funded
+sparks bonded into it; only the order changed, and it changed so an operator does
+not lose their money because they also received a grant.
 
 **A bond is a seat, and the seat changes only at a boundary.** The committee is
 the top `committee_size` bonds by stake, ties broken by public-key bytes, with

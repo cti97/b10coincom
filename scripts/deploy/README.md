@@ -582,6 +582,26 @@ exit **only in full**, which is what `unstake` without `--amount` does.
 > Either way the seat is wasted and the margin is one failure thinner: stake only
 > with the key the node runs, and keep every genesis key's node running.
 
+**A bonded key that has rotated OUT cannot be restarted until it is re-seated —
+so a crash in an out-of-seat epoch is a permanent exit until then (audit B-2).**
+The entry check asks two questions about the **locally stored** head: is this key
+in the genesis list, and does it hold a seat at `head + 1` in the committee that
+height derives? A key that bonded after genesis and whose seat has since ended
+answers **no** to both, and `b10coin node` refuses to start with "holds no seat
+there". `systemd`'s `Restart=always` cannot help: it restarts into the same
+refusal, every five seconds, for as long as the process lives. The local head
+does not move while the process is down, so the epoch at `head + 1` never
+changes either — waiting for a later boundary that seats the key does **not**
+make this directory startable. What does: let the chain reach an epoch that
+seats the key again, then start the node over a data directory whose stored head
+is inside that epoch (resync from a peer, or a fresh directory the node fills by
+pull), which is "re-seating plus a resync". A **genesis** key is exempt — the
+genesis list is checked first — which is why this recipe's three Pis may be
+restarted at any time. The fix for B-1 (a rotated-out node keeps running and
+follows rather than freezing) does not change this: admission at STARTUP and
+admission of a DRIVER rebuilt mid-run are two different gates, and only the
+second one was widened.
+
 `unstake` and `withdraw` **run** here without any spendable funds — an exit is
 free by consensus rule (§3.2 bonds every genesis seat with
 `power: 100000000000`, 1,000 b10 = `MIN_STAKE`) — but a genesis seat's exit
@@ -589,7 +609,9 @@ free by consensus rule (§3.2 bonds every genesis seat with
 `withdraw` finds no record to release (audit ST-3, and `unstake` prints exactly
 that). The only sparks an operator can withdraw are the ones it funded itself
 through `stake`; those are recorded as a funded bond and released after one
-cooldown like any other. Decide the powers before the chain starts: the file is
+cooldown like any other — **including when the seat also holds a genesis grant:
+an exit returns the operator's own coins first and destroys the grant last**
+(audit C-1). Decide the powers before the chain starts: the file is
 final once it has, because editing it changes the genesis hash and starts a
 different chain.
 
@@ -661,6 +683,20 @@ To update a binary: overwrite `/opt/b10coin/b10coin` (§2's `install`) and
 `sudo systemctl restart b10coin` on each machine — **all machines from the
 same build**, for the §3 reason.
 
+> **⚠️ A data directory written before the ST-3 change cannot be opened by this
+> build — it is a hard fork of the genesis state, not a compatible upgrade.**
+> Audit ST-3 made a genesis seat's bond carry `unfunded` sparks in the committed
+> bond leaf, which changed the genesis **state root**; the genesis **hash** did
+> not change, because it covers the committee document and no derived state.
+> The consequences are easy to misread: `store.CheckGenesis` passes, the node
+> starts, replays, and fails at height 1 with "the first stored block does not
+> link this build's genesis block". That is version skew, not corruption —
+> nothing in the log needs repairing. **Upgrade all three Pis together and start
+> each on a FRESH `--dir`** (or resync the node from a peer on the same build);
+> do not try to keep a pre-ST-3 directory. The error now names the skew and the
+> ST-3 cause explicitly (audit C-2), so a pre-fix directory is not mistaken for a
+> damaged one.
+
 > **⚠️ Restart the committee TOGETHER — a rolling reboot can hold the chain
 > down for minutes.** Each round at an undecided height is given
 > `200 ms + 100 ms × round`, with no cap, and that growth is what lets
@@ -677,6 +713,14 @@ same build**, for the §3 reason.
 > forward, and the ladder is the only closer. The 2026-10-30 Docker re-run
 > measured exactly this: restarting three seated validators one at a time
 > left a four-seat chain at one head for 4 to 6.5 minutes, twice.
+>
+> This is **not** the older three-seat fault that was fixed in the engine (a
+> proposal for a round not yet entered was dropped; it is buffered now, and that
+> fault produced no stall in 50 Docker cycles afterwards). Nothing is lost here:
+> the live seats are simply in different rounds, so no round can collect a
+> quorum, and only the ladder brings them back together. Treat a stall after a
+> rolling restart as the ladder's wait, not as a bug to chase — the line the
+> node prints names the round divergence for exactly that reason.
 >
 > - **Do:** restart all three nodes within one block time (a few seconds of
 >   each other) — `sudo systemctl restart b10coin` back to back on the three
