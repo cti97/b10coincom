@@ -1,5 +1,12 @@
 # Test run report: M5 branch, Docker-only (2026-10-30)
 
+> **Correction, 2026-10-31.** This is a snapshot of `9ea1cb8`; its status rows
+> are left exactly as written. Three rows were fixed later on `m5-plan`: **M-1**
+> by `88e70a8` (default the reconnect ceiling), **M-3** by `b531c08` (correct
+> the four-seat displacement text), and **L-3** by `f566f79` (correct the CI
+> timeout and its comment). Read those rows as history, not as the branch's
+> current state.
+
 | | |
 |---|---|
 | Branch / commit | `m5-plan` @ `9ea1cb8` ("audit 2026-10-30"), version `0.1.0` |

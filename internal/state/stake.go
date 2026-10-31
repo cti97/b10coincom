@@ -18,11 +18,14 @@ import (
 //
 //	spendable (Account.Balance) + bonded (bonds) + unbonding (unbonding)
 //
-// is conserved by every stake transaction. `Bond` moves sparks from the first
-// term to the second, `Unbond` from the second to the third, and `Withdraw`
-// from the third back to the first. No transaction creates or destroys a spark:
-// a transfer lowers the sum by exactly its fee, which is burned. Emission and
-// faucet claims are chain-level and move the sum as a whole.
+// is conserved exactly by `Unbond` and `Withdraw`: `Unbond` moves sparks from
+// the second term to the third, and `Withdraw` from the third back to the
+// first. `Bond` moves only its Amount from the first term to the second; it
+// also pays its fee out of the first term and BURNS it (applyBond), so a Bond
+// lowers the sum by exactly its fee, just as a transfer does. Unbond and
+// Withdraw carry fee 0 by consensus and are the only stake transactions that
+// conserve the sum. The fee burn is the only per-transaction destruction;
+// emission and faucet claims are chain-level and move the sum as a whole.
 //
 // The one exception is the genesis bond (audit ST-3): the genesis state writes
 // it from no account, and an Unbond DESTROYS its unfunded part instead of

@@ -248,10 +248,12 @@ func (s *State) TotalUnbonding() uint64
 
 **Invariants and constraints.**
 
-- **Money is conserved by every stake transaction, exactly.** `spendable + bonded +
-  unbonding` is unchanged by `Bond`, `Unbond` and `Withdraw`; a transfer lowers it by
-  exactly its fee (the fee is burned, as it is today); emission and claims are chain
-  level and outside this sum's per-transaction invariance. Genesis is the initial
+- **The stake terms move, and a `Bond` burns its fee.** `spendable + bonded +
+  unbonding` is conserved exactly by `Unbond` and `Withdraw` (both carry fee 0 by
+  consensus). `Bond` moves `Amount` from the first term to the second and burns its
+  fee out of the first, so a bond lowers the sum by exactly its fee — the same burn
+  a transfer performs. Emission and claims are chain level and outside this sum's
+  per-transaction invariance. Genesis is the initial
   condition: genesis seats are bonded by the genesis hash, not bought, so height 0 has
   bonded stake that no balance funded. Say that in the code, because it is the first
   place a reviewer will look for a double count.
@@ -301,7 +303,7 @@ func (s *State) TotalUnbonding() uint64
 **Tests.**
 
 - `TestBondMovesSparksFromSpendableToLocked`: balance down by `Amount+Fee`, bonded up
-  by `Amount`, the three-way sum unchanged.
+  by `Amount`, the three-way sum down by exactly the burned fee.
 - `TestBondBelowMinStakeIsRefused` and `TestBondAccumulatesToTheFloor`: 600 alone is
   refused; 600 then 500 is accepted because the *resulting* 1100 clears the floor.
 - `TestUnbondingCoinsAreNeitherSpendableNorCounted`: after `Unbond`, bonded down,
@@ -376,7 +378,10 @@ var ErrZeroCommittee = errors.New("state: CommitteeSize is zero")
   address is a hash, so its byte order is unrelated, and §6.3's tie-break is on the key.
 - The cap: `p_i = min(stake_i, T/4)` with `T` the seated total, applied in passes; each
   pass computes `T` once and clamps everyone against it, repeating until a pass changes
-  nothing. Passes are capped at 64 and a non-converged result is an error, never an
+  nothing. Passes are capped at 256 — a derived bound, not a guess: the slowest case
+  shrinks by a quarter per pass, at most ~155 passes over the uint64 domain (measured
+  worst case 148), and 64 would refuse to seat a committee a real chain can reach — and
+  a non-converged result is an error, never an
   approximation. The pass structure is what makes the result independent of the order
   the validators are visited in.
 - After the fixed point the largest share is at most 1/4 — equality is allowed, because
@@ -924,7 +929,8 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request)
 **Spec coverage.** §6.3's stake weighting, 1/4 cap and 1,000-block epoch are Tasks 1–3;
 §6.5's admission ramp (Bond ≥ MIN_STAKE, top 21, Unbond + cooldown + Withdraw) is Tasks
 0–2; §6.6's peer discovery is Task 4; §9.2's "supply never exceeds the cap, sum of
-accounts is conserved" is Task 1's property test; §10's M5 row — the coefficient plotted
+accounts is conserved" is Task 1's scripted four-step invariant test (not a generated
+property test); §10's M5 row — the coefficient plotted
 and the set rotating at a boundary — is Tasks 3 and 5, wired to the CLI in Task 6.
 
 **Not in this plan, deliberately:** slashing, delegation and a bond marketplace; a
