@@ -426,9 +426,11 @@ appending to one store is not a client design.
 | `withdraw` | `--node URL --key PATH [--yes \| --dry-run]` | `Withdraw` (tag 5): releases **every** matured unbonding record to the spendable balance; fee 0 by consensus rule |
 
 `--amount` is b10 as an exact decimal, parsed by integer arithmetic (no float
-ever holds an amount); the transaction carries sparks. `stake` refuses an amount
-below the node's `min_stake_sparks` and a bond the balance cannot cover, before
-submitting; `unstake` refuses more than is bonded, and refuses a partial exit
+ever holds an amount); the transaction carries sparks. `stake` refuses a bond
+that would end below the node's `min_stake_sparks` — the floor is on the
+RESULTING bond, so a top-up may itself be smaller than the floor — and a bond
+the balance cannot cover, before submitting; `unstake` refuses more than is
+bonded, and refuses a partial exit
 that would leave a bond under `MIN_STAKE` — the state's candidacy floor, so the
 verb and the chain refuse the same remainders; `withdraw` refuses while no
 record has matured and names the next release height. None of the verbs waits
@@ -468,6 +470,19 @@ transaction invalid by misreporting the genesis hash. What it can no longer do
 is choose the fee: the default bounds that loss to one spark, and the
 confirmation shows the number before anything is signed.
 
+There is deliberately **no `--chain-id` flag**. The genesis hash *is* the chain
+binding, and the signature covers the hash the node reports: a transaction
+built against a different chain's node is therefore only valid on that other
+chain and invalid on the chain the operator meant — **useless, not dangerous**,
+because it cannot move a spark on the intended chain. The preview prints that
+hash so the operator can compare it. The CLI also refuses HTTP redirects, since
+a redirect would move these reads outside the node the operator named.
+
+Sparks cross the HTTP API as **JSON numbers, not strings** (`uint64`). Every
+on-chain amount is bounded by the 2.1e15-spark supply cap, below 2^53, so an
+IEEE-754 reader represents each value exactly; a client that does arithmetic on
+them should still use 64-bit integers rather than doubles.
+
 Example, from the live run in [Staking](#staking):
 
 ```text
@@ -479,15 +494,17 @@ transaction to sign (built, not yet signed):
   nonce       0  (the node's claim)
   fee         1 spark  (the node's claim; ceiling 1)
   amount      100000000000 sparks (1000 b10)  (from --amount)
+  effect      the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every 1000 blocks as this node reports it), never mid-epoch
   genesis     bb884a8c1a688674dd329b1effd4551fba01fbf277f37d73f45bdf0053515111  (the node's claim; the signature is bound to it)
   bytes       03de98c0af74f66fcf8f2fbb7bd876ce6848b5b15c20595a3002843c7001986d530a75f3b22301018390eab909d88096b241c9c99f2d00000000000000000000000000000001000000174876e80000
   nonce, fee and genesis above come from http://127.0.0.1:8645 and this CLI cannot check
   them: a node reporting a future nonce builds a bond that applies later,
   and one under-reporting the bond makes an exit partial. Only --amount
   (when given) and the signing key are yours.
+  The signature cannot be withdrawn: once a node accepts these bytes this CLI
+  cannot cancel or replace the transaction, and a bond or exit is irreversible.
 Type "yes" to sign and post this transaction: yes
 txid        5586cdb24337ea3d0f1a9989777f0057bb74a3b6d66caeea1ef788f24bba47af
-the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every 1000 blocks), never mid-epoch.
 ```
 
 **Where the stake comes from is a real limitation, not a footnote.** A bond
@@ -1200,8 +1217,11 @@ by `cmd` alone.
 
 Two configurations ship in `genesis/`, mirroring the design's devnet and
 testnet chains. The Go constructors in `internal/genesis` (`genesis.Devnet`,
-`genesis.Testnet`) are the source of truth the node runs from — nothing parses
-the JSON at runtime, so JSON never enters a hashed path. The JSON files are
+`genesis.Testnet`) are the source of truth the node runs from: the node never
+reads these two JSON files at runtime, so their text never enters a hashed
+path. (An operator's `--genesis` **committee file** is JSON and *is* parsed at
+runtime by `genesis.LoadCommitteeJSON`; its values are re-encoded canonically
+before hashing, so the file's bytes do not.) The JSON files are
 **checked records**: `TestGenesisJSONRecordsMatchTheGoConstructors` unmarshals
 each one and requires it to agree field-for-field with the corresponding
 constructor (`chain_id`, validator and dev-account counts, every `params`
@@ -1339,9 +1359,12 @@ toolchain go.mod pins: currently Go 1.27.3 over language version 1.26.0.
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
 | Acceptance check, M5 rotation + Nakamoto | `go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto` |
 
-Actions in CI are pinned to commit SHAs, not mutable tags, and the whole
-workflow's token is scoped to `contents: read`
-(`.github/workflows/ci.yml`); Dependabot watches Go modules and GitHub
+Actions in CI are pinned to commit SHAs, not mutable tags. The workflow defaults
+the token to `contents: read`; two jobs narrow that further and grant exactly
+one extra permission each: `lint` has `issues: write` (the scheduled
+toolchain-chore step) and the scheduled `report` job has `issues: write` (it
+files the issue for any failed job). `test`, `release` and `cross` remain
+read-only (`.github/workflows/ci.yml`); Dependabot watches Go modules and GitHub
 Actions weekly (`.github/dependabot.yml`).
 
 Makefile targets: `make test`, `make race`, `make build` (produces

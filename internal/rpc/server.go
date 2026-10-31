@@ -45,7 +45,11 @@ type statusResponse struct {
 
 // accountResponse is the /account/{address} view: the spendable account plus
 // the two locked-stake records the staking verbs must know about. Amounts are
-// sparks (uint64), never b10 and never a float.
+// sparks (uint64), never b10 and never a float. They travel as JSON NUMBERS,
+// not strings, to keep the wire contract additive; every on-chain amount is
+// below 2^53 because the supply cap is 2.1e15, so an IEEE-754 reader holds each
+// one exactly, but a client doing arithmetic must use 64-bit integers (audit
+// CL-4).
 //
 // Unbonding is always a JSON list, never null: a client iterating it should
 // not have to special-case "no records". UnbondingTotal is the number of
@@ -237,13 +241,19 @@ type Server struct {
 	chain     *chain.Chain
 	mempool   *mempool.Mempool
 	txLimiter *sourceLimiter
+	// genesisHash is the chain's immutable genesis identifier, computed once
+	// at construction (audit CL-4): /status used to re-hash the whole genesis
+	// on every request. Genesis cannot change under a running chain, so the
+	// hash cannot either.
+	genesisHash [32]byte
 }
 
 func NewServer(c *chain.Chain, mp *mempool.Mempool) *Server {
 	return &Server{
-		chain:     c,
-		mempool:   mp,
-		txLimiter: newSourceLimiter(txRateBurst, txRatePerSecond, txRateMaxSources),
+		chain:       c,
+		mempool:     mp,
+		txLimiter:   newSourceLimiter(txRateBurst, txRatePerSecond, txRateMaxSources),
+		genesisHash: c.Genesis().Hash(),
 	}
 }
 
@@ -270,10 +280,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	// One snapshot, one lock (audit O-8): reading Head() then Height()
 	// separately let a commit in between pair the new height with the old
-	// head's hash and root. Genesis is immutable, so it needs no such care.
+	// head's hash and root. Genesis is immutable, so it needs no such care,
+	// and its hash is cached at construction (audit CL-4).
 	height, headID, stateRoot := s.chain.HeadSnapshot()
 	g := s.chain.Genesis()
-	genesisHash := g.Hash()
+	genesisHash := s.genesisHash
 	writeJSON(w, http.StatusOK, statusResponse{
 		ChainID:   g.ChainID,
 		Height:    height,

@@ -312,7 +312,6 @@ func TestOnePeerCannotSpendMoreThanThePerWaveOrLifetimeBudget(t *testing.T) {
 // is not a no-op, it is a bug the decoder refuses.
 func TestPeerExchangeSendRateIsBounded(t *testing.T) {
 	wave := 10 * time.Millisecond
-	period := time.Duration(peerExchangeEveryWaves) * wave
 	sending, err := StartValidator(ValidatorConfig{
 		Dir:        t.TempDir(),
 		Index:      0,
@@ -325,23 +324,35 @@ func TestPeerExchangeSendRateIsBounded(t *testing.T) {
 	}
 	defer sending.Close()
 
-	// The bound is structural (one send per 4 waves); the ASSERTION is an upper
-	// bound with slack, so a loaded machine can only send fewer. A node that
-	// sent on every wave would be far over it.
-	window := 12 * period
-	time.Sleep(window)
-	got := sending.PeerExchangesSent()
-	ceiling := uint64(window/period) + 2
-	if got == 0 {
-		t.Fatalf("a listening node sent no PEER_EXCHANGE in %s: the mesh would never form", window)
+	// Wait for a NUMBER OF WAVES, not a wall-clock sleep (audit TS-2). The wave
+	// counter is the same clock the sender uses, so a loaded host cannot make
+	// the window too short: it only makes the wait longer. The assertion is an
+	// upper bound with slack, so a slow host can send fewer; a node that sent
+	// on every wave sends about four times the bound.
+	const waves = 12
+	startWave := sending.currentWave()
+	deadline := time.Now().Add(30 * time.Second)
+	for sending.currentWave()-startWave < waves && time.Now().Before(deadline) {
+		time.Sleep(wave)
 	}
+	elapsedWaves := sending.currentWave() - startWave
+	got := sending.PeerExchangesSent()
+	if elapsedWaves < waves {
+		t.Fatalf("the wave loop advanced %d of %d waves in 30 s: the send cadence cannot be measured", elapsedWaves, waves)
+	}
+	if got == 0 {
+		t.Fatalf("a listening node sent no PEER_EXCHANGE in %d waves: the mesh would never form", elapsedWaves)
+	}
+	ceiling := uint64(elapsedWaves/uint64(peerExchangeEveryWaves)) + 2
 	if got > ceiling {
-		t.Fatalf("a node sent %d PEER_EXCHANGE frames in %s; the send bound is one per %d waves (%s), so at most ~%d",
-			got, window, peerExchangeEveryWaves, period, ceiling)
+		t.Fatalf("a node sent %d PEER_EXCHANGE frames in %d waves; the send bound is one per %d waves, so at most ~%d",
+			got, elapsedWaves, peerExchangeEveryWaves, ceiling)
 	}
 
 	// No listener: no advertisement. This is the NAT shape §6.6 describes, and
-	// the reason the sender emits nothing rather than an empty list.
+	// the reason the sender emits nothing rather than an empty list. Wait for
+	// waves so a would-be send boundary has certainly passed, with a deadline
+	// rather than a fixed sleep (audit TS-2).
 	mute, err := StartValidator(ValidatorConfig{
 		Dir:        t.TempDir(),
 		Index:      1,
@@ -352,7 +363,15 @@ func TestPeerExchangeSendRateIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mute.Close()
-	time.Sleep(2 * period)
+	startWave = mute.currentWave()
+	deadline = time.Now().Add(30 * time.Second)
+	for mute.currentWave()-startWave < 2*uint64(peerExchangeEveryWaves) && time.Now().Before(deadline) {
+		time.Sleep(wave)
+	}
+	if elapsed := mute.currentWave() - startWave; elapsed < 2*uint64(peerExchangeEveryWaves) {
+		t.Fatalf("the mute node's wave loop advanced %d of %d waves in 30 s; the no-advertisement check would be vacuous",
+			elapsed, 2*peerExchangeEveryWaves)
+	}
 	if got := mute.PeerExchangesSent(); got != 0 {
 		t.Fatalf("a dial-only node (no listener) sent %d PEER_EXCHANGE frames, want 0", got)
 	}
