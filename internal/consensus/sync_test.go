@@ -211,7 +211,7 @@ func routeHonest(vals []genesis.Validator, ep transport.Transport, d *Driver, sr
 			return
 		}
 		req, err := wire.DecodeBlockSyncReq(m.Data)
-		if err != nil || verifySyncReq(req, vals) != nil {
+		if err != nil || verifySyncReq(req, seatedIn(vals)) != nil {
 			return
 		}
 		if logReq != nil {
@@ -519,6 +519,21 @@ func (w *certWorld) assertUnchanged(where string, height uint64, headID [32]byte
 // syncSignReq signs a request the way PullAndAdopt does, for tests that talk
 // to Answer directly. The nonce is unique per call: the syncer's replay set
 // keys on (requester, nonce), so a repeated fixture request must not reuse one.
+// seatedIn adapts a fixed validator list to verifySyncReq/verifySyncResp's
+// authorisation predicate. Production passes the syncer's chain-backed
+// syncSeated; the fixture tests keep a literal set, and both go through the
+// one gate.
+func seatedIn(vals []genesis.Validator) func([]byte) bool {
+	return func(pub []byte) bool {
+		for i := range vals {
+			if string(vals[i].PubKey) == string(pub) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
 func syncSignReq(t *testing.T, priv ed25519PrivateKey, from, to uint64) *wire.BlockSyncReq {
 	t.Helper()
 	req := &wire.BlockSyncReq{From: from, To: to, Nonce: testNonce.Add(1), Requester: priv.Public().(ed25519PublicKey)}
@@ -591,7 +606,7 @@ func TestASyncerPullsAndAdoptsMissedBlocks(t *testing.T) {
 		t.Fatal("no BLOCK_SYNC request ever went out")
 	}
 	for i, req := range c.reqs {
-		if err := verifySyncReq(req, c.g.Validators); err != nil {
+		if err := verifySyncReq(req, seatedIn(c.g.Validators)); err != nil {
 			t.Fatalf("recorded request %d does not authenticate: %v", i, err)
 		}
 	}
@@ -1756,10 +1771,10 @@ func TestTheAnswererSignsAsItsMemberIdentity(t *testing.T) {
 	if len(resp.Responder) == 0 || len(resp.Sig) == 0 {
 		t.Fatal("the answer carried no responder key or signature")
 	}
-	if err := verifySyncResp(req, resp, committeePub(1), f.chain.Genesis().Validators); err != nil {
+	if err := verifySyncResp(req, resp, committeePub(1), seatedIn(f.chain.Genesis().Validators)); err != nil {
 		t.Fatalf("the answer did not verify as the member that produced it: %v", err)
 	}
-	if err := verifySyncResp(req, resp, committeePub(0), f.chain.Genesis().Validators); !errors.Is(err, ErrBadSyncRespAuth) {
+	if err := verifySyncResp(req, resp, committeePub(0), seatedIn(f.chain.Genesis().Validators)); !errors.Is(err, ErrBadSyncRespAuth) {
 		t.Fatalf("the answer verified against a DIFFERENT selected member (%v): the responder pin did not hold", err)
 	}
 }
@@ -2134,5 +2149,189 @@ func TestAReplayedSyncRequestDoesNotSpendTheMembersBudget(t *testing.T) {
 	honest := syncSignReq(t, f.pullerKey, 1, 1)
 	if _, err := f.server.Answer(honest); err != nil {
 		t.Fatalf("the member's own next request was refused after 50 replays of a captured frame: %v", err)
+	}
+}
+
+// RT-5. The pre-fix order RECORDED a (requester, nonce) before the rate bucket
+// charged for it, so an authenticated member could send distinct nonces past
+// its own budget for free: every refused request still entered the fixed
+// 4,096-entry replay set, evicting other members' served entries until the
+// replay drain the reorder had closed came back. This test constructs the
+// eviction pressure rather than provoking it:
+//
+//   - the replay set is put exactly AT its cap, with one honest served entry in
+//     it and every entry fresh, so nothing is reclaimable;
+//   - the flooder's only token is spent by a request of its own, so the bucket
+//     refuses every distinct nonce the loop then sends.
+//
+// An admitted request may still evict one entry (that is the documented bounded
+// cache, and it costs a token); a REFUSED one must touch nothing. On the
+// pre-fix order the first refused nonce is already in the set, and the loop's
+// 64 insertions evict the honest entry.
+func TestARefusedSyncRequestIsNotRecordedInTheReplaySet(t *testing.T) {
+	f := newCertServeFixture(t, 2)
+	f.server.RateLimit = 1
+	f.server.RateWindow = time.Minute // never resets mid-test
+
+	flooder := testCommitteeKey(2)
+	if _, err := f.server.Answer(syncSignReq(t, flooder, 1, 1)); err != nil {
+		t.Fatalf("the flooder's first (admitted) request was refused: %v", err)
+	}
+
+	honest := seenKey{who: string(f.pullerKey.Public().(ed25519PublicKey)), nonce: 1 << 62}
+	now := f.server.now()
+	f.server.seenMu.Lock()
+	f.server.seen = make(map[seenKey]time.Time, syncSeenMax)
+	f.server.seen[honest] = now
+	for i := len(f.server.seen); i < syncSeenMax; i++ {
+		f.server.seen[seenKey{who: "filler", nonce: uint64(i)}] = now
+	}
+	f.server.seenMu.Unlock()
+
+	var flood []*wire.BlockSyncReq
+	for i := 0; i < 64; i++ {
+		req := syncSignReq(t, flooder, 1, 1)
+		flood = append(flood, req)
+		if _, err := f.server.Answer(req); !errors.Is(err, ErrSyncRateLimited) {
+			t.Fatalf("distinct nonce %d past the flooder's budget gave %v, want ErrSyncRateLimited", i, err)
+		}
+	}
+
+	f.server.seenMu.Lock()
+	defer f.server.seenMu.Unlock()
+	if _, ok := f.server.seen[honest]; !ok {
+		t.Fatal("refused requests evicted another member's served nonce: the replay drain RT-5 closed is open again")
+	}
+	if len(f.server.seen) != syncSeenMax {
+		t.Fatalf("the replay set holds %d entries after 64 REFUSED requests, want its cap %d: a refused request must record nothing", len(f.server.seen), syncSeenMax)
+	}
+	for i, req := range flood {
+		if _, ok := f.server.seen[seenEntry(req)]; ok {
+			t.Fatalf("refused request %d was recorded in the replay set: a nonce the bucket refused bought no work, so it must buy no memory", i)
+		}
+	}
+}
+
+// rotatedOutSyncChain builds the RT-3 state on a real chain: four genesis
+// seats, a five-seat committee, and a FUNDED NON-GENESIS key X that bonds into
+// epoch 1 and unbonds fully in epoch 1 so that epoch 2 seats only the four
+// genesis validators. At the head (height >= 8, epoch 2) X is in NO committee
+// that outlives its epoch - and yet it has held a seat, which is the only term
+// that admits it. Committee epochs are 4 blocks; the deciding heights are 3
+// (epoch 1 seats X) and 7 (epoch 2 drops X).
+func rotatedOutSyncChain(t *testing.T) (*chain.Chain, *genesis.Genesis, ed25519PrivateKey) {
+	t.Helper()
+	g := fourValGenesis(t)
+	g.Params.EpochBlocks = 4
+	g.Params.CommitteeSize = 5
+	xpub, xpriv := genesis.DevAccountKey(0)
+	ch, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatalf("opening the rotated-out fixture chain: %v", err)
+	}
+	t.Cleanup(func() { _ = ch.Close() })
+
+	sign := func(tx *types.Tx) *types.Tx {
+		h := tx.SigningHash(g.Hash())
+		tx.Sig = crypto.Sign(xpriv, h[:])
+		return tx
+	}
+	build := func(txs ...types.Tx) {
+		b, err := ch.Build(testCommitteeKey(0), txs, ch.Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatalf("building block %d: %v", ch.Height()+1, err)
+		}
+		if err := ch.Append(b); err != nil {
+			t.Fatalf("appending block %d: %v", ch.Height()+1, err)
+		}
+	}
+	bond := sign(&types.Tx{
+		Type: types.TxBond, From: types.AddressFromPub(xpub), PubKey: xpub,
+		Nonce: 0, Fee: g.Params.MinFeeSparks, Amount: g.Params.MinStakeSparks,
+	})
+	build(*bond) // 1: X bonds (epoch 0, so epoch 1's deciding state holds it)
+	build()      // 2
+	build()      // 3: epoch 1 is decided here
+	if !ch.IsSeatedAt(4, xpub) {
+		t.Fatal("fixture: the post-genesis bond was not seated in epoch 1")
+	}
+	build() // 4
+	unbond := sign(&types.Tx{
+		Type: types.TxUnbond, From: types.AddressFromPub(xpub), PubKey: xpub,
+		Nonce: 1, Fee: 0, Amount: g.Params.MinStakeSparks,
+	})
+	build(*unbond) // 5: X leaves the bond map mid-epoch
+	build()        // 6
+	build()        // 7: epoch 2 is decided here, without X
+	build()        // 8
+	build()        // 9
+	build()        // 10
+	if got := ch.Height(); got != 10 {
+		t.Fatalf("fixture: height %d, want 10", got)
+	}
+	if ch.IsSeatedAt(9, xpub) || ch.IsSeatedAt(10, xpub) {
+		t.Fatal("fixture: X is still seated at the head; the rotated-out state was not constructed")
+	}
+	return ch, g, xpriv
+}
+
+// RT-3, the AUTHORISATION half, at the same height a stranger is refused at.
+// The chain is the constructed rotated-out state above. X's pull names its own
+// head, height 9 (epoch 2), where X holds no seat; the node answering is at the
+// same head 10. Without the ever-seated term the request is refused
+// (ErrBadSyncAuth) even though X was a member one epoch ago. A key that has
+// never held a seat is STILL refused, by the same gate, on the same request.
+func TestASyncPullIsAdmittedForARotatedOutPostGenesisSeat(t *testing.T) {
+	ch, g, xpriv := rotatedOutSyncChain(t)
+	xpub := xpriv.Public().(ed25519PublicKey)
+
+	// A certificate at the head, so the pull can be SERVED rather than merely
+	// get past the membership check. The fixture's quorum cert signs genesis
+	// seats 0..2, which are exactly the epoch-2 committee's seats.
+	srv := NewSyncer(ch, nil, testCommitteeKey(1))
+	head, err := ch.BlockAt(ch.Height())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.RecordCommit(ch.Height(), 2, quorumCertFor(t, head, ch.Height(), 2))
+
+	// X is a post-genesis key, not a genesis seat, and holds no seat at its
+	// own head (9) or at the answering node's head (10).
+	if genesis.SeatOfPubKey(g.Validators, xpub) >= 0 {
+		t.Fatal("fixture: X is a genesis seat")
+	}
+	if ch.IsSeatedAt(9, xpub) || ch.IsSeatedAt(10, xpub) || ch.IsSeatedAt(0, xpub) {
+		t.Fatal("fixture: X is seated at 0, 9 or 10; the only admitting term would not be ever-seated")
+	}
+	if !ch.EverSeated(xpub) {
+		t.Fatal("fixture: X has no ever-seated record")
+	}
+
+	// THE WIDENING: a rotated-out post-genesis member is admitted by NAME.
+	resp, err := srv.Answer(syncSignReq(t, xpriv, 10, 10))
+	if err != nil {
+		t.Fatalf("a pull from a validator seated in the previous epoch was refused: %v", err)
+	}
+	if len(resp.Units) != 1 {
+		t.Fatalf("the admitted pull served %d units, want 1", len(resp.Units))
+	}
+
+	// THE BOUNDARY: the same request from a key that never held a seat is
+	// refused by the same gate at the same head.
+	strangerPub, strangerPriv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ch.EverSeated(strangerPub) || genesis.SeatOfPubKey(g.Validators, strangerPub) >= 0 {
+		t.Fatal("fixture: the stranger key has held a seat")
+	}
+	if _, err := srv.Answer(syncSignReq(t, strangerPriv, 10, 10)); !errors.Is(err, ErrBadSyncAuth) {
+		t.Fatalf("a stranger's pull at the same head gave %v, want ErrBadSyncAuth", err)
+	}
+
+	// And the gate's positive term is ever-seated, not "any key": a genesis
+	// seat at the same head is admitted too, unchanged.
+	if _, err := srv.Answer(syncSignReq(t, testCommitteeKey(0), 10, 10)); err != nil {
+		t.Fatalf("a genesis seat's pull at the same head was refused: %v", err)
 	}
 }

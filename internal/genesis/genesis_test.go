@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -717,6 +719,57 @@ func TestValidateRejectsAnOutOfRangeCommitteeSize(t *testing.T) {
 		g.Params.CommitteeSize = size
 		if err := g.Validate(); !errors.Is(err, ErrBadGenesis) {
 			t.Fatalf("expected ErrBadGenesis for CommitteeSize %d, got %v", size, err)
+		}
+	}
+}
+
+// RT-9: a genesis must not name more validators than its committee can seat.
+// CommitteeSize caps the top-N stake selection, while the node entry point and
+// chain.Append admit EVERY listed key: a crafted genesis with
+// CommitteeSize < len(Validators) would ship keys authorised to start a node
+// and sign blocks that can never hold a seat. The committee-file loader already
+// refuses this; Validate is the general contract chain.Open enforces, so it
+// must refuse it too (the "unreachable through the loader" argument is not a
+// reason to leave it open).
+func TestValidateRejectsACommitteeSmallerThanTheValidatorList(t *testing.T) {
+	cases := []struct {
+		validators int
+		size       int
+		refused    bool
+	}{
+		{3, 2, true},  // the audit's crafted shape: one key can never seat
+		{3, 0, true},  // zero seats cannot seat any of the three
+		{3, 3, false}, // exactly enough: no spare seat
+		{3, 4, false}, // one spare seat, the RT-2 fix's shape
+		{3, maxCommitteeSize, false},
+		{0, 0, false}, // an empty, not-yet-populated genesis stays legal
+	}
+	for _, tc := range cases {
+		g := Testnet()
+		g.Validators = make([]Validator, tc.validators)
+		for i := range g.Validators {
+			pub, _, err := crypto.GenerateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			g.Validators[i] = Validator{PubKey: pub, Power: 1}
+		}
+		g.Params.CommitteeSize = tc.size
+		err := g.Validate()
+		if tc.refused {
+			if !errors.Is(err, ErrBadGenesis) {
+				t.Fatalf("%d validators over a %d-seat committee must be refused with ErrBadGenesis, got %v",
+					tc.validators, tc.size, err)
+			}
+			for _, want := range []string{fmt.Sprintf("CommitteeSize is %d", tc.size), "could never hold a seat"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal must name what is wrong (%q missing): %v", want, err)
+				}
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%d validators over a %d-seat committee must be legal: %v", tc.validators, tc.size, err)
 		}
 	}
 }

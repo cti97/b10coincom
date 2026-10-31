@@ -342,14 +342,19 @@ func TestAValidatorThatJoinsLateCatchesUpOverTCP(t *testing.T) {
 	// a 60-second margin. If one of the three live seats falls a round or two
 	// ahead - the `-race` clock/dispatch skew that produced this test's CI
 	// flake - the round gap closes only through the timeout-ladder asymmetry,
-	// and its latency grows with the gap. At this devnet's production timeouts
-	// (base 200ms, step 100ms) a gap-1 divergence recovers in ~2s, gap 3 in
-	// ~150s and the constructed gap-5 shape in ~490s (8.2 min). Ten minutes
-	// clears the constructed shape with margin; it does NOT make recovery
-	// fast, and a deeper divergence (gap 10 is ~42 min) would still exceed it.
-	// Removing the old saturating cap turned a permanent park into a finite
-	// one - see driver.go's Tick comment and README "Consensus" for the
-	// operational consequence.
+	// and its latency grows with BOTH the gap and the round it starts at. At
+	// this devnet's production timeouts (base 200ms, step 100ms) the estimate
+	// near the old cap's round 16 is gap 1 ~2s, gap 3 ~150s and the
+	// constructed gap-5 shape ~8.2 min, which this ten-minute budget clears.
+	// The same five-round gap STARTING AT ROUND 40 was measured at 1597s
+	// (26.6 min) in the constructed three-of-four state - the round the
+	// field's rolling-restart stall reached - so ten minutes does NOT bound a
+	// recovery from the round a real outage can leave behind, and a deeper
+	// divergence (round-40 gap 10 is well over an hour) would exceed it too.
+	// The budget below is sized for THIS fixture's near-cap divergence, not
+	// offered as a recovery guarantee; removing the old saturating cap turned
+	// a permanent park into a finite one - see driver.go's Tick comment and
+	// README "Consensus" for the operational consequence.
 	waitAllReach(t, vs[:3], 6, 10*time.Minute)
 
 	late, err := StartValidator(ValidatorConfig{

@@ -675,6 +675,22 @@ type committeeCandidate struct {
 // equal keys and equal amounts would then hash an arbitrary map order, so the
 // address makes the order total and the derivation deterministic for every
 // state, not merely every reachable one.
+//
+// THE KEY TIE-BREAK IS GRINDABLE, and that is accepted rather than hidden
+// (audit RT-8). Among candidates with EQUAL bonded stake, the seat boundary
+// runs through raw public-key bytes, and a key's owner chooses those bytes
+// when it generates the key: an attacker who wants to outrank an equally
+// staked honest candidate - or to win the last free seat - can generate keys
+// until its key sorts first, at the cost of keygen attempts and one bond per
+// try. Nothing here makes that impossible, and nothing safety-critical rests
+// on the order: the order decides WHO holds a seat among equally staked
+// candidates, never whether the derivation is deterministic (every node sorts
+// the same bytes identically) or how much power a seat carries (the cap is a
+// function of the seated total). The alternative - ordering by address - is
+// just as grindable (an address is a key hash), and a secret or committee-voted
+// tie-break would put a non-state input into a pure function of committed
+// state. Grinding also competes for seats at a cost of MIN_STAKE per attempt,
+// and ST-1's floor plus the epoch cooldown bound how fast seats can be retried.
 func compareCandidates(x, y committeeCandidate) int {
 	switch {
 	case x.amount > y.amount:

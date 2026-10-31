@@ -433,11 +433,30 @@ func (e *Engine) OnTimeout(ev TimeoutEvent) error {
 		// An engine whose key has no seat returns ErrNotValidator HERE and does
 		// not enter the next round (audit C-11:
 		// TestANonMemberEngineReturnsAnErrorInsteadOfPanicking). That is the
-		// inert shape a rotated-out validator's driver runs: it tallies and it
-		// emits nothing. If it falls behind it is caught up by the node's pull,
-		// which rebuilds the engine at the adopted head - so the freeze costs a
-		// lag, never a stall of the chain. Do not swallow this error to make it
-		// advance rounds: the error IS the contract.
+		// inert shape a rotated-out validator's driver runs IF NO PROPOSAL
+		// ARRIVED for the round: it tallies and it emits nothing, and this
+		// branch hands the error back instead of advancing. If it falls behind
+		// it is caught up by the node's pull, which rebuilds the engine at the
+		// adopted head - so with no proposal the freeze costs a lag, never a
+		// stall of the chain. Do not swallow this error to make it advance
+		// rounds: the error IS the contract.
+		//
+		// THE COMMENT USED TO SAY THIS WAS THE ONLY SHAPE, AND IT IS NOT (audit
+		// RT-10). A round-0 PROPOSAL that reaches an unseated engine takes the
+		// other path: maybePrevote records StepPrevote before its own
+		// emitVote, that emission is refused by CheckMembership, and the
+		// engine is left at StepPrevote with the error returned to the caller.
+		// On the next timeout this branch is skipped (the step is no longer
+		// StepPropose), so the engine DOES enter round 1 - and if the round's
+		// prevotes reach a polka, maybePrecommit locks and persists a lock at
+		// a height where it holds no seat. That is harmless (the lock is a
+		// promise by a non-seat, it can only ever prevent a vote this engine
+		// cannot cast anyway, and PruneLocks drops it once the height
+		// commits), but it is a STATE TRANSITION, not the inertness claimed
+		// here before. What remains true, and is the property that matters: an
+		// unseated engine emits nothing - every emitVote is refused at
+		// CheckMembership - so it cannot vote, propose, or contribute weight
+		// to any quorum. "Inert" means NO EMISSION, not "no state change".
 		if err := e.emitVote(MsgPrevote, [32]byte{}); err != nil {
 			return err
 		}

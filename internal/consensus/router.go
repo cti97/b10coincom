@@ -158,56 +158,29 @@ func NewMessageRouter(sync *Syncer) *MessageRouter {
 	return &MessageRouter{Sync: sync}
 }
 
-// committee returns the validator set membership is checked against FOR A
-// HEIGHT, and whether a committee is known at all.
-//
-// Committee, when set explicitly, wins and is height-independent: that is the
-// unit-test shape (a fixed fixture set), never a node built through
-// NewMessageRouter with a live syncer.
-//
-// Otherwise the set is the syncer chain's committee at THAT height - the
-// epoch's set, not the genesis one. This is the whole point of the per-frame
-// height here: a vote signed by a validator whose seat ended at the boundary
-// must fail membership, and a vote signed by one whose seat began there must
-// pass it, in the same round. A genesis-wide check admits the first and
-// refuses the second, which is the cross-boundary failure
-// TestTheRouterRefusesTheOldEpochsVotes pins.
-//
-// A height the chain cannot answer for (a future epoch, a chain whose genesis
-// cannot seat a committee) is reported as KNOWN-but-empty rather than unknown:
-// the caller then refuses the frame. Falling back to an unknown committee
-// would skip the membership check entirely and let a self-signed stranger
-// through to the signature branch, which proves nothing about membership.
-// The returned slice is never mutated here.
-func (r *MessageRouter) committee(h uint64) ([]genesis.Validator, bool) {
-	if r.Committee != nil {
-		return r.Committee, true
-	}
-	if r.Sync != nil && r.Sync.chain != nil {
-		vals, err := r.Sync.chain.CommitteeAt(h)
-		if err != nil {
-			return nil, true
-		}
-		return vals, true
-	}
-	return nil, false
-}
-
 // isMemberAt reports whether pub is a committee key at height h, and whether a
 // committee is known at all. known=false (no syncer chain and no explicit
 // Committee) means the caller must fall back to the signature check alone: the
 // unit-test shape, never a node built through NewMessageRouter.
+//
+// On the chain path this asks Chain.IsSeatedAt, NOT Chain.CommitteeAt: every
+// vote and every proposal runs this check before its signature is verified, and
+// CommitteeAt's defensive deep copy (a slice plus one allocation per seat, up
+// to 255) was paid per frame for an answer that is a boolean (audit RT-6). The
+// set tested is the same memoised epoch committee; only the copy is gone.
 func (r *MessageRouter) isMemberAt(pub []byte, h uint64) (member, known bool) {
-	vals, known := r.committee(h)
-	if !known {
-		return false, false
-	}
-	for i := range vals {
-		if string(vals[i].PubKey) == string(pub) {
-			return true, true
+	if r.Committee != nil {
+		for i := range r.Committee {
+			if string(r.Committee[i].PubKey) == string(pub) {
+				return true, true
+			}
 		}
+		return false, true
 	}
-	return false, true
+	if r.Sync != nil && r.Sync.chain != nil {
+		return r.Sync.chain.IsSeatedAt(h, pub), true
+	}
+	return false, false
 }
 
 // voteHeightInWindow reports whether a vote at height could still be judged by

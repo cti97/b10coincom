@@ -351,6 +351,21 @@ func (g *Genesis) Validate() error {
 	if p.CommitteeSize < 0 || p.CommitteeSize > maxCommitteeSize {
 		return fmt.Errorf("%w: CommitteeSize is %d, want 0..%d", ErrBadGenesis, p.CommitteeSize, maxCommitteeSize)
 	}
+	// A genesis must not name more validators than its committee can seat
+	// (audit RT-9). CommitteeSize caps the TOP-N selection the stake
+	// derivation performs, while the node entry point and chain.Append admit
+	// EVERY key in g.Validators: a crafted genesis with CommitteeSize below
+	// the list therefore ships keys that are authorised to sign blocks and to
+	// start a node but can never hold a seat, silently raising the quorum bar
+	// for the seats that do exist. The committee-file loader already refuses
+	// this (ParseCommitteeJSON requires committee_size >= len(validators)), so
+	// this is the general contract chain.Open enforces, one layer down; it
+	// costs one comparison and removes the "unreachable through the loader"
+	// caveat rather than resting on it.
+	if p.CommitteeSize < len(g.Validators) {
+		return fmt.Errorf("%w: CommitteeSize is %d but the genesis names %d validators, so %d listed key(s) could never hold a seat (committee_size must be at least the validator count; a LARGER number leaves spare seats)",
+			ErrBadGenesis, p.CommitteeSize, len(g.Validators), len(g.Validators)-p.CommitteeSize)
+	}
 	// The genesis timestamp is the height-0 block's timestamp and obeys the
 	// same rule every later block does (types.ValidateStructure: Timestamp > 0).
 	// A non-positive genesis time is not a time.

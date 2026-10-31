@@ -599,9 +599,22 @@ func (d *Driver) Tick(nowMillis int64) {
 		// now grows its rounds' cost without bound: at production defaults
 		// (base 200ms, step 100ms) round 16 costs 1.8s, round 100 costs
 		// 10.2s, round 1000 costs 100.2s and round 10000 costs about 16.7
-		// min; a round divergence of gap g recovers in finite time that grows
-		// with g - gap 1 in 2s, gap 3 in 150s, gap 5 in 490s (8.2 min), gap
-		// 10 in 42 min, gap 50 in 2.6 days, gap 100 in 26 days. OPERATIONAL
+		// min. A round divergence closes in finite time that grows with BOTH
+		// the gap AND THE ROUND IT STARTS AT, because every round's deadline
+		// is larger than the last. MEASURED on the constructed three-of-four
+		// state (one live seat ahead) at production timeouts: a ONE-round gap
+		// starting at round 40 commits after about 13 s, and a FIVE-round gap
+		// there after 1597 s (26.6 min, ~27 min rounded). Those are the
+		// figures the M5 re-run report and README carry, and the round-40
+		// gap-5 case is the operative one - it is the round the field's
+		// rolling-restart stall reached. The older estimate for a divergence
+		// starting near the old cap's round 16 was gap 1 ~2 s, gap 3 ~150 s,
+		// gap 5 ~8.2 min, gap 10 ~42 min; it is a starting-point-specific
+		// estimate, NOT the cost of the same gap at round 40, where the same
+		// gap is more than three times slower. This comment previously
+		// presented the round-16 figures as the recovery cost without saying
+		// what round they started at, which read as a contradiction of the
+		// measured ~27 minutes; audit RT-11 caught exactly that. OPERATIONAL
 		// CONSEQUENCE, and an operator must know it: on three Raspberry Pis,
 		// a long outage that leaves one live seat a single round ahead can
 		// hold the chain effectively down for many minutes, and a deep

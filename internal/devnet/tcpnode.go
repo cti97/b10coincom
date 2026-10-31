@@ -1004,10 +1004,37 @@ func committeeMemberAt(ch *chain.Chain, g *genesis.Genesis, pub []byte, height u
 	if genesis.SeatOfPubKey(g.Validators, pub) >= 0 {
 		return true
 	}
-	if vals, err := ch.CommitteeAt(height); err == nil && genesis.SeatOfPubKey(vals, pub) >= 0 {
+	if ch.IsSeatedAt(height, pub) {
 		return true
 	}
-	if vals, err := ch.CommitteeAt(ch.Height()); err == nil && genesis.SeatOfPubKey(vals, pub) >= 0 {
+	if ch.IsSeatedAt(ch.Height(), pub) {
+		return true
+	}
+	// EVER SEATED (audit RT-3). A validator that joined after genesis and
+	// later rotated out is in NONE of the sets above once the committee moves
+	// on: not genesis, not the committee at its lagging head, not the
+	// committee at the peers' head. Without this term its HELLO is refused,
+	// the connection is never admitted, its BLOCK_SYNC requests never reach
+	// the router, and the process is frozen: its engine is inert and its
+	// catch-up is refused, so it can neither follow nor re-announce. That is
+	// the state `4972883` recorded as open.
+	//
+	// THE WIDENING, stated exactly: this term admits any key that has ever
+	// held a seat on THIS node's committed chain, forever, including after it
+	// unbonds and withdraws. Genesis keys already had that permanence (they
+	// are the first term above); the change is that a post-genesis seat now
+	// gets the same treatment instead of freezing when it ends. It admits NO
+	// key that never held a seat, and it is an authorisation (DoS-budget) gate
+	// only: the router still checks the committee at the frame's own height,
+	// and the certificate gate still re-tallies every adopted block against
+	// the seats of ITS epoch, so a rotated-out key that is admitted here
+	// cannot vote, propose or authorise anything (audit RT-7). There is no
+	// cheap narrowing to state beside it: this term is the minimum that names
+	// a rotated-out member at all, and a time-bounded version would re-freeze
+	// that member after a long outage while the genesis keys keep their
+	// unbounded permanence. Bounding THOSE is the separate change RT-7
+	// describes, not something this set makes cheaper.
+	if ch.EverSeated(pub) {
 		return true
 	}
 	return false
