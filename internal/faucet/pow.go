@@ -2,9 +2,12 @@
 // that rate-limits claims, and the emission schedule that funds them.
 //
 // PoW here is NOT consensus. It is a rate limiter on a faucet. The difficulty is
-// calibrated so a Raspberry Pi completes a puzzle in seconds, and at that
-// difficulty ASICs confer no meaningful advantage. The chain's security comes
-// from the validator set (M3), not from this.
+// calibrated so a Raspberry Pi completes a puzzle in seconds; it is not a
+// mining race, and the chain's security comes from the validator set (M3), never
+// from this. Argon2id's memory hardness means raw compute speed buys little, so
+// an ASIC is a poor fit for the puzzle - but this file does not claim an ASIC
+// would gain NOTHING, because nothing here measures one. The claim that matters
+// is the one above: no faucet puzzle result can affect consensus.
 package faucet
 
 import (
@@ -71,8 +74,10 @@ func TargetWithLeadingZeroBits(bits int) [32]byte {
 func PreTarget() [32]byte { return preTarget }
 
 // Argon2Params configures the puzzle. Argon2id is memory-hard, so the cost of a
-// guess is dominated by memory bandwidth rather than raw compute — which is
-// exactly why ASICs do not help at this difficulty.
+// guess is dominated by memory bandwidth rather than raw compute, which is why a
+// specialized ASIC has little to exploit compared with a general-purpose
+// machine. That is a reason the puzzle is a fair rate limiter, not a measured
+// claim that an ASIC confers no advantage.
 type Argon2Params struct {
 	MemoryKiB   uint32
 	Iterations  uint32

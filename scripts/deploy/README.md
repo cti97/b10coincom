@@ -390,18 +390,20 @@ authenticates nothing by design, so whatever can reach 7001 can flood, pin
 connection slots and censor honest votes (its `--help` records the bound it
 puts on that) — allowlisting the validators is what keeps strangers off.
 
-### 4.1 The in-process access token (audit N-8)
+### 4.1 The in-process access token (audit N-8, PX-3, D-1)
 
 An IP allowlist is not always usable: a home validator behind CGNAT shares a
 pool address that rotates, and the allowlist has to be edited every time it
-does. The relay therefore ALSO supports a **pre-shared token** — a token both
-ends hold, compared by length and equality, with no decoding. The relay
-announces the gate with a fixed first frame, the node answers with the token,
-and the relay confirms with a second fixed frame; a node that does not see the
-greeting REFUSES to send the token (a relay started without
-`--access-token-file` would forward it to every peer) and logs the refusal, as
-does a node whose token the relay rejects. Generate at least 16 bytes: a
-shorter token is brute-forced by dialling:
+does. The relay therefore ALSO supports a **pre-shared token** — a secret both
+ends hold, used only as an HMAC key, with no decoding. The exchange has four
+fixed-width frames: the relay announces the gate with a fixed first frame and
+sends a fresh 32-byte challenge; the node answers
+`HMAC-SHA-256(token, challenge)` — the token itself is NEVER sent — and the
+relay sends `HMAC-SHA-256(token, challenge ‖ answer)` as the confirmation. A
+node that does not see the greeting REFUSES to answer (a relay started without
+`--access-token-file` would forward the answer to every peer) and logs the
+refusal, as does a node whose answer the relay rejects. Generate at least 16
+bytes: a shorter token is brute-forced by dialling:
 
 ```sh
 # on the VPS, once; readable only by the service user
@@ -413,27 +415,51 @@ sudo -u b10coin /opt/b10coin/b10coin-relay --addr :7001 \
     --access-token-file /var/lib/b10coin/relay.token
 ```
 
-Every connection must send exactly those bytes (a trailing newline is
-trimmed) as the frame after the greeting or it is closed and counted
-`unauthorized`. The token frame is consumed, never forwarded, and an
-unauthenticated connection is never registered, so it receives nothing. Copy
-the SAME token file to every Pi (`scp`, mode 0600) and give each node
-`--relay-access-token-file` (§5, §6).
+Every connection must answer that challenge (a trailing newline on the token
+file is trimmed) or it is closed and counted `unauthorized`. The answer is
+consumed, never forwarded, and an unauthenticated connection is never
+registered, so it receives nothing. Copy the SAME token file to every Pi
+(`scp`, mode 0600) and give each node `--relay-access-token-file` (§5, §6). A
+node and a relay of different gate vintages refuse each other and the node logs
+the reason; upgrade both together.
 
-**Two limits of this layer, stated because nothing else states them:** the
-token travels in **plaintext** over TCP, so anyone who can observe the link
-reads it; and it is **replayable**, because it is a constant compared once per
-connection that neither end challenges or expires. It authenticates a
-connection, not a peer — run it over a trusted path (a VPN), and treat its
-disclosure as a connection someone else can make.
+**What the gate proves, and what it does not.** It proves that the far end holds
+the token. The old third frame was a public constant, so a stranger on a
+token-less relay could loop greeting/challenge/accepted into a token-configured
+node and make it install the link as gated, silently defeating the operator's
+"only a gated relay" intent (audit D-1). The confirmation is now a token-keyed
+MAC over the challenge and the node's answer, which that stranger cannot
+compute, so the loop no longer installs anything. **Two limits remain, stated
+because nothing else states them:** the token travels in **plaintext** over TCP,
+so anyone who can observe the link reads it; and the relay proves possession,
+not an identity — an attacker who can proxy the node's exchange to a genuine
+gated relay holding the same token, and carry its confirmation back, can still
+interpose. No shared-secret gate without a relay identity closes that. Run it
+over a trusted path (a VPN), and treat disclosure of the token as a connection
+someone else can make.
 
-This keeps the relay's "parses nothing" property exactly: the relay reads one
-frame, compares raw bytes, and writes two constant frames. There is no
-decoder, no tag check and no consensus concept anywhere in the path — the
-token is opaque to the relay. Use BOTH layers where you can: the allowlist is
-the cheap outer filter, and the token is the one that survives a rotating
-CGNAT address. With no token the relay sends no greeting and behaves exactly
-as before.
+**The gate's own resource bounds, measured (audit D-5).** A token dial that
+answers nothing is closed `--access-timeout` seconds after accept (5 s default;
+measured at 5.0 s on the audit host, not the ~95 s the 2026-10-31 audit
+reported, because the two gate frames are under 300 bytes and fit the socket
+buffer even when the dialer never reads). A gate frame that cannot be written is
+a dying socket and is no longer counted `unauthorized`; only a wrong, short or
+absent answer is. Once a socket is gated, a HELLO-shaped frame costs one Ed25519
+verification before the per-wave hint window can be consulted - the window is
+keyed by the claimed validator key, and that key is not authenticated until the
+signature verifies, so the verify cannot safely move first. On a relay,
+`observePeerExchange` likewise spends one verification per frame before its
+window, because the frame names an unauthenticated signer. Both are single
+verifications (tens of microseconds), bounded by each connection's frame rate;
+neither makes the relay or the node do work on another peer's behalf.
+
+This keeps the relay's "parses nothing" property exactly: it writes one
+constant, one random nonce plus its own address, reads one MAC, and writes one
+MAC over bytes it already holds. There is no decoder, no tag check and no
+consensus concept anywhere in the path — the token is opaque to the relay. Use
+BOTH layers where you can: the allowlist is the cheap outer filter, and the
+token is the one that survives a rotating CGNAT address. With no token the
+relay sends no greeting and behaves exactly as before.
 
 The relay binds everything a stranger controls (frame size, connection
 count, per-connection buffers, stalled-read timeout) and authenticates
@@ -490,16 +516,19 @@ the key never leaves the machine, and the verbs never open the data directory:
 sudo -u b10coin /opt/b10coin/b10coin stake \
     --node http://127.0.0.1:8645 \
     --key  /var/lib/b10coin/b10coin.key \
-    --amount 1000 --yes
+    --amount 1000
 ```
 
 `--amount` is **b10**, as an exact decimal — the command converts it to sparks
 with integer arithmetic and signs against the `genesis_hash` the node reports,
 so it is the same ordinary signed transaction a transfer is. It prints the
 whole transaction (from, nonce, fee, amount, genesis hash and canonical bytes)
-*before* signing and then the **txid**; `--yes` confirms a non-interactive run
-(the verbs otherwise require a terminal answer of "yes", and `--dry-run`
-prints the transaction without signing or posting). It does not wait, because a
+*before* signing and then the **txid**. It then asks you to type `yes`; add
+`--yes` only for an unattended run, which is the deliberate statement that no
+human will confirm (the verbs otherwise require a terminal answer of "yes", and
+`--dry-run` prints the transaction without signing or posting). `--yes` and
+`--dry-run` together are accepted, but `--dry-run` wins: nothing is signed and
+`--yes` is inert. It does not wait, because a
 bond takes effect when a block applies it and a **seat** changes only at the
 next epoch boundary. The fee ceiling is one spark by default (the protocol
 minimum on every shipped genesis; a higher fee is burned and buys nothing) —
@@ -508,7 +537,7 @@ minimum on every shipped genesis; a higher fee is burned and buys nothing) —
 ```sh
 # unbond everything (or give --amount, leaving at least MIN_STAKE bonded);
 # fee 0 by consensus rule
-sudo -u b10coin /opt/b10coin/b10coin unstake --yes \
+sudo -u b10coin /opt/b10coin/b10coin unstake \
     --node http://127.0.0.1:8645 \
     --key /var/lib/b10coin/b10coin.key
 # ... the output names the RELEASE HEIGHT: the coins are neither spendable
@@ -520,7 +549,7 @@ sudo -u b10coin /opt/b10coin/b10coin unstake --yes \
 # minute apart (the driver's rhythm is the round protocol's; `block_time_ms` is
 # the spec's target, not a pacing timer).
 # Once the chain is at or past it:
-sudo -u b10coin /opt/b10coin/b10coin withdraw --yes \
+sudo -u b10coin /opt/b10coin/b10coin withdraw \
     --node http://127.0.0.1:8645 \
     --key /var/lib/b10coin/b10coin.key
 ```
@@ -837,12 +866,14 @@ hashes below, never from reachability).
 
    **Fault recipes: name the survivors, not the stopped node.** The harness also
    accepts **two** validators, which is how §8's "stop one seat and see whether
-   the two survivors are STALLED" is judged: pass the two live Pis and expect
-   **STALLED** (exit 2), the correct verdict for 2 of 3, below quorum. A
-   two-validator PASS is possible too, and the output says it is a partial
-   reading rather than M4's criterion. Entries are de-duplicated by *machine*, so
-   `pi-a` and `pi-a:8645` are one validator, and a repeated host is a usage error
-   instead of a phantom third seat.
+   the two survivors are STALLED" is judged: pass the two live Pis WITH
+   `--partial` and expect **STALLED** (exit 2), the correct verdict for 2 of 3,
+   below quorum. The flag is required for two: a two-validator reading is a
+   partial reading, and a two-validator PASS now exits **6** (PARTIAL PASS),
+   never 0, so it cannot be mistaken for M4's three-validator acceptance
+   criterion. Entries are de-duplicated by *machine*, so `pi-a` and `pi-a:8645`
+   are one validator, and a repeated host is a usage error instead of a phantom
+   third seat.
 
 ## 8. When it does not work: the five failures
 

@@ -1034,7 +1034,7 @@ func (s *Store) scanLocks() error {
 	// this fix. Heights strictly below the committed head are never judged
 	// again (the driver only ever restores a lock for head+1), and the head's
 	// own record is deliberately kept - the conservative superset, and what
-	// chain_lock_test asserts survives a reopen.
+	// chain_precommit_lock_test asserts survives a reopen.
 	if s.have {
 		s.pruneLockMap(s.last)
 	}

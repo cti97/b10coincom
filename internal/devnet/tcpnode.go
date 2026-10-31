@@ -179,11 +179,13 @@ type ValidatorConfig struct {
 	// this node dials, or the node would open a second, direct-mode connection
 	// to it.
 	Relay []string
-	// RelayAccessToken, when non-empty, is the pre-shared first frame sent on
-	// every relay dial (audit N-8): the credential a relay started with
-	// Options.AccessToken requires before it registers the link. It is NOT a
-	// consensus secret - the relay only compares bytes by length and equality
-	// - and an empty value keeps the previous behaviour.
+	// RelayAccessToken, when non-empty, is the pre-shared key of the relay gate
+	// (audit N-8, PX-3, D-1): on every relay dial the node answers the relay's
+	// per-connection challenge with HMAC-SHA-256(token, challenge) and requires
+	// HMAC-SHA-256(token, challenge ‖ answer) back before the link is
+	// installed. The token is never sent on the wire. It is NOT a consensus
+	// secret - the relay hashes bytes it is handed and decodes nothing - and an
+	// empty value keeps the previous behaviour.
 	RelayAccessToken []byte
 	// AllowLocalPeerHints is the PEER_EXCHANGE admission exception: it permits a
 	// hint naming a loopback, private or link-local address, which the default

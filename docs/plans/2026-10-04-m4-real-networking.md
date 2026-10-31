@@ -28,6 +28,8 @@
 
 **2. The frame carries no type tag of its own beyond the payload's first byte.** The canonical encoding already discriminates: a `HELLO` and a consensus message start with different tags. Framing exists only to delimit, and a frame layer that also interpreted would be a second place for the wire semantics to live.
 
+**Correction (audit N-5).** The middle sentence was FALSE when written: the consensus tags and the wire tags both used 1–3, so a `HELLO` and a vote began with the SAME bytes, and a router keyed on the first byte fed votes into the sync layer (a Task-4 rig stalled on exactly that). The router therefore routes by verified decode, never by a bare tag, and `wire` later renumbered its union to `WireTagFloor = 0x80` so the claim is now true by construction. The decision's real point — the frame layer only delimits — never depended on the tag values and is unchanged.
+
 **3. Dedup lives in the transport-facing layer, keyed on `(validator_id, height, round, type)`.** A star topology has no loops, so this is not needed today — but it costs one map and it is the thing that must exist *before* the topology becomes a mesh, which is M5. Building it later means retrofitting it into a live protocol.
 
 **4. `BLOCK_SYNC` is pull-based, and the requester verifies every block it adopts.** A lagging validator asks for blocks by height range and adopts what it receives only after the ordinary validation path accepts them. A push-based design would let any peer force work on a validator; a pull that trusted its source would be a remote code path that installs unvalidated state.
@@ -337,7 +339,7 @@ This is the M3 carry-forward the limits note names: *"a validator that falls beh
 
 **Interfaces:**
 - Consumes: `wire`, `transport.Send`, `chain`
-- Produces: `consensus.Syncer` with `Answer(req) ([][]byte, error)` and `PullAndAdopt(from uint64) error`
+- Produces: `consensus.Syncer` with `Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error)` and `PullAndAdopt(from uint64) error`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -359,7 +361,7 @@ Expected: FAIL — `undefined: Syncer`.
 
 - [ ] **Step 3: Write the implementation**
 
-`Answer` serves encoded blocks from the local chain by height range, refusing a range it does not hold. `PullAndAdopt` requests the range above its head, decodes each block, and appends it **through the ordinary `chain.Append` path**, so the same validation that guards a live block guards an adopted one. Any block that fails is dropped and the pull stops rather than skipping ahead.
+`Answer` serves encoded blocks AND their commit certificates from the local chain by height range, refusing the whole range when any height in it lacks a certificate that still proves quorum for the block held there (Design Decision 8). `PullAndAdopt` requests the range above its head, decodes each block, re-tallies the carried precommit votes through `VoteSet.Add`, requires `HasQuorum(block.ID())`, and only then appends it **through the ordinary `chain.Append` path**, so the same validation that guards a live block guards an adopted one. Any block that fails is dropped and the pull stops rather than skipping ahead.
 
 `Send` goes on the `Transport` interface with a doc comment saying why it exists (a request/response is not a broadcast), and the simulator implements it as an immediate unicast so determinism is preserved.
 

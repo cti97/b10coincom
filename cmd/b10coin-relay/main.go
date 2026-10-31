@@ -137,25 +137,31 @@ enforce any of it)
   routed prefix - cannot hold the registry.
 
   --access-token-file (default unset) enables the relay's own access control
-  (audit N-8). When set, the file's bytes (a trailing newline is trimmed) are
-  the PRE-SHARED TOKEN, and at least 16 bytes are required: a shorter one is
-  brute-forced by dialling it (one byte falls in 256 attempts), so a relay
-  that would advertise a gate it cannot defend refuses to start instead. The
-  exchange is three FIXED frames and no decoding anywhere: the relay writes
-  the gate greeting as a connection's first frame, the connection must then
-  send exactly the token bytes or be closed and counted unauthorized, and the
-  relay confirms with a fixed accepted frame - which is how a node tells a
-  refusal from a dead socket. A node that does not see the greeting refuses to
-  send its token at all, so a relay started WITHOUT --access-token-file can no
-  longer be handed the secret only to forward it to every peer. The relay
-  compares length and bytes only - it still decodes nothing, so this is not a
-  second implementation of any wire semantics. This is the defence that works
-  where an IP allowlist cannot (home validators behind CGNAT, rotating
-  outbound addresses): the token is a secret both ends hold, not an address.
-  The token frame is consumed, never forwarded, and an unauthenticated
-  connection is never registered, so it receives nothing. The token travels in
-  PLAINTEXT over TCP and is REPLAYABLE (a constant compared once per
-  connection, never challenged or expired): run it over a trusted path such as
+  (audit N-8, PX-3, D-1). When set, the file's bytes (a trailing newline is
+  trimmed) are the PRE-SHARED TOKEN, and at least 16 bytes are required: a
+  shorter one is brute-forced by dialling it (one byte falls in 256 attempts),
+  so a relay that would advertise a gate it cannot defend refuses to start
+  instead. The exchange is four fixed-width frames and no decoding anywhere:
+  the relay writes the gate greeting as a connection's first frame, then a
+  fresh random challenge; the connection answers with HMAC-SHA-256(token,
+  challenge) or is closed and counted unauthorized; on a match the relay sends
+  HMAC-SHA-256(token, challenge || answer). The token itself is never sent: a
+  token-less relay that forwards the answer forwards a MAC, and the answer is
+  bound to a fresh per-connection challenge, so a recorded exchange cannot be
+  replayed. The final confirmation is what lets a node tell a relay that holds
+  the token from a stranger on a token-less relay looping public frames; a
+  relay that never gated cannot produce it (audit D-1). A node that does not
+  see the greeting refuses to answer at all, so a relay started WITHOUT
+  --access-token-file cannot be handed a proof. The relay hashes bytes it is
+  handed and compares them in constant time - it still decodes nothing, so
+  this is not a second implementation of any wire semantics. This is the
+  defence that works where an IP allowlist cannot (home validators behind
+  CGNAT, rotating outbound addresses): the token is a secret both ends hold,
+  not an address. The proof is consumed, never forwarded, and an unauthenticated
+  connection is never registered, so it receives nothing. The relay proves
+  POSSESSION of the token, not an identity: an active proxy to a genuine gated
+  relay holding the same token can still interpose. The token still travels in
+  PLAINTEXT over TCP and is not expired, so run it over a trusted path such as
   a VPN, and treat its disclosure as a connection someone else can make. With
   no token the relay sends no greeting and behaves exactly as before.
 
@@ -296,7 +302,7 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 	writeTimeout := fs.Int("write-timeout", int(relay.DefaultWriteTimeout/time.Second), "seconds a connection's write queue may stay backed up before it is closed and its queued bytes and slot released; the queue must drain to empty within it")
 	readTimeout := fs.Int("read-timeout", int(relay.DefaultReadTimeout/time.Second), "seconds one frame may take to arrive; expiry closes that connection and releases its slot")
 	keepAlive := fs.Int("keepalive", int(relay.DefaultKeepAlive/time.Second), "TCP keepalive probe period in seconds; half-open connections are reaped by the kernel after unanswered probes")
-	accessTokenFile := fs.String("access-token-file", "", "path to a file whose bytes are the pre-shared access token (audit N-8; at least 16 bytes). The relay announces the gate with a fixed first frame, each connection must then send exactly those bytes or be closed and counted unauthorized, and the relay confirms with a second fixed frame. Compared by length and equality, decoded by nothing; the token is plaintext over TCP and replayable, so run it over a trusted path")
+	accessTokenFile := fs.String("access-token-file", "", "path to a file whose bytes are the pre-shared access token (audit N-8; at least 16 bytes). The relay announces the gate with a fixed first frame and a fresh random challenge; each connection must then answer HMAC-SHA-256(token, challenge) or be closed and counted unauthorized, and the relay confirms with HMAC-SHA-256(token, challenge || answer). The token is never sent, is bound to a fresh challenge (not replayable on another connection), and the relay decodes nothing; it still travels in plaintext, so run it over a trusted path")
 
 	err := fs.Parse(args)
 	switch {

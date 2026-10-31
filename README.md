@@ -182,11 +182,18 @@ report its own architecture — its format and architecture tokens (`Mach-O`,
 wherever they sit in `file`'s output, so the check holds for Apple's `file`
 word order ("Mach-O 64-bit executable arm64") and upstream libmagic's ("Mach-O
 64-bit arm64 executable", which the Linux CI runners emit) alike, and `Mach-O`
-/ `PE32+` names never appear except where they belong; and the build is
-**reproducible**: every artifact is built with `-trimpath -buildvcs=false`
-(no checkout path, no VCS revision or dirty flag), and `dist/BUILD-INFO`
-records the toolchain the go command actually ran and those exact flags, so
-two builds of one clean tree on one toolchain are byte-identical.
+/ `PE32+` names never appear except where they belong. Every artifact is built
+with `-trimpath -buildvcs=false` (no checkout path, no VCS revision or dirty
+flag), and `dist/BUILD-INFO` records the toolchain the go command actually ran
+and those exact flags. **What is actually evidenced about reproducibility** is
+narrower than "deterministic": the 2026-10-30 Docker re-run reports that a warm
+build and a cold-`GOCACHE` build in separate containers (sharing the module
+cache) produced byte-identical `SHA256SUMS` for all 12 artifacts. The first
+2026-10-30 report says a cold-cache cross-check matched only 2 of 12, so the two
+runs disagree. CI builds ONCE and compares nothing. Reproducibility is therefore
+supported by one reported run, not continuously verified, and this repository
+has never executed a signed release: every `SHA256SUMS` it has produced is
+**UNSIGNED**.
 On the target machine, verify what you copied:
 
 ```sh
@@ -318,7 +325,7 @@ whose keys sign, and that is the security boundary:**
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
 | `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1). The address itself is **reserved against peer hints** (audit PX-6): a hint may not name the relay this node dials, or the node would open a second, direct-mode connection to it. Literal IP:port relay addresses are compared as parsed, canonical addresses, so a different spelling of the same endpoint is still refused |
-| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The secret is **never sent**: the node waits for the relay's **gate greeting** and its per-connection **challenge** (32 fresh random bytes plus the relay's own address), answers `HMAC-SHA-256(token, challenge)`, and only then expects the relay's **accepted** frame. A relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — gets no proof at all and the refusal is logged; a stranger who drives the greeting through such a relay receives a MAC, never the token, and that MAC is useless on any other connection (audit PX-3). The token still travels in plaintext at the relay's end of the comparison: see the relay section |
+| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The secret is **never sent**: the node waits for the relay's **gate greeting** and its per-connection **challenge** (32 fresh random bytes plus the relay's own address), answers `HMAC-SHA-256(token, challenge)`, and only then expects the relay's **confirmation**, `HMAC-SHA-256(token, challenge ‖ answer)` — a value only a party holding the token can produce, so a stranger looping public frames cannot make the node install the link (audit D-1). A relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — gets no proof at all and the refusal is logged; a stranger who drives the greeting through such a relay receives a MAC, never the token, and that MAC is useless on any other connection (audit PX-3). The token still travels in plaintext at the relay's end of the comparison: see the relay section |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
 | `--advertise IP:PORT` | *unset* | the address `PEER_EXCHANGE` should advertise when `--listen` binds a **wildcard** address (`0.0.0.0:7001`, `[::]:7001`), which names no endpoint a peer can dial. This is the port-forwarded home node's flag: `--listen 0.0.0.0:7001 --advertise <public IP>:7001` (audit PX-8). It must be a literal IP:port, not unspecified or multicast, and it requires `--listen`. Without it a wildcard-bind node advertises nothing and says so **once** in the log |
 | `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
@@ -402,6 +409,7 @@ bails out if the node it is talking to runs a different chain.
 |---|---|---|
 | `--node URL` | `http://127.0.0.1:8645` | HTTP RPC of the node to submit the claim to |
 | `--dir PATH` | `./b10coin-data` | accepted for uniformity with the other commands, and deliberately **never read**: the claim command reads nothing from disk and writes nothing |
+| `--print-key` | `true` | print the ephemeral signing key to stdout so a follow-up transfer is possible. `--print-key=false` withholds it — the safe choice when stdout is captured by a shell, CI log or journalctl, because the key is then unrecoverable (audit O-10) |
 
 The **claim command** has no key file and no keystore: it signs with an ephemeral
 fresh key, and prints that key once — copy it out immediately if you plan a
@@ -553,12 +561,14 @@ The exchange is four frames and no decoding anywhere: the relay announces
 gating (`b10coin-relay-gate-v1`), sends a per-connection challenge (32 random
 bytes plus its own listening address), the node answers
 `HMAC-SHA-256(token, challenge)` — the token itself is NEVER written — and the
-relay confirms with a fixed accepted frame, comparing the answer in constant
-time (`subtle.ConstantTimeCompare`). So a node refuses to answer a relay that
-has not announced it gates, a node whose proof is REFUSED logs the handshake
-death instead of redialling in silence, and a stranger on a token-less relay
-who loops the greeting and a challenge of its own making harvests a MAC, not
-the token (audit PX-3). The token must be at least 16 bytes on both ends (a
+relay confirms with `HMAC-SHA-256(token, challenge ‖ answer)`, comparing the
+answer in constant time (`subtle.ConstantTimeCompare`). So a node refuses to
+answer a relay that has not announced it gates, a node whose proof is REFUSED
+logs the handshake death instead of redialling in silence, a stranger on a
+token-less relay who loops the greeting and a challenge of its own making
+harvests a MAC, not the token (audit PX-3), and that stranger cannot complete
+the exchange at all: the confirmation is keyed by the token, so the node does
+not install a link through a relay that never gated (audit D-1). The token must be at least 16 bytes on both ends (a
 shorter one is brute-forced by dialling: one byte falls in 256 attempts).
 **One limit remains:** the challenge and the answer travel in **plaintext**
 over TCP, so a passive observer sees a proof that is valid for that one

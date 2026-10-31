@@ -34,6 +34,8 @@
 
 **4. The locking rule is implemented literally, and tested adversarially.** A validator that precommits block `B` at round `r` locks `(r, B)`. In any later round it prevotes only for `B`, or for a proposal at a round strictly greater than `r`. Without this, two conflicting blocks can commit at the same height — the failure the spec calls safety-critical.
 
+**SUPERSEDED by Decision 11.** The literal "or a round strictly greater than `r`" branch is unsafe (the counterexample is in Decision 11): the shipped unlock is evidence-based, a verified polka from a strictly later round, plus the justification check. This decision records the M3 starting shape, not the rule that shipped; do not implement it from this paragraph.
+
 **5. Proposer selection is a pure function of `(height, round, parentHash, committee)`.** Weighted round-robin by power, with the choice derived from a hash so every validator computes the same proposer without communication. A proposer-selection divergence would not lose safety, but it would stall liveness on every round, so it is pinned by a test that checks agreement across all validators.
 
 **6. Voting power is capped per validator at 1/4 of the total.** The spec requires it: a single operator holding more than 1/3 of power could commit conflicting blocks alone. The cap keeps every operator below the threshold, and `Config.Validate` rejects a committee where the cap cannot hold.
