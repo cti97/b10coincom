@@ -306,6 +306,26 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 		}
 		wantParent := c.head.ID()
 		if blk.Header.ParentHash != wantParent {
+			// HEIGHT 1 IS A SPECIAL CASE, AND SAYING SO IS THE POINT OF AUDIT
+			// C-2. The only predecessor of the first stored block is the
+			// SYNTHESIZED genesis block, whose ID is a function of the genesis
+			// document AND the genesis state root this build derives from it -
+			// while store.CheckGenesis compares the DOCUMENT hash, which covers
+			// no derived state. So a directory written by a build whose genesis
+			// state root differed passes CheckGenesis and then fails here, at
+			// height 1, with the message this file uses for a renumbered or
+			// corrupt log. That is not what happened, and an operator sent to
+			// look for corruption in a healthy log is a diagnostic failure.
+			//
+			// The known instance is the ST-3 hard fork: committing Bond.Unfunded
+			// in state.bondLeaf changed the genesis state root without changing
+			// genesis.Hash, so every data directory written before it is
+			// unopenable by a build after it. The fix is a fresh --dir or a
+			// resync, never a repair.
+			if h == 1 {
+				return nil, fmt.Errorf("%w at height 1: the first stored block does not link this build's genesis block (parent %x, expected %x). The genesis HASH matches - the store checks it before replay - so this directory was written by a DIFFERENT BUILD of b10coin whose genesis STATE ROOT differed from this one (the document hash covers no derived state). A data directory written before the ST-3 change, which added Bond.Unfunded to the committed bond leaf, is the known case. Nothing here is corrupt: start a fresh --dir, or resync this node from a peer on this build",
+					ErrGenesisReplay, blk.Header.ParentHash[:8], wantParent[:8])
+			}
 			return nil, fmt.Errorf("%w at height %d: stored block does not link its predecessor (parent %x, expected %x)",
 				ErrGenesisReplay, h, blk.Header.ParentHash[:8], wantParent[:8])
 		}

@@ -1234,7 +1234,7 @@ func TestWithdrawVerbReleasesOnlyMaturedRecords(t *testing.T) {
 // forecast that printed the raw sum would name a height that can never appear.
 func TestReleaseForecastRoundsToTheEpochBoundary(t *testing.T) {
 	st := stakingStatus{Height: 100, EpochBlocks: 1_000, UnbondingEpochs: 2}
-	line, ok := releaseForecast(1_000_000, 0, st, 2_000)
+	line, ok := releaseForecast(1_000_000, st, 2_000)
 	if !ok {
 		t.Fatal("no forecast for a funded exit")
 	}
@@ -1244,34 +1244,66 @@ func TestReleaseForecastRoundsToTheEpochBoundary(t *testing.T) {
 	}
 	// A release that already lands on a boundary does not move.
 	st.Height = 999 // 1,000 + 2,000 = 3,000
-	line, ok = releaseForecast(1_000_000, 0, st, 2_000)
+	line, ok = releaseForecast(1_000_000, st, 2_000)
 	if !ok || !strings.Contains(line, "height 3000") {
 		t.Fatalf("an exact boundary moved: %q", line)
 	}
+	// Nothing recorded, no forecast: a height would promise a payout that cannot
+	// happen.
+	if line, ok := releaseForecast(0, st, 2_000); ok {
+		t.Fatalf("a zero funded exit forecast a release: %q", line)
+	}
 }
 
-// TestReleaseForecastSaysAGenesisExitReleasesNothing is audit ST-3 in the verb:
-// when the whole exit is the seat's unfunded genesis power, the state destroys
-// it rather than recording it, so the verb must not print a release height that
-// promises a payout.
-func TestReleaseForecastSaysAGenesisExitReleasesNothing(t *testing.T) {
-	st := stakingStatus{Height: 5, EpochBlocks: 10, UnbondingEpochs: 2}
-	line, ok := releaseForecast(100, 100, st, 20)
-	if !ok {
-		t.Fatal("a genesis exit must still produce a message")
+// TestAUnbondForecastFollowsTheFundedFirstSplit is audit C-1 in the verb, both
+// halves. The state returns the operator's FUNDED coins first and destroys the
+// unfunded grant only past them; and a partial exit leaves a seat, so the text
+// must not say the seat is gone.
+func TestAUnbondForecastFollowsTheFundedFirstSplit(t *testing.T) {
+	const minStake = 1_000 * genesis.SparksPerB10
+	st := stakingStatus{Height: 5, EpochBlocks: 10, UnbondingEpochs: 2, MinStakeSparks: minStake}
+
+	// A topped-up genesis seat: a MIN_STAKE grant plus the operator's own
+	// MIN_STAKE. A partial exit of the operator's MIN_STAKE is funded-first, so it
+	// is RECORDED, gets a release height, and the remaining MIN_STAKE keeps the
+	// seat. This is the case the old text answered with "the seat is gone ... and
+	// there is nothing to withdraw".
+	effect := unbondEffect(minStake, 2*minStake, minStake, st)
+	for _, want := range []string{"RETAINED", "100000000000 sparks stay bonded", "height", "withdraw"} {
+		if !strings.Contains(effect, want) {
+			t.Fatalf("a funded partial exit from a topped-up genesis seat does not say %q: %q", want, effect)
+		}
 	}
-	if !strings.Contains(line, "destroy") || !strings.Contains(line, "UNFUNDED") {
-		t.Fatalf("the genesis exit does not say the power is destroyed: %q", line)
+	// Nothing of the grant is touched, so nothing is destroyed and the seat is
+	// not gone - the two claims the old text made unconditionally.
+	if strings.Contains(effect, "destroyed") {
+		t.Fatalf("a partial exit of the operator's own coins destroyed part of the grant: %q", effect)
 	}
-	if strings.Contains(line, "height") {
-		t.Fatalf("the genesis exit still forecasts a release height: %q", line)
+	if strings.Contains(effect, "the seat is gone") {
+		t.Fatalf("a partial exit that leaves a seat says the seat is gone: %q", effect)
+	}
+	if funded, destroyed := splitUnbondExit(minStake, 2*minStake, minStake); funded != minStake || destroyed != 0 {
+		t.Fatalf("split = (funded %d, destroyed %d), want (%d, 0): the operator's coins leave first", funded, destroyed, minStake)
 	}
 
-	// A funded exit from the same status still forecasts a height (5+1+20 = 26
-	// -> the next 10-block boundary, 30).
-	line, ok = releaseForecast(100, 0, st, 20)
-	if !ok || !strings.Contains(line, "height 30") {
-		t.Fatalf("the funded exit's forecast = %q, want height 30", line)
+	// The whole bond: the funded part is released and the grant is destroyed in
+	// the same transaction, and only now is the seat gone.
+	effect = unbondEffect(2*minStake, 2*minStake, minStake, st)
+	if !strings.Contains(effect, "the seat is gone") || !strings.Contains(effect, "destroyed") || !strings.Contains(effect, "height") {
+		t.Fatalf("a full exit from a topped-up genesis seat = %q, want a release, a destruction and a leaving seat", effect)
+	}
+	if funded, destroyed := splitUnbondExit(2*minStake, 2*minStake, minStake); funded != minStake || destroyed != minStake {
+		t.Fatalf("full-exit split = (%d, %d), want (%d, %d)", funded, destroyed, minStake, minStake)
+	}
+
+	// A pure genesis grant: nothing funded, so nothing is released, and the exit
+	// is destroyed whole - with the seat gone only because the bond was the grant.
+	effect = unbondEffect(minStake, minStake, minStake, st)
+	if strings.Contains(effect, "height") || strings.Contains(effect, "withdraw") {
+		t.Fatalf("a pure genesis exit forecast a payout: %q", effect)
+	}
+	if !strings.Contains(effect, "destroyed") || !strings.Contains(effect, "the seat is gone") {
+		t.Fatalf("a pure genesis exit = %q, want destroyed and the seat gone", effect)
 	}
 }
 
@@ -1874,13 +1906,13 @@ func TestReleaseForecastRefusesAHostileOverflow(t *testing.T) {
 	if _, ok := cooldownBlocks(stakingStatus{EpochBlocks: maxUint64, UnbondingEpochs: 2}); ok {
 		t.Fatal("cooldownBlocks accepted an epoch_blocks x unbonding_epochs product that overflows uint64")
 	}
-	if _, ok := releaseForecast(1, 0, stakingStatus{Height: maxUint64, EpochBlocks: 1, UnbondingEpochs: 1}, 1); ok {
+	if _, ok := releaseForecast(1, stakingStatus{Height: maxUint64, EpochBlocks: 1, UnbondingEpochs: 1}, 1); ok {
 		t.Fatal("releaseForecast accepted head+1 wrapping to zero")
 	}
-	if _, ok := releaseForecast(1, 0, stakingStatus{Height: 1, EpochBlocks: 1, UnbondingEpochs: 1}, maxUint64); ok {
+	if _, ok := releaseForecast(1, stakingStatus{Height: 1, EpochBlocks: 1, UnbondingEpochs: 1}, maxUint64); ok {
 		t.Fatal("releaseForecast accepted head+1+cooldown that overflows uint64")
 	}
-	if _, ok := releaseForecast(1, 0, stakingStatus{Height: maxUint64 - 1, EpochBlocks: maxUint64 - 1, UnbondingEpochs: 1}, 0); ok {
+	if _, ok := releaseForecast(1, stakingStatus{Height: maxUint64 - 1, EpochBlocks: maxUint64 - 1, UnbondingEpochs: 1}, 0); ok {
 		t.Fatal("releaseForecast accepted a round-up to the next boundary that overflows uint64")
 	}
 }

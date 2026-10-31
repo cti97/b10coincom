@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -429,6 +430,78 @@ func TestOpenRejectsRenumberedStoredChain(t *testing.T) {
 	}
 	if !errors.Is(err, ErrGenesisReplay) {
 		t.Fatalf("Open = %v, want an error wrapping ErrGenesisReplay", err)
+	}
+}
+
+// TestAPreFixDataDirectoryFailsWithAVersionMessage is audit C-2's test 8. A data
+// directory written before the ST-3 change passed store.CheckGenesis (the genesis
+// DOCUMENT hash did not move) and then failed at height 1 with the message this
+// file uses for a renumbered or corrupt log - "does not link its predecessor".
+// The failure is real; the DIAGNOSIS was wrong, and the error now says so.
+//
+// Constructed, not provoked: the store is written directly with the marker for
+// this genesis and one block whose parent is a genesis block with a DIFFERENT
+// state root - exactly the shape a pre-ST-3 build leaves, since the Unfunded leaf
+// moved the root (and so the genesis block's ID) while Genesis.Hash stayed put.
+func TestAPreFixDataDirectoryFailsWithAVersionMessage(t *testing.T) {
+	dir := t.TempDir()
+	g := genesis.Devnet()
+	_, priv := devKey()
+	pub, _ := priv.Public().(ed25519.PublicKey)
+
+	// The genesis block this build does NOT synthesize: same document, another
+	// state root. That is what a pre-ST-3 directory's first block links.
+	oldGenesis := &types.Block{Header: types.Header{
+		Height:    0,
+		StateRoot: [32]byte{0xAA, 0xBB, 0xCC},
+		TxRoot:    crypto.MerkleRoot(nil),
+		Timestamp: g.Time,
+	}}
+	first := &types.Block{Header: types.Header{
+		Height:     1,
+		ParentHash: oldGenesis.ID(),
+		StateRoot:  [32]byte{0x01},
+		TxRoot:     crypto.MerkleRoot(nil),
+		Timestamp:  g.Time + 1,
+		Proposer:   pub,
+	}}
+
+	s, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckGenesis(g.Hash()); err != nil {
+		t.Fatalf("recording this genesis: %v", err)
+	}
+	if err := s.Append(1, first.Encode()); err != nil {
+		t.Fatalf("writing the pre-fix block: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Open(g, dir)
+	if err == nil {
+		c.Close()
+		t.Fatal("Open accepted a directory whose first block links another build's genesis")
+	}
+	if !errors.Is(err, ErrGenesisReplay) {
+		t.Fatalf("Open = %v, want an error wrapping ErrGenesisReplay", err)
+	}
+	for _, want := range []string{
+		"does not link this build's genesis block",
+		"DIFFERENT BUILD",
+		"ST-3",
+		"Nothing here is corrupt",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the pre-fix directory's error does not say %q: %v", want, err)
+		}
+	}
+	// And it is not the message for a corrupt log, which is what the operator
+	// used to be sent to investigate.
+	if strings.Contains(err.Error(), "does not link its predecessor") {
+		t.Fatalf("the pre-fix directory's error still reads as a corrupt log: %v", err)
 	}
 }
 

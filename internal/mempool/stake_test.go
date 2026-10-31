@@ -192,8 +192,27 @@ func TestMempoolRefusesStakeTransactionsThatCannotApply(t *testing.T) {
 		if err := pos.ApplyTx(&unbond); err != nil {
 			t.Fatalf("fixture unbond: %v", err)
 		}
-		pm := newTestPool(t, 100, pos, 0)
+		// A Withdraw is admitted only from the height its record MATURES at (audit
+		// C-3): at the head the record is created, the transaction can never apply
+		// to the next block, and the pool refuses it. Advance the head state to the
+		// record's release height - which is what a real chain does while the
+		// operator waits - and the same transaction is admitted.
+		recs := pos.UnbondingOf(k.addr)
+		if len(recs) != 1 {
+			t.Fatalf("fixture: %d unbonding records, want 1", len(recs))
+		}
+		release := recs[0].ReleaseHeight
+		pos.SetHeight(release)
+		pm := newTestPool(t, 100, pos, release)
 		mustAdd(t, pm, k.stake(t, types.TxWithdraw, 2, 0, 0))
+
+		// And the unmatured case is refused, at the same address and nonce: with
+		// the head two blocks below the release height, even the NEXT block cannot
+		// apply the Withdraw.
+		early := newTestPool(t, 100, pos, release-2)
+		if err := early.Add([]types.Tx{k.stake(t, types.TxWithdraw, 2, 0, 0)})[0]; !errors.Is(err, state.ErrNothingToWithdraw) {
+			t.Fatalf("a Withdraw whose record matures one block later: err = %v, want state.ErrNothingToWithdraw", err)
+		}
 	})
 
 	// A state with zero staking parameters cannot apply ANY stake transaction
@@ -206,4 +225,72 @@ func TestMempoolRefusesStakeTransactionsThatCannotApply(t *testing.T) {
 			t.Fatalf("Bond on an unparameterised state: err = %v, want state.ErrStakeUnconfigured", err)
 		}
 	})
+}
+
+// TestAnUnmaturedRecordCannotParkAFeeFreeWithdrawFlood is audit C-3's first half.
+// admitStake used to accept a Withdraw on ANY unbonding record, so one address
+// whose only record was still in cooldown could fill its per-sender allowance of
+// 64 fee-free Withdraws with distinct future nonces; the admission succeeded, the
+// transactions sat in the pool, and every block's SelectApplicable failed them
+// until the record matured. The record now has to be mature at the next block.
+func TestAnUnmaturedRecordCannotParkAFeeFreeWithdrawFlood(t *testing.T) {
+	pos := stakeState()
+	k := newTestKey(t)
+	pos.Set(k.addr, state.Account{Balance: 3_001})
+	bond := k.stake(t, types.TxBond, 0, 1_000, 1)
+	if err := pos.ApplyTx(&bond); err != nil {
+		t.Fatalf("fixture bond: %v", err)
+	}
+	unbond := k.stake(t, types.TxUnbond, 1, 1_000, 0)
+	if err := pos.ApplyTx(&unbond); err != nil {
+		t.Fatalf("fixture unbond: %v", err)
+	}
+	recs := pos.UnbondingOf(k.addr)
+	if len(recs) != 1 {
+		t.Fatalf("fixture: %d unbonding records, want 1", len(recs))
+	}
+	if recs[0].ReleaseHeight <= 1 {
+		t.Fatalf("fixture: the record matures at %d, which the next block already reaches; the flood would be admissible", recs[0].ReleaseHeight)
+	}
+	m := newTestPool(t, 1_000, pos, 0)
+	admitted := 0
+	for nonce := uint64(2); nonce < 2+MaxPendingTransfersPerSender; nonce++ {
+		err := m.Add([]types.Tx{k.stake(t, types.TxWithdraw, nonce, 0, 0)})[0]
+		switch {
+		case err == nil:
+			admitted++
+		case !errors.Is(err, state.ErrNothingToWithdraw):
+			t.Fatalf("nonce %d: err = %v, want state.ErrNothingToWithdraw", nonce, err)
+		}
+	}
+	if admitted != 0 {
+		t.Fatalf("an address with ONE unmatured record parked %d fee-free Withdraws, want 0", admitted)
+	}
+	if m.Len() != 0 {
+		t.Fatalf("the flood left %d transactions in the pool, want 0", m.Len())
+	}
+}
+
+// TestAnUnbondThatWouldLeaveASubFloorRemainderIsRefusedAtAdmission is audit
+// C-3's second half. applyUnbond refuses a positive remainder below MIN_STAKE, so
+// a transaction that would leave one can never apply; the pool admitted it and
+// SelectApplicable discarded it on every block.
+func TestAnUnbondThatWouldLeaveASubFloorRemainderIsRefusedAtAdmission(t *testing.T) {
+	pos := stakeState()
+	k := newTestKey(t)
+	pos.Set(k.addr, state.Account{Balance: 3_001})
+	bond := k.stake(t, types.TxBond, 0, 1_000, 1)
+	if err := pos.ApplyTx(&bond); err != nil {
+		t.Fatalf("fixture bond: %v", err)
+	}
+	m := newTestPool(t, 100, pos, 0)
+	// One spark short of the whole bond: a positive remainder of one spark.
+	if err := m.Add([]types.Tx{k.stake(t, types.TxUnbond, 1, 999, 0)})[0]; !errors.Is(err, state.ErrStakeBelowMinimum) {
+		t.Fatalf("an Unbond leaving one spark bonded: err = %v, want state.ErrStakeBelowMinimum", err)
+	}
+	if m.Len() != 0 {
+		t.Fatalf("the refused Unbond was kept in the pool")
+	}
+	// The full exit leaves nothing, which the same rule allows.
+	mustAdd(t, m, k.stake(t, types.TxUnbond, 1, 1_000, 0))
 }

@@ -164,16 +164,34 @@ func NewDriver(cfg Config, ch *chain.Chain, priv ed25519.PrivateKey, tp transpor
 	// vote.
 	//
 	// WHAT "OUTSIDE" MEANS UNDER ROTATION: a key that is neither in the chain's
-	// base (genesis) committee NOR seated at the height this driver will judge
-	// is a stranger and is refused. A key whose seat ENDED at this boundary is
-	// in the base committee and is NOT seated here - that is a legitimate
+	// base (genesis) committee, NOR seated at the height this driver will judge,
+	// NOR ever seated on this chain is a stranger and is refused. A key whose
+	// seat ENDED at this boundary is NOT seated here - that is a legitimate
 	// rotated-out validator, and it must keep running rather than fail to
 	// construct: its engine is inert (emitVote and CheckMembership refuse to
 	// sign without a seat, see Engine.CheckMembership), so it tallies and
 	// follows the chain without voting. A key that joined AFTER genesis and is
-	// seated at this height is admitted by the second half of the test, which
-	// is what lets a rotated-in node restart and resume.
-	if err := eng.CheckMembership(); err != nil && cfg.IndexOf(priv.Public().(ed25519.PublicKey)) < 0 {
+	// seated at this height passes CheckMembership, which is what lets a
+	// rotated-in node restart and resume.
+	//
+	// THE EVER-SEATED TERM (audit B-1) is the third case, and it is the SAME
+	// authorisation set audit RT-3 added everywhere else - never a wider one.
+	// Before it, a post-genesis key that had ROTATED OUT was admitted by none of
+	// the three: not seated at head+1, and not in the genesis list cfg.IndexOf
+	// scans. Validator.rebuildDriver then failed on exactly the adoption that
+	// moved the chain past the boundary, and its caller's otherwise-unreachable
+	// error branch ran: it demoted the honest peer that had just served the pull
+	// and left the engine judging the pre-pull head, so every later adopted block
+	// failed the same rebuild until the key was re-seated. The engine built here
+	// is inert (this key is seated nowhere at head+1), which is the state a
+	// rotated-out genesis seat has always run in. It admits NO key that never
+	// held a seat: chain.EverSeated is filled from the genesis list and from
+	// every epoch committee this chain has derived, and consensus still judges
+	// votes, proposals and certificates against CommitteeAt(height) alone - so a
+	// rotated-out key can follow but cannot vote, propose, count toward a quorum
+	// or authorise a block.
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	if err := eng.CheckMembership(); err != nil && cfg.IndexOf(pub) < 0 && !ch.EverSeated(pub) {
 		return nil, err
 	}
 	// timeoutAt is ARMED ON THE FIRST TICK, not at construction (the sentinel

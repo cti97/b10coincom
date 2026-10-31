@@ -924,20 +924,39 @@ func (e *Engine) onProposal(p *Proposal) error {
 // nothing: justification, block validity and the lock are all checked by
 // maybePrevote when the engine is IN the round, exactly as for a proposal that
 // arrived on time.
+//
+// THE DUPLICATE CHECK RUNS FIRST (audit B-3), before the proposer draw. A replay
+// of a kept round's proposal used to cost a full Config.Proposer evaluation - an
+// encoder allocation, a hash, a big.Int modulus by the total power and a scan of
+// the committee - only to be dropped by the very next test. The map lookup is
+// O(1), records nothing, and cannot change a decision: the only writer of
+// pending is the tail of this function, after the signer matched the drawn
+// proposer and the signature verified, so a non-nil pending IS that round's
+// genuine proposal and any second frame for the round is a duplicate whatever
+// key it names.
+//
+// WHAT IS BOUNDED, STATED EXACTLY: a REPLAY never reaches this function at all
+// on the networked path - MessageRouter.Route checks Dedup.Has before the
+// Ed25519 verify and Dedup.Seen after it (audit PX-4), so the same frame is
+// dropped there. What remains is one proposer draw per DISTINCT, member-signed,
+// verifying early proposal, and that frame has already cost the router an
+// Ed25519 verification, which dominates the draw. A caller that drives the
+// engine directly (the in-process simulator, a unit test) has no router dedup,
+// which is why the O(1) test is worth having here and not only there.
 func (e *Engine) bufferProposal(p *Proposal) error {
 	if p.Block.Header.Height != p.Height {
 		return fmt.Errorf("%w: header claims height %d, envelope names height %d",
 			ErrBadProposalHeight, p.Block.Header.Height, p.Height)
-	}
-	if string(p.Validator) != string(e.cfg.Proposer(e.height, p.Round, e.parent)) {
-		e.diag.wrongProposer++
-		return nil
 	}
 	// First proposal wins, as in the current round. Checked before Verify and
 	// without setsFor, so a second copy costs neither a signature check nor an
 	// allocation: the kept one was verified when it arrived.
 	if s := e.sets[p.Round]; s != nil && s.pending != nil {
 		e.diag.duplicateProposal++
+		return nil
+	}
+	if string(p.Validator) != string(e.cfg.Proposer(e.height, p.Round, e.parent)) {
+		e.diag.wrongProposer++
 		return nil
 	}
 	if err := p.Verify(); err != nil {

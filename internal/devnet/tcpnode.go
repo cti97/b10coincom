@@ -1356,7 +1356,9 @@ func (v *Validator) substantiatePeer(who string, reached uint64) {
 // wave wait on it while truthful peers - including others behind the same
 // relay name - are passed over. A pull that reaches the attested height
 // substantiates and clears the demotion, so a merely slow member is not
-// distrusted forever.
+// distrusted forever. The demotion is the MEMBER's, and it is a judgement about
+// the ANSWER: a pull that adopted blocks substantiates the member even when
+// this node's own driver could not be rebuilt over the new head (audit B-1).
 func (v *Validator) maybeCatchUp() {
 	v.beginWave()
 	who, via, peerH := v.tallestPeer()
@@ -1377,15 +1379,23 @@ func (v *Validator) maybeCatchUp() {
 	err := pull(before + 1)
 	after := v.ch.Height()
 	if after > before {
+		// The blocks are IN, so the adoption is counted whether or not this
+		// node can re-enter consensus over them: `adopted` is the observable
+		// that the chain moved by a pull (see its field comment), and it was
+		// wrong to fold the local rejoin into the same number.
+		v.adopted.Add(after - before)
 		if rerr := v.rebuildDriver(); rerr != nil {
-			// Unreachable for a validator the constructor already admitted
-			// (same config, same key): treat it as a failed catch-up - demote
-			// the member and let a later wave retry - rather than panic or
-			// keep an engine that judges a head the chain has left.
-			v.demotePeer(who, after)
+			// A rebuild that fails AFTER a successful adoption is THIS node's
+			// failure to rejoin, not the peer's failure to serve (audit B-1).
+			// The peer's answer passed the certificate gate and was appended;
+			// demoting it here accused the one member that had just helped, and
+			// did so on every later wave, until the reason the rebuild was
+			// refused cleared. The refused rebuild is the fact worth keeping,
+			// and a later wave retries it (the next pull re-enters this
+			// branch); NewDriver no longer refuses a rotated-out post-genesis
+			// key, so the case this branch used to hit is gone.
 			return
 		}
-		v.adopted.Add(after - before)
 	}
 	if err != nil || (after < peerH && after == before) {
 		// Demote the MEMBER, not the transport name: an honest member behind

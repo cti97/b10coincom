@@ -911,17 +911,35 @@ func ceilToEpoch(h, epochBlocks uint64) (uint64, bool) {
 	return h + add, true
 }
 
-// releaseForecast is the "release" line cmdUnstake prints, as a function so the
-// arithmetic and the genesis-bond case are testable without capturing stdout.
+// splitUnbondExit mirrors state.applyUnbond's split for the preview: the bond's
+// FUNDED part leaves first and is the sparks the address is owed, and only an
+// exit larger than that reaches the seat's unfunded genesis power, which the
+// state DESTROYS rather than records (audits ST-3 and C-1). The order is the
+// whole of C-1: a genesis operator that topped up with its own coins recovers
+// them through an ordinary partial exit, and loses only the grant.
 //
-// amount <= bondUnfunded means the whole exit is the seat's unfunded genesis
-// power, which the state DESTROYS rather than records (audit ST-3): printing a
-// release height for it would promise a payout that cannot happen. Otherwise
-// the funded part is recorded, and its release height is the epoch boundary at
-// or after the earliest applying block (head+1) plus the cooldown.
-func releaseForecast(amount, bondUnfunded uint64, st stakingStatus, cooldown uint64) (string, bool) {
-	if amount <= bondUnfunded {
-		return fmt.Sprintf("nothing: all %d sparks of this exit are the seat's UNFUNDED genesis power, which an unbond destroys instead of releasing (audit ST-3)", amount), true
+// A hand-built /account reply with Unfunded above Bonded is not a state the chain
+// can hold; like the state's own subtraction, this floors the funded part at zero
+// rather than wrapping.
+func splitUnbondExit(amount, bonded, unfunded uint64) (funded, destroyed uint64) {
+	fundedInBond := uint64(0)
+	if unfunded < bonded {
+		fundedInBond = bonded - unfunded
+	}
+	funded = min(amount, fundedInBond)
+	return funded, amount - funded
+}
+
+// releaseForecast is the "release" line cmdUnstake prints for the sparks the
+// state will RECORD, as a function so the arithmetic is testable without
+// capturing stdout. funded is that recorded amount (see splitUnbondExit); its
+// release height is the epoch boundary at or after the earliest applying block
+// (head+1) plus the cooldown. funded == 0 means the exit records nothing, and no
+// height is forecast for it - printing one would promise a payout that cannot
+// happen.
+func releaseForecast(funded uint64, st stakingStatus, cooldown uint64) (string, bool) {
+	if funded == 0 {
+		return "", false
 	}
 	earliest := st.Height + 1
 	if earliest == 0 { // head was MaxUint64; a wrapped "earliest" would forecast the past
@@ -936,6 +954,36 @@ func releaseForecast(amount, bondUnfunded uint64, st stakingStatus, cooldown uin
 	}
 	return fmt.Sprintf("height %d at the earliest (submitted at head %d; the cooldown is %d epochs x %d blocks = %d blocks, and the release height is the epoch boundary at or after head+1+cooldown)",
 		release, st.Height, st.UnbondingEpochs, st.EpochBlocks, cooldown), true
+}
+
+// unbondEffect is the consequence line cmdUnstake prints before the signature
+// (audit CL-2), and audit C-1's other half: it is CONDITIONAL on the split, not
+// on "is this exit bigger than the grant". The text used to say "the seat is gone
+// from the committee and there is nothing to withdraw" for every exit no larger
+// than the grant - which is wrong twice for a topped-up genesis seat, because the
+// funded part now leaves first (so there IS something to withdraw) and a
+// remainder at or above the floor keeps the seat.
+func unbondEffect(amount, bonded, unfunded uint64, st stakingStatus) string {
+	funded, destroyed := splitUnbondExit(amount, bonded, unfunded)
+	var parts []string
+	if funded > 0 {
+		line := "the funded coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then"
+		if cooldown, ok := cooldownBlocks(st); ok {
+			if forecast, ok := releaseForecast(funded, st, cooldown); ok {
+				line = forecast + "; " + line
+			}
+		}
+		parts = append(parts, line)
+	}
+	if destroyed > 0 {
+		parts = append(parts, fmt.Sprintf("%d sparks are the seat's unfunded genesis power and are destroyed, not released (audit ST-3)", destroyed))
+	}
+	if remainder := bonded - amount; remainder == 0 {
+		parts = append(parts, "the whole bond leaves, so the seat is gone from the committee at the next epoch boundary")
+	} else {
+		parts = append(parts, fmt.Sprintf("%d sparks stay bonded, at the minimum or above, so the seat is RETAINED until a later exit takes it below the minimum", remainder))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func cmdStake(args []string) error {
@@ -1087,21 +1135,10 @@ func cmdUnstake(args []string) error {
 	// The consequence is part of the preview, not a receipt printed after the
 	// irreversible POST (audit CL-2). The applying block is at least head+1, so
 	// the height is the EARLIEST release; the block that applies the unbond
-	// sets the exact one, which is why the line says "at the earliest".
-	var effect string
-	if amount > t.account.BondUnfunded {
-		effect = "the coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then"
-		if t.account.BondUnfunded > 0 {
-			effect = fmt.Sprintf("%d sparks of this exit are the seat's unfunded genesis power and are destroyed, not released (audit ST-3); ", t.account.BondUnfunded) + effect
-		}
-		if cooldown, ok := cooldownBlocks(t.status); ok {
-			if line, ok := releaseForecast(amount, t.account.BondUnfunded, t.status, cooldown); ok {
-				effect = line + "; " + effect
-			}
-		}
-	} else {
-		effect = "the seat is gone from the committee and there is nothing to withdraw: a genesis grant was never funded (audit ST-3)"
-	}
+	// sets the exact one, which is why the line says "at the earliest". The
+	// wording is CONDITIONAL on the funded/grant split and on the remainder
+	// (audit C-1): a partial exit can return coins AND keep the seat.
+	effect := unbondEffect(amount, t.account.Bonded, t.account.BondUnfunded, t.status)
 	// An exit carries fee 0 by consensus, so its ceiling is 0: any non-zero
 	// fee this verb somehow built would be refused rather than signed.
 	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{amount: amountSource, effect: effect})

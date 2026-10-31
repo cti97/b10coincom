@@ -274,7 +274,7 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 				continue
 			}
 		case types.TxBond, types.TxUnbond, types.TxWithdraw:
-			if err := m.admitStake(&tx, st); err != nil {
+			if err := m.admitStake(&tx, st, headHeight); err != nil {
 				errs[i] = err
 				continue
 			}
@@ -336,8 +336,12 @@ func (m *Mempool) admitNonClaim(tx *types.Tx, st *state.State) error {
 //     reproduced);
 //   - an Unbond cannot exceed the bond, so an address holding none is refused
 //     with ErrUnbondExceedsBond;
-//   - a Withdraw needs at least one unbonding record, mature or not: with none
-//     it can never apply, so it is refused with ErrNothingToWithdraw.
+//   - a Withdraw needs at least one unbonding record MATURE at the next block
+//     (head+1, the earliest height it can apply at): with none - or with only
+//     records still in cooldown - it can never apply to the next block, so it is
+//     refused with ErrNothingToWithdraw (audit C-3; a record that matures later
+//     can be resubmitted then). The sub-floor-remainder half of the same finding
+//     is mirrored from applyUnbond below.
 //
 // These are the IMPOSSIBILITY facts, not a second copy of the transition: the
 // minimum-stake rule, the fee floor and maturity (a height-dependent fact) are
@@ -350,7 +354,7 @@ func (m *Mempool) admitNonClaim(tx *types.Tx, st *state.State) error {
 // funding transaction is admitted and a resubmission one block later succeeds.
 // The alternative - admitting stake transactions that cannot apply - is the
 // free flood this closes.
-func (m *Mempool) admitStake(tx *types.Tx, st *state.State) error {
+func (m *Mempool) admitStake(tx *types.Tx, st *state.State, headHeight uint64) error {
 	if err := m.admitNonClaim(tx, st); err != nil {
 		return err
 	}
@@ -366,12 +370,30 @@ func (m *Mempool) admitStake(tx *types.Tx, st *state.State) error {
 			return fmt.Errorf("%w: balance %d, bond %d + fee %d", state.ErrInsufficientFunds, acc.Balance, tx.Amount, tx.Fee)
 		}
 	case types.TxUnbond:
-		if bonded := st.Bonded(tx.From); tx.Amount > bonded {
+		bonded := st.Bonded(tx.From)
+		if tx.Amount > bonded {
 			return fmt.Errorf("%w: unbond %d, bonded %d", state.ErrUnbondExceedsBond, tx.Amount, bonded)
 		}
+		// THE CANDIDACY FLOOR, MIRRORED (audit C-3). applyUnbond refuses a
+		// remainder that is positive and below MIN_STAKE, so a transaction that
+		// would leave one can never apply: admitting it only parks a slot that
+		// SelectApplicable then rejects on every block. Same rule, same sentence
+		// as the state's, one subtraction here so it costs no transition.
+		if remainder := bonded - tx.Amount; remainder != 0 && remainder < p.MinStake {
+			return fmt.Errorf("%w: unbond %d of %d would leave %d bonded, below the minimum %d; exit in full or leave at least the minimum",
+				state.ErrStakeBelowMinimum, tx.Amount, bonded, remainder, p.MinStake)
+		}
 	case types.TxWithdraw:
-		if !st.HasUnbonding(tx.From) {
-			return fmt.Errorf("%w: %x holds no unbonding record", state.ErrNothingToWithdraw, tx.From[:])
+		// A record MATURE AT THE NEXT BLOCK (audit C-3). This used to accept any
+		// record at all, so an address whose only record was still in cooldown
+		// could park its per-sender cap of fee-free Withdraws that failed in
+		// SelectApplicable on every block. Maturity is a height fact and the pool
+		// judges the head state: the earliest height this transaction can apply is
+		// head+1, and a record that matures later can be resubmitted then - the
+		// documented workflow already says "once the chain is at or past it".
+		if !st.HasMatureUnbonding(tx.From, headHeight+1) {
+			return fmt.Errorf("%w: %x holds no unbonding record mature at height %d (a record still in cooldown can be withdrawn once the chain reaches its release height)",
+				state.ErrNothingToWithdraw, tx.From[:], headHeight+1)
 		}
 	}
 	return nil

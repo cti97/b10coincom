@@ -1204,54 +1204,91 @@ func TestAGenesisBondIsUnfundedAndUnbondingItReleasesNothing(t *testing.T) {
 }
 
 // TestAFundedTopUpOnAGenesisSeatStaysWithdrawable is why Bond.Unfunded exists
-// instead of a bare Height == 0 test. A genesis seat that bonds its own funds
-// must be able to get THOSE sparks back while the grant is destroyed; a rule
-// that burned the whole bond would destroy an operator's money, and one that
-// paid the whole bond would pay out the grant.
+// instead of a bare Height == 0 test, and why the FUNDED part of an exit goes
+// first (audit C-1). A genesis seat that bonds its own funds must be able to get
+// THOSE sparks back while the grant is destroyed; a rule that burned the whole
+// bond would destroy an operator's money, and one that paid the whole bond would
+// pay out the grant.
+//
+// THE ORDER IS THE POINT. Under the old split (grant first) a partial exit of
+// the operator's coins was burned whole whenever the exit was no larger than the
+// grant, and recorded nothing: the operator could only recover by exiting in one
+// full-size step, and the deploy README's "released after one cooldown like any
+// other" was false for exactly the case its own example produced (a genesis seat
+// topped up with `stake`). Now the same partial exit records the operator's
+// coins and leaves the grant on the seat, still unfunded - so the seat survives
+// too, which is the second half of the finding.
 func TestAFundedTopUpOnAGenesisSeatStaysWithdrawable(t *testing.T) {
 	s := NewWithParams(stakingParams())
-	addr, pub, priv := keypair(t)
-	// The devnet fixture's shape: a one-spark genesis seat ...
-	s.SetBond(addr, Bond{Validator: pub, Amount: 1, Unfunded: 1, Height: 0})
-	// ... funded with its own MIN_STAKE through an ordinary Bond.
+	// A DETERMINISTIC key, so the two roots this test quotes are reproducible:
+	// the point of quoting them is that the OLD and NEW order produce different
+	// states from the same starting state, not that any particular key does.
+	pub, priv := genesis.DevAccountKey(0)
+	addr := types.AddressFromPub(pub)
+	// The shipped recipe's shape: a genesis seat whose power IS a MIN_STAKE bond
+	// that no account funded (deploy README §3.2), ...
+	s.SetBond(addr, Bond{Validator: pub, Amount: minStakeSparks, Unfunded: minStakeSparks, Height: 0})
+	// ... topped up with the operator's own MIN_STAKE through an ordinary Bond.
 	s.Set(addr, Account{Balance: minStakeSparks + 1}) // +1: the bond's fee
 	if err := s.ApplyTx(bondTx(t, pub, priv, addr, 0, minStakeSparks, 1)); err != nil {
 		t.Fatalf("topping up a genesis seat: %v", err)
 	}
 	bond, ok := s.BondOf(addr)
-	if !ok || bond.Amount != minStakeSparks+1 || bond.Unfunded != 1 || bond.Height != 0 {
-		t.Fatalf("bond after the top-up = %+v, want Amount %d (the grant plus the funded MIN_STAKE), Unfunded 1, Height 0",
-			bond, minStakeSparks+1)
+	if !ok || bond.Amount != 2*minStakeSparks || bond.Unfunded != minStakeSparks || bond.Height != 0 {
+		t.Fatalf("bond after the top-up = %+v, want Amount %d (the grant plus the funded MIN_STAKE), Unfunded %d, Height 0",
+			bond, 2*minStakeSparks, minStakeSparks)
 	}
 
-	// The genesis spark goes first and is destroyed; the remaining bond is
-	// fully funded, which is the ST-1 floor's exact boundary (MIN_STAKE).
+	// A PARTIAL exit of exactly the operator's own MIN_STAKE, which is the floor's
+	// boundary and therefore legal (the remainder is one MIN_STAKE). The funded
+	// part goes first, so the whole exit is recorded and the grant stays on the
+	// seat - the seat is RETAINED, which is the half the CLI used to get wrong.
+	// Under the old order this exit matched the grant first: it was burned whole,
+	// recorded nothing, and the operator's coins stayed locked with the grant
+	// already spent.
 	s.SetHeight(3)
-	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, 1)); err != nil {
-		t.Fatalf("unbonding the unfunded spark: %v", err)
+	rootBefore := s.Root()
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 1, minStakeSparks)); err != nil {
+		t.Fatalf("unbonding the operator's funded MIN_STAKE: %v", err)
 	}
-	if recs := s.UnbondingOf(addr); len(recs) != 0 {
-		t.Fatalf("unbonding the genesis spark recorded %+v, want none", recs)
-	}
-	bond, _ = s.BondOf(addr)
-	if bond.Amount != minStakeSparks || bond.Unfunded != 0 {
-		t.Fatalf("bond = %+v, want the funded MIN_STAKE with Unfunded 0", bond)
-	}
-
-	// The funded part exits normally and IS withdrawable.
-	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 2, minStakeSparks)); err != nil {
-		t.Fatalf("unbonding the funded part: %v", err)
-	}
+	// The root MOVES here, and the cause is the split: the bond keeps the grant
+	// (Amount MIN_STAKE, Unfunded MIN_STAKE) and the funded MIN_STAKE becomes an
+	// unbonding record, where the old order burned the grant and recorded
+	// nothing. Quoted in the audit's evidence so the movement is attributable.
+	t.Logf("partial exit: root %x -> %x (funded-first: the bond keeps its unfunded grant and the operator's MIN_STAKE becomes a record)", rootBefore, s.Root())
 	recs := s.UnbondingOf(addr)
 	if len(recs) != 1 || recs[0].Amount != minStakeSparks {
-		t.Fatalf("unbonding = %+v, want one funded MIN_STAKE record", recs)
+		t.Fatalf("unbonding = %+v, want one record of the operator's funded MIN_STAKE", recs)
 	}
+	bond, ok = s.BondOf(addr)
+	if !ok || bond.Amount != minStakeSparks || bond.Unfunded != minStakeSparks {
+		t.Fatalf("bond after the partial exit = %+v, want the MIN_STAKE grant (Amount %d, Unfunded %d): the operator's coins left and the seat did not",
+			bond, minStakeSparks, minStakeSparks)
+	}
+
+	// The operator's coins come back ...
 	s.SetHeight(recs[0].ReleaseHeight)
-	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 3)); err != nil {
+	if err := s.ApplyTx(withdrawTx(t, pub, priv, addr, 2)); err != nil {
 		t.Fatalf("withdraw of the funded part: %v", err)
 	}
 	if got := s.Get(addr).Balance; got != minStakeSparks {
-		t.Fatalf("balance = %d, want the funded MIN_STAKE back", got)
+		t.Fatalf("balance = %d, want the operator's funded MIN_STAKE back", got)
+	}
+
+	// ... and the grant is still not money: the last exit is the unfunded
+	// MIN_STAKE, destroyed rather than recorded, so the balance does not move and
+	// no second record appears (ST-3, unchanged by the order).
+	if err := s.ApplyTx(unbondTx(t, pub, priv, addr, 3, minStakeSparks)); err != nil {
+		t.Fatalf("unbonding the remaining genesis grant: %v", err)
+	}
+	if recs := s.UnbondingOf(addr); len(recs) != 0 {
+		t.Fatalf("unbonding the genesis grant recorded %+v, want none", recs)
+	}
+	if _, ok := s.BondOf(addr); ok {
+		t.Fatal("the genesis seat is still bonded after its final exit")
+	}
+	if got := s.Get(addr).Balance; got != minStakeSparks {
+		t.Fatalf("balance = %d after the grant's exit, want %d: a genesis grant became withdrawable", got, minStakeSparks)
 	}
 }
 
