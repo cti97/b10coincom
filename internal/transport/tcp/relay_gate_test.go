@@ -394,7 +394,7 @@ func TestAWrongTokenIsLoggedNodeSide(t *testing.T) {
 	})
 	waitFor(t, "the node-side log line for the refused token", 10*time.Second, func() bool {
 		s := logs.String()
-		return strings.Contains(s, "b10coin: relay "+addr) && strings.Contains(s, "accepting the proof")
+		return strings.Contains(s, "b10coin: relay "+addr) && strings.Contains(s, "did not prove it holds the access token")
 	})
 	if peers := tp.Peers(); len(peers) != 0 {
 		t.Fatalf("a token-refused dial was installed as a peer: %v", peers)

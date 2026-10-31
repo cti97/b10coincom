@@ -287,25 +287,29 @@ type Options struct {
 	// KeepAlive is the TCP keepalive probe period for accepted connections,
 	// how they shed half-open peers in minutes. Default DefaultKeepAlive.
 	KeepAlive time.Duration
-	// AccessToken, when non-empty, is a PRE-SHARED FIRST FRAME (audit N-8):
-	// a newly accepted connection must present exactly these bytes as its
-	// first frame or it is closed and counted as unauthorized. It is the
-	// in-process access control that works where an IP allowlist cannot -
-	// behind CGNAT, or when a home validator's outbound address rotates -
-	// and it keeps the relay's "parses nothing" posture by construction: the
-	// check is a length-and-equality comparison of raw frame bytes, never a
-	// decode, so the relay still understands nothing about consensus.
+	// AccessToken, when non-empty, is the PRE-SHARED KEY of a challenge-response
+	// gate (audit N-8, PX-3, D-1): a newly accepted connection is greeted with
+	// RelayGateGreeting and a fresh random challenge, must answer
+	// HMAC-SHA-256(token, challenge), and only then is sent
+	// HMAC-SHA-256(token, challenge ‖ answer) and registered. A socket that
+	// fails any step is closed and counted unauthorized, and the token bytes
+	// are NEVER written. It is the in-process access control that works where
+	// an IP allowlist cannot - behind CGNAT, or when a home validator's
+	// outbound address rotates - and it keeps the relay's "parses nothing"
+	// posture by construction: the check is a length-and-equality comparison
+	// of raw frame bytes plus one HMAC over bytes the relay already holds,
+	// never a decode, so the relay still understands nothing about consensus.
 	//
-	// The token frame is CONSUMED, not forwarded, and a connection that has
-	// not presented it is never registered: it cannot receive another peer's
-	// frames and cannot forward anything. Empty disables the check (the
-	// pre-existing behaviour), so an existing deployment that adds no token
-	// is unchanged.
+	// The answer is CONSUMED, not forwarded, and a connection that has not
+	// completed the exchange is never registered: it cannot receive another
+	// peer's frames and cannot forward anything. Empty disables the check (the
+	// pre-existing behaviour), so an existing deployment that adds no token is
+	// unchanged.
 	AccessToken []byte
-	// AccessTimeout bounds how long an accepted connection may take to
-	// present AccessToken before it is closed. Default accessTokenTimeout.
-	// It is short because an honest client sends the token immediately; a
-	// socket silent for this long is a scanner.
+	// AccessTimeout bounds how long an accepted connection may take to answer
+	// the gate challenge before it is closed. Default accessTokenTimeout.
+	// It is short because an honest client answers immediately; a socket silent
+	// for this long is a scanner.
 	AccessTimeout time.Duration
 }
 
@@ -1051,26 +1055,28 @@ func (r *Relay) releaseHandshake(nc net.Conn) {
 // both caps (audit F1). With no token configured it is the admit call alone.
 //
 // With a token, the exchange is four frames and no decoding at any point
-// (audit PX-3): the relay writes the FIXED greeting FIRST, then a 32-byte
+// (audit PX-3, D-1): the relay writes the FIXED greeting FIRST, then a 32-byte
 // random nonce followed by this socket's own local address - the challenge;
 // the connection's FIRST inbound frame must then be the HMAC-SHA-256 of that
 // challenge under the token, and it is consumed, never forwarded; and only on
-// a match does the relay write the FIXED accepted frame so the node can tell a
-// refusal from a dead socket instead of redialling in silence. The challenge
-// costs one extra bounded write on a socket that is already open, before the
-// relay knows anything about the peer; the token is never sent, so forwarding
-// the node's answer to every peer forwards no secret.
+// a match does the relay write RelayGateConfirmation, an HMAC over the
+// challenge and that proof. That last frame is what lets the node tell a gated
+// relay from BOTH a dead socket and a stranger looping the first three frames
+// through an ungated relay (audit D-1). The challenge costs one extra bounded
+// write on a socket that is already open, before the relay knows anything about
+// the peer; the token is never sent, so forwarding the node's answer to every
+// peer forwards no secret.
 //
 // The relay still calls no decoder anywhere in this path: it reads a frame
 // (wire.ReadFrame), compares raw bytes in constant time (subtle.
-// ConstantTimeCompare), and writes two constant byte strings. Its "parses
-// nothing" posture is intact by construction. A connection that fails, or says
-// nothing within accessTokenTimeout, is closed, counted as unauthorized, and
-// its reserved slot is RELEASED; it is NEVER registered, so it can neither
-// receive nor forward a frame.
+// ConstantTimeCompare), and writes two constant-width frames and one fixed
+// constant. Its "parses nothing" posture is intact by construction. A
+// connection that fails, or says nothing within accessTokenTimeout, is closed,
+// counted as unauthorized, and its reserved slot is RELEASED; it is NEVER
+// registered, so it can neither receive nor forward a frame.
 //
-// The greeting is a wire-format fact shared with the node side, so it comes
-// from internal/wire (RelayGateGreeting/RelayGateAccepted), which both ends
+// The frames are a wire-format fact shared with the node side, so they come
+// from internal/wire (RelayGateGreeting/RelayGateConfirmation), which both ends
 // already import - one source of truth, no import of the transport layer here.
 func (r *Relay) handshake(nc net.Conn, group string) {
 	defer r.wg.Done()
@@ -1080,7 +1086,10 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 		// refuses to answer (tcp.adoptRelay). The write is bounded like every
 		// other handshake write on this socket.
 		if err := writeGateFrame(nc, wire.RelayGateGreeting, r.opts.WriteTimeout); err != nil {
-			r.unauthorized.Add(1)
+			// A failed gate WRITE is a dying socket, not a refused token
+			// (audit D-5): counting it as unauthorized made a healthy relay
+			// look like it was turning valid tokens away whenever a peer
+			// disconnected mid-handshake.
 			r.releaseHandshake(nc)
 			_ = nc.Close()
 			return
@@ -1102,8 +1111,7 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 			challenge = append(challenge, la.String()...)
 		}
 		if err := writeGateFrame(nc, challenge, r.opts.WriteTimeout); err != nil {
-			r.unauthorized.Add(1)
-			r.releaseHandshake(nc)
+			r.releaseHandshake(nc) // dying socket, not a refused token (audit D-5)
 			_ = nc.Close()
 			return
 		}
@@ -1128,13 +1136,15 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 			_ = nc.Close()
 			return
 		}
-		// The token matched. Confirm it with the fixed accepted frame BEFORE
-		// clearing the deadline, so a node with a wrong token (which the relay
-		// closes above, without an ack) is distinguishable from one that was
-		// admitted: the node's read of this frame is its only signal. A write
-		// failure here is a dying socket, not a refused token, so it is not
-		// counted as unauthorized.
-		if err := writeGateFrame(nc, wire.RelayGateAccepted, r.opts.WriteTimeout); err != nil {
+		// The proof matched. Confirm it BEFORE clearing the deadline, so a node
+		// with a wrong token (which the relay closes above, without an ack) is
+		// distinguishable from one that was admitted: the node's read of this
+		// frame is its only signal. The confirmation is keyed by the token
+		// (audit D-1), so a stranger on an ungated relay cannot produce it by
+		// looping the greeting and a challenge. A write failure here is a dying
+		// socket, not a refused token, so it is not counted as unauthorized.
+		confirmation := wire.RelayGateConfirmation(r.opts.AccessToken, challenge, frame)
+		if err := writeGateFrame(nc, confirmation, r.opts.WriteTimeout); err != nil {
 			r.releaseHandshake(nc)
 			_ = nc.Close()
 			return
@@ -1165,11 +1175,12 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 
 // writeGateFrame writes one gate frame under a write deadline, so a peer that
 // has stopped reading cannot park the handshake goroutine on a 20-byte write.
-// The greeting and the accepted frame are constants; the challenge is 32 random
-// bytes the relay generated plus its own local address. None of them contains a
-// token byte or anything a peer sent, and nothing on the other side requires
-// decoding them. The deadline is cleared by the caller once the gate is done,
-// because the connection's reader and writer arm their own.
+// The greeting is a constant; the challenge is 32 random bytes the relay
+// generated plus its own local address; the confirmation is an HMAC over bytes
+// the relay already holds. None of them contains a token byte or anything a
+// peer sent, and nothing on the other side requires decoding them. The deadline
+// is cleared by the caller once the gate is done, because the connection's
+// reader and writer arm their own.
 func writeGateFrame(nc net.Conn, frame []byte, timeout time.Duration) error {
 	if err := nc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return err

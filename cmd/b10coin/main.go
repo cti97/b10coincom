@@ -136,7 +136,9 @@ a local devnet ships.
 Every staking verb BUILDS the transaction, prints its fields and its canonical
 bytes, and only then signs - after a confirmation: type "yes" at the prompt,
 or pass --yes when stdin is not an interactive terminal. --dry-run prints the
-transaction and stops without signing and without posting. The fee ceiling
+transaction and stops without signing and without posting; if --yes and
+--dry-run are given together, --dry-run wins and --yes is inert (nothing is
+signed either way). The fee ceiling
 defaults to 1 spark because that is min_fee_sparks on every shipped genesis and
 a fee above it buys nothing: the mempool admits on nonce and state rather than
 on price, and applyBond burns the whole fee. --max-fee SPARKS raises the
@@ -574,6 +576,8 @@ type stakingTxOptions struct {
 	// the exits pass 0: any non-zero fee they somehow built would be refused.
 	maxFee uint64
 	// yes is --yes: sign and post without asking, for a non-interactive run.
+	// With dryRun also set, dryRun wins and yes is inert: dry-run returns
+	// before the confirmation is reached, so nothing is signed either way.
 	yes bool
 	// dryRun is --dry-run: build and print, then stop. Nothing is signed and
 	// nothing is posted.
@@ -740,20 +744,21 @@ func (b *builtTx) print(w io.Writer, genesisHash [32]byte, node string, prov txP
 // interactive terminal (a pipe, a file, cron) or it closed.
 var errNoAnswer = errors.New("stdin is not an interactive terminal, or it closed before an answer")
 
-// stdinIsTerminal reports whether f is an interactive terminal. A real terminal
-// is a character device; /dev/null is one too (and is what `go test`, cron and
-// CI hand a process), so identity with the null device is excluded explicitly.
-// Reading is still what decides: an empty answer is a refusal whatever the
-// device was, because EOF must never look like consent.
+// stdinIsTerminal reports whether f is an interactive terminal. The portable
+// test is os.ModeCharDevice on f's stat: a pipe and a regular file are not
+// character devices, and a console is. Comparing against os.DevNull instead
+// (the pre-fix code) is NOT portable: on Windows a console handle and NUL both
+// stat with volume serial and file index zero, so os.SameFile matched and every
+// stake/unstake/withdraw without --yes was refused as non-interactive
+// (audit E-1). /dev/null is itself a character device, so this returns true for
+// it; that is safe because READING still decides - an empty line is a refusal,
+// and EOF must never look like consent (askConfirmation).
 func stdinIsTerminal(f *os.File) bool {
 	fi, err := f.Stat()
-	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+	if err != nil {
 		return false
 	}
-	if null, err := os.Stat(os.DevNull); err == nil && os.SameFile(fi, null) {
-		return false
-	}
-	return true
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // askConfirmation is the interactive half of the confirmation boundary, kept
@@ -819,8 +824,8 @@ func (t *stakingTarget) submit(tx *types.Tx, o stakingTxOptions, prov txProvenan
 	// before any signature exists. It must not depend on the reported
 	// min_fee_sparks being honest: the ceiling is this CLI's own number.
 	if built.tx.Fee > o.maxFee {
-		return "", false, fmt.Errorf("refusing to sign: the node at %s puts a fee of %d spark on this transaction, above %s. Re-run with --max-fee %d (sparks) only if you accept that cost",
-			t.base, built.tx.Fee, feeCeilingReason(o.maxFee), built.tx.Fee)
+		return "", false, fmt.Errorf("refusing to sign: the node at %s puts a fee of %d spark on this transaction, above %s. Nothing was signed. If you deliberately accept a higher fee, raise --max-fee to a number YOU choose above %d; do not copy the fee the node reported",
+			t.base, built.tx.Fee, feeCeilingReason(o.maxFee), o.maxFee)
 	}
 
 	if o.dryRun {
@@ -1267,7 +1272,7 @@ func cmdNode(args []string) error {
 	//     anyone with the repository can reproduce, for development only.
 	peers := fs.String("peers", "", "comma-separated peer addresses to dial")
 	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
-	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8; at least 16 bytes). Sent only after the relay announces its gate with a fixed first frame, so a relay without a token never receives it; a refused token is logged and retried. Plaintext over TCP and replayable: use it over a trusted path")
+	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8; at least 16 bytes). The token is NEVER sent: the node answers the relay's per-connection challenge with HMAC-SHA-256(token, challenge) only after the relay announces its gate, and requires HMAC-SHA-256(token, challenge || answer) back, so a relay (or a stranger behind an ungated one) that does not hold the token is refused and logged (audit D-1). The exchange is in plaintext: use it over a trusted path")
 	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
 	// The advertisement override (audit PX-8). A port-forwarded home node listens
 	// on 0.0.0.0:7001, which names no endpoint a peer can dial, so PEER_EXCHANGE

@@ -1,10 +1,15 @@
 package tcp
 
-// Audit PX-3's pin, BEFORE and AFTER: a registered stranger on a token-less
-// relay can still make a token-configured node answer the gate (the relay
-// forwards the public greeting, a challenge the stranger chose, and the public
-// accepted frame into the node's handshake), but what the relay forwards onward
-// must never be the token. It is an HMAC of the challenge under the token.
+// Audit PX-3's and D-1's pin, BEFORE and AFTER: a registered stranger on a
+// token-less relay can still make a token-configured node ANSWER the gate (the
+// relay forwards the public greeting and a challenge the stranger chose), but
+// what the relay forwards onward must never be the token, and the stranger must
+// not be able to complete the exchange. D-1: the third frame used to be a
+// public constant, so looping greeting/challenge/that-constant made the node
+// install a link through a relay that never gated. It is now a token-keyed MAC
+// over the challenge and the node's answer, which the stranger cannot compute;
+// the loop below sends the OLD public accepted frame and the link must NOT be
+// installed.
 //
 // The relay here is the real one, started WITHOUT an access token - the
 // misconfiguration from the finding - so it registers every socket immediately
@@ -24,13 +29,13 @@ import (
 
 // TestATokenlessRelayForwardsNoProofOfTheToken is the harvest, after the fix.
 // The stranger registers first and drives the whole gate: greeting, a challenge
-// it invents, and the accepted frame. The node, configured with a token, reads
-// them (it cannot tell a forwarded frame from the relay's own - documented
-// residual) and answers. The frame the stranger then receives is the answer.
-//
-// The assertion is deliberately absolute: the answer must NOT be the token. A
-// mutant that restores the constant-greeting-then-token exchange makes the
-// stranger read the token itself and fails here WITHOUT printing it.
+// it invents, and the OLD public accepted frame. The node, configured with a
+// token, reads them and answers; the frame the stranger then receives is the
+// answer. Three assertions are absolute: the answer must NOT be the token (a
+// mutant that restores the constant-greeting-then-token exchange fails here
+// WITHOUT printing it); it must be the challenge's HMAC; and the node must NOT
+// install the link, because the third frame the stranger can forge (a public
+// constant) is no longer the confirmation the gate now requires (audit D-1).
 func TestATokenlessRelayForwardsNoProofOfTheToken(t *testing.T) {
 	rl := relay.New(relay.Options{MaxFrameBytes: 4096, MaxConns: 16, MaxConnsPerIP: 16, WriteQueueBytes: 1 << 16})
 	if err := rl.Listen("127.0.0.1:0"); err != nil {
@@ -72,11 +77,13 @@ func TestATokenlessRelayForwardsNoProofOfTheToken(t *testing.T) {
 		for rl.Stats().Conns < 2 && time.Now().Before(reg) {
 			time.Sleep(5 * time.Millisecond)
 		}
-		// greeting, challenge, accepted - all forwarded by the relay into the
-		// node's gate handshake, all three indistinguishable from the relay's.
+		// greeting, challenge, and the OLD public accepted frame - all
+		// forwarded by the relay into the node's gate handshake, all three
+		// indistinguishable from the relay's. The third is exactly what a
+		// pre-D-1 node accepted; a post-D-1 node must refuse it.
 		_ = wire.WriteFrame(stranger, wire.RelayGateGreeting)
 		_ = wire.WriteFrame(stranger, challenge)
-		_ = wire.WriteFrame(stranger, wire.RelayGateAccepted)
+		_ = wire.WriteFrame(stranger, []byte("b10coin-relay-gate-v1-ok"))
 		_ = stranger.SetReadDeadline(time.Now().Add(10 * time.Second))
 		frame, err := wire.ReadFrame(stranger, 1<<16)
 		if err != nil {
@@ -115,6 +122,15 @@ func TestATokenlessRelayForwardsNoProofOfTheToken(t *testing.T) {
 	if len(frame) != wire.RelayGateMACBytes {
 		t.Fatalf("the forwarded answer is %d bytes, want the fixed %d-byte MAC", len(frame), wire.RelayGateMACBytes)
 	}
+	// D-1: the node answered, but it must NOT install the link. The relay
+	// registered the node's socket before the gate ran (it has no token), so
+	// the count falls back to the stranger alone only when the node closes it.
+	if peers := tp.Peers(); len(peers) != 0 {
+		t.Fatalf("the node installed %v through a relay that never gated: a stranger's looped frames defeated the operator's \"only a gated relay\" intent (audit D-1)", peers)
+	}
+	waitFor(t, "the node to drop the ungated relay link", 10*time.Second, func() bool {
+		return rl.Stats().Conns == 1
+	})
 }
 
 // TestAGateProofIsNotReplayableOnAnotherConnection is the nonce's half of PX-3:
@@ -150,9 +166,17 @@ func TestAGateProofIsNotReplayableOnAnotherConnection(t *testing.T) {
 	if err := wire.WriteFrame(first, proofOne); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := wire.ReadFrame(first, 1<<16); err != nil || !bytes.Equal(got, wire.RelayGateAccepted) {
-		t.Fatalf("first connection accepted frame: %q, %v", got, err)
+	if got, err := wire.ReadFrame(first, 1<<16); err != nil || !bytes.Equal(got, wire.RelayGateConfirmation(token, challengeOne, proofOne)) {
+		t.Fatalf("first connection confirmation frame: %q, %v", got, err)
 	}
+	// The relay writes the confirmation BEFORE it registers the connection, so
+	// reading it is not proof of registration. Wait for the holder's slot
+	// before the replayed dial is judged; asserting Conns synchronously here is
+	// exactly the race that failed two CI runs on commits that touched neither
+	// this test nor this code (audit F-3).
+	waitFor(t, "the legitimate holder to be registered", 5*time.Second, func() bool {
+		return rl.Stats().Conns == 1
+	})
 
 	// Connection two: read its own (different) challenge, then present the
 	// FIRST connection's proof. The nonce makes it wrong here.

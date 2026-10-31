@@ -10,6 +10,22 @@ on:
   # pass, without anyone touching the repository.
   schedule:
     - cron: '23 5 * * 2,5'
+  # Audit F-2: the scheduled-failure REPORTER (`report` below) has never run
+  # except as skipped, and CI-1's fix merged after the last scheduled run, so
+  # there was no way to exercise it without waiting for a cron Tuesday. This
+  # manual trigger can run the whole workflow, and `simulate_failure` fails the
+  # `test` job on purpose so the reporter's issue-filing path runs end to end:
+  #
+  #     gh workflow run ci.yml -f simulate_failure=true
+  #
+  # It files one test issue (delete it afterwards). Without the input it is an
+  # ordinary on-demand run of every job.
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "FAIL the test job on purpose so the scheduled-failure reporter can be exercised; a test issue is filed (audit F-2)"
+        type: boolean
+        default: false
 
 # The workflow's token can do nothing but read: neither vet, test, release nor
 # lint needs write access to the repository. Scoping the token is the audit's
@@ -53,22 +69,59 @@ jobs:
       # binary, so the number the timeout must clear is the worst single
       # package's ceilings, not the suite's.
       #
-      # Re-measured 2026-10-30 (audit L-3): the devnet package's ceilings —
-      # every deadline its wait helpers are given (waitAllReach, waitFor,
-      # reachError, convergedError) plus its bounded polls — now total about
-      # 3,030 s (~50 min); counting the sub-second polls as well, about
-      # 3,900 s (~65 min). The earlier "~1770 s (all second-literals, ~2340 s)"
-      # was already an undercount, and 40 m (2,400 s) no longer clears the
-      # package's own ceilings. 60 m does, for both the plain and the -race
-      # binary (same ceilings, slower execution), and it is still far above the
-      # measured healthy pass: internal/devnet takes 104 s alone, 177 s in the
-      # full suite and 201 s under -race on the audit host, and that healthy
-      # pass is the only run that should ever finish. A timeout this large is a
-      # bound on a pathological run, never an expectation.
+      # Re-measured 2026-10-31 (audit F-1): summing every `N*time.Second` and
+      # `N*time.Minute` literal in internal/devnet/*_test.go (comments
+      # excluded) gives 6,527 s (108 min 47 s) at a13578e; three bare
+      # `time.Minute` arguments in stall_test.go and tcp_test.go add 180 s, so
+      # the full explicit ceiling is 6,707 s (111 min 47 s), with
+      # rotation_out_rt3_test.go alone at 1,800 s. The command for the N*
+      # half (it does not count bare literals):
+      #
+      #   python3 - <<'PY'
+      #   import re,glob
+      #   print(sum(int(m.group(1))*(60 if m.group(2)=='Minute' else 1)
+      #             for f in glob.glob('internal/devnet/*_test.go')
+      #             for ln in open(f) for m in
+      #             re.finditer(r'(\d+)\s*\*\s*time\.(Second|Minute)',
+      #                         ln.split('//')[0])))
+      #   PY
+      #
+      # The audit's 6,357 s does not reproduce under either reading (the
+      # `N*time.Second` literals alone sum to 5,927 s); all three numbers are
+      # far above 60 m. The previous comment claimed ~3,030 s / ~3,900 s; that
+      # was wrong for the second report in a row. 120 m (7,200 s) clears the
+      # full 6,707 s with about eight minutes of headroom, for both the plain
+      # and the -race binary (same ceilings, slower execution). It is still far
+      # above the measured healthy pass:
+      # internal/devnet takes 104 s alone, 177 s in the full suite and 201 s
+      # under -race on the audit host, and that healthy pass is the only run
+      # that should ever finish. A timeout this large is a bound on a
+      # pathological run, never an expectation.
       - run: go vet ./...
-      - run: go test -timeout 60m -count=1 ./...
-      - run: go test -race -timeout 60m -count=1 ./...
+      - run: go test -timeout 120m -count=1 ./...
+      - run: go test -race -timeout 120m -count=1 ./...
       - run: go build ./...
+      # Audit F-2: the failure path of a manual run. Only workflow_dispatch can
+      # request it, so pushes and PRs are unaffected. A red test job with the
+      # `report` job's issue is the end-to-end proof that CI-1's reporter runs;
+      # see the comment on the `report` job for the exact command.
+      - name: simulate a failure (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch' && inputs.simulate_failure
+        run: |
+          echo "::error::simulated failure requested by workflow_dispatch input simulate_failure=true (audit F-2); the report job should file an issue"
+          exit 1
+      # Audit F-4: the two benchmarks that back the "allocates nothing" claims in
+      # internal/consensus/diag.go and Chain.IsSeatedAt were never executed by
+      # CI. They are opt-in by construction (`go test` skips benchmarks), so the
+      # claims rested on prose. This runs BOTH at a fixed 100 iterations, which
+      # measured 1.4 s on the audit host (0.38 s devnet + 0.25 s chain plus
+      # compilation; the devnet benchmark brings up four in-process validators).
+      # It is evidence in the log (0 B/op, 0 allocs/op on the steady paths), not
+      # a gate: the benchmark asserts no threshold, so a regression is visible
+      # but not red. Turning it into a gate would need an allocation assertion
+      # in the benchmark itself; that is deliberately not done here because
+      # allocs/op is a measurement, not a correctness property.
+      - run: go test -run '^$' -bench 'Benchmark(HotPathObservers|CommitteeMembershipPerFrame)$' -benchmem -benchtime=100x ./internal/devnet ./internal/chain
       # The milestone acceptance commands must keep printing OK with exit 0.
       # The first is the default run — its --claims default makes it pay one
       # claim and prove the same-epoch double claim refused — and the second
@@ -270,7 +323,12 @@ jobs:
   # off pushes and PRs, where the author already sees the failure. The script
   # dedups by exact title and exits 0 on every path, including a failed gh call.
   report:
-    if: always() && github.event_name == 'schedule'
+    # Schedule is the normal path. A manual run with simulate_failure=true is
+    # the F-2 rehearsal: the `test` job fails on purpose, this job runs, and the
+    # issue-filing script below is exercised end to end. `gh workflow run
+    # ci.yml -f simulate_failure=true` is the whole procedure; delete the test
+    # issue it files.
+    if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.simulate_failure))
     needs: [test, lint, release, cross]
     runs-on: ubuntu-latest
     permissions:

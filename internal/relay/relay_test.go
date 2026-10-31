@@ -129,16 +129,16 @@ func readFrame(t *testing.T, c net.Conn, max int) []byte {
 	return payload
 }
 
-// expectGateGreeting / expectGateAccepted pin the two fixed frames of the
-// access-token handshake (review, audit fix round 4). The relay writes the
-// greeting as its FIRST frame on every accepted connection when a token is
-// configured, and the accepted frame only after the presented token matched.
-// Both are byte-for-byte constants from internal/wire: the relay still decodes
-// nothing, and a node that does not see the greeting never sends its token, so
-// a relay started without --access-token-file cannot be handed the secret to
-// forward. waitClosed's "delivered data instead of closing" check is what keeps
-// these honest: it is handed the frames it expects, so any other byte is still
-// a protocol violation.
+// expectGateGreeting / expectGateAccepted pin the two RELAY->node frames of the
+// access-token handshake (review, audit fix round 4; confirmation, audit D-1).
+// The relay writes the greeting as its FIRST frame on every accepted connection
+// when a token is configured, and the confirmation only after the presented
+// proof matched. The greeting is a byte-for-byte constant; the confirmation is
+// an HMAC over the challenge and the node's proof, so the test recomputes it
+// from the same three values. The relay still decodes nothing, and a node that
+// does not see the greeting never sends its proof, so a relay started without
+// --access-token-file cannot be handed the secret to forward. waitClosed's
+// "delivered data instead of closing" check is what keeps these honest.
 func expectGateGreeting(t *testing.T, c net.Conn) {
 	t.Helper()
 	if got := readFrame(t, c, 1<<16); !bytes.Equal(got, wire.RelayGateGreeting) {
@@ -162,10 +162,11 @@ func expectGateChallenge(t *testing.T, c net.Conn) []byte {
 // just read, never the token (audit PX-3).
 func gateAnswer(token, challenge []byte) []byte { return wire.RelayGateProof(token, challenge) }
 
-func expectGateAccepted(t *testing.T, c net.Conn) {
+func expectGateAccepted(t *testing.T, c net.Conn, token, challenge, proof []byte) {
 	t.Helper()
-	if got := readFrame(t, c, 1<<16); !bytes.Equal(got, wire.RelayGateAccepted) {
-		t.Fatalf("relay's frame after a valid token is %q; want the fixed accepted frame %q", got, wire.RelayGateAccepted)
+	want := wire.RelayGateConfirmation(token, challenge, proof)
+	if got := readFrame(t, c, 1<<16); !bytes.Equal(got, want) {
+		t.Fatalf("relay's frame after a valid proof is % x; want the token-keyed confirmation % x (audit D-1: a stranger must not be able to forge this)", got, want)
 	}
 }
 
@@ -2016,13 +2017,17 @@ func TestTheAccessTokenGateAdmitsOnlyTheTokenHolder(t *testing.T) {
 	// never hands its secret to a relay that would forward it as payload.
 	a := dial(t, r.Addr().String())
 	expectGateGreeting(t, a)
-	writeFrame(t, a, gateAnswer(token, expectGateChallenge(t, a)))
-	expectGateAccepted(t, a)
+	challengeA := expectGateChallenge(t, a)
+	proofA := gateAnswer(token, challengeA)
+	writeFrame(t, a, proofA)
+	expectGateAccepted(t, a, token, challengeA, proofA)
 	waitRegistered(t, r, 1, "the first token holder was not registered")
 	b := dial(t, r.Addr().String())
 	expectGateGreeting(t, b)
-	writeFrame(t, b, gateAnswer(token, expectGateChallenge(t, b)))
-	expectGateAccepted(t, b)
+	challengeB := expectGateChallenge(t, b)
+	proofB := gateAnswer(token, challengeB)
+	writeFrame(t, b, proofB)
+	expectGateAccepted(t, b, token, challengeB, proofB)
 	waitRegistered(t, r, 2, "the second token holder was not registered")
 
 	// Neither the token nor either answer reached the forwarding path: the
@@ -2437,4 +2442,28 @@ func TestAShortAccessTokenIsRefusedAtStartup(t *testing.T) {
 		t.Fatalf("a token of exactly the minimum length was refused: %v", err)
 	}
 	r.Close()
+}
+
+// TestAFailedGateWriteIsNotCountedAsUnauthorized pins audit D-5's cheap half.
+// A gate frame that cannot be WRITTEN is a dying socket, not a token the relay
+// refused; counting it as `unauthorized` made an operator read "someone is
+// presenting wrong tokens" when a peer had simply disconnected mid-handshake.
+// The state is constructed with net.Pipe: the peer end is closed before the
+// greeting write, so the write fails deterministically and no socket, timer or
+// network is involved.
+func TestAFailedGateWriteIsNotCountedAsUnauthorized(t *testing.T) {
+	r := New(Options{AccessToken: []byte("a-sixteen-byte-token")})
+	defer r.Close()
+
+	server, client := net.Pipe()
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r.wg.Add(1) // handshake's own accounting; no accept loop is running here
+	r.handshake(server, "127.0.0.1:0")
+	_ = server.Close()
+
+	if got := r.Stats().Unauthorized; got != 0 {
+		t.Fatalf("Unauthorized = %d after a failed gate write, want 0: a dying socket is not a refused token (audit D-5)", got)
+	}
 }

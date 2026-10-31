@@ -379,3 +379,46 @@ func committeeFileBytes256(t *testing.T) []byte {
 	}
 	return raw
 }
+
+// TestCommitteeFileRefusesAMisspelledField pins audit E-4. encoding/json's
+// default decoder ignores unknown fields, so a misspelling of a real field
+// silently changed the chain: "committee_sise" dropped the spare seat, and on a
+// full committee the next bonded newcomer then evicted a genesis seat instead
+// of taking the spare. ParseCommitteeJSON now calls DisallowUnknownFields, at
+// the top level AND inside each validator entry.
+func TestCommitteeFileRefusesAMisspelledField(t *testing.T) {
+	good := string(committeeFileBytes(t, testPub(0)))
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "top-level committee_size misspelled",
+			raw:  strings.Replace(good, `"validators"`, `"committee_sise":4,"validators"`, 1),
+			want: "committee_sise",
+		},
+		{
+			name: "entry field misspelled",
+			raw:  strings.Replace(good, `"power":`, `"powr":`, 1),
+			want: "powr",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.raw == good {
+				t.Fatalf("the test did not change the file: %s", good)
+			}
+			g, err := ParseCommitteeJSON([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("a file with an unknown field parsed as %+v; a typo must not silently produce a different chain (audit E-4)", g)
+			}
+			if !errors.Is(err, ErrBadCommitteeFile) {
+				t.Fatalf("the refusal does not carry ErrBadCommitteeFile: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("the refusal does not name the unknown field %q, so the operator cannot find the typo: %v", tc.want, err)
+			}
+		})
+	}
+}

@@ -61,6 +61,12 @@
 #                         agreed, the verdict says exactly that.
 #   INCONCLUSIVE(exit 5)  agreement could not be READ: a /block/<H> fetch
 #                         failed after both status readings succeeded.
+#   PARTIALPASS (exit 6)  the run PASSED with exactly two validators and the
+#                         operator said --partial. It is a real result for the
+#                         survivors of a three-seat network, but it is NOT the
+#                         three-validator M4 acceptance criterion, so it does
+#                         not exit 0. Named two hosts on a larger committee
+#                         with a frozen third cannot borrow the full verdict.
 #
 # Dependencies: bash (/dev/tcp and arrays — present on macOS and Raspberry Pi
 # OS; the recipe's §8 already assumes bash) and curl, with wget as the
@@ -69,8 +75,9 @@
 # /status and /block bodies are flat JSON with known keys, so fields are read
 # with sed — no JSON parser, no jq, no python.
 #
-# Exit codes: 0 PASS, 1 UNREACHABLE, 2 STALLED, 3 DISAGREE, 4 RELAY,
-# 5 INCONCLUSIVE, 64 bad usage, 70 could not create its temp dir.
+# Exit codes: 0 PASS (three or more validators), 1 UNREACHABLE, 2 STALLED,
+# 3 DISAGREE, 4 RELAY, 5 INCONCLUSIVE, 6 PARTIAL PASS (a named two-validator
+# reading, only with --partial), 64 bad usage, 70 could not create its temp dir.
 
 set -uo pipefail
 
@@ -82,6 +89,7 @@ ADVANCE_WAIT=15         # seconds between the two readings
 PROBE_TIMEOUT=5         # relay TCP probe bound, seconds
 RELAY_GIVEN=""
 PIS_ARG=""
+PARTIAL=no
 FETCH_TIMEOUT=8         # per-HTTP-request bound, seconds
 
 usage() {
@@ -115,6 +123,10 @@ Options:
   --http-port N     validator RPC port (default $HTTP_PORT)
   --ssh-user NAME   SSH user for validator hosts (default $SSH_USER; a
                     user@host entry in --pis overrides it)
+  --partial         REQUIRED for a two-validator reading: name the survivors of
+                    a three-seat network deliberately. A two-validator PASS
+                    exits 6, never 0, so it cannot be mistaken for the full
+                    three-validator acceptance criterion
   --advance-wait S  seconds between the two /status readings (default $ADVANCE_WAIT)
   --relay-timeout S bound for the relay TCP probe (default $PROBE_TIMEOUT)
   --help            this text
@@ -122,8 +134,8 @@ Options:
 Environment: B10COIN_FETCH curl|wget forces the HTTP client (default: first
 of curl, wget found in PATH). Exit codes: 0 PASS, 1 UNREACHABLE (a SCHEMA
 MISMATCH — a reached validator whose reply is not a b10coin /status — fails
-here too), 2 STALLED, 3 DISAGREE, 4 RELAY, 5 INCONCLUSIVE, 64 usage,
-70 could not create its temp dir.
+here too), 2 STALLED, 3 DISAGREE, 4 RELAY, 5 INCONCLUSIVE, 6 PARTIAL PASS
+(two validators with --partial), 64 usage, 70 could not create its temp dir.
 EOF
 }
 
@@ -138,6 +150,7 @@ while [ $# -gt 0 ]; do
         --pis=*) PIS_ARG=${1#*=};                                                            shift ;;
         --relay) [ $# -ge 2 ] || die_usage "--relay needs a value";         RELAY_GIVEN=$2;  shift 2 ;;
         --relay=*) RELAY_GIVEN=${1#*=};                                                      shift ;;
+        --partial) PARTIAL=yes;                                                              shift ;;
         --mode)  [ $# -ge 2 ] || die_usage "--mode needs a value";          MODE=$2;         shift 2 ;;
         --mode=*) MODE=${1#*=};                                                              shift ;;
         --http-port) [ $# -ge 2 ] || die_usage "--http-port needs a value"; HTTP_PORT=$2;    shift 2 ;;
@@ -202,6 +215,14 @@ IFS=$OLDIFS
 # stays a usage error, failed before any probing rather than looking like
 # evidence.
 [ ${#PIS[@]} -ge 2 ] || die_usage "--pis named ${#PIS[@]} validator(s) — this harness judges a chain from at least TWO validators (the survivors of a 3-seat network minus one); one validator cannot tell a finalising chain from a stalled one"
+# Audit E-3: a two-validator PASS used to be exit 0, indistinguishable from the
+# three-validator acceptance criterion. Naming two healthy hosts on a larger
+# committee with a frozen third could therefore look like a full pass. The
+# operator must now SAY it is a partial reading, and a partial PASS has its own
+# exit code below.
+if [ ${#PIS[@]} -lt 3 ] && [ "$PARTIAL" != yes ]; then
+    die_usage "a ${#PIS[@]}-validator reading is PARTIAL: three is the M4 acceptance criterion, and exit 0 must mean three. Re-run with --partial if you deliberately mean the survivors of a three-seat network (deploy README §8), or name three validators"
+fi
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -633,15 +654,21 @@ elif [ "$RELAY_STATE" = UNREACHABLE ]; then
     echo "  The probe ran from THIS machine (a laptop-side firewall can cause exactly this); from a validator:"
     echo "  ssh <pi> 'bash -c \"exec 3<>/dev/tcp/$RELAY_HOST/$RELAY_PORT\" && echo open'  (deploy README §8, failure 2)."
 else
-    CODE=0
-    echo "agreement   $AGREE_DETAIL"
-    echo
-    echo "VERDICT: PASS — $N validators on chain ${CH[0]}, every height increased during the ${ADVANCE_WAIT}s wait, and all"
-    echo "  report the identical block at height $COMMON_H: the committee finalises ONE shared chain. M4's criterion —"
-    echo "  validators finalising blocks — holds for the machines named above; paste this entire output."
     if [ "$N" -lt 3 ]; then
-        echo "  NOTE: this is a $N-validator reading, not the three-validator acceptance criterion. It is what the"
-        echo "  survivors of a 3-seat network minus one produce; quote the stopped validator's log beside it."
+        CODE=6
+        echo "agreement   $AGREE_DETAIL"
+        echo
+        echo "VERDICT: PARTIAL PASS (exit 6) — $N validators on chain ${CH[0]}, every height increased during the ${ADVANCE_WAIT}s wait, and both"
+        echo "  report the identical block at height $COMMON_H. This is a real reading of the SURVIVORS of a three-seat network minus one,"
+        echo "  but it is NOT M4's three-validator acceptance criterion and it deliberately does not exit 0. Quote the stopped"
+        echo "  validator's log beside it."
+    else
+        CODE=0
+        echo "agreement   $AGREE_DETAIL"
+        echo
+        echo "VERDICT: PASS — $N validators on chain ${CH[0]}, every height increased during the ${ADVANCE_WAIT}s wait, and all"
+        echo "  report the identical block at height $COMMON_H: the committee finalises ONE shared chain. M4's criterion —"
+        echo "  validators finalising blocks — holds for the machines named above; paste this entire output."
     fi
 fi
 

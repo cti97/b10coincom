@@ -1502,36 +1502,39 @@ func (t *TcpTransport) readHello(nc net.Conn, addr string) (transport.PeerID, er
 // waits for the relay to present wire.RelayGateGreeting and its per-connection
 // challenge, answers wire.RelayGateProof(token, challenge) - HMAC-SHA-256 over
 // bytes the relay just generated - and only then waits for
-// wire.RelayGateAccepted before installing the connection (audit PX-3,
-// replacing round 4's constant-greeting-then-token exchange). The ID
-// announcement is omitted on this path. Without a token the ID announcement is
-// unchanged, so every relay deployment that configures no token behaves exactly
-// as before.
+// wire.RelayGateConfirmation before installing the connection (audit PX-3,
+// D-1). The ID announcement is omitted on this path. Without a token the ID
+// announcement is unchanged, so every relay deployment that configures no
+// token behaves exactly as before.
 //
-// The order and the MAC are the fix, not details. The first shape wrote the
+// The order and the MACs are the fix, not details. The first shape wrote the
 // token unconditionally, and a relay started without --access-token-file
 // consumes no token frame at all: it forwarded the operator's secret to EVERY
 // registered connection. The second waited for a fixed greeting, which is a
 // public constant: a registered stranger on a token-less relay could send that
 // constant through it, have the relay forward it into this handshake, and then
-// read the token as the relay forwarded it onward (audit PX-3). Now the answer
-// is a MAC over a fresh challenge, so even a stranger who wins that exchange
-// receives no token, and cannot replay the answer on any other connection. The
-// price is that a token-configured node requires a token-configured relay of
-// at least this vintage; a relay with no token is refused loudly and repeatedly
-// rather than trusted with a proof of the secret. Every refusal here is logged
+// read the token as the relay forwarded it onward (audit PX-3). The third read
+// a fixed accepted frame, which was ALSO a public constant: a stranger on a
+// token-less relay could loop greeting, a challenge it chose, and that accepted
+// frame, and this node would install the link as gated even though the relay
+// never checked anything (audit D-1). Now the answer is a MAC over a fresh
+// challenge and the relay's confirmation is a MAC keyed by the token over that
+// challenge and the answer, so a relay that never gated cannot manufacture it
+// and a stranger has nothing valid to loop. The price is that a
+// token-configured node requires a token-configured relay of at least this
+// vintage; a relay with no token is refused loudly and repeatedly rather than
+// trusted with a proof of the secret. Every refusal here is logged
 // (relayHandshakeFailed) - before this, a node with a wrong token redialled
 // forever in silence and the failure was visible only in the relay's
 // unauthorized counter.
 //
 // WHAT IS NOT FIXED HERE, stated so it is not mistaken for closed: the gate
-// authenticates the RELAY to this node only to the extent that a stranger
-// behind a token-less relay cannot distinguish its forged greeting/challenge/
-// accepted trio from the relay's own - the node reads frames, not provenance.
-// Such a stranger can make this node answer a challenge it chose and then
-// install a connection to a relay that never gated. That is a misconfigured
-// relay the operator chose to dial; the secret is still never disclosed, which
-// was PX-3's finding.
+// binds the far end to possession of the token, not to an identity. An attacker
+// who can proxy this node's proof to a GENUINE gated relay (holding the same
+// token) and carry that relay's confirmation back can still interpose. That
+// needs an active bidirectional proxy and a real gated relay with the shared
+// secret, and no shared-secret gate without a relay identity can close it. The
+// secret is still never disclosed, which was PX-3's finding.
 func (t *TcpTransport) adoptRelay(nc net.Conn, addr string) (*conn, error) {
 	if len(t.opts.RelayAccessToken) > 0 {
 		if err := t.readGateFrame(nc, addr, wire.RelayGateGreeting,
@@ -1546,11 +1549,12 @@ func (t *TcpTransport) adoptRelay(nc net.Conn, addr string) (*conn, error) {
 		// the token itself (audit PX-3). A stranger who makes this node answer a
 		// chosen challenge through a token-less relay receives a MAC, which is
 		// useless for any other connection and discloses nothing about the key.
-		if err := t.writeHandshakeFrame(nc, addr, wire.RelayGateProof(t.opts.RelayAccessToken, challenge)); err != nil {
+		proof := wire.RelayGateProof(t.opts.RelayAccessToken, challenge)
+		if err := t.writeHandshakeFrame(nc, addr, proof); err != nil {
 			return nil, err
 		}
-		if err := t.readGateFrame(nc, addr, wire.RelayGateAccepted,
-			"the relay closed the socket instead of accepting the proof (a wrong or mismatched token, a replayed handshake, or a relay that predates the challenge-response gate)"); err != nil {
+		if err := t.readGateFrame(nc, addr, wire.RelayGateConfirmation(t.opts.RelayAccessToken, challenge, proof),
+			"the relay did not prove it holds the access token, so the link was not installed (a wrong or mismatched token, a relay that predates the challenge-confirmation gate, or a stranger behind an ungated relay looping the greeting and a challenge)"); err != nil {
 			return nil, err
 		}
 	} else if err := t.writeHello(nc, addr); err != nil {
@@ -1598,7 +1602,8 @@ func (t *TcpTransport) readGateChallenge(nc net.Conn, addr string) ([]byte, erro
 
 // readGateFrame reads exactly one relay-gate frame under the handshake
 // deadline, verifies it is byte-for-byte the FIXED frame the relay sends
-// (length and bytes, via wire.RelayGateGreeting/RelayGateAccepted), clears the
+// (length and bytes: wire.RelayGateGreeting, or the computed
+// wire.RelayGateConfirmation), clears the
 // deadline, and logs-and-errors on anything else. The failure text is composed
 // from why the node stopped, never from the bytes it read, so a stranger's
 // frame content cannot reach the log through this path.

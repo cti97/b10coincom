@@ -1428,10 +1428,26 @@ func TestHostileNodeFeeIsRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("a bond whose fee is the whole spendable balance was signed, not refused")
 	}
-	for _, want := range []string{"refusing to sign", "--max-fee", "ceiling", fmt.Sprint(hostileFee)} {
+	for _, want := range []string{"refusing to sign", "--max-fee", "ceiling", fmt.Sprint(defaultMaxFeeSparks)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal must contain %q for the operator to act on it, got: %v", want, err)
 		}
+	}
+	// Audit E-2: the instruction must quote the CEILING, never the fee the
+	// node reported. A hostile node chooses balance-amount, so echoing it into
+	// "Re-run with --max-fee N" hands the operator a copy-pasteable flag that
+	// signs away the whole balance.
+	// The hostile fee may appear ONCE, as the reported claim. It must not
+	// appear again in the instruction: "raise --max-fee above <the node's
+	// number>" would still steer an operator into copying it.
+	if got := strings.Count(err.Error(), fmt.Sprint(hostileFee)); got != 1 {
+		t.Errorf("the node's fee appears %d times in the refusal, want exactly 1 (the report); the instruction must quote the ceiling, not the node's number: %v", got, err)
+	}
+	if strings.Contains(err.Error(), fmt.Sprintf("--max-fee %d", hostileFee)) {
+		t.Errorf("the refusal echoed the node's fee into the --max-fee instruction: %v", err)
+	}
+	if !strings.Contains(err.Error(), "raise --max-fee") {
+		t.Errorf("the refusal does not tell the operator to choose a ceiling itself: %v", err)
 	}
 	// The transaction the node asked for was built and printed BEFORE the
 	// refusal, so the operator can see the number that was refused.
@@ -1915,4 +1931,95 @@ func TestReleaseForecastRefusesAHostileOverflow(t *testing.T) {
 	if _, ok := releaseForecast(1, stakingStatus{Height: maxUint64 - 1, EpochBlocks: maxUint64 - 1, UnbondingEpochs: 1}, 0); ok {
 		t.Fatal("releaseForecast accepted a round-up to the next boundary that overflows uint64")
 	}
+}
+
+// TestStdinIsTerminalUsesThePortableCharDeviceTest pins audit E-1's test. The
+// classifier must NOT compare against os.DevNull: on Windows a console handle
+// and NUL both stat with zero volume serial and index, so os.SameFile matched
+// and a real console was reported non-interactive. os.ModeCharDevice is the
+// portable answer. Both cases below are constructed from real files, not from
+// the runner's stdin.
+func TestStdinIsTerminalUsesThePortableCharDeviceTest(t *testing.T) {
+	pipe, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipe.Close()
+	defer pipeW.Close()
+	if stdinIsTerminal(pipe) {
+		t.Error("a pipe was reported as an interactive terminal: piped consent would be accepted")
+	}
+
+	regular, err := os.CreateTemp(t.TempDir(), "not-a-tty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regular.Close()
+	if stdinIsTerminal(regular) {
+		t.Error("a regular file was reported as an interactive terminal")
+	}
+
+	// os.DevNull is a character device on Unix AND on Windows (Go's own
+	// TestFileStatNUL pins ModeDevice|ModeCharDevice for NUL). Reporting it
+	// true is the point of the portable test; the READ path is what refuses it,
+	// which the next test pins.
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	if !stdinIsTerminal(null) {
+		t.Error("the null device is a character device; the portable test must report it as one (a Windows console handle has the same stat shape, and that is the bug E-1 fixed)")
+	}
+}
+
+// TestRealAskConfirmationRefusesEveryNonTerminal runs the REAL askConfirmation
+// (not the stubbed seam) against constructed stdin states. The positive "yes"
+// path needs a terminal and cannot be built portably (a pty is Unix-only, and a
+// Windows conpty is a different API), so this covers every refusal the guard
+// exists for: a pipe carrying "yes", a regular file carrying "yes", and the
+// null device, which is a character device and therefore reaches the read.
+func TestRealAskConfirmationRefusesEveryNonTerminal(t *testing.T) {
+	old := os.Stdin
+	defer func() { os.Stdin = old }()
+
+	pipe, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipeW.WriteString("yes\n"); err != nil {
+		t.Fatal(err)
+	}
+	pipeW.Close()
+	os.Stdin = pipe
+	if answer, err := askConfirmation(); err != errNoAnswer || answer != "" {
+		t.Fatalf("a pipe carrying %q produced (%q, %v); want the errNoAnswer refusal: piped consent must never sign", "yes", answer, err)
+	}
+	pipe.Close()
+
+	regular, err := os.CreateTemp(t.TempDir(), "answers-yes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := regular.WriteString("yes\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := regular.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = regular
+	if answer, err := askConfirmation(); err != errNoAnswer || answer != "" {
+		t.Fatalf("a regular file carrying %q produced (%q, %v); want the errNoAnswer refusal", "yes", answer, err)
+	}
+	regular.Close()
+
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = null
+	if answer, err := askConfirmation(); err != errNoAnswer || answer != "" {
+		t.Fatalf("the null device produced (%q, %v); EOF must never look like consent", answer, err)
+	}
+	null.Close()
 }
