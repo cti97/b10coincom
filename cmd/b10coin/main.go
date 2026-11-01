@@ -126,11 +126,14 @@ connections. HOW the committee is named decides whose keys sign:
 Without any of those flags the node is the M1 producer: one chain, no round
 protocol.
 
-The claim command signs with an ephemeral key that is printed and never
-stored: the key signs exactly this claim and is printed once so it can be
-reused for a follow-up transfer. Because stdout is captured by shells, CI
-logs and journalctl, --print-key=false withholds the key: safe when
-no follow-up transfer is planned, and the claimant address is still printed.
+Without --key, the claim command signs with an ephemeral key that is printed
+and never stored: the key signs exactly this claim and is printed once so it
+can be reused for a follow-up transfer. Because stdout is captured by shells,
+CI logs and journalctl, --print-key=false withholds the key: safe when no
+follow-up transfer is planned, and the claimant address is still printed.
+With --key PATH the claim signs for that key file, through the same
+print-confirm-sign envelope as the staking verbs, so its coins are spendable by
+a key you hold (claim --dry-run prints the transaction and stops).
 
 balance and history are READ verbs: clients of the node, not a second chain.
 balance is one /status read plus one /account/{address} read; history is one
@@ -158,9 +161,10 @@ transfer, and the state machine judges them at execution time. A bond needs
 MIN_STAKE (1,000 b10 = 10^11 sparks) and takes effect at the next epoch
 boundary. No shipped genesis funds a fresh key with MIN_STAKE: the faucet pays
 one claim per key per epoch (1 b10 on the devnet parameters, 100 b10 on the
-testnet parameters), and claim signs with an ephemeral key it never saves. See
-README "Staking" for the arithmetic and for the one pre-funded fixture account
-a local devnet ships.
+testnet parameters), so reaching the floor means 1,001 claims from 1,001 keys
+plus 1,001 transfers (~2,002 blocks of emission) - claim --key and send walk
+that path, and it is long. See README "Staking" for the arithmetic and for the
+one pre-funded fixture account a local devnet ships.
 
 Every staking verb BUILDS the transaction, prints its fields and its canonical
 bytes, and only then signs - after a confirmation: type "yes" at the prompt,
@@ -581,7 +585,7 @@ func postTxHex(url string, raw []byte) (string, error) {
 // It is returned at the point a verb refuses for lack of funds or stake, so an
 // operator meets it with the command in hand rather than in a doc they have not
 // opened yet.
-const stakingFundingNote = "no shipped genesis gives an operator's key MIN_STAKE in spendable funds: the faucet pays one claim per key per epoch and `b10coin claim` signs with an ephemeral key it does not save, so a fresh operator has no shipped path to this balance; see README \"Staking\" for the claim arithmetic"
+const stakingFundingNote = "no shipped genesis gives an operator's key MIN_STAKE in spendable funds: the faucet pays one claim per key per epoch, so the 1,001-claim, 1,001-transfer path to this balance is ~2,002 blocks of emission (README \"Staking\" derives it), not a starting balance"
 
 // fundingNote returns the MIN_STAKE hint, prefixed for appending to a refusal,
 // ONLY when the account's spendable balance is itself below MIN_STAKE.

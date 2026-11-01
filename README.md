@@ -49,6 +49,7 @@ go run ./cmd/b10coin devnet --blocks 100  # the single-node acceptance check
 go run ./cmd/b10coin devnet --validators 4 --blocks 100  # the consensus acceptance check
 go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 \
     --rotate-demo --plot-nakamoto         # the M5 rotation + Nakamoto acceptance check
+./scripts/acceptance-walkthrough.sh       # the M6 walkthrough, extracted from docs/ and run (CI runs it too)
 ```
 
 `devnet --blocks 100` builds a fresh local chain in a temporary directory,
@@ -223,8 +224,9 @@ platform can rot silently and none is verified-then-discarded.
 
 ## The CLI
 
-`cmd/b10coin` implements nine subcommands: `devnet`, `keygen`, `node`,
-`claim`, `stake`, `unstake`, `withdraw`, `version` and `help`. With no
+`cmd/b10coin` implements twelve subcommands: `devnet`, `keygen`, `node`,
+`claim`, `balance`, `history`, `send`, `stake`, `unstake`, `withdraw`,
+`version` and `help`. With no
 subcommand, or with an unknown one, it prints the usage text and exits with
 code 2.
 
@@ -319,7 +321,7 @@ whose keys sign, and that is the security boundary:**
 | Flag | Default | Meaning |
 |---|---|---|
 | `--dir PATH` | `./b10coin-data` | data directory |
-| `--http ADDR` | `127.0.0.1:8645` | HTTP RPC listen address (loopback-only by default; keep it that way) |
+| `--http ADDR` | `127.0.0.1:8645` | HTTP RPC listen address (loopback-only by default; keep it that way). The same address serves the M6 `GET /faucet` and `GET /explorer` pages beside the JSON API |
 | `--block-time DURATION` | `2s` | target block interval (single-node producer only; refused with networking) |
 | `--genesis PATH` | *unset* | shared committee file listing the validators' public keys; giving it runs the consensus committee that file names |
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
@@ -408,14 +410,83 @@ bails out if the node it is talking to runs a different chain.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--node URL` | `http://127.0.0.1:8645` | HTTP RPC of the node to submit the claim to |
-| `--dir PATH` | `./b10coin-data` | accepted for uniformity with the other commands, and deliberately **never read**: the claim command reads nothing from disk and writes nothing |
-| `--print-key` | `true` | print the ephemeral signing key to stdout so a follow-up transfer is possible. `--print-key=false` withholds it — the safe choice when stdout is captured by a shell, CI log or journalctl, because the key is then unrecoverable (audit O-10) |
+| `--dir PATH` | `./b10coin-data` | accepted for uniformity with the other commands, and deliberately **never read**: the claim command never touches the data directory, reads nothing from it and writes nothing (with `--key` it reads the key file you name and nothing else) |
+| `--key PATH` | *unset* | sign the claim with this key file (`b10coin keygen`) so the coins land on an address you hold. Without it the claim signs with an ephemeral key it prints and never saves |
+| `--print-key` | `true` | print the ephemeral signing key to stdout so a follow-up transfer is possible. No effect with `--key`, whose key is already a file. `--print-key=false` withholds it — the safe choice when stdout is captured by a shell, CI log or journalctl, because the key is then unrecoverable (audit O-10) |
+| `--yes` / `--dry-run` | *off* | the shared transaction envelope's confirmation flags. They apply to `--key` only: the ephemeral claim prints no preview and asks for no confirmation, so either flag without `--key` is refused rather than silently ignored |
 
-The **claim command** has no key file and no keystore: it signs with an ephemeral
-fresh key, and prints that key once — copy it out immediately if you plan a
-follow-up transfer, because it cannot be recovered later. (This is about the
-`claim` command only; validator keys are real files, see `keygen`.) The claim
-is only queued by this command; the node pays it when its next block applies it.
+Without `--key`, the **claim command** has no key file and no keystore: it signs
+with an ephemeral fresh key, and prints that key once — copy it out immediately
+if you plan a follow-up transfer, because it cannot be recovered later. With
+`--key PATH` it signs for a key you hold, so the claimed coins are spendable by
+that key; the claim then goes through the same build-print-confirm-sign-post
+envelope as `stake` and `send` (printed transaction, `--yes`/`--dry-run`, no
+`--max-fee` because a claim may not carry a fee, and no wait for inclusion).
+(This is about the `claim` command only; validator keys are real files, see
+`keygen`.) The claim is only queued by this command; the node pays it when its
+next block applies it.
+
+### `b10coin balance`, `b10coin history`
+
+Two **read-only clients** of a running node. Neither opens a data directory, a
+store or a block file, and neither signs nor posts anything: `balance` is one
+`/status` read plus one `/account/{address}` read, and `history` is one
+`/history` read. `--key` and `--address` name the account and are alternatives;
+both verbs are clients of the node, not a second chain.
+
+| Verb | Flags | Reads |
+|---|---|---|
+| `balance` | `--node URL (--key PATH \| --address ADDR)` | spendable balance, nonce, bond, unbonding record count, and the node's chain and height, printed in sparks with the exact b10 render |
+| `history` | `--node URL (--key PATH \| --address ADDR) [--blocks N]` | that account's transactions in the node's last `N` blocks (default 100, maximum 500) |
+
+`history` is a **bounded backward scan, not an account ledger**: there is no
+transaction index, so it walks at most `--blocks` committed blocks back from the
+node's head and prints the window it scanned (`blocks A..B, scanned N`). A
+window with no transfers does not prove an account never transacted, and a
+transaction older than the window cannot be reached by asking for more than 500
+blocks; the verb prints that sentence on every run, not only when the reply was
+truncated. The numbers come from the node: the CLI has no independent copy of
+the chain and cannot check them.
+
+### `b10coin send`
+
+`send` is the **transfer verb**, and it is the same envelope as `stake` —
+literally the same `submit` path: it reads `/status` and `/account/{address}`,
+builds one `transfer` (tag 1) with the account's nonce and the node's
+`min_fee_sparks`, prints the decoded fields and the canonical bytes, asks for
+confirmation (`--yes`, or `yes` at a TTY), signs with `--key`, and POSTs the
+bytes to `/tx`. The fee ceiling (`--max-fee`, default 1 spark), `--dry-run`, the
+redirect refusal and the printed-bytes rule are the staking verbs' rules, not a
+second implementation. There is deliberately **no `--wait`**: no `/tx/{id}`
+route exists, so inclusion is observed with `balance` or `history`.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--node URL` | `http://127.0.0.1:8645` | HTTP RPC of the node to submit to |
+| `--key PATH` | *required* | key file that pays and signs |
+| `--to ADDRESS` | *required* | recipient b10 address (canonical and checksummed); a self-transfer is refused before any network read |
+| `--amount N` | *required* | b10 as an exact decimal (e.g. `0.5`), parsed by integer arithmetic; sparks only, never a float |
+| `--max-fee SPARKS` | `1` | ceiling on the signed fee; a node asking for more is refused before any signature exists |
+| `--yes` / `--dry-run` | *off* | skip the TTY confirmation / build and print only, signing and posting nothing |
+
+Example, from the [walkthrough](docs/2026-11-01-m6-walkthrough.md) (lines
+elided there as here):
+
+```text
+transaction to sign (built, not yet signed):
+  type        transfer (1)
+  from        b10iwvk7nvjvewzqtcx2i5r35p2fs2vksfslf7aera
+  nonce       1  (the node's claim)
+  fee         1 spark  (the node's claim; ceiling 1)
+  amount      50000000 sparks (0.5 b10)  (from --amount)
+  to          b10gsmtxpsxbrt2s4hdkx3pmj5eubtq7jvbcmvrjly  (the operator's --to; the address this transfer credits)
+```
+
+The recipient is credited only when a block includes the transaction; the
+1-spark fee is burned (it pays no one), and the signature cannot be withdrawn.
+`send` refuses a zero amount, a self-transfer, a bad address, a fee above the
+ceiling, and a balance that cannot cover `amount + fee` — all before anything is
+signed.
 
 ### `b10coin stake`, `b10coin unstake`, `b10coin withdraw`
 
@@ -520,11 +591,16 @@ must clear `MIN_STAKE` (1,000 b10 = 10^11 sparks), and **no shipped genesis give
 an operator's key that much in spendable funds** — the verbs are usable only
 against a chain that already bonds a key (a genesis `power` at or above
 `MIN_STAKE`, which is locked stake and not spendable, or the devnet fixture
-account, which no shipped command turns into a key file). The faucet pays one
-claim per key per epoch and `claim` signs with an ephemeral key it never saves,
-so there is no shipped path from zero to a bond. The refusal messages say
-exactly that and point at [Staking](#staking), which carries the claim
-arithmetic.
+account, which no shipped command turns into a key file). Since M6 the faucet is
+no longer a dead end: `claim --key PATH` signs a claim for a key file the
+operator holds, and `send` transfers the result. The path to a bond therefore
+exists, but it is long: **1,001 claims from 1,001 keys, then 1,001 transfers
+into one address**, because each transfer burns its 1-spark fee —
+1,001 × 10^8 − 1,001 = 100,099,998,999 sparks ≥ 10^11 — paid for by **2,002
+blocks** of 0.5 b10/block emission, about **67 minutes** at 2 s blocks. The
+walkthrough takes one claim and one send, not this path, and M6 does not shorten
+it. The refusal messages say no shipped genesis funds the key and point at
+[Staking](#staking), which carries the derivation.
 
 ### `b10coin-relay`
 
@@ -1053,44 +1129,48 @@ per key per epoch**, at most **8 claims per block**, funded by emission at
 **0.5 b10 per block**. The binding constraint is the faucet's balance, not the
 per-key rule:
 
-- **2,000 blocks of emission** produce the 1,000 b10 that 1,000 b10 of claims
-  need (1,000 ÷ 0.5) before the faucet can pay them out;
-- the claims themselves are cheap: 1,000 claims of 1 b10 from 1,000 distinct
-  keys at 8 per block is **125 blocks**, and on the testnet parameters 10 claims
-  of 100 b10 is **2 blocks**;
-- the 1,000 separate balances must then be consolidated into one key by
-  transfers; a block carries up to 10,000 transactions, so that is about **one
-  more block**.
+- **2,002 blocks of emission** produce 1,001 b10 (2,002 × 0.5), which pays
+  1,001 claims of 1 b10 each; the extra b10 over the 1,000-b10 floor covers the
+  transfer fees;
+- the claims themselves are cheap: 1,001 claims at 8 per block is **126 blocks**
+  (⌈1,001 ÷ 8⌉), and on the testnet parameters 11 claims of 100 b10 is
+  **2 blocks**;
+- each of the 1,001 claimed balances must then be transferred to one address,
+  and every transfer burns a 1-spark fee: 1,001 × (10^8 − 1) =
+  **100,099,998,999 sparks**, which clears 10^11. A block carries up to 10,000
+  transactions, so the transfers fit in **one block** and can be interleaved
+  with the claims.
 
-| Chain parameters | Claim | Claims for 1,000 b10 | Faucet fill | Claim blocks | Total | At 2 s blocks |
-|---|---|---|---|---|---|---|
-| devnet, **and any operator committee file** (the file keeps the devnet fixture parameters) | 1 b10 | 1,000 (1,000 keys) | 2,000 | 125 | ~2,125 | ~71 min |
-| testnet (compiled in, but it names no validators — no chain runs on it) | 100 b10 | 10 (10 keys) | 2,000 | 2 | ~2,000 | ~67 min |
+| Chain parameters | Claim | Claims + transfers to net 1,000 b10 | Faucet emission | At 2 s blocks |
+|---|---|---|---|---|
+| devnet, **and any operator committee file** (the file keeps the devnet fixture parameters) | 1 b10 | 1,001 claims + 1,001 transfers (1,001 claimant keys) | 2,002 blocks | ~67 min |
+| testnet (compiled in, but it names no validators — no chain runs on it) | 100 b10 | 11 claims + 11 transfers (11 claimant keys) | 2,200 blocks | ~73 min |
 
 The wall-clock column is an illustration at 2 s blocks, the single-node
 producer's default. **A consensus committee is not paced by
 `block_time_ms`**: that parameter is the spec's target and the basis of the
 Argon2 budget, while the driver's cadence is the round protocol's (a timeout is
 the failure path, not the rhythm). Measure it on the chain you care about —
-two `/status` readings a minute apart give blocks/second — and divide the
-~2,000 blocks by it. A faster committee shortens the wait; it does not loosen
+two `/status` readings a minute apart give blocks/second — and divide the block
+count by it. A faster committee shortens the wait; it does not loosen
 the one-claim-per-key-per-epoch rule.
 
 > **Correction (audit RT-2).** This table used to divide 1,000 claims by the
 > one-claim-per-key rule and report 1,000 epochs = 1,000,000 blocks ≈ 23 days.
-> That was wrong by a factor of about 470. The rule is per **key** per epoch, so
-> 1,000 distinct keys claim inside one epoch, and the 8-per-block bound plus the
-> faucet's 0.5 b10/block emission — not the epoch length — set the real floor.
-> The shipped CLI still cannot walk this path (see below); the numbers above are
-> what the *protocol* allows, which is what a reader sizing a deployment needs.
+> That was wrong by a factor of about 500 on the fee-adjusted path in this
+> section. The rule is per **key** per epoch, so a thousand-odd distinct keys
+> claim inside one epoch, and the 8-per-block bound plus the faucet's
+> 0.5 b10/block emission — not the epoch length — set the real floor. The shipped CLI can now walk this path
+> with `claim --key` and `send`; the numbers above are what the *protocol*
+> allows, which is what a reader sizing a deployment needs.
 
-Those figures assume a client that holds **1,000 keys** and can **transfer**
-their balances into one. `b10coin claim` does neither: it generates a fresh
-ephemeral key per run and never saves it, and there is no `transfer` verb, so a
-claimant's coins land at a new address each time and cannot be accumulated.
-**No shipped command reaches `MIN_STAKE` through the faucet** — the arithmetic
-above is what the protocol allows, not a path an operator can walk today.
-What does exist, stated so it is not mistaken for a path:
+The figures are the protocol's arithmetic, and since M6 the shipped CLI can
+walk it: `claim --key PATH` signs a claim for a key file the operator holds, and
+`send` transfers the balance to one address. It is **1,001 claims and 1,001
+transfers** — about **2,002 blocks of emission, roughly 67 minutes** at 2 s
+blocks — and the walkthrough deliberately takes one claim and one send instead.
+M6 makes the path exist; it does not make it short. What also exists, stated so
+it is not mistaken for the path:
 
 - The **devnet fixture** premines one account — `b10coin-devnet-faucet-tester`,
   returned by `genesis.DevAccountKey(0)` — with 1,000,000 b10 (1,000×
@@ -1186,7 +1266,7 @@ by `cmd` alone.
 | `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency. M5 adds `CommitteeAt(h)`: the one per-height committee (an epoch's seats, memoised when its deciding state is committed), read by consensus, the certificate gate and the vote router |
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction. Admission is **stateful** against the head state a block would execute now (audit R-1): a faucet claim is refused for a wrong epoch, an already-spent claim marker, a wrong nonce or a missing cheap outer puzzle before any Argon2id evaluation; claims are capped in a sub-pool separate from transfers and per sender, and a claim `Take` keeps skipping ages out. A full pool refuses a new transaction rather than evicting an older one |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
-| `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size, and since M5 `genesis_hash`, `min_fee_sparks`, `min_stake_sparks`, `epoch_blocks`, `unbonding_epochs`, `committee_size` — fields are added, never renamed), `GET /block/{height}`, `GET /account/{address}` (balance, nonce, bonded, `bond_unfunded`, and each unbonding record's `amount` and `release_height`; the unbonding list takes `?limit=`/`?offset=` and reports `unbonding_total`, and no reply carries more than 256 records), and `POST /tx` (hex-encoded canonical transaction bytes) |
+| `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size, and since M5 `genesis_hash`, `min_fee_sparks`, `min_stake_sparks`, `epoch_blocks`, `unbonding_epochs`, `committee_size` — fields are added, never renamed), `GET /block/{height}`, `GET /account/{address}` (balance, nonce, bonded, `bond_unfunded`, and each unbonding record's `amount` and `release_height`; the unbonding list takes `?limit=`/`?offset=` and reports `unbonding_total`, and no reply carries more than 256 records), and `POST /tx` (hex-encoded canonical transaction bytes). M6 adds `GET /history?address=…&blocks=…` (the bounded backward scan the wallet reads; `address` is optional for the explorer's feed), the server-rendered `GET /faucet` and `GET /explorer` pages on the same listener (no second listener, no JavaScript), and `claim_amount_sparks` on `/status` |
 | `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters. M4 adds BLOCK_SYNC catch-up and a certificate log: a commit certificate is persisted to the data directory, so a restarted validator still serves the evidence for blocks it adopted before it restarted |
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
@@ -1389,8 +1469,9 @@ a valueless testnet.
 `go test -count=1 ./...` and `go test -race -count=1 ./...` are green across the test
 suite, and `go vet ./...`, `gofmt`, `staticcheck` and `govulncheck` are clean
 on this repository as committed. CI (`.github/workflows/ci.yml`) runs all
-four acceptance commands on every push and pull request as well, on the
-toolchain go.mod pins: currently Go 1.27.3 over language version 1.26.0.
+four devnet acceptance commands and the M6 walkthrough on every push and pull
+request as well, on the toolchain go.mod pins: currently Go 1.27.3 over
+language version 1.26.0.
 
 | Check | Command |
 |---|---|
@@ -1404,6 +1485,7 @@ toolchain go.mod pins: currently Go 1.27.3 over language version 1.26.0.
 | Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
 | Acceptance check, M5 rotation + Nakamoto | `go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto` |
+| Acceptance check, M6 walkthrough | `./scripts/acceptance-walkthrough.sh` (extracts and runs the one shell fence in `docs/2026-11-01-m6-walkthrough.md`; CI runs it on every push) |
 
 Actions in CI are pinned to commit SHAs, not mutable tags. The workflow defaults
 the token to `contents: read`; two jobs narrow that further and grant exactly
@@ -1422,7 +1504,7 @@ check).
 
 ## Status and roadmap
 
-Implemented — modules M0 through M5:
+Implemented — modules M0 through M6:
 
 - **M0** — repository skeleton, canonical encoding, crypto wrappers, CI.
 - **M1** — single-node chain: account state machine, block production,
@@ -1461,17 +1543,39 @@ Implemented — modules M0 through M5:
   height 40) and the single-node root, which moved once inside M5 to
   `98e5cf46…` when the bond leaf began committing the bond's unfunded amount
   (audit ST-3). **The funding limit is stated in [Staking](#staking): no
-  shipped command reaches `MIN_STAKE` through the faucet.**
+  shipped genesis gives an operator's key `MIN_STAKE` in spendable funds, and
+  the faucet path to it is ~2,000 commands long.**
+- **M6** — wallet CLI, minimal explorer and faucet page: `balance` and
+  `history` read-only over the node's `/status`, `/account/{address}` and
+  `/history`, `send` as an ordinary transfer through the same envelope as
+  `stake`, and `claim --key` so a claim lands on a key the operator holds; the
+  server-rendered `GET /faucet` and `GET /explorer` pages on the node's `--http`
+  address (default `http://127.0.0.1:8645` — no second listener, no JavaScript,
+  no key over HTTP), and `claim_amount_sparks` on `/status`; no new
+  dependencies. Acceptance: the [walkthrough](docs/2026-11-01-m6-walkthrough.md)
+  — two keys, one claim and one send — is executed by
+  [`scripts/acceptance-walkthrough.sh`](scripts/acceptance-walkthrough.sh),
+  which extracts the doc's single shell fence and runs it against a fresh node;
+  CI runs it on every push. The state root did not move — M6 is CLI, HTTP pages
+  and documentation.
 
 Pending:
 
 - **M4/M5 acceptance on real hardware** — three Raspberry Pis on separate home
   networks plus a relay VPS, checked end-to-end by
-  `scripts/deploy/acceptance.sh`. The code and the recipe are in place; the
-  deterministic simulator cannot catch real-network failures, so this run is
-  what validates the transport on real hardware. M5's rotation is exercised by
-  the simulator and the CLI acceptance run, not on a Pi.
-- **M6** — a wallet CLI with a minimal explorer and faucet web UI.
+  `scripts/deploy/acceptance.sh`. The code and the recipe are in place, and two
+  Docker runs (containers on one Windows host, one bridge network,
+  linux/amd64 — [first](docs/testrun-2026-10-30-m5-docker.md),
+  [re-run](docs/testrun-2026-10-30-m5-docker-rerun.md)) did exercise the
+  transport across real processes. They found two permanent-freeze defects — a
+  validator that fell more than one 64-block sync window behind never caught
+  up, and a relay-only three-seat chain halted after a restart in **4 of 9**
+  cycles — both now fixed (the re-run's 8 restart cycles produced no halt).
+  But one Docker bridge is not a home network: **ARM64, separate NAT'd
+  networks, real packet loss and Pi-class timing remain unvalidated**, and M5's
+  rotation has still run only in the simulator and the CLI acceptance command,
+  never on a Pi. This three-Pi run is what validates the transport on real
+  hardware.
 
 ## Documentation
 
@@ -1493,5 +1597,11 @@ Pending:
   rotation, admission and `PEER_EXCHANGE` implementation plan: the staking
   transaction types and state, the committee derivation and rotation, the
   Nakamoto series, and this milestone's acceptance gate.
+- `docs/plans/2026-11-01-m6-wallet-explorer-faucet.md` — the M6 wallet,
+  explorer and faucet implementation plan: the read surface, the transfer
+  envelope, the pages and this milestone's acceptance gate.
+- `docs/2026-11-01-m6-walkthrough.md` — the claim-and-send walkthrough a
+  stranger follows; its single shell fence is executed by
+  `scripts/acceptance-walkthrough.sh` on every push.
 - `scripts/deploy/README.md` — the three-Pi plus relay deployment recipe, and
   `scripts/deploy/acceptance.sh` — the end-to-end verdict it is checked with.

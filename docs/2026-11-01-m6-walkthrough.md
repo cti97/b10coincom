@@ -315,10 +315,12 @@ on the devnet there is no reason to.
 - **This does not make you a validator.** `MIN_STAKE` is 1,000 b10 =
   100,000,000,000 sparks. One claim pays 1 b10 and the 1-spark transfer fee means
   a claimer can forward at most 99,999,999 sparks, so reaching the floor from
-  faucet claims alone takes **1,001 keys, 1,001 claims and 1,001 transfers** —
-  about 2,002 blocks of faucet emission, or roughly 67 minutes at the default
-  2-second block time. That is a documented limitation, not a step this
-  walkthrough skips for convenience.
+  faucet claims alone takes **1,001 keys, 1,001 claims and 1,001 transfers**:
+  1,001 × 99,999,999 = 100,099,998,999 sparks ≥ 10^11. The faucet must emit
+  1,001 × 10^8 = 100,100,000,000 sparks, which at 0.5 b10 (50,000,000 sparks)
+  per block is **2,002 blocks** — 4,004 seconds, or roughly **67 minutes** at
+  the default 2-second block time. That is a documented limitation, not a step
+  this walkthrough skips for convenience.
 - **A lost key is a lost balance.** There is no recovery, no import verb and no
   customer support. The key file is the account.
 - **The node is untrusted.** It reports your nonce, the fee and the genesis hash
