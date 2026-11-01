@@ -652,8 +652,8 @@ func TestTheExplorerPageSharesTheNodesOneServer(t *testing.T) {
 // The page's bounds must stay inside the bounds /history was audited with: one
 // source of truth for "how much work may an unauthenticated read do".
 func TestExplorerBoundsStayInsideTheHistoryBounds(t *testing.T) {
-	if explorerBlocks > maxHistoryBlocks {
-		t.Errorf("explorerBlocks = %d exceeds maxHistoryBlocks = %d", explorerBlocks, maxHistoryBlocks)
+	if explorerBlocks > MaxHistoryBlocks {
+		t.Errorf("explorerBlocks = %d exceeds MaxHistoryBlocks = %d", explorerBlocks, MaxHistoryBlocks)
 	}
 	if explorerTxs > maxHistoryEntries {
 		t.Errorf("explorerTxs = %d exceeds maxHistoryEntries = %d", explorerTxs, maxHistoryEntries)

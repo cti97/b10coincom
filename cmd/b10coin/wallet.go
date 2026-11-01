@@ -36,11 +36,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/faucet"
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/keystore"
+	"github.com/cti97/b10coincom/internal/rpc"
 	"github.com/cti97/b10coincom/internal/types"
 )
 
@@ -141,7 +143,7 @@ func cmdBalance(args []string) error {
 	fmt.Printf("%-11s %d\n", "nonce", acc.Nonce)
 	fmt.Printf("%-11s %d sparks (%s b10)\n", "bonded", acc.Bonded, genesis.FormatB10(acc.Bonded))
 	fmt.Printf("%-11s %d records\n", "unbonding", acc.UnbondingTotal)
-	fmt.Printf("%-11s %s\n", "chain", st.ChainID)
+	fmt.Printf("%-11s %s\n", "chain", safeText(st.ChainID))
 	fmt.Printf("%-11s %d\n", "height", st.Height)
 	return nil
 }
@@ -175,7 +177,7 @@ type walletHistoryEntry struct {
 const defaultHistoryBlocks = 100
 
 // historyBlocksHelp is the one place the verb's window bound is described.
-const historyBlocksHelp = "how many blocks back from the node's head to scan (default 100, maximum 500; the node clamps anything above 500 and the reply reports what it actually scanned)"
+const historyBlocksHelp = "how many blocks back from the node's head to scan (default 100, maximum 500: a larger value is refused here before the node is asked, and the reply reports what the node actually scanned)"
 
 // cmdHistory prints one account's transactions inside a bounded block window.
 //
@@ -198,6 +200,12 @@ func cmdHistory(args []string) error {
 	if *blocks == 0 {
 		return fmt.Errorf("--blocks 0 asks for no window: give at least 1")
 	}
+	if *blocks > rpc.MaxHistoryBlocks {
+		// The node reads at most MaxHistoryBlocks per request; say so here
+		// instead of letting the node answer 400 to a window it would have
+		// clamped anyway (audit W-5).
+		return fmt.Errorf("--blocks %d is above the %d blocks a node reads per request: ask for at most %d", *blocks, rpc.MaxHistoryBlocks, rpc.MaxHistoryBlocks)
+	}
 	addr, err := walletAddress(*keyPath, *addrFlag)
 	if err != nil {
 		return err
@@ -213,12 +221,29 @@ func cmdHistory(args []string) error {
 		return fmt.Errorf("cannot read the history at %s: %w", base+"/history", err)
 	}
 	// The node echoes the address it answered for; a reply for another account
-	// would make every line below a lie about this one.
-	if h.Address != "" {
-		got, perr := types.ParseAddress(h.Address)
-		if perr != nil || got != addr {
-			return fmt.Errorf("the node reports history for %q where this read asked for %s; refusing to show another account's history", h.Address, addr)
+	// would make every line below a lie about this one, and a reply that
+	// names no account at all commits to nothing (audit W-3).
+	if h.Address == "" {
+		return fmt.Errorf("the node did not say which address its history is for; refusing to show a reply that does not commit to %s", addr)
+	}
+	if got, perr := types.ParseAddress(h.Address); perr != nil || got != addr {
+		return fmt.Errorf("the node reports history for %q where this read asked for %s; refusing to show another account's history", h.Address, addr)
+	}
+	// Every row is the node's word too: a counterparty that is not an
+	// address is refused rather than printed, and a type outside the closed
+	// set is quoted, so no node-supplied bytes can forge or hide a line of
+	// this output (audit W-2).
+	for i := range h.Txs {
+		e := &h.Txs[i]
+		if _, perr := types.ParseAddress(e.From); perr != nil {
+			return fmt.Errorf("the node's history names a sender (%s) that is not an address; refusing to show it", safeText(e.From))
 		}
+		if e.To != "" {
+			if _, perr := types.ParseAddress(e.To); perr != nil {
+				return fmt.Errorf("the node's history names a recipient (%s) that is not an address; refusing to show it", safeText(e.To))
+			}
+		}
+		e.Type = historyTypeLabel(e.Type)
 	}
 
 	if h.Blocks == 0 {
@@ -428,6 +453,29 @@ func buildTx(tx *types.Tx) (*builtTx, error) {
 }
 
 // txTypeLabel names a transaction type for the preview.
+// historyTypeLabel admits a node-reported type only when it is one of the
+// labels txTypeLabel emits; anything else is quoted so it cannot carry a line
+// break or a terminal escape into the output (audit W-2).
+func historyTypeLabel(reported string) string {
+	for _, t := range []types.TxType{types.TxTransfer, types.TxFaucetClaim, types.TxBond, types.TxUnbond, types.TxWithdraw} {
+		if reported == txTypeLabel(t) {
+			return reported
+		}
+	}
+	return strconv.Quote(reported)
+}
+
+// safeText returns s when every rune is printable, else s quoted: a string
+// the node chose is never allowed to break a line or move the cursor.
+func safeText(s string) string {
+	for _, r := range s {
+		if !unicode.IsPrint(r) {
+			return strconv.Quote(s)
+		}
+	}
+	return s
+}
+
 func txTypeLabel(t types.TxType) string {
 	switch t {
 	case types.TxTransfer:
@@ -790,6 +838,14 @@ func claimWithKey(nodeURL, keyPath string, yes, dryRun bool) error {
 	// different chain would refuse it anyway, so say so here.
 	if t.status.ChainID != g.ChainID {
 		return fmt.Errorf("the node at %s runs chain %q, not the devnet genesis %q", nodeURL, t.status.ChainID, g.ChainID)
+	}
+	// The chain ID is a string any node can claim; the genesis hash is the
+	// value the signature binds to (audit W-1). This verb holds the real one,
+	// so a node reporting the devnet's name over another chain's genesis
+	// would get a claim that verifies on that other chain if this were not
+	// checked.
+	if want := g.Hash(); t.genesis != want {
+		return fmt.Errorf("the node at %s reports chain %q but a genesis hash (%x) that is not the devnet's (%x); refusing to sign for a chain this claim was not solved for", nodeURL, t.status.ChainID, t.genesis[:8], want[:8])
 	}
 	if t.status.EpochBlocks == 0 {
 		return fmt.Errorf("the node reports epoch_blocks 0: the claim's epoch cannot be derived")

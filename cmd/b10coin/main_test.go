@@ -2877,7 +2877,9 @@ func TestClaimPreviewPrintsTheEpochAndThePowNonce(t *testing.T) {
 func TestClaimWithoutKeyIsUnchanged(t *testing.T) {
 	_, fileAddr, stub := claimTestSetup(t, 0, 0)
 	out := captureStdout(t, func() {
-		if err := cmdClaim([]string{"--node", stub.url}); err != nil {
+		// --print-key is opt-in since audit W-6; this test is about the
+		// shape of the full output, so it asks for the key.
+		if err := cmdClaim([]string{"--node", stub.url, "--print-key"}); err != nil {
 			t.Fatalf("cmdClaim (ephemeral): %v", err)
 		}
 	})
@@ -2926,7 +2928,7 @@ func TestClaimWithoutKeyIsUnchanged(t *testing.T) {
 	if strings.Contains(out, "<- copy now only if you plan a follow-up transfer") {
 		t.Errorf("--print-key=false still printed the ephemeral key:\n%s", out)
 	}
-	if !strings.Contains(out, "ephemeral key withheld (--print-key=false)") {
+	if !strings.Contains(out, "pass --print-key to see it") {
 		t.Errorf("--print-key=false does not say the key was withheld:\n%s", out)
 	}
 }

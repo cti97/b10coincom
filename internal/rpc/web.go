@@ -201,19 +201,31 @@ func (s *Server) faucetView(nodeURL, rawAddr string) (faucetView, error) {
 // bytes (128 hex); neither is an address, and 128 hex digits in a form are
 // far more likely to be a pasted secret than a typo.
 func keyShape(s string) string {
-	if len(s) != 64 && len(s) != 128 {
-		return ""
-	}
+	// The key is looked for as a RUN of hex digits anywhere in the input, not
+	// as the whole input (audit R-3): a key file pasted into a single-line
+	// field arrives with its JSON around the key, a key may carry a 0x prefix
+	// or quotes, and a trailing space is the commonest paste artefact. Every
+	// one of those used to fail ParseAddress and be echoed. A canonical b10
+	// address is far shorter than 64 characters, so no address trips this.
+	longest, run := 0, 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
-			return ""
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			run++
+			if run > longest {
+				longest = run
+			}
+			continue
 		}
+		run = 0
 	}
-	if len(s) == 128 {
+	switch {
+	case longest >= 128:
 		return "a 128-hex-character private key"
+	case longest >= 64:
+		return "a 64-hex-character public key"
 	}
-	return "a 64-hex-character public key"
+	return ""
 }
 
 // maxQueryEcho bounds how much of a refused query the refusal sentence quotes.
@@ -245,7 +257,9 @@ func queryEcho(raw string) string {
 // command an attacker chose is not acceptable.
 func faucetNodeURL(r *http.Request) string {
 	u, err := url.Parse("http://" + r.Host)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.User != nil {
+		// A Host header never carries credentials; one that does is not a
+		// host this page should name in a command line (audit T-2).
 		return defaultNodeURL
 	}
 	host, port := u.Hostname(), u.Port()

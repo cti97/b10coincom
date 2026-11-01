@@ -2,7 +2,7 @@
 //
 // There is no transaction index in the store and M6 does not add one (design
 // decision 2). What this handler does instead is a SERVER-SIDE BACKWARD SCAN
-// over the blocks the caller asked for: it reads at most maxHistoryBlocks
+// over the blocks the caller asked for: it reads at most MaxHistoryBlocks
 // blocks back from the head, keeps at most maxHistoryEntries matching entries,
 // newest first, and reports the window it actually scanned. `from`, `to`,
 // `blocks` and `truncated` are the honest answer to "how far back does this
@@ -24,11 +24,11 @@ const (
 	// defaultHistoryBlocks is what a client gets without asking: one hundred
 	// blocks back from the head.
 	defaultHistoryBlocks = 100
-	// maxHistoryBlocks bounds ONE request. This endpoint is unauthenticated
+	// MaxHistoryBlocks bounds ONE request. This endpoint is unauthenticated
 	// and outside the /tx limiter, so its work must not be a function of the
 	// chain: a request may never ask for more than this, whatever it sends.
 	// Every block is a disk read, and the HTTP server's write timeout is 10 s.
-	maxHistoryBlocks = 500
+	MaxHistoryBlocks = 500
 	// maxHistoryEntries bounds the reply itself, independently of the window:
 	// an address with thousands of transactions in the scanned window would
 	// otherwise turn a bounded number of block reads into an unbounded JSON
@@ -74,8 +74,8 @@ func historyBlocks(q url.Values) (blocks int, err error) {
 		if perr != nil || v == 0 {
 			return 0, errors.New("blocks must be a positive integer")
 		}
-		if v > maxHistoryBlocks {
-			v = maxHistoryBlocks
+		if v > MaxHistoryBlocks {
+			v = MaxHistoryBlocks
 		}
 		blocks = int(v)
 	}
@@ -158,7 +158,7 @@ func historyMatches(tx *types.Tx, addr types.Address) bool {
 // transactions are returned, newest first.
 //
 // BOUNDS (this endpoint is unauthenticated and outside the /tx limiter):
-//   - at most maxHistoryBlocks block reads, whatever `blocks` says;
+//   - at most MaxHistoryBlocks block reads, whatever `blocks` says;
 //   - at most maxHistoryEntries entries, whatever the window holds;
 //   - the reply's `from`/`to`/`blocks` describe the window actually scanned and
 //     `truncated` is true when the entry cap dropped matches.
@@ -248,7 +248,7 @@ func (s *Server) scanHistory(ctx context.Context, head uint64, want types.Addres
 	dropped := 0
 	for h := to; ; h-- {
 		// A client that has gone is not read for (audit R-1): the scan is
-		// up to maxHistoryBlocks disk reads and decodes, and WriteTimeout
+		// up to MaxHistoryBlocks disk reads and decodes, and WriteTimeout
 		// only ends the connection, never the goroutine doing them.
 		if err := ctx.Err(); err != nil {
 			return historyResponse{}, err

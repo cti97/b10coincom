@@ -426,7 +426,7 @@ func cmdClaim(args []string) error {
 	// but stdout is captured by shells, CI and journalctl, so the opt-out is
 	// the safe choice for any run that does not intend a follow-up transfer
 	// (audit O-10). The claimant ADDRESS is printed either way.
-	printKey := fs.Bool("print-key", true, "print the ephemeral signing key to stdout; set --print-key=false to keep the secret out of shell history, CI logs and journalctl (the key is then unrecoverable and no follow-up transfer is possible). No effect with --key, whose key is already a file")
+	printKey := fs.Bool("print-key", false, "print the ephemeral signing key to stdout (off by default, so the secret stays out of shell history, CI logs and journalctl; without it the key is unrecoverable and no follow-up transfer from this claimant is possible - use --key for a claim you intend to spend from). No effect with --key, whose key is already a file")
 	keyPath := fs.String("key", "", "sign the claim with this key file (b10coin keygen) so the claimed coins land on an address you hold; absent, the claim signs with an ephemeral key it prints and never saves")
 	// The envelope's confirmation surface. It applies to --key only: the
 	// ephemeral claim prints no preview and never asks, so a --yes or
@@ -502,7 +502,7 @@ func cmdClaim(args []string) error {
 	if *printKey {
 		fmt.Printf("ephemeral key %x  <- copy now only if you plan a follow-up transfer\n", priv)
 	} else {
-		fmt.Println("ephemeral key withheld (--print-key=false); no follow-up transfer from this claimant is possible")
+		fmt.Println("the signing key was not printed (pass --print-key to see it); no follow-up transfer from this claimant is possible without it")
 	}
 	fmt.Println("the claim is queued on the node; it is paid when the node's next block applies it.")
 	return nil

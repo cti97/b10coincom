@@ -886,8 +886,8 @@ func TestHistoryWindowIsBoundedAndSaysWhatItScanned(t *testing.T) {
 		t.Fatalf("absent blocks = %d, %v; want %d, nil", got, err, defaultHistoryBlocks)
 	}
 	got, err = historyBlocks(url.Values{"blocks": {"10000"}})
-	if err != nil || got != maxHistoryBlocks {
-		t.Fatalf("blocks=10000 = %d, %v; want the clamped %d", got, err, maxHistoryBlocks)
+	if err != nil || got != MaxHistoryBlocks {
+		t.Fatalf("blocks=10000 = %d, %v; want the clamped %d", got, err, MaxHistoryBlocks)
 	}
 
 	s, ts := testServer(t)
@@ -959,23 +959,23 @@ func TestHistoryWindowIsBoundedAndSaysWhatItScanned(t *testing.T) {
 
 // TestHistoryBlocksClampsTheScanAtTheMaximum is the endpoint-level face of the
 // clamp: 505 committed blocks, one request for 10000, and the reply reports
-// exactly maxHistoryBlocks scanned - the handler never walks the whole chain.
+// exactly MaxHistoryBlocks scanned - the handler never walks the whole chain.
 func TestHistoryBlocksClampsTheScanAtTheMaximum(t *testing.T) {
 	s, ts := testServer(t)
 	c := s.chain
 	g := c.Genesis()
-	for i := 1; i <= maxHistoryBlocks+5; i++ {
+	for i := 1; i <= MaxHistoryBlocks+5; i++ {
 		appendBlock(t, c, nil, g.Time+int64(i))
 	}
 	body := getHistory(t, ts, "blocks=10000")
-	if body.Head != maxHistoryBlocks+5 {
-		t.Fatalf("head = %d, want %d", body.Head, maxHistoryBlocks+5)
+	if body.Head != MaxHistoryBlocks+5 {
+		t.Fatalf("head = %d, want %d", body.Head, MaxHistoryBlocks+5)
 	}
-	if body.Blocks != maxHistoryBlocks {
-		t.Fatalf("scanned %d blocks, want the %d maximum", body.Blocks, maxHistoryBlocks)
+	if body.Blocks != MaxHistoryBlocks {
+		t.Fatalf("scanned %d blocks, want the %d maximum", body.Blocks, MaxHistoryBlocks)
 	}
-	if body.To != maxHistoryBlocks+5 || body.From != 6 {
-		t.Fatalf("window = %d..%d, want 6..%d (the newest %d blocks)", body.From, body.To, maxHistoryBlocks+5, maxHistoryBlocks)
+	if body.To != MaxHistoryBlocks+5 || body.From != 6 {
+		t.Fatalf("window = %d..%d, want 6..%d (the newest %d blocks)", body.From, body.To, MaxHistoryBlocks+5, MaxHistoryBlocks)
 	}
 }
 
