@@ -1003,14 +1003,21 @@ func (c *Chain) Append(b *types.Block) error {
 // store deliberately never holds (store heights start at 1): it is
 // re-synthesised from the genesis configuration exactly as Open built it.
 func (c *Chain) BlockAt(height uint64) (*types.Block, error) {
+	// The chain lock covers the HEAD snapshot only (audit R-2). It used to be
+	// held across the store's disk read and the decode as well, so every
+	// reader already inside a serialised read delayed Append, and a /history
+	// scan multiplied that by its window. A historical block never changes
+	// once appended, so the read needs no chain state beyond the head it was
+	// judged against; the store guards its own index.
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	headHeight := c.head.Header.Height
+	head := c.head
+	c.mu.RUnlock()
+	headHeight := head.Header.Height
 	if height > headHeight {
 		return nil, fmt.Errorf("%w: %d", store.ErrNotFound, height)
 	}
 	if height == headHeight {
-		return c.head, nil
+		return head, nil
 	}
 	if height == 0 {
 		st := genesisState(c.gen)
