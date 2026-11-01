@@ -204,7 +204,7 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	// One head read, once: the window is fixed before the scan, so appends
 	// during the scan cannot make the reply describe two different chains.
-	out, err := s.scanHistory(r.Context(), s.chain.Height(), want, filtered, blocks, maxHistoryEntries)
+	out, err := s.scanHistory(r.Context(), s.chain.Height(), want, filtered, blocks, maxHistoryEntries, nil)
 	if err != nil {
 		if r.Context().Err() != nil {
 			// The client is gone (audit R-1): there is nobody to answer, and
@@ -235,7 +235,11 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 // Bounds are the caller's: `blocks` is the window, `maxEntries` is the reply
 // cap. Both callers pass a constant or a clamped `blocks`, so the work per
 // request is never a function of the chain's length.
-func (s *Server) scanHistory(ctx context.Context, head uint64, want types.Address, filtered bool, blocks, maxEntries int) (historyResponse, error) {
+//
+// visit, when non-nil, sees every block the scan reads, newest first, before
+// its transactions are filtered: the explorer builds its block table from the
+// same pass instead of reading the window twice (audit R-4).
+func (s *Server) scanHistory(ctx context.Context, head uint64, want types.Address, filtered bool, blocks, maxEntries int, visit func(uint64, *types.Block)) (historyResponse, error) {
 	from, to := historyWindow(head, blocks)
 	out := historyResponse{Head: head, From: from, To: to, Txs: []historyEntry{}}
 	if filtered {
@@ -258,6 +262,9 @@ func (s *Server) scanHistory(ctx context.Context, head uint64, want types.Addres
 			// The caller turns this into a generic failure: err.Error() names
 			// the data directory, the segment file and an offset.
 			return historyResponse{}, err
+		}
+		if visit != nil {
+			visit(h, b)
 		}
 		for i := range b.Txs {
 			if filtered && !historyMatches(&b.Txs[i], want) {

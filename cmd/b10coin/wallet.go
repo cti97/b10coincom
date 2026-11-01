@@ -389,6 +389,14 @@ func connectWalletNode(nodeURL, keyPath string) (*walletTarget, error) {
 	if err != nil {
 		return nil, err
 	}
+	return connectWalletNodeWithKey(nodeURL, keyPath, priv)
+}
+
+// connectWalletNodeWithKey is connectWalletNode for a caller that has already
+// loaded the key (audit W-4): a verb that checks something about the key
+// before touching the network must sign with the key it checked, not with a
+// second read of the file.
+func connectWalletNodeWithKey(nodeURL, keyPath string, priv ed25519.PrivateKey) (*walletTarget, error) {
 	pub, ok := priv.Public().(ed25519.PublicKey)
 	if !ok {
 		return nil, fmt.Errorf("key file %s holds no Ed25519 public key", keyPath)
@@ -775,7 +783,8 @@ func cmdSend(args []string) error {
 		return fmt.Errorf("--to %s is the sending key's own address: state.applyTransfer refuses a transfer to self (ErrSelfTransfer), so nothing was signed and no node was asked", to)
 	}
 
-	t, err := connectWalletNode(*nodeURL, *keyPath)
+	// The key checked above is the key that signs (audit W-4).
+	t, err := connectWalletNodeWithKey(*nodeURL, *keyPath, priv)
 	if err != nil {
 		return err
 	}

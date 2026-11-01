@@ -424,17 +424,27 @@ func (s *Server) handleExplorer(w http.ResponseWriter, r *http.Request) {
 // describes the one snapshot the header names.
 func (s *Server) explorerView(ctx context.Context) (explorerView, error) {
 	head, id, root := s.chain.HeadSnapshot()
-	blocks, err := s.recentBlocks(head, explorerBlocks)
-	if err != nil {
-		return explorerView{}, err
-	}
 	// The transaction list is the ONE scan /history uses, with no address
 	// filter, given the same window as the block table and its own entry cap.
 	// Reusing it is what keeps the page's `from`/`to`/`truncated` semantics
-	// identical to the wallet's instead of a second, drifting copy.
-	scan, err := s.scanHistory(ctx, head, types.Address{}, false, explorerBlocks, explorerTxs)
+	// identical to the wallet's instead of a second, drifting copy - and the
+	// block table is built from the same pass (audit R-4): the window used to
+	// be read and decoded twice, once per table.
+	blocks := make([]explorerBlock, 0, explorerBlocks+1)
+	scan, err := s.scanHistory(ctx, head, types.Address{}, false, explorerBlocks, explorerTxs, func(_ uint64, b *types.Block) {
+		blocks = append(blocks, explorerRow(b))
+	})
 	if err != nil {
 		return explorerView{}, err
+	}
+	if head < uint64(explorerBlocks) {
+		// The table reaches genesis, which the scan never reads: height 0
+		// carries no transactions. recentBlocks's contract, kept here.
+		g, err := s.chain.BlockAt(0)
+		if err != nil {
+			return explorerView{}, err
+		}
+		blocks = append(blocks, explorerRow(g))
 	}
 	return explorerView{
 		ChainID:     s.chain.Genesis().ChainID,
@@ -477,14 +487,19 @@ func (s *Server) recentBlocks(head uint64, n int) ([]explorerBlock, error) {
 			// chain rather than an admission that this node cannot serve it.
 			return nil, err
 		}
-		id := b.ID()
-		out = append(out, explorerBlock{
-			Height: b.Header.Height,
-			Hash:   hex.EncodeToString(id[:]),
-			Time:   b.Header.Timestamp,
-			Txs:    len(b.Txs),
-			Root:   hex.EncodeToString(b.Header.StateRoot[:]),
-		})
+		out = append(out, explorerRow(b))
 	}
 	return out, nil
+}
+
+// explorerRow is one block as the explorer's table shows it.
+func explorerRow(b *types.Block) explorerBlock {
+	id := b.ID()
+	return explorerBlock{
+		Height: b.Header.Height,
+		Hash:   hex.EncodeToString(id[:]),
+		Time:   b.Header.Timestamp,
+		Txs:    len(b.Txs),
+		Root:   hex.EncodeToString(b.Header.StateRoot[:]),
+	}
 }
