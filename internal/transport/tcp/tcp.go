@@ -710,6 +710,12 @@ type conn struct {
 	// connection, which is exactly the "once per connection" the diagnostic
 	// promises; a fresh connection gets a fresh notice.
 	vintageNoted atomic.Bool
+	// bindingLen is len(helloBinding) mirrored as an atomic so the N-3 notice can
+	// read it without t.mu: helloBinding is published under t.mu by exchangeNonce,
+	// and noticeBindingVintage is reached from the reader AND from the node layer
+	// (NoteBindingVintage), which cannot safely take a lock the caller may hold.
+	// -race caught exactly that unlocked read of c.helloBinding.
+	bindingLen atomic.Int32
 	// ready is set by start, after the connection's last handshake frame has
 	// been exchanged and immediately before its reader and writer begin. A
 	// connection that is admitted but not ready is still HANDSHAKING: Peers(),
@@ -1492,6 +1498,7 @@ func (t *TcpTransport) exchangeNonce(nc net.Conn, c *conn) error {
 	// The peer's HELLO must name BOTH challenges, the peer's own first: that is
 	// the half a member cannot get a third node to generate for it (audit A-2).
 	c.helloBinding = wire.HelloBinding(remote, local)
+	c.bindingLen.Store(int32(len(c.helloBinding)))
 	t.mu.Unlock()
 	return nil
 }
@@ -2134,7 +2141,8 @@ func (t *TcpTransport) noticeBindingVintage(c *conn, width int) {
 	// Only the ONE-challenge form is a known older build. Any other width - an
 	// empty nonce copied off a relay, a hostile length - is a refused frame, not
 	// a vintage split, and must not be misdiagnosed as one.
-	if width != connectionNonceBytes || width == len(c.helloBinding) {
+	local := int(c.bindingLen.Load())
+	if width != connectionNonceBytes || width == local {
 		return
 	}
 	if !c.vintageNoted.CompareAndSwap(false, true) {
@@ -2144,7 +2152,7 @@ func (t *TcpTransport) noticeBindingVintage(c *conn, width int) {
 	// reliable ordering witness: a test (or an operator) that sees the count
 	// has already had the line written.
 	log.Printf("b10coin: %s: a HELLO carries a %d-byte socket binding (the pre-A-2 one-challenge form), but this connection's is %d: the peer is on the other side of the A-2 binding change and its HELLO cannot be accepted on this socket (audit N-3)",
-		c.remote, width, len(c.helloBinding))
+		c.remote, width, local)
 	t.bindingVintages.Add(1)
 }
 
