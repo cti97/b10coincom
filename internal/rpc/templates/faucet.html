@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>b10coin faucet — {{.ChainID}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; max-width: 48rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.9rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #8884; vertical-align: top; }
+  th { white-space: nowrap; font-weight: 600; }
+  pre { background: #8881; padding: 0.7rem 0.9rem; overflow-x: auto; }
+  code { background: #8881; padding: 0 0.2rem; }
+  form { margin: 1rem 0; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  label { flex-basis: 100%; }
+  input { font: inherit; padding: 0.4rem 0.5rem; flex: 1 1 22rem; }
+  button { font: inherit; padding: 0.4rem 0.9rem; }
+  .claim-ok { color: #067d62; }
+  .claim-no { color: #b3261e; }
+  .limits { border-top: 1px solid #8884; margin-top: 2.2rem; padding-top: 0.5rem; }
+</style>
+</head>
+<body>
+<h1>b10coin faucet</h1>
+<p>This is a page over the chain's existing faucet claim. It reads committed state; it does not solve the puzzle, sign anything or submit anything.</p>
+
+<form method="get" action="/faucet">
+  <label for="address">Your b10 address</label>
+  <input id="address" name="address" value="{{.Queried}}" placeholder="b10…" autocomplete="off" spellcheck="false">
+  <button type="submit">Check this address</button>
+</form>
+
+{{if .QueriedErr}}
+<p class="claim-no" role="alert">{{.QueriedErr}}</p>
+{{else}}
+<p{{if .QueriedAddr}} class="{{if .CanClaim}}claim-ok{{else}}claim-no{{end}}"{{end}}>{{.Reason}}</p>
+{{end}}
+
+<h2>The faucet right now</h2>
+<table>
+  <tr><th>Chain</th><td>{{.ChainID}}</td></tr>
+  <tr><th>Head height</th><td>{{.Height}}</td></tr>
+  <tr><th>Claim epoch</th><td>epoch {{.Epoch}} — a claim you submit now would be applied by the next block, and it executes this epoch</td></tr>
+  <tr><th>Epoch length</th><td>{{.EpochBlocks}} blocks</td></tr>
+  <tr><th>One claim pays</th><td>{{.ClaimAmountB10}} b10 = {{.ClaimAmount}} sparks</td></tr>
+  <tr><th>Faucet balance</th><td>{{.FaucetBalB10}} b10 = {{.FaucetBalance}} sparks</td></tr>
+  <tr><th>Faucet address</th><td>{{.FaucetAddress}}</td></tr>
+  <tr><th>RPC node</th><td>{{.NodeURL}}</td></tr>
+  {{if .QueriedAddr}}<tr><th>Last claim</th><td>{{if .ClaimedEpoch}}epoch {{.ClaimedEpoch}}{{else}}never claimed from this address{{end}}</td></tr>{{end}}
+</table>
+<p>The faucet also receives each block's emission, so the balance above is not a cap on the claim you can queue.</p>
+
+<h2>What to run</h2>
+<p>Claiming means solving the Argon2id puzzle on your own machine and signing with the key that will receive the coins, so the command runs locally:</p>
+<pre>{{.Command}}</pre>
+<p>Replace <code>&lt;path&gt;</code> with the key file <code>b10coin keygen --out</code> wrote, and run it from a terminal on the machine that holds the key. It prints the transaction and asks you to confirm before it signs.</p>
+
+<section class="limits">
+<h2>What this page cannot do</h2>
+<ul>
+  <li>It cannot sign a transaction. Signing happens in <code>b10coin claim</code> on your machine, after you read the transaction it prints.</li>
+  <li>It cannot hold your key. Never paste a private key into a page: this page is served over plain HTTP, it has no use for a key, and a key pasted here would be a key exposed. Paste the address, never the key.</li>
+  <li>It cannot pay you. A claim is queued when the node accepts it and is paid only when a later block applies it; the coins are not spendable at the moment the claim is accepted.</li>
+  <li>The faucet is rate-limited: it pays one claim per key per epoch, and that is a consensus rule rather than a setting on this page. Claiming twice in one epoch is refused by the chain.</li>
+  <li>It cannot guarantee payment. Eligibility is the claim rule; the block that applies your claim also needs the faucet to hold the amount at that moment, and a claim whose block cannot pay it is dropped rather than held.</li>
+  <li>It cannot solve the Argon2id puzzle for you. Solving for anonymous requests would make this node's CPU the faucet's cost and turn it into a free-claim oracle, which is the whole reason the puzzle exists.</li>
+  <li>It cannot show history, search the chain or recover a lost key; it reports one address at the current head.</li>
+  <li>It is unauthenticated and bound to the node's loopback address. Exposing that address to the internet exposes this page and the node's transaction endpoint together.</li>
+</ul>
+</section>
+
+<p>Server-rendered HTML: no JavaScript, no external asset, no stylesheet from anywhere else.</p>
+</body>
+</html>
