@@ -284,9 +284,9 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 	boundary := (bondHeight/rotationInEpoch + 1) * rotationInEpoch
 	waitAllReach(t, vs, boundary, 120*time.Second)
 
-	// The rotation-IN itself: the committee that judges the new epoch seats
-	// the joining key, and it displaced a genesis seat (the committee stayed
-	// at five, as the chain's committee_size says).
+	// The rotation-IN itself: the committee that judges the new epoch fills
+	// its spare seat with the joining key (the fixture has five genesis seats
+	// and a committee_size of six, so this is a seat ADDED, not an eviction).
 	seated := false
 	for _, v := range vs {
 		next, err := v.Chain().CommitteeAt(boundary)
@@ -371,6 +371,30 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 	})
 	t.Logf("the joining validator's precommit is in the certificate at height %d (%d of the committee's seats reached quorum with it counted)",
 		provenHeight, rotationInCommittee)
+
+	// THE PROPOSAL ITSELF, not only the prevote (audit A-1). The certificate
+	// assertion above passes even while EVERY block this key proposes is
+	// refused: a precommit is a vote on some other validator's block. A
+	// post-genesis seat that is DRAWN as proposer must have its block COMMITTED.
+	// Before the fix none ever was - Chain.validateLocked checked the genesis
+	// list, so every validator nil-prevoted the joiner's block and that round
+	// was burned - which is exactly how this test missed the regression. The
+	// scan is a bounded wait on a positive observable (a committed block whose
+	// header names the joining key), the same kind of wait as the ones above.
+	waitFor(t, "a block proposed by the joining validator to be committed", 120*time.Second, func() bool {
+		head := joinerNode.Height()
+		for h := boundary + 1; h <= head; h++ {
+			blk, err := joinerNode.Chain().BlockAt(h)
+			if err != nil {
+				return false
+			}
+			if string(blk.Header.Proposer) == string(joinerPub) {
+				t.Logf("the joining validator's own block is committed at height %d", h)
+				return true
+			}
+		}
+		return false
+	})
 
 	// The joining node holds the same history as the committee it joined: its
 	// votes came from a chain that agrees, not from a fork of its own.

@@ -30,16 +30,18 @@ import (
 	"github.com/cti97/b10coincom/internal/wire"
 )
 
-// mustLocalNonce reads the challenge this node generated for a live connection.
-// A connection is only visible (Peers, ConnNonces) once its handshake is done,
-// so this cannot race the exchange.
-func mustLocalNonce(t *testing.T, v *Validator, peer transport.PeerID) []byte {
+// mustHelloBinding reads the value the peer's HELLO must carry on a live
+// connection: the A-2 binding, PEER challenge first then ours (the mirror of
+// what this node signs into its own HELLOs). A connection is only visible
+// (Peers, ConnNonces) once its handshake is done, so this cannot race the
+// exchange.
+func mustHelloBinding(t *testing.T, v *Validator, peer transport.PeerID) []byte {
 	t.Helper()
-	ours, _, ok := v.ttp.ConnNonces(peer)
+	ours, theirs, ok := v.ttp.ConnNonces(peer)
 	if !ok {
 		t.Fatalf("no connection is registered under %q", peer)
 	}
-	return ours
+	return wire.HelloBinding(theirs, ours)
 }
 
 func TestACapturedMemberHelloDoesNotAdmitAHintDialledStranger(t *testing.T) {
@@ -94,13 +96,20 @@ func TestACapturedMemberHelloDoesNotAdmitAHintDialledStranger(t *testing.T) {
 
 	// The node SENDS its own HELLO to a gated socket it dialled (the peer needs
 	// it to admit us), so a hostile peer can echo it straight back: a valid
-	// signature, the right connection nonce, and no proof of anything. It must
-	// not admit either.
+	// signature, a well-formed binding, and no proof of anything. The frame is
+	// byte-for-byte what this node would put on that socket (the binding in the
+	// SENDER's order, which is why the echo already mismatches the receiver's
+	// order); the self-key check refuses it on its own terms too. It must not
+	// admit.
+	ours, theirs, ok := v.ttp.ConnNonces("stranger")
+	if !ok {
+		t.Fatal("no connection is registered under \"stranger\"")
+	}
 	echo := &wire.Hello{
 		ChainID:   v.g.ChainID,
 		Validator: v.pub,
 		Height:    v.Height(),
-		Nonce:     mustLocalNonce(t, v, "stranger"),
+		Nonce:     wire.HelloBinding(ours, theirs),
 	}
 	eh := helloHash(echo)
 	echo.Sig = crypto.Sign(v.priv, eh[:])
@@ -118,16 +127,16 @@ func TestACapturedMemberHelloDoesNotAdmitAHintDialledStranger(t *testing.T) {
 		t.Fatalf("the echoed self-HELLO moved the sync pull target: %x via %q", []byte(who), via)
 	}
 
-	// NOT REFUSE-EVERYTHING: a HELLO bound to THIS connection's challenge is
+	// NOT REFUSE-EVERYTHING: a HELLO carrying THIS socket's full binding is
 	// admitted and becomes the pull target. The stranger cannot produce one -
-	// it has no committee key - but the transport hands the test the value so
-	// the positive half is pinned rather than assumed.
-	ours := mustLocalNonce(t, v, "stranger")
+	// it has no committee key, and the binding includes a challenge this node
+	// generated for OUR side of the pair - but the transport hands the test the
+	// value so the positive half is pinned rather than assumed.
 	bound := &wire.Hello{
 		ChainID:   v.g.ChainID,
 		Validator: priv.Public().(ed25519.PublicKey),
 		Height:    v.Height(),
-		Nonce:     ours,
+		Nonce:     mustHelloBinding(t, v, "stranger"),
 	}
 	bh := helloHash(bound)
 	bound.Sig = crypto.Sign(priv, bh[:])

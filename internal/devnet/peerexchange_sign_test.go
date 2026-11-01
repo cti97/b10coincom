@@ -19,9 +19,13 @@ package devnet
 // ConnectDirectly goes through this same verification path). What the
 // signature does NOT stop, stated plainly: a SEATED member can still advertise
 // junk addresses (bounded per member per wave, and evicted when they never
-// complete a handshake), and a stranger who can replay a member's HELLO is
-// still admitted as a peer (PX-2) - but the replayed HELLO no longer confers
-// any hint authority, because the authority is the signature.
+// complete a handshake). What PX-2 changed is the old statement that a stranger
+// who replays a member's HELLO is admitted on a LEARNED dial: that dial is gated
+// by a HELLO bound to its socket's two fresh challenges, so a captured HELLO
+// does not admit a stranger there. On a relay link, which has no per-socket
+// challenge for either end, a replayed member HELLO is still admitted on the
+// shared link - the documented A-3 residual - but it confers no hint authority
+// either way, because the authority is the signature.
 
 import (
 	"fmt"
@@ -256,7 +260,8 @@ func TestOneMemberCannotSpendAnotherMembersPerWaveBudget(t *testing.T) {
 // the age instead of waiting for it: two addresses are learned, one is marked
 // proven (as observeHello marks a real peer's), and the wave is advanced past
 // the grace. The unproven address is evicted - removed from the book and its
-// maintainer retired - and the proven one is not.
+// maintainer retired - and the proven one is not, within its separate (much
+// longer) lifetime.
 func TestALearnedAddressThatNeverCompletesIsEvicted(t *testing.T) {
 	v := startFrozen(t, true)
 	dials := recordPeerDial(v)
@@ -298,7 +303,7 @@ func TestALearnedAddressThatNeverCompletesIsEvicted(t *testing.T) {
 	if got := v.LearnedPeerAddrs(); got != 1 {
 		t.Fatalf("LearnedPeerAddrs = %d after the eviction, want 1 (the proven address stays)", got)
 	}
-	// Ten more waves: a proven address is never evicted, however quiet it is.
+	// Ten more waves, still far inside a proven address's lifetime: it stays.
 	for i := 0; i < 10; i++ {
 		v.beginWave()
 	}
@@ -313,6 +318,172 @@ func TestALearnedAddressThatNeverCompletesIsEvicted(t *testing.T) {
 	v.observePeerExchange("v1", memberHint(t, v, 1, []string{"127.0.0.1:11"}))
 	if got := v.LearnedPeerAddrs(); got != 2 {
 		t.Fatalf("LearnedPeerAddrs = %d after a new hint, want 2: the evicted slot was not freed", got)
+	}
+}
+
+// TestTheEvictionAndTheLearnPathShareOneLock pins audit D-3. The bug was an
+// ordering: expireUnprovenHints deleted the book entry, RELEASED the lock, and
+// only then retired the maintainer, so a re-learn of the same address in that
+// window found the old registration, recorded a fresh book entry, and had its
+// maintainer removed by the retirement that followed - an entry with no
+// maintainer until restart.
+//
+// The property is mutual exclusion, so the test observes it directly: the
+// retirement seam asks whether the book's mutex is held at the moment it runs.
+// It must be. (TryLock, not a goroutine race: a timing test would be the flaky
+// construct audit F-3 is about, and "the lock was held" is exactly the
+// invariant a re-learn needs to respect.) A pre-fix expires deletes and unlocks
+// first, so TryLock succeeds and this fails.
+func TestTheEvictionAndTheLearnPathShareOneLock(t *testing.T) {
+	v := startFrozen(t, true)
+	recordPeerDial(v)
+
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{"127.0.0.1:9"}))
+	if got := v.LearnedPeerAddrs(); got != 1 {
+		t.Fatalf("setup: LearnedPeerAddrs = %d, want 1", got)
+	}
+
+	var removed int
+	held := false
+	v.peerRemove = func(string) bool {
+		removed++
+		if v.hints.mu.TryLock() {
+			v.hints.mu.Unlock() // we acquired it: it was NOT held, the D-3 window is open
+			held = false
+		} else {
+			held = true
+		}
+		return true
+	}
+	for i := 0; i < hintHandshakeGraceWaves; i++ {
+		v.beginWave()
+	}
+	if removed != 1 {
+		t.Fatalf("the maintainer was retired %d times, want 1", removed)
+	}
+	if !held {
+		t.Fatal("peerRemove ran without the hint book's lock: a concurrent re-learn between the delete and the retirement records an entry whose maintainer this call then removes (audit D-3)")
+	}
+	if got := v.LearnedPeerAddrs(); got != 0 {
+		t.Fatalf("LearnedPeerAddrs = %d after the eviction, want 0", got)
+	}
+}
+
+// TestAProvenAddressIsRetiredOnceItsPeerIsGone pins audit D-4's bound. The old
+// rule was "proven is forever", so a member that rotated out, moved or died
+// kept one of the 32 learned slots and a maintainer redialling at the backoff
+// ceiling for the process's life. The clock is constructed, not waited on: a
+// proven entry whose last HELLO is older than hintProvenLifetimeWaves and which
+// has no admitted connection is retired, and the slot is freed.
+func TestAProvenAddressIsRetiredOnceItsPeerIsGone(t *testing.T) {
+	v := startFrozen(t, true)
+	recordPeerDial(v)
+	var removed []string
+	v.peerRemove = func(addr string) bool {
+		removed = append(removed, addr)
+		return true
+	}
+
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{"127.0.0.1:21"}))
+	key := "127.0.0.1:21"
+	v.hints.mu.Lock()
+	h := v.hints.learned[key]
+	h.proven = true
+	h.lastProven = v.currentWave()
+	v.hints.mu.Unlock()
+
+	// One wave short of the proven lifetime: still kept, because the stamp is
+	// recent even though no connection exists.
+	for i := 0; i < hintProvenLifetimeWaves-1; i++ {
+		v.beginWave()
+	}
+	if got := v.LearnedPeerAddrs(); got != 1 || v.PeerHintsEvicted() != 0 {
+		t.Fatalf("before the proven lifetime: learned=%d evicted=%d, want 1 and 0", v.LearnedPeerAddrs(), v.PeerHintsEvicted())
+	}
+
+	// The wave that reaches the lifetime retires it and cancels its maintainer:
+	// the dead member no longer holds a slot for the process's life.
+	v.beginWave()
+	if got := v.LearnedPeerAddrs(); got != 0 {
+		t.Fatalf("LearnedPeerAddrs = %d after the proven lifetime with no connection, want 0", got)
+	}
+	if len(removed) != 1 || removed[0] != key {
+		t.Fatalf("retired addresses = %v, want exactly [%s]", removed, key)
+	}
+	if got := v.PeerHintsEvicted(); got != 1 {
+		t.Fatalf("PeerHintsEvicted = %d, want 1", got)
+	}
+}
+
+// TestALiveProvenPeerIsNotRetiredEvenWhenItsHelloStops pins the other half of
+// D-4: a stamped-out proven entry is NOT retired while an admitted connection
+// still sits at the address. This is the property that makes the bound safe -
+// it can only evict a peer that is BOTH silent for the whole lifetime and
+// disconnected. The state is constructed: the peer's wave loop is an hour away,
+// the link is brought up with two explicit HELLOs, and the stamp is then aged
+// past the lifetime by hand.
+func TestALiveProvenPeerIsNotRetiredEvenWhenItsHelloStops(t *testing.T) {
+	v, err := StartValidator(ValidatorConfig{
+		Dir:                 t.TempDir(),
+		Index:               0,
+		Validators:          2,
+		Listen:              "127.0.0.1:0",
+		AllowLocalPeerHints: true,
+		TickEvery:           time.Hour,
+		WaveEvery:           time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close()
+
+	peer, err := StartValidator(ValidatorConfig{
+		Dir:        t.TempDir(),
+		Index:      1,
+		Validators: 2,
+		Listen:     "127.0.0.1:0",
+		TickEvery:  time.Hour,
+		WaveEvery:  time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	v.observePeerExchange("v1", memberHint(t, v, 1, []string{peer.Addr()}))
+	key := peer.Addr()
+	var removed []string
+	v.peerRemove = func(addr string) bool {
+		removed = append(removed, addr)
+		return true
+	}
+
+	// Bring the gated learned link up: V's HELLO admits V at the peer, the
+	// peer's HELLO admits the peer at V.
+	waitFor(t, "the learned address to become a proven peer", 10*time.Second, func() bool {
+		v.broadcastHello()
+		peer.broadcastHello()
+		v.hints.mu.Lock()
+		defer v.hints.mu.Unlock()
+		h := v.hints.learned[key]
+		return h != nil && h.proven
+	})
+
+	// Age the stamp past the lifetime WITHOUT closing the link. If the rule
+	// looked at the stamp alone, the next expiry would retire a live peer.
+	v.hints.mu.Lock()
+	v.hints.learned[key].lastProven = v.currentWave()
+	v.hints.mu.Unlock()
+	v.expireUnprovenHints(v.currentWave() + hintProvenLifetimeWaves + 1)
+
+	if got := v.LearnedPeerAddrs(); got != 1 {
+		t.Fatalf("LearnedPeerAddrs = %d, want 1: a live admitted peer was retired", got)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("retired %v, want nothing: a live admitted peer was retired", removed)
+	}
+	if got := v.PeerHintsEvicted(); got != 0 {
+		t.Fatalf("PeerHintsEvicted = %d, want 0", got)
 	}
 }
 

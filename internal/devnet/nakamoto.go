@@ -15,6 +15,20 @@ package devnet
 // exactly one third is not enough, because a one-third coalition cannot by
 // itself finalise a conflicting block. The arithmetic is integer throughout -
 // no float is formed from a power sum anywhere in this file.
+//
+// WHAT IT COUNTS, STATED HERE BECAUSE THIS IS WHERE THE NUMBER IS READ (audit
+// C-5, ST-2): the coefficient counts KEYS, not STAKE. The powers it sums are the
+// SEATED committee's powers after the one-quarter cap, and that cap is a fixed
+// point over the seated total, so a dominant seat is dragged down toward the
+// others rather than left at its stake. On a four-seat committee one 10,000 b10
+// seat and three 1,000 b10 seats all come out at a quarter each: the three floor
+// seats hold 3/4 between them and can commit alone, while this series prints
+// k=2 - although one party holds about 77% of the stake behind the committee.
+// Read k as "how many keys must collude", never as "how many b10 must collude".
+// The uncapped stake is in /account's bonded figures and in the derivation; the
+// README's Consensus/Staking sections and its quick-start example carry the same
+// caveat, and the plan's proposal records the protocol change that would make the
+// series stake-weighted rather than count-weighted (none of it is implemented).
 
 import (
 	"bytes"

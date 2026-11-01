@@ -366,6 +366,27 @@ func (g *Genesis) Validate() error {
 		return fmt.Errorf("%w: CommitteeSize is %d but the genesis names %d validators, so %d listed key(s) could never hold a seat (committee_size must be at least the validator count; a LARGER number leaves spare seats)",
 			ErrBadGenesis, p.CommitteeSize, len(g.Validators), len(g.Validators)-p.CommitteeSize)
 	}
+	// THE POWER SUM MUST FIT (audit N-5). Epoch 0's committee is derived from
+	// the genesis state with a CHECKED sum (state.sumPowers). Validator powers
+	// whose total overflows uint64 (two seats above 2^63 already do) therefore
+	// make applyPowerCap fail, committees[0] absent, and Chain.validateLocked
+	// refuse EVERY block at epoch 0 - a chain that opens and accepts nothing.
+	// Consensus could never run on such a genesis either, but the single-node
+	// producer used to scan the genesis list and accept, so the refusal is new
+	// there; refusing the DOCUMENT here is the earliest point, and the message
+	// names the committee rather than leaving an operator with a node that
+	// never advances. The RT-9 rule above guarantees the genesis committee
+	// seats EVERY listed validator, so this sum is exactly the one
+	// applyPowerCap sees at epoch 0.
+	var powerTotal uint64
+	for i, v := range g.Validators {
+		next, carry := bits.Add64(powerTotal, v.Power, 0)
+		if carry != 0 {
+			return fmt.Errorf("%w: the %d validator powers overflow uint64 at validator %d (%d + %d); the epoch-0 committee could not be derived, so every block at epoch 0 would be refused",
+				ErrBadGenesis, len(g.Validators), i, powerTotal, v.Power)
+		}
+		powerTotal = next
+	}
 	// The genesis timestamp is the height-0 block's timestamp and obeys the
 	// same rule every later block does (types.ValidateStructure: Timestamp > 0).
 	// A non-positive genesis time is not a time.

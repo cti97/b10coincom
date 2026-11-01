@@ -320,9 +320,20 @@ func TestCommitteeFileSpareSeatsAreAConsensusParameter(t *testing.T) {
 
 // TestTheShippedExampleCommitteeFileIsLoadable pins the example file the deploy
 // recipe tells operators to copy. The audit's section 6 recorded "example file
-// untested", and RT-2's vector was exactly that file's "power": 1 — so the
+// untested", and RT-2's vector was exactly that file's "power": 1 - so the
 // checked-in example must parse, carry no sub-floor seat, and ask for at least
 // one spare seat (admission without eviction).
+//
+// Audit A-4's half: the file must also NOT ship the capturable shape. Three
+// seats at exactly MIN_STAKE with one spare seat are capturable for three
+// MIN_STAKE bonds plus a few key-generation attempts (equal powers are ordered
+// by raw key bytes, and applyPowerCap then makes the four seats a quarter
+// each), which is what the deploy README's callout says. The example therefore
+// carries ten times the floor, matching the README's recommendation; lowering it
+// back to the floor fails here. Note that this file feeds a genesis HASH (the
+// powers are part of the committee document): raising them starts a different
+// example chain, which is exactly why the recipe says to choose them before the
+// chain starts. No test pins that hash.
 func TestTheShippedExampleCommitteeFileIsLoadable(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/deploy/committee.example.json")
 	if err != nil {
@@ -333,9 +344,22 @@ func TestTheShippedExampleCommitteeFileIsLoadable(t *testing.T) {
 		t.Fatalf("scripts/deploy/committee.example.json does not load: %v", err)
 	}
 	minPower := Devnet().Params.MinStakeSparks
+	// The README's recommendation is "ten times the floor"; the floor itself is
+	// the shape the capture argument prices, so it is the line the example must
+	// clear, not merely reach.
+	capturablePower := minPower
+	recommended := 10 * minPower
 	for i, v := range g.Validators {
 		if v.Power < minPower {
 			t.Fatalf("the shipped example's validator %d carries power %d, under MIN_STAKE %d: it would ship RT-2's one-spark genesis seat", i, v.Power, minPower)
+		}
+		if v.Power <= capturablePower {
+			t.Fatalf("the shipped example's validator %d carries power %d, at or below the %d floor: three such seats are the capturable shape the deploy README prices at three MIN_STAKE bonds (audit A-4); set ten times the floor (%d)",
+				i, v.Power, capturablePower, recommended)
+		}
+		if v.Power < recommended {
+			t.Fatalf("the shipped example's validator %d carries power %d, below the README's recommended ten times the floor (%d): the file operators copy must match the advice beside it (audit A-4)",
+				i, v.Power, recommended)
 		}
 	}
 	if g.Params.CommitteeSize <= len(g.Validators) {
@@ -378,4 +402,47 @@ func committeeFileBytes256(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+// TestCommitteeFileRefusesAMisspelledField pins audit E-4. encoding/json's
+// default decoder ignores unknown fields, so a misspelling of a real field
+// silently changed the chain: "committee_sise" dropped the spare seat, and on a
+// full committee the next bonded newcomer then evicted a genesis seat instead
+// of taking the spare. ParseCommitteeJSON now calls DisallowUnknownFields, at
+// the top level AND inside each validator entry.
+func TestCommitteeFileRefusesAMisspelledField(t *testing.T) {
+	good := string(committeeFileBytes(t, testPub(0)))
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "top-level committee_size misspelled",
+			raw:  strings.Replace(good, `"validators"`, `"committee_sise":4,"validators"`, 1),
+			want: "committee_sise",
+		},
+		{
+			name: "entry field misspelled",
+			raw:  strings.Replace(good, `"power":`, `"powr":`, 1),
+			want: "powr",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.raw == good {
+				t.Fatalf("the test did not change the file: %s", good)
+			}
+			g, err := ParseCommitteeJSON([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("a file with an unknown field parsed as %+v; a typo must not silently produce a different chain (audit E-4)", g)
+			}
+			if !errors.Is(err, ErrBadCommitteeFile) {
+				t.Fatalf("the refusal does not carry ErrBadCommitteeFile: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("the refusal does not name the unknown field %q, so the operator cannot find the typo: %v", tc.want, err)
+			}
+		})
+	}
 }

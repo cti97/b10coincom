@@ -68,6 +68,18 @@ type accountResponse struct {
 }
 
 // unbondingResponse is one record in that list.
+//
+// THE LIST IS NOT A PER-EPOCH HISTORY, AND IT MUST NOT BE READ AS ONE (audit
+// C-5). state.mergeUnbonding rewrites every record already MATURE at an unbond's
+// applying height into one record at the EARLIEST of their release heights and
+// the sum of their amounts. That is what bounds an address to at most
+// UnbondingEpochs+2 records (audit ST-4), and it is indistinguishable to a
+// Withdraw - which releases every record at or below its block's height, so
+// already-mature records pay identically whenever they are merged. What it costs
+// is exactly the archaeology: two epochs' records that have both matured show one
+// entry, at the earlier release height, with the combined amount. A client that
+// needs "which epoch did each unbond happen in" must read the blocks, not this
+// endpoint.
 type unbondingResponse struct {
 	Amount        uint64 `json:"amount"`
 	ReleaseHeight uint64 `json:"release_height"`

@@ -97,6 +97,10 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		WriteTimeout:     30 * time.Second,
 		ReadTimeout:      2 * time.Minute,
 		KeepAlive:        15 * time.Second,
+		// Audit N-7: the deploy recipe quotes this bound for a dial that answers
+		// nothing; it is a real flag, and its default is the package's exported
+		// number so the prose and the binary cannot drift.
+		AccessTimeout: relay.DefaultAccessTimeout,
 	}
 	if !reflect.DeepEqual(opts, want) {
 		t.Fatalf("default Options drifted from the documented numbers: got %+v, want %+v", opts, want)
@@ -113,6 +117,7 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		"--write-timeout", "6",
 		"--read-timeout", "30",
 		"--keepalive", "10",
+		"--access-timeout", "7",
 	}, &stderr2)
 	if err != nil {
 		t.Fatalf("parseArgs(overrides): %v", err)
@@ -129,6 +134,7 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		WriteTimeout:     6 * time.Second,
 		ReadTimeout:      30 * time.Second,
 		KeepAlive:        10 * time.Second,
+		AccessTimeout:    7 * time.Second,
 	}
 	if !reflect.DeepEqual(opts, wantOverride) {
 		t.Fatalf("overrides did not reach Options: got %+v, want %+v", opts, wantOverride)
@@ -136,11 +142,11 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 
 	// A zero is a deliberate convention ("use the default", relay.Options'
 	// contract) and must pass through untouched, not become some other value.
-	_, opts, err = parseArgs([]string{"--read-timeout", "0", "--keepalive", "0", "--write-timeout", "0", "--max-conns-per-ip", "0", "--write-queue-bytes", "0", "--write-queue-frames", "0"}, &stderr2)
+	_, opts, err = parseArgs([]string{"--read-timeout", "0", "--keepalive", "0", "--write-timeout", "0", "--max-conns-per-ip", "0", "--write-queue-bytes", "0", "--write-queue-frames", "0", "--access-timeout", "0"}, &stderr2)
 	if err != nil {
 		t.Fatalf("parseArgs(zeros): %v", err)
 	}
-	if opts.ReadTimeout != 0 || opts.KeepAlive != 0 || opts.WriteTimeout != 0 || opts.MaxConnsPerIP != 0 || opts.WriteQueueBytes != 0 || opts.WriteQueueFrames != 0 {
+	if opts.ReadTimeout != 0 || opts.KeepAlive != 0 || opts.WriteTimeout != 0 || opts.MaxConnsPerIP != 0 || opts.WriteQueueBytes != 0 || opts.WriteQueueFrames != 0 || opts.AccessTimeout != 0 {
 		t.Fatalf("zero flags must pass through for the relay's default convention: got %+v", opts)
 	}
 }

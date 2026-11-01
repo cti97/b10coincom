@@ -182,11 +182,18 @@ report its own architecture — its format and architecture tokens (`Mach-O`,
 wherever they sit in `file`'s output, so the check holds for Apple's `file`
 word order ("Mach-O 64-bit executable arm64") and upstream libmagic's ("Mach-O
 64-bit arm64 executable", which the Linux CI runners emit) alike, and `Mach-O`
-/ `PE32+` names never appear except where they belong; and the build is
-**reproducible**: every artifact is built with `-trimpath -buildvcs=false`
-(no checkout path, no VCS revision or dirty flag), and `dist/BUILD-INFO`
-records the toolchain the go command actually ran and those exact flags, so
-two builds of one clean tree on one toolchain are byte-identical.
+/ `PE32+` names never appear except where they belong. Every artifact is built
+with `-trimpath -buildvcs=false` (no checkout path, no VCS revision or dirty
+flag), and `dist/BUILD-INFO` records the toolchain the go command actually ran
+and those exact flags. **What is actually evidenced about reproducibility** is
+narrower than "deterministic": the 2026-10-30 Docker re-run reports that a warm
+build and a cold-`GOCACHE` build in separate containers (sharing the module
+cache) produced byte-identical `SHA256SUMS` for all 12 artifacts. The first
+2026-10-30 report says a cold-cache cross-check matched only 2 of 12, so the two
+runs disagree. CI builds ONCE and compares nothing. Reproducibility is therefore
+supported by one reported run, not continuously verified, and this repository
+has never executed a signed release: every `SHA256SUMS` it has produced is
+**UNSIGNED**.
 On the target machine, verify what you copied:
 
 ```sh
@@ -318,7 +325,7 @@ whose keys sign, and that is the security boundary:**
 | `--key PATH` | *unset* | this validator's key file (`b10coin keygen`); **required with `--genesis`**, refused elsewhere — a key that is not in the committee refuses to start |
 | `--peers ADDR,...` | *unset* | comma-separated peer addresses to dial (committee mode) |
 | `--relay ADDR` | *unset* | the dumb forwarder relay to dial (committee mode), through the transport's relay mode: the connection announces its own ID and reads nothing back (with an access token, it reads only the relay's two fixed gate frames), is registered under the fixed name `relay:<addr>`, and reconnects with backoff — no frame the relay forwards can name, duplicate, or silence it (audit N-1). The address itself is **reserved against peer hints** (audit PX-6): a hint may not name the relay this node dials, or the node would open a second, direct-mode connection to it. Literal IP:port relay addresses are compared as parsed, canonical addresses, so a different spelling of the same endpoint is still refused |
-| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The secret is **never sent**: the node waits for the relay's **gate greeting** and its per-connection **challenge** (32 fresh random bytes plus the relay's own address), answers `HMAC-SHA-256(token, challenge)`, and only then expects the relay's **accepted** frame. A relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — gets no proof at all and the refusal is logged; a stranger who drives the greeting through such a relay receives a MAC, never the token, and that MAC is useless on any other connection (audit PX-3). The token still travels in plaintext at the relay's end of the comparison: see the relay section |
+| `--relay-access-token-file PATH` | *unset* | the relay's pre-shared access token (audit N-8; at least 16 bytes, refused below that). The secret is **never sent**: the node waits for the relay's **gate greeting** and its per-connection **challenge** (32 fresh random bytes plus the relay's own address), answers `HMAC-SHA-256(token, challenge)`, and only then expects the relay's **confirmation**, `HMAC-SHA-256(token, challenge ‖ answer)` — a value only a party holding the token can produce, so a stranger looping public frames cannot make the node install the link (audit D-1). A relay that does not gate — one started without `--access-token-file`, which would forward whatever it received to every peer — gets no proof at all and the refusal is logged; a stranger who drives the greeting through such a relay receives a MAC, never the token, and that MAC is useless on any other connection (audit PX-3). The token still travels in plaintext at the relay's end of the comparison: see the relay section |
 | `--listen ADDR` | *unset* | P2P listen address for direct connections (committee mode) |
 | `--advertise IP:PORT` | *unset* | the address `PEER_EXCHANGE` should advertise when `--listen` binds a **wildcard** address (`0.0.0.0:7001`, `[::]:7001`), which names no endpoint a peer can dial. This is the port-forwarded home node's flag: `--listen 0.0.0.0:7001 --advertise <public IP>:7001` (audit PX-8). It must be a literal IP:port, not unspecified or multicast, and it requires `--listen`. Without it a wildcard-bind node advertises nothing and says so **once** in the log |
 | `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
@@ -402,6 +409,7 @@ bails out if the node it is talking to runs a different chain.
 |---|---|---|
 | `--node URL` | `http://127.0.0.1:8645` | HTTP RPC of the node to submit the claim to |
 | `--dir PATH` | `./b10coin-data` | accepted for uniformity with the other commands, and deliberately **never read**: the claim command reads nothing from disk and writes nothing |
+| `--print-key` | `true` | print the ephemeral signing key to stdout so a follow-up transfer is possible. `--print-key=false` withholds it — the safe choice when stdout is captured by a shell, CI log or journalctl, because the key is then unrecoverable (audit O-10) |
 
 The **claim command** has no key file and no keystore: it signs with an ephemeral
 fresh key, and prints that key once — copy it out immediately if you plan a
@@ -553,12 +561,14 @@ The exchange is four frames and no decoding anywhere: the relay announces
 gating (`b10coin-relay-gate-v1`), sends a per-connection challenge (32 random
 bytes plus its own listening address), the node answers
 `HMAC-SHA-256(token, challenge)` — the token itself is NEVER written — and the
-relay confirms with a fixed accepted frame, comparing the answer in constant
-time (`subtle.ConstantTimeCompare`). So a node refuses to answer a relay that
-has not announced it gates, a node whose proof is REFUSED logs the handshake
-death instead of redialling in silence, and a stranger on a token-less relay
-who loops the greeting and a challenge of its own making harvests a MAC, not
-the token (audit PX-3). The token must be at least 16 bytes on both ends (a
+relay confirms with `HMAC-SHA-256(token, challenge ‖ answer)`, comparing the
+answer in constant time (`subtle.ConstantTimeCompare`). So a node refuses to
+answer a relay that has not announced it gates, a node whose proof is REFUSED
+logs the handshake death instead of redialling in silence, a stranger on a
+token-less relay who loops the greeting and a challenge of its own making
+harvests a MAC, not the token (audit PX-3), and that stranger cannot complete
+the exchange at all: the confirmation is keyed by the token, so the node does
+not install a link through a relay that never gated (audit D-1). The token must be at least 16 bytes on both ends (a
 shorter one is brute-forced by dialling: one byte falls in 256 attempts).
 **One limit remains:** the challenge and the answer travel in **plaintext**
 over TCP, so a passive observer sees a proof that is valid for that one
@@ -651,6 +661,7 @@ relay with exponential backoff. Bandwidth is kilobytes per second.
 | `--write-timeout SECONDS` | `30` | per-connection write deadline, anchored to when the queue became non-empty: the backlog must drain to empty within it, so a never-reading sink **and** a slow-reading one are ended and their queued bytes and entry ring released |
 | `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |
 | `--keepalive SECONDS` | `15` | TCP keepalive probe period for every accepted connection; a half-open connection is reaped by the kernel after unanswered probes |
+| `--access-timeout SECONDS` | `5` | how long an accepted connection may take to answer the `--access-token-file` challenge before it is closed and its slot released (audit N-7); an honest client answers immediately, and a socket silent for this long is a scanner |
 
 Ctrl-C (or, on Unix, SIGTERM) stops the listener, closes every connection and
 joins every goroutine before the process exits. Same as the node command: one
@@ -840,6 +851,27 @@ with P of T power (quorum Q), yet nothing commits; peers=…; tallies …` — w
 the per-round vote tallies and the peers it sees, so the stall is no longer
 silent.
 
+**That stall and the 3-seat stall are two different faults, and the difference
+is worth keeping straight.** The 3-seat one (fixed by `5af2174`, pinned in
+`internal/consensus/future_proposal_test.go`) was an ENGINE fault: a proposal
+for a round the engine had not entered yet arrived one round early and was
+dropped, so a restarted validator could never prevote the block the survivors
+were locked on; buffering the early proposal closed it, and 50 Docker cycles
+afterwards saw zero stalls. The 4-seat one is not that and does not involve a
+lost frame at all: it is **round divergence among exactly-quorum live seats** —
+every live seat is in a different round, so no round can gather a quorum, and
+nothing is dropped. Two closers exist and only one can act: the round-resync
+jump requires `total − quorum + 1` of the power to be ahead (2 on a four-seat
+committee), which one ahead seat cannot supply, so the **timeout ladder** is
+the whole recovery — which is why the wait grows with the round the divergence
+starts at. The networked Docker evidence is the re-run report; the mechanism is
+covered deterministically by
+`internal/simnet/round_divergence_test.go`, which constructs 4, 5 and 6 seats
+with one seat powered off (live power exactly the quorum), sets one live seat a
+few rounds ahead through the durable round record, and asserts the chain
+finalises again on one history. It is not a wall-clock reproduction of the
+4-to-6-minute stall and does not claim to be: an in-process restart is instant.
+
 Three rules carry the safety, and all three are about the arithmetic of
 distrust:
 
@@ -930,7 +962,21 @@ leaves is a `Bond`'s fee, burned exactly as a transfer's is, and emission and
 faucet claims are chain-level. One exception, and it is the genesis seat: an
 `Unbond` of a genesis bond destroys that bond's unfunded part rather than
 recording it (`Bond.Unfunded`, audit ST-3), so a genesis grant never becomes
-spendable and the sum falls by exactly what the genesis created.
+spendable and the sum falls by exactly what the genesis created. **The operator's
+own coins leave first** (audit C-1): an exit consumes the funded part of the bond
+before it reaches the grant, so a genesis seat that was topped up with `stake`
+returns those sparks through an ordinary partial exit — and keeps its seat if the
+remainder clears `MIN_STAKE` — while the grant is destroyed only once the exit
+goes past them. The total a bond can ever return is still exactly the funded
+sparks bonded into it; what changed is whose coins leave first, so an operator
+does not lose their money because they also received a grant. **The order is a
+consensus rule, not a presentation detail**: it changes the post-state of any
+exit from a bond holding both a grant and a top-up, so C-1 is a hard fork with
+no in-band marker (no header carries a rule version). A chain that applied such
+an exit under the old order diverges on replay, and `Chain.Open` now names the
+C-1 rule change instead of reporting the log as corrupt; the deploy README's
+hard-fork callout carries the same warning. The fixtures cannot see this
+because their genesis seats are pure grants.
 
 **A bond is a seat, and the seat changes only at a boundary.** The committee is
 the top `committee_size` bonds by stake, ties broken by public-key bytes, with
@@ -1144,7 +1190,7 @@ by `cmd` alone.
 | `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters. M4 adds BLOCK_SYNC catch-up and a certificate log: a commit certificate is persisted to the data directory, so a restarted validator still serves the evidence for blocks it adopted before it restarted |
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
-| `internal/transport/tcp` | The real TCP transport: a framed reader/writer with socket deadlines, direct dial/listen, a relay-aware dial mode registered under `relay:<addr>`, and reconnect backoff. Its per-connection frame-rate bucket (audit N-6, the bound that stops one flooder monopolising the single dispatch callback) is applied to DIRECT connections only: on a relay connection the connection is the shared link, not the sender, so the bucket would drop honest members' votes for a stranger's flood — the relay's own per-sender share is the bound that replaces it there |
+| `internal/transport/tcp` | The real TCP transport: a framed reader/writer with socket deadlines, direct dial/listen, a relay-aware dial mode registered under `relay:<addr>`, and reconnect backoff. Its per-connection frame-rate bucket (audit N-6, the bound that stops one flooder monopolising the single dispatch callback) is applied to DIRECT connections only: on a relay connection the connection is the shared link, not the sender, so the bucket would drop honest members' votes for a stranger's flood — the relay's own per-sender share is the bound that replaces it there. The per-connection challenge that binds a HELLO is exchanged **commit-then-reveal**: each side sends `H(challenge)` before it may learn the peer's, so a challenge cannot be substituted after the peer has seen it. What that does **not** stop (audit A-2) is a member holding sockets to two honest nodes and relaying each node's commitment and reveal to the other, which leaves both nodes with the same pair and makes one node's signed HELLO admissible on the member's socket at the other; no value exchanged over plaintext TCP between unauthenticated parties can prevent that. The harm it could do to catch-up is closed in the node's attestation table instead: a pull that goes unanswered demotes the **socket** it went down, never the member, so the member's genuine path keeps serving (`internal/devnet`, `demotePeer`). A gated HELLO whose binding has the OLD one-challenge width logs the two widths **once per connection** (`BindingVintages`), so a mixed-version deployment fails loudly instead of only incrementing `GatedFrames` (audit N-3) |
 | `internal/relay` | The dumb frame forwarder (`cmd/b10coin-relay`): a peer registry, per-receiver byte- and frame-bounded queues, per-source-prefix connection caps, socket deadlines and an optional pre-shared access-token HMAC challenge-response gate; it decodes nothing beyond the length prefix |
 | `internal/wire` | The wire envelopes shared with the transport and the consensus syncer: HELLO and BLOCK_SYNC request/response codecs with their own signed hashes, and (M5) `PEER_EXCHANGE` — a bounded, canonical list of listening addresses inside a signed envelope (the advertising member's key, its height, and a signature over chain id, height and list; audit PX-1) |
 | `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, catch-up and prefix-agreement assertions — the harness the eight seeded scenarios drive, and the multi-validator devnet with it; M5 adds the rotation fixture's `Unbond` submission through a committee's mempool and per-height committee access |

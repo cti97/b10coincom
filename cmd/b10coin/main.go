@@ -136,7 +136,9 @@ a local devnet ships.
 Every staking verb BUILDS the transaction, prints its fields and its canonical
 bytes, and only then signs - after a confirmation: type "yes" at the prompt,
 or pass --yes when stdin is not an interactive terminal. --dry-run prints the
-transaction and stops without signing and without posting. The fee ceiling
+transaction and stops without signing and without posting; if --yes and
+--dry-run are given together, --dry-run wins and --yes is inert (nothing is
+signed either way). The fee ceiling
 defaults to 1 spark because that is min_fee_sparks on every shipped genesis and
 a fee above it buys nothing: the mempool admits on nonce and state rather than
 on price, and applyBond burns the whole fee. --max-fee SPARKS raises the
@@ -574,6 +576,8 @@ type stakingTxOptions struct {
 	// the exits pass 0: any non-zero fee they somehow built would be refused.
 	maxFee uint64
 	// yes is --yes: sign and post without asking, for a non-interactive run.
+	// With dryRun also set, dryRun wins and yes is inert: dry-run returns
+	// before the confirmation is reached, so nothing is signed either way.
 	yes bool
 	// dryRun is --dry-run: build and print, then stop. Nothing is signed and
 	// nothing is posted.
@@ -740,20 +744,21 @@ func (b *builtTx) print(w io.Writer, genesisHash [32]byte, node string, prov txP
 // interactive terminal (a pipe, a file, cron) or it closed.
 var errNoAnswer = errors.New("stdin is not an interactive terminal, or it closed before an answer")
 
-// stdinIsTerminal reports whether f is an interactive terminal. A real terminal
-// is a character device; /dev/null is one too (and is what `go test`, cron and
-// CI hand a process), so identity with the null device is excluded explicitly.
-// Reading is still what decides: an empty answer is a refusal whatever the
-// device was, because EOF must never look like consent.
+// stdinIsTerminal reports whether f is an interactive terminal. The portable
+// test is os.ModeCharDevice on f's stat: a pipe and a regular file are not
+// character devices, and a console is. Comparing against os.DevNull instead
+// (the pre-fix code) is NOT portable: on Windows a console handle and NUL both
+// stat with volume serial and file index zero, so os.SameFile matched and every
+// stake/unstake/withdraw without --yes was refused as non-interactive
+// (audit E-1). /dev/null is itself a character device, so this returns true for
+// it; that is safe because READING still decides - an empty line is a refusal,
+// and EOF must never look like consent (askConfirmation).
 func stdinIsTerminal(f *os.File) bool {
 	fi, err := f.Stat()
-	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+	if err != nil {
 		return false
 	}
-	if null, err := os.Stat(os.DevNull); err == nil && os.SameFile(fi, null) {
-		return false
-	}
-	return true
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // askConfirmation is the interactive half of the confirmation boundary, kept
@@ -819,8 +824,8 @@ func (t *stakingTarget) submit(tx *types.Tx, o stakingTxOptions, prov txProvenan
 	// before any signature exists. It must not depend on the reported
 	// min_fee_sparks being honest: the ceiling is this CLI's own number.
 	if built.tx.Fee > o.maxFee {
-		return "", false, fmt.Errorf("refusing to sign: the node at %s puts a fee of %d spark on this transaction, above %s. Re-run with --max-fee %d (sparks) only if you accept that cost",
-			t.base, built.tx.Fee, feeCeilingReason(o.maxFee), built.tx.Fee)
+		return "", false, fmt.Errorf("refusing to sign: the node at %s puts a fee of %d spark on this transaction, above %s. Nothing was signed. If you deliberately accept a higher fee, raise --max-fee to a number YOU choose above %d; do not copy the fee the node reported",
+			t.base, built.tx.Fee, feeCeilingReason(o.maxFee), o.maxFee)
 	}
 
 	if o.dryRun {
@@ -911,17 +916,35 @@ func ceilToEpoch(h, epochBlocks uint64) (uint64, bool) {
 	return h + add, true
 }
 
-// releaseForecast is the "release" line cmdUnstake prints, as a function so the
-// arithmetic and the genesis-bond case are testable without capturing stdout.
+// splitUnbondExit mirrors state.applyUnbond's split for the preview: the bond's
+// FUNDED part leaves first and is the sparks the address is owed, and only an
+// exit larger than that reaches the seat's unfunded genesis power, which the
+// state DESTROYS rather than records (audits ST-3 and C-1). The order is the
+// whole of C-1: a genesis operator that topped up with its own coins recovers
+// them through an ordinary partial exit, and loses only the grant.
 //
-// amount <= bondUnfunded means the whole exit is the seat's unfunded genesis
-// power, which the state DESTROYS rather than records (audit ST-3): printing a
-// release height for it would promise a payout that cannot happen. Otherwise
-// the funded part is recorded, and its release height is the epoch boundary at
-// or after the earliest applying block (head+1) plus the cooldown.
-func releaseForecast(amount, bondUnfunded uint64, st stakingStatus, cooldown uint64) (string, bool) {
-	if amount <= bondUnfunded {
-		return fmt.Sprintf("nothing: all %d sparks of this exit are the seat's UNFUNDED genesis power, which an unbond destroys instead of releasing (audit ST-3)", amount), true
+// A hand-built /account reply with Unfunded above Bonded is not a state the chain
+// can hold; like the state's own subtraction, this floors the funded part at zero
+// rather than wrapping.
+func splitUnbondExit(amount, bonded, unfunded uint64) (funded, destroyed uint64) {
+	fundedInBond := uint64(0)
+	if unfunded < bonded {
+		fundedInBond = bonded - unfunded
+	}
+	funded = min(amount, fundedInBond)
+	return funded, amount - funded
+}
+
+// releaseForecast is the "release" line cmdUnstake prints for the sparks the
+// state will RECORD, as a function so the arithmetic is testable without
+// capturing stdout. funded is that recorded amount (see splitUnbondExit); its
+// release height is the epoch boundary at or after the earliest applying block
+// (head+1) plus the cooldown. funded == 0 means the exit records nothing, and no
+// height is forecast for it - printing one would promise a payout that cannot
+// happen.
+func releaseForecast(funded uint64, st stakingStatus, cooldown uint64) (string, bool) {
+	if funded == 0 {
+		return "", false
 	}
 	earliest := st.Height + 1
 	if earliest == 0 { // head was MaxUint64; a wrapped "earliest" would forecast the past
@@ -936,6 +959,36 @@ func releaseForecast(amount, bondUnfunded uint64, st stakingStatus, cooldown uin
 	}
 	return fmt.Sprintf("height %d at the earliest (submitted at head %d; the cooldown is %d epochs x %d blocks = %d blocks, and the release height is the epoch boundary at or after head+1+cooldown)",
 		release, st.Height, st.UnbondingEpochs, st.EpochBlocks, cooldown), true
+}
+
+// unbondEffect is the consequence line cmdUnstake prints before the signature
+// (audit CL-2), and audit C-1's other half: it is CONDITIONAL on the split, not
+// on "is this exit bigger than the grant". The text used to say "the seat is gone
+// from the committee and there is nothing to withdraw" for every exit no larger
+// than the grant - which is wrong twice for a topped-up genesis seat, because the
+// funded part now leaves first (so there IS something to withdraw) and a
+// remainder at or above the floor keeps the seat.
+func unbondEffect(amount, bonded, unfunded uint64, st stakingStatus) string {
+	funded, destroyed := splitUnbondExit(amount, bonded, unfunded)
+	var parts []string
+	if funded > 0 {
+		line := "the funded coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then"
+		if cooldown, ok := cooldownBlocks(st); ok {
+			if forecast, ok := releaseForecast(funded, st, cooldown); ok {
+				line = forecast + "; " + line
+			}
+		}
+		parts = append(parts, line)
+	}
+	if destroyed > 0 {
+		parts = append(parts, fmt.Sprintf("%d sparks are the seat's unfunded genesis power and are destroyed, not released (audit ST-3)", destroyed))
+	}
+	if remainder := bonded - amount; remainder == 0 {
+		parts = append(parts, "the whole bond leaves, so the seat is gone from the committee at the next epoch boundary")
+	} else {
+		parts = append(parts, fmt.Sprintf("%d sparks stay bonded, at the minimum or above, so the seat is RETAINED until a later exit takes it below the minimum", remainder))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func cmdStake(args []string) error {
@@ -1087,21 +1140,10 @@ func cmdUnstake(args []string) error {
 	// The consequence is part of the preview, not a receipt printed after the
 	// irreversible POST (audit CL-2). The applying block is at least head+1, so
 	// the height is the EARLIEST release; the block that applies the unbond
-	// sets the exact one, which is why the line says "at the earliest".
-	var effect string
-	if amount > t.account.BondUnfunded {
-		effect = "the coins are neither spendable nor counted in the committee until the release height; `b10coin withdraw` releases them then"
-		if t.account.BondUnfunded > 0 {
-			effect = fmt.Sprintf("%d sparks of this exit are the seat's unfunded genesis power and are destroyed, not released (audit ST-3); ", t.account.BondUnfunded) + effect
-		}
-		if cooldown, ok := cooldownBlocks(t.status); ok {
-			if line, ok := releaseForecast(amount, t.account.BondUnfunded, t.status, cooldown); ok {
-				effect = line + "; " + effect
-			}
-		}
-	} else {
-		effect = "the seat is gone from the committee and there is nothing to withdraw: a genesis grant was never funded (audit ST-3)"
-	}
+	// sets the exact one, which is why the line says "at the earliest". The
+	// wording is CONDITIONAL on the funded/grant split and on the remainder
+	// (audit C-1): a partial exit can return coins AND keep the seat.
+	effect := unbondEffect(amount, t.account.Bonded, t.account.BondUnfunded, t.status)
 	// An exit carries fee 0 by consensus, so its ceiling is 0: any non-zero
 	// fee this verb somehow built would be refused rather than signed.
 	txid, posted, err := t.submit(tx, stakingTxOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{amount: amountSource, effect: effect})
@@ -1230,7 +1272,7 @@ func cmdNode(args []string) error {
 	//     anyone with the repository can reproduce, for development only.
 	peers := fs.String("peers", "", "comma-separated peer addresses to dial")
 	relay := fs.String("relay", "", "address of the dumb forwarder relay to dial")
-	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8; at least 16 bytes). Sent only after the relay announces its gate with a fixed first frame, so a relay without a token never receives it; a refused token is logged and retried. Plaintext over TCP and replayable: use it over a trusted path")
+	relayTokenPath := fs.String("relay-access-token-file", "", "path to the relay's pre-shared access token (audit N-8; at least 16 bytes). The token is NEVER sent: the node answers the relay's per-connection challenge with HMAC-SHA-256(token, challenge) only after the relay announces its gate, and requires HMAC-SHA-256(token, challenge || answer) back, so a relay (or a stranger behind an ungated one) that does not hold the token is refused and logged (audit D-1). The exchange is in plaintext: use it over a trusted path")
 	listen := fs.String("listen", "", "P2P listen address for direct connections (empty: dial only)")
 	// The advertisement override (audit PX-8). A port-forwarded home node listens
 	// on 0.0.0.0:7001, which names no endpoint a peer can dial, so PEER_EXCHANGE

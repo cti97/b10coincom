@@ -853,3 +853,52 @@ func TestValidateRejectsANonPositiveGenesisTime(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateRefusesAValidatorPowerSumThatOverflows is audit N-5. Epoch 0's
+// committee is derived from the genesis state with a CHECKED power sum
+// (state.sumPowers). When the sum overflows uint64, applyPowerCap fails,
+// committees[0] is absent, and chain.validateLocked refuses every block at
+// epoch 0: the node opens and accepts nothing. Consensus could never have run
+// on such a genesis either, but the single-node producer used to accept; the
+// document is now refused at load, with the committee named as the reason.
+//
+// The boundary is pinned too: a sum that FITS must still validate, so the rule
+// cannot be satisfied by refusing large-but-representable powers.
+func TestValidateRefusesAValidatorPowerSumThatOverflows(t *testing.T) {
+	withPowers := func(powers ...uint64) *Genesis {
+		g := Devnet()
+		g.ChainID = "b10coin-power-sum"
+		g.Params.ChainID = g.ChainID
+		g.Validators = make([]Validator, len(powers))
+		for i, p := range powers {
+			pub, _, err := deterministicKey(fmt.Sprintf("power-sum-key-%d", i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			g.Validators[i] = Validator{PubKey: pub, Power: p}
+		}
+		g.Params.CommitteeSize = len(powers)
+		return g
+	}
+
+	// Two seats of 2^63 each: 2^63 + 2^63 == 2^64, one past MaxUint64.
+	overflow := withPowers(1<<63, 1<<63)
+	err := overflow.Validate()
+	if err == nil {
+		t.Fatal("a genesis whose validator powers sum past MaxUint64 validated: its epoch-0 committee cannot be derived and it would refuse every block")
+	}
+	if !errors.Is(err, ErrBadGenesis) {
+		t.Fatalf("the overflowing genesis reported %v, want ErrBadGenesis", err)
+	}
+	for _, want := range []string{"overflow uint64", "epoch-0 committee"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the overflow error does not say %q: %v", want, err)
+		}
+	}
+
+	// The same seats one spark lower each: the sum fits, so the rule allows it.
+	fit := withPowers(1<<63-1, 1<<63-1)
+	if err := fit.Validate(); err != nil {
+		t.Fatalf("a genesis whose powers fit in uint64 was refused: %v", err)
+	}
+}

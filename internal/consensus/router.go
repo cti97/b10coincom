@@ -97,12 +97,14 @@ type MessageRouter struct {
 	// hint, deduplicate, and call transport.AddPeer (never a raw dial) - and it
 	// runs on the transport's dispatch goroutine, so it must not block.
 	//
-	// The frame is NOT signed and carries no consensus meaning. Its authority
-	// is the connection it arrived on; the node layer should therefore also
-	// require that the connection has carried a verified committee HELLO
-	// (devnet's observePeerExchange does), and nothing here may treat the
-	// addresses as evidence about the chain. Nil means such frames are counted
-	// and dropped.
+	// The frame IS signed (audit PX-1): the sender signs (chain id, height,
+	// address list) with its validator key, and the authority is that signature
+	// plus a seat at the advertised height - NOT the connection it arrived on,
+	// because on a relay every member and every stranger shares one connection.
+	// The node layer verifies both (devnet's observePeerExchange through
+	// hintAuthority) before it dials anything; a stranger's frame, however it
+	// arrived, is refused. Nothing here may treat the addresses as evidence
+	// about the chain. Nil means such frames are counted and dropped.
 	OnPeerExchange func(peer transport.PeerID, p *wire.PeerExchange)
 	// Committee, when non-nil, is the validator set whose keys may carry a
 	// consensus frame. A vote or proposal whose key is absent from it is

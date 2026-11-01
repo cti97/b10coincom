@@ -4,7 +4,6 @@
 package chain
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -23,9 +22,23 @@ var (
 	ErrBadHeight       = errors.New("chain: height is not head+1")
 	ErrBadStateRoot    = errors.New("chain: computed state root does not match header")
 	ErrBadProposerSig  = errors.New("chain: proposer signature is missing or invalid")
-	ErrNotValidator    = errors.New("chain: proposer is not in the validator set")
+	ErrNotValidator    = errors.New("chain: proposer does not hold a seat at the block's height")
 	ErrGenesisReplay   = errors.New("chain: replay diverged from stored state root")
 	ErrUnknownProposer = errors.New("chain: cannot determine proposer key")
+	// ErrRuleChange reports a stored block whose transactions replay to a
+	// DIFFERENT state root than its header commits. It is deliberately NOT
+	// ErrGenesisReplay: the block's height, parent link and bytes all matched,
+	// so nothing about the log is structurally wrong. The usual cause is a
+	// build whose CONSENSUS RULES differ at that height - the genesis document
+	// hash covers no derived state and no header carries a rule version, so a
+	// rule change presents exactly like this. The known cases are ST-3 (the
+	// bond leaf began committing Bond.Unfunded; its genesis-root change usually
+	// fails the height-1 parent-link check first) and C-1 (the FUNDED-FIRST
+	// unbond order, which changes the post-state of an exit from a bond holding
+	// both a genesis grant and a top-up and therefore diverges at the unbond's
+	// own height). An operator sent to look for corruption would apply the
+	// wrong remedy; the message names the rule change instead.
+	ErrRuleChange = errors.New("chain: stored chain does not replay under this build's consensus rules")
 	// ErrWrongGenesis reports a data directory whose recorded genesis hash
 	// differs from the genesis the node was started with (audit O-5). It is
 	// deliberately distinct from ErrGenesisReplay: a wrong genesis is a
@@ -253,6 +266,17 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 	if vals, err := st.Committee(); err == nil {
 		c.committees[0] = vals
 	}
+	// The genesis state is COMMITTED AT HEIGHT 0, so it also decides the epoch
+	// that begins at height 1. Under the shipped epoch lengths that epoch is
+	// epoch 0 (already recorded above) and memoCommitteeLocked(st, 0) writes
+	// nothing; under EpochBlocks == 1 it is epoch 1, and this call is the only
+	// place its seats can be recorded - the only block whose commit would decide
+	// them is the genesis block, which is never appended. Without it a
+	// one-block-epoch chain could not judge its FIRST block: every proposer
+	// would be reported unseated at height 1. The gap predates audit A-1 - the
+	// old genesis-only proposer check never asked for a committee - but the fix
+	// makes the append path ask, so the deciding state must be recorded.
+	c.memoCommitteeLocked(st, 0)
 
 	// Compare the genesis BEFORE replaying a single block (audit O-5). A data
 	// directory belongs to one chain; opening it with a different genesis
@@ -296,15 +320,44 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 		}
 		wantParent := c.head.ID()
 		if blk.Header.ParentHash != wantParent {
+			// HEIGHT 1 IS A SPECIAL CASE, AND SAYING SO IS THE POINT OF AUDIT
+			// C-2. The only predecessor of the first stored block is the
+			// SYNTHESIZED genesis block, whose ID is a function of the genesis
+			// document AND the genesis state root this build derives from it -
+			// while store.CheckGenesis compares the DOCUMENT hash, which covers
+			// no derived state. So a directory written by a build whose genesis
+			// state root differed passes CheckGenesis and then fails here, at
+			// height 1, with the message this file uses for a renumbered or
+			// corrupt log. That is not what happened, and an operator sent to
+			// look for corruption in a healthy log is a diagnostic failure.
+			//
+			// The known instance is the ST-3 hard fork: committing Bond.Unfunded
+			// in state.bondLeaf changed the genesis state root without changing
+			// genesis.Hash, so every data directory written before it is
+			// unopenable by a build after it. The fix is a fresh --dir or a
+			// resync, never a repair.
+			if h == 1 {
+				return nil, fmt.Errorf("%w at height 1: the first stored block does not link this build's genesis block (parent %x, expected %x). The genesis HASH matches - the store checks it before replay - so this directory was written by a DIFFERENT BUILD of b10coin whose genesis STATE ROOT differed from this one (the document hash covers no derived state). A data directory written before the ST-3 change, which added Bond.Unfunded to the committed bond leaf, is the known case. Nothing here is corrupt: start a fresh --dir, or resync this node from a peer on this build",
+					ErrGenesisReplay, blk.Header.ParentHash[:8], wantParent[:8])
+			}
 			return nil, fmt.Errorf("%w at height %d: stored block does not link its predecessor (parent %x, expected %x)",
 				ErrGenesisReplay, h, blk.Header.ParentHash[:8], wantParent[:8])
 		}
 		if err := c.applyValidated(blk); err != nil {
 			return nil, fmt.Errorf("%w at height %d: %v", ErrGenesisReplay, h, err)
 		}
-		// The stored header's root must equal what we just recomputed.
-		if c.state.Root() != blk.Header.StateRoot {
-			return nil, fmt.Errorf("%w at height %d", ErrGenesisReplay, h)
+		// The stored header's root must equal what we just recomputed. THIS IS
+		// THE C-1 DIVERGENCE POINT (audit N-1). The block's height, parent link
+		// and bytes matched, so the log is not structurally damaged; what
+		// differs is what its transactions DO to the state. A build that ran
+		// the old grant-first unbond order writes a different post-state for
+		// any exit from a bond holding both a genesis grant and a top-up, and a
+		// mixed-build committee forks at that unbond. Reporting it with
+		// ErrGenesisReplay's "replay diverged" text sent the operator looking
+		// for corruption; ErrRuleChange says which rule changed and what to do.
+		if root := c.state.Root(); root != blk.Header.StateRoot {
+			return nil, fmt.Errorf("%w at height %d: this block's transactions replay to state root %x, but the stored header commits %x. Height, parent link and block bytes all matched, so NOTHING HERE IS CORRUPT: the usual cause is a DIFFERENT BUILD of b10coin whose CONSENSUS RULES differ at this height (the genesis hash covers no derived state and a header carries no rule version). Two known cases: ST-3's bond-leaf change (which moves the genesis state root and normally fails the height-1 link check first), and C-1's FUNDED-FIRST unbond order, which changes the post-state of an exit from a bond holding both a genesis grant and a top-up and therefore diverges at that unbond's height. A mixed-build committee forks here. Start a fresh --dir, or resync this node from a peer on this build; do not attempt a repair",
+				ErrRuleChange, h, root[:8], blk.Header.StateRoot[:8])
 		}
 	}
 	owned = true
@@ -393,12 +446,25 @@ func (c *Chain) CommitteeAt(h uint64) ([]genesis.Validator, error) {
 // CommitteeAt returns, so a caller can only ever be told exactly what
 // CommitteeAt would have contained at that height.
 func (c *Chain) IsSeatedAt(h uint64, pub []byte) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.seatedAtLocked(h, pub)
+}
+
+// seatedAtLocked is IsSeatedAt's body. The caller must ALREADY hold c.mu, for
+// reading or writing.
+//
+// It exists because IsSeatedAt cannot be called from validateLocked: Append
+// calls validateLocked under the WRITE lock, and a nested RLock blocks while a
+// writer is pending (Go's RWMutex is not reentrant), so calling the exported
+// method there would deadlock the append path on itself. validateLocked reads
+// the memoised map directly through this helper, under the lock it already
+// holds, and gets exactly the answer IsSeatedAt would give.
+func (c *Chain) seatedAtLocked(h uint64, pub []byte) bool {
 	blocks := c.gen.Params.EpochBlocks
 	if blocks == 0 {
 		return false
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	for i := range c.committees[h/blocks] {
 		if string(c.committees[h/blocks][i].PubKey) == string(pub) {
 			return true
@@ -478,16 +544,6 @@ func (c *Chain) HeadSnapshot() (height uint64, id [32]byte, stateRoot [32]byte) 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.head.Header.Height, c.head.ID(), c.head.Header.StateRoot
-}
-
-// isValidator reports whether pub is in the genesis validator set.
-func (c *Chain) isValidator(pub []byte) bool {
-	for _, v := range c.gen.Validators {
-		if bytes.Equal(v.PubKey, pub) {
-			return true
-		}
-	}
-	return false
 }
 
 // creditEmissionLocked pays the block's emission into the faucet account. It
@@ -731,7 +787,8 @@ func (c *Chain) memoCommitteeLocked(st *state.State, height uint64) {
 // validators can only disagree about the chain, never about the rules.
 //
 // The checks, in Append's order: parent link, head+1 height, block structure
-// (types), proposer membership, proposer signature, then the whole state
+// (types), the proposer's seat at this block's height (the epoch committee,
+// not genesis - audit A-1), proposer signature, then the whole state
 // transition through advanceLocked - height set, emission credited,
 // transactions applied - whose recomputed root must equal the header's claim.
 // That last check is the state-root probe: the same Probe-style transition a
@@ -758,8 +815,39 @@ func (c *Chain) validateLocked(b *types.Block) (*state.State, error) {
 		return nil, fmt.Errorf("%w: block timestamp %d is not after parent timestamp %d",
 			ErrBadTimestamp, b.Header.Timestamp, c.head.Header.Timestamp)
 	}
-	if !c.isValidator(b.Header.Proposer) {
-		return nil, ErrNotValidator
+	// THE PROPOSER'S SEAT, AT THIS BLOCK'S HEIGHT (audit A-1). This used to scan
+	// c.gen.Validators - the GENESIS list - while consensus draws the proposer
+	// from the epoch committee that judges this height (Driver.configFor ->
+	// Chain.CommitteeAt, then Config.Proposer). A key bonded after genesis was
+	// therefore drawn, built a block, and had it refused here by EVERY
+	// validator, itself included, while its own prevote seam ran this same
+	// check: every round it was drawn was burned, and a committee whose genesis
+	// seats had all exited could never append again. Catch-up could not repair
+	// it because Syncer.PullAndAdopt ends in this Append. RT-1's rotation-in
+	// made that mismatch routinely reachable; this is the correction.
+	//
+	// The rule is now exactly the committee that drew the block: seated at
+	// b.Header.Height means seated by the epoch h/EpochBlocks committee, which
+	// is memoised from the state at that epoch's deciding height. No genesis
+	// fallback is needed, and none would be safe to add casually: for every
+	// genesis chain.Open accepts, the epoch-0 committee derived from the genesis
+	// state is EXACTLY the genesis validator set (genesis.Validate requires
+	// CommitteeSize >= len(Validators) and every Power > 0; state.Committee
+	// clamps powers but never drops a seat, and clamps at seats >= 4 only, where
+	// a positive total over at least four seats gives a nonzero quarter), so
+	// epoch 0 is unchanged. Pinned by
+	// TestTheGenesisCommitteeIsTheEpochZeroCommittee.
+	//
+	// SAFETY: this cannot admit a proposer that was not entitled to propose.
+	// "Entitled" IS this membership: the proposer draw (Config.Proposer) selects
+	// from the same CommitteeAt(height) set the router checks every frame
+	// against, and the certificate gate re-tallies the commit with it. A key
+	// outside the epoch committee is refused here, so the only way a block
+	// passes is the way an honest one does - a key the committee for its own
+	// height seats. In particular EverSeated is NOT used: "was seated once" is
+	// an authorisation widening (RT-3) and would admit a rotated-out proposer.
+	if !c.seatedAtLocked(b.Header.Height, b.Header.Proposer) {
+		return nil, fmt.Errorf("%w at height %d", ErrNotValidator, b.Header.Height)
 	}
 	if b.Sig == nil {
 		return nil, ErrBadProposerSig

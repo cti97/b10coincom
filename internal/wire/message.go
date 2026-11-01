@@ -66,31 +66,121 @@ const WireTagFloor MsgType = 0x80
 // different messages by two different paths.
 var ErrUnknownMsgType = errors.New("wire: unknown message type")
 
-// MaxHelloNonceBytes bounds the HELLO's freshness nonce. The transport uses a
-// 32-byte per-connection nonce (tcp.connectionNonceBytes); the slack exists so
-// the wire layer is not the place a transport's nonce width is decided. Empty
-// is legal and means "this connection issued no challenge" (a relay link,
+// MaxHelloNonceBytes bounds the HELLO's socket binding. On a direct connection
+// the binding is TWO 32-byte per-connection challenges (tcp.connectionNonceBytes),
+// the sender's own followed by the receiver's - see HelloBinding - so 64 is the
+// exact width, not slack: a transport that widens its challenge must widen this
+// constant too (tcp.connectionNonceBytes is checked against it by a test).
+// Empty is legal and means "this connection issued no challenge" (a relay link,
 // where one socket carries every member's frames and the transport therefore
-// has no peer nonce to bind - see tcp.adoptRelay).
+// has no peer challenge to bind - see tcp.adoptRelay).
 const MaxHelloNonceBytes = 64
+
+// HelloBinding is the value a HELLO carries in Nonce on a direct connection:
+// the SENDER's own per-connection challenge, followed by the RECEIVER's. Both
+// sides derive it from the same two values (the sender's local and remote; the
+// receiver's remote and local, in that order), so a HELLO names the one socket
+// whose two ends produced it.
+//
+// BOTH halves are load-bearing (audit A-2). The receiver's challenge alone was
+// the PX-2 binding and it is not enough: the peer CHOOSES the challenge it
+// sends us, so a malicious member can send a third node's challenge, receive
+// our HELLO signed over it, and replay that signature onto the third node's
+// socket, where the same challenge is the one it checks. The sender's own
+// challenge closes that: it is the value on the signing socket that the
+// attacker cannot transplant, because the third node never generated it and
+// will never accept a HELLO that quotes it.
+//
+// The EXCHANGE that produces the pair (tcp.exchangeNonce) is commit-then-reveal,
+// which stops a challenge from being substituted after the peer has seen it.
+// It does NOT make the pair the socket's own against a party holding two
+// sockets (audit A-2, fix review): a member M connected to both A and B can
+// copy each node's commitment and reveal to the other, so A and B end up
+// holding the same pair and A's HELLO verifies on M's socket at B. The
+// commitment binds only the challenge, never the identities at the socket's
+// ends, and over plaintext TCP between parties that have not yet authenticated
+// each other no exchanged value can bind them: M is, for this purpose, the
+// wire.
+//
+// WHAT THIS IS, then: it ties a HELLO to the two CHALLENGES of a socket, which
+// makes a CAPTURED frame useless on any other socket. What it is not is
+// identity binding. A party that CONTROLS the byte stream - the relay, where
+// one socket carries every member's frames, a transparent proxy at an address
+// the operator dialled, or the two-socket member above - can carry a genuine
+// handshake through and forward whatever frame it likes. That is the documented
+// residual (audit A-3 for the relay, A-2 for the two-socket member), and the
+// harm it could do to catch-up is closed in the node's attestation table
+// instead: a silent pull demotes the SOCKET it went down, never the member
+// (devnet.demotePeer). On a relay link both halves are empty (nil), which is
+// exactly what tcp.PeerChallenges/ConnNonces report there.
+func HelloBinding(sender, receiver []byte) []byte {
+	out := make([]byte, 0, len(sender)+len(receiver))
+	out = append(out, sender...)
+	return append(out, receiver...)
+}
+
+// HelloNonceWidth reports the DECLARED width of h's socket binding without
+// decoding the message: it walks the canonical layout up to the Nonce length
+// prefix and returns that number. ok is false when the frame is not a HELLO or
+// is too short to carry the prefix. It allocates nothing and reads no byte past
+// the frame.
+//
+// It exists for ONE operator diagnostic (audit N-3): the binding changed width
+// from one challenge (32 bytes) to two (64) in the A-2 fix, and an old and a
+// new node never admit each other on a gated socket. The transport compares
+// this width with the width of the connection's own binding so it can say so
+// ONCE per connection instead of failing silently. It is not an admission
+// decision - callers must not accept or refuse a frame on it - and it is not a
+// second decoder: the width it reports is the width DecodeHello's bounded
+// VarBytesMax would read.
+func HelloNonceWidth(frame []byte) (int, bool) {
+	d := types.NewDecoder(frame)
+	raw, err := d.U8()
+	if err != nil || MsgType(raw) != MsgHello {
+		return 0, false
+	}
+	// ChainID and Validator: their lengths only, no copies.
+	for i := 0; i < 2; i++ {
+		n, err := d.Len()
+		if err != nil || d.Skip(n) != nil {
+			return 0, false
+		}
+	}
+	if _, err := d.U64(); err != nil { // Height
+		return 0, false
+	}
+	width, err := d.Len()
+	if err != nil {
+		return 0, false
+	}
+	return width, true
+}
 
 // Hello is the first message a connection speaks. It is not signed at this
 // layer - the Sig carries whatever the transport's handshake policy needs of
 // it, and verifying that policy is the connection's job, not the decoder's.
 //
-// Nonce is the RECEIVER's per-connection challenge, echoed so the signature is
-// bound to one socket (audit PX-2). The transport picks a fresh 32-byte value
-// per direct connection during the ID handshake and hands it to the node
-// layer; a HELLO signed over another connection's nonce - a captured member
-// HELLO replayed on a hint-dialled socket - does not verify HERE even though
-// its Ed25519 signature is perfectly valid. Empty means the connection issued
-// or demands no challenge (relay mode), not "check skipped": the check is an
-// equality against the value the transport recorded for that connection.
+// Nonce is the socket binding HelloBinding builds: the sender's per-connection
+// challenge followed by the receiver's (audit PX-2, A-2). The transport picks a
+// fresh 32-byte value per direct connection during the ID handshake, so a
+// HELLO signed for one socket does not verify on any other - the receiver
+// compares the whole binding, not one half of it. Each value is fixed by
+// commit-then-reveal (see HelloBinding), so neither end can choose its half
+// after learning the other's; that ordering is what closes A-2. Empty means
+// the connection issued or demands no challenge (relay mode), not "check
+// skipped": the check is an equality against the value the transport recorded
+// for that connection.
+//
+// There is deliberately no version field (audit N-3). Done() refuses trailing
+// bytes, so adding one is itself a vintage break that an older node cannot read
+// or negotiate; the binding width is what identifies the one split that exists,
+// and the transport reports it once per connection. A version belongs in a
+// negotiated handshake, not appended to a fixed message.
 type Hello struct {
 	ChainID   string
 	Validator []byte // Ed25519 public key
 	Height    uint64
-	Nonce     []byte // the receiver's per-connection challenge
+	Nonce     []byte // sender's challenge || receiver's challenge (HelloBinding)
 	Sig       []byte
 }
 
@@ -136,11 +226,11 @@ func DecodeHello(b []byte) (*Hello, error) {
 	if h.Height, err = d.U64(); err != nil {
 		return nil, err
 	}
-	// The nonce is a fixed-size challenge with a hard ceiling (audit PX-2), so
-	// it is bounded before the copy for the same reason the validator key is:
-	// an attacker-supplied length must not turn one HELLO into a frame-sized
-	// allocation. Empty is legal - it is how a relay connection, which has no
-	// peer nonce, is framed.
+	// The binding is a fixed number of fixed-size challenges with a hard
+	// ceiling (audit PX-2, A-2), so it is bounded before the copy for the same
+	// reason the validator key is: an attacker-supplied length must not turn one
+	// HELLO into a frame-sized allocation. Empty is legal - it is how a relay
+	// connection, which has no peer challenge, is framed.
 	if h.Nonce, err = d.VarBytesMax(MaxHelloNonceBytes); err != nil {
 		return nil, err
 	}

@@ -106,6 +106,71 @@ func TestALoneSeatDoesNotCryStallWithoutAReachableQuorum(t *testing.T) {
 	}
 }
 
+// TestAStallOnAnUnderivableCommitteeDoesNotPrintAQuorum pins audit B-4: when
+// the committee for the next height cannot be derived, the stall line must not
+// print a quorum at all.
+//
+// The state is constructed: three live seats of four are attested (so the OLD
+// fallback would have had a non-empty genesis set to measure against and would
+// have printed "quorum reachable with 3 of 4 power (quorum 3)"), and then the
+// validator's per-height committee source is replaced with one that fails. The
+// driver keeps its own copy of the config, so it keeps ticking; only the
+// watcher's lookup sees the failure. The genesis committee is asserted non-empty
+// first: without that check the absence of a quorum in the line would prove
+// nothing, because the fallback would have had nothing to print either.
+func TestAStallOnAnUnderivableCommitteeDoesNotPrintAQuorum(t *testing.T) {
+	vs := quietValidators(t, 4)
+	live := vs[:3]
+	v := live[0]
+	for seat := 1; seat < 3; seat++ {
+		attestPeer(t, v, string(live[seat].pub), fmt.Sprintf("v%d", seat), 0)
+	}
+	v.mu.Lock()
+	if len(v.cfgC.Committee) != 4 {
+		v.mu.Unlock()
+		t.Fatalf("fixture: the genesis committee holds %d seats, so the old fallback had nothing to measure a quorum against and this test would be vacuous", len(v.cfgC.Committee))
+	}
+	v.cfgC.CommitteeFor = func(h uint64) ([]genesis.Validator, error) {
+		return nil, fmt.Errorf("constructed: no committee for height %d", h)
+	}
+	v.mu.Unlock()
+
+	reachRound(t, live, stallReportRounds-1)
+	// The tick loop polls every round, so the watcher has already seen this
+	// height below the threshold: that observation is what fixes reachFrom at
+	// the round the height began in, exactly as the existing stall-line tests
+	// establish it. Nothing may be said one round short.
+	if line, pre := v.stallReportOnce(); pre {
+		t.Fatalf("a height %d rounds in reported before the threshold of %d:%s", stallReportRounds-1, stallReportRounds, line)
+	}
+	reachRound(t, live, stallReportRounds)
+	line, ok := v.stallReportOnce()
+	if !ok {
+		t.Fatal("a height whose next committee cannot be derived said nothing: the operator is left with a silent chain")
+	}
+	t.Logf("underivable-committee stall line: %s", line)
+	for _, bad := range []string{"quorum reachable", "power (quorum", "of 4 power"} {
+		if strings.Contains(line, bad) {
+			t.Fatalf("the line prints quorum arithmetic measured against the genesis set (%q in it):%s", bad, line)
+		}
+	}
+	for _, want := range []string{
+		"no block for 8 rounds",
+		"height 0 (round 8",
+		"the committee for height 1 cannot be derived",
+		"constructed: no committee for height 1",
+		"no quorum is reported",
+		"Driver.HaltError",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("the line does not say %q:%s", want, line)
+		}
+	}
+	if again, ok := v.stallReportOnce(); ok {
+		t.Fatalf("the same undeducible height was reported twice:%s", again)
+	}
+}
+
 // TestTheStallLineReArmsAtTheNextHeight pins the reset: the line is
 // once per HEIGHT, not once per process. The state is constructed exactly as
 // production advances it - a block appended by the chain's own writer and the

@@ -217,6 +217,63 @@ func TestTheFirstEarlyProposalForARoundWins(t *testing.T) {
 	}
 }
 
+// TestADuplicateEarlyProposalCostsNoProposerDraw pins audit B-3's ordering: the
+// duplicate check runs BEFORE the drawn-proposer evaluation, not after it.
+//
+// The observable is the diagnostic classification, because the work saved is a
+// pure computation with no other trace. A frame for a round whose genuine
+// proposal is already held is a DUPLICATE whatever key it names, so the
+// duplicate counter must move and the wrong-proposer counter must not. Under
+// the old order the draw ran first and this frame was filed as a wrong
+// proposer - one full proposer draw (encoder, hash, big.Int modulus, committee
+// scan) spent on a frame the very next O(1) test rejects.
+func TestADuplicateEarlyProposalCostsNoProposerDraw(t *testing.T) {
+	cfg := wholeCommittee(t, 3)
+	parent := crypto.HashParts([]byte("parent"))
+	const idx = 2
+	h := futureProposalHeight(t, cfg, idx, 1, parent)
+	e := newTestEngine(t, cfg, idx, h, parent)
+
+	kept := &Proposal{Height: h, Round: 1, Block: testProposer(t, cfg, h, 1, parent), ValidRound: -1, Validator: cfg.Proposer(h, 1, parent)}
+	kept.Sig = signProposal(t, cfg, kept)
+	if err := e.OnMessage(EncodeProposal(kept)); err != nil {
+		t.Fatalf("the genuine early proposal was refused: %v", err)
+	}
+
+	// A member who is NOT round 1's drawn proposer, signing a different block
+	// for the same round: valid signature, duplicate round.
+	wrong := -1
+	for i := range cfg.Committee {
+		if string(cfg.Committee[i].PubKey) != string(cfg.Proposer(h, 1, parent)) {
+			wrong = i
+			break
+		}
+	}
+	if wrong < 0 {
+		t.Fatal("fixture: every committee member is round 1's proposer")
+	}
+	blk := conflictingBlock(t, cfg, h, 1, parent, 0x52)
+	blk.Header.Proposer = cfg.Committee[wrong].PubKey
+	dup := &Proposal{Height: h, Round: 1, Block: blk, ValidRound: -1, Validator: cfg.Committee[wrong].PubKey}
+	dup.Sig = signProposal(t, cfg, dup)
+	if err := e.OnMessage(EncodeProposal(dup)); err != nil {
+		t.Fatalf("the duplicate frame was refused instead of dropped: %v", err)
+	}
+	if got := e.diagCounters(); got.DuplicateProposals != 1 || got.WrongProposerProposals != 0 {
+		t.Fatalf("the duplicate was classified duplicate=%d wrongproposer=%d, want 1 and 0: the duplicate test must run before the proposer draw",
+			got.DuplicateProposals, got.WrongProposerProposals)
+	}
+	// And the kept proposal is still the genuine one: the duplicate changed
+	// nothing an engine reads.
+	if err := e.OnTimeout(TimeoutEvent{Height: h, Round: 0}); err != nil {
+		t.Fatal(err)
+	}
+	v := prevoteAt(t, e.Drain(), 1)
+	if v == nil || v.BlockID != kept.Block.ID() {
+		t.Fatalf("entering round 1 the engine prevoted %v, want the kept proposal %x", v, kept.Block.ID())
+	}
+}
+
 // TestAnEarlyProposalSuppliesTheBytesForACommitAheadOfTheEngine: a precommit
 // quorum for round 1 arrives while the engine is still in round 0, so commitAt
 // adopts round 1 without entering it. The block's bytes are the early proposal

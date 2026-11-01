@@ -1234,7 +1234,7 @@ func TestWithdrawVerbReleasesOnlyMaturedRecords(t *testing.T) {
 // forecast that printed the raw sum would name a height that can never appear.
 func TestReleaseForecastRoundsToTheEpochBoundary(t *testing.T) {
 	st := stakingStatus{Height: 100, EpochBlocks: 1_000, UnbondingEpochs: 2}
-	line, ok := releaseForecast(1_000_000, 0, st, 2_000)
+	line, ok := releaseForecast(1_000_000, st, 2_000)
 	if !ok {
 		t.Fatal("no forecast for a funded exit")
 	}
@@ -1244,34 +1244,66 @@ func TestReleaseForecastRoundsToTheEpochBoundary(t *testing.T) {
 	}
 	// A release that already lands on a boundary does not move.
 	st.Height = 999 // 1,000 + 2,000 = 3,000
-	line, ok = releaseForecast(1_000_000, 0, st, 2_000)
+	line, ok = releaseForecast(1_000_000, st, 2_000)
 	if !ok || !strings.Contains(line, "height 3000") {
 		t.Fatalf("an exact boundary moved: %q", line)
 	}
+	// Nothing recorded, no forecast: a height would promise a payout that cannot
+	// happen.
+	if line, ok := releaseForecast(0, st, 2_000); ok {
+		t.Fatalf("a zero funded exit forecast a release: %q", line)
+	}
 }
 
-// TestReleaseForecastSaysAGenesisExitReleasesNothing is audit ST-3 in the verb:
-// when the whole exit is the seat's unfunded genesis power, the state destroys
-// it rather than recording it, so the verb must not print a release height that
-// promises a payout.
-func TestReleaseForecastSaysAGenesisExitReleasesNothing(t *testing.T) {
-	st := stakingStatus{Height: 5, EpochBlocks: 10, UnbondingEpochs: 2}
-	line, ok := releaseForecast(100, 100, st, 20)
-	if !ok {
-		t.Fatal("a genesis exit must still produce a message")
+// TestAUnbondForecastFollowsTheFundedFirstSplit is audit C-1 in the verb, both
+// halves. The state returns the operator's FUNDED coins first and destroys the
+// unfunded grant only past them; and a partial exit leaves a seat, so the text
+// must not say the seat is gone.
+func TestAUnbondForecastFollowsTheFundedFirstSplit(t *testing.T) {
+	const minStake = 1_000 * genesis.SparksPerB10
+	st := stakingStatus{Height: 5, EpochBlocks: 10, UnbondingEpochs: 2, MinStakeSparks: minStake}
+
+	// A topped-up genesis seat: a MIN_STAKE grant plus the operator's own
+	// MIN_STAKE. A partial exit of the operator's MIN_STAKE is funded-first, so it
+	// is RECORDED, gets a release height, and the remaining MIN_STAKE keeps the
+	// seat. This is the case the old text answered with "the seat is gone ... and
+	// there is nothing to withdraw".
+	effect := unbondEffect(minStake, 2*minStake, minStake, st)
+	for _, want := range []string{"RETAINED", "100000000000 sparks stay bonded", "height", "withdraw"} {
+		if !strings.Contains(effect, want) {
+			t.Fatalf("a funded partial exit from a topped-up genesis seat does not say %q: %q", want, effect)
+		}
 	}
-	if !strings.Contains(line, "destroy") || !strings.Contains(line, "UNFUNDED") {
-		t.Fatalf("the genesis exit does not say the power is destroyed: %q", line)
+	// Nothing of the grant is touched, so nothing is destroyed and the seat is
+	// not gone - the two claims the old text made unconditionally.
+	if strings.Contains(effect, "destroyed") {
+		t.Fatalf("a partial exit of the operator's own coins destroyed part of the grant: %q", effect)
 	}
-	if strings.Contains(line, "height") {
-		t.Fatalf("the genesis exit still forecasts a release height: %q", line)
+	if strings.Contains(effect, "the seat is gone") {
+		t.Fatalf("a partial exit that leaves a seat says the seat is gone: %q", effect)
+	}
+	if funded, destroyed := splitUnbondExit(minStake, 2*minStake, minStake); funded != minStake || destroyed != 0 {
+		t.Fatalf("split = (funded %d, destroyed %d), want (%d, 0): the operator's coins leave first", funded, destroyed, minStake)
 	}
 
-	// A funded exit from the same status still forecasts a height (5+1+20 = 26
-	// -> the next 10-block boundary, 30).
-	line, ok = releaseForecast(100, 0, st, 20)
-	if !ok || !strings.Contains(line, "height 30") {
-		t.Fatalf("the funded exit's forecast = %q, want height 30", line)
+	// The whole bond: the funded part is released and the grant is destroyed in
+	// the same transaction, and only now is the seat gone.
+	effect = unbondEffect(2*minStake, 2*minStake, minStake, st)
+	if !strings.Contains(effect, "the seat is gone") || !strings.Contains(effect, "destroyed") || !strings.Contains(effect, "height") {
+		t.Fatalf("a full exit from a topped-up genesis seat = %q, want a release, a destruction and a leaving seat", effect)
+	}
+	if funded, destroyed := splitUnbondExit(2*minStake, 2*minStake, minStake); funded != minStake || destroyed != minStake {
+		t.Fatalf("full-exit split = (%d, %d), want (%d, %d)", funded, destroyed, minStake, minStake)
+	}
+
+	// A pure genesis grant: nothing funded, so nothing is released, and the exit
+	// is destroyed whole - with the seat gone only because the bond was the grant.
+	effect = unbondEffect(minStake, minStake, minStake, st)
+	if strings.Contains(effect, "height") || strings.Contains(effect, "withdraw") {
+		t.Fatalf("a pure genesis exit forecast a payout: %q", effect)
+	}
+	if !strings.Contains(effect, "destroyed") || !strings.Contains(effect, "the seat is gone") {
+		t.Fatalf("a pure genesis exit = %q, want destroyed and the seat gone", effect)
 	}
 }
 
@@ -1396,10 +1428,26 @@ func TestHostileNodeFeeIsRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("a bond whose fee is the whole spendable balance was signed, not refused")
 	}
-	for _, want := range []string{"refusing to sign", "--max-fee", "ceiling", fmt.Sprint(hostileFee)} {
+	for _, want := range []string{"refusing to sign", "--max-fee", "ceiling", fmt.Sprint(defaultMaxFeeSparks)} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal must contain %q for the operator to act on it, got: %v", want, err)
 		}
+	}
+	// Audit E-2: the instruction must quote the CEILING, never the fee the
+	// node reported. A hostile node chooses balance-amount, so echoing it into
+	// "Re-run with --max-fee N" hands the operator a copy-pasteable flag that
+	// signs away the whole balance.
+	// The hostile fee may appear ONCE, as the reported claim. It must not
+	// appear again in the instruction: "raise --max-fee above <the node's
+	// number>" would still steer an operator into copying it.
+	if got := strings.Count(err.Error(), fmt.Sprint(hostileFee)); got != 1 {
+		t.Errorf("the node's fee appears %d times in the refusal, want exactly 1 (the report); the instruction must quote the ceiling, not the node's number: %v", got, err)
+	}
+	if strings.Contains(err.Error(), fmt.Sprintf("--max-fee %d", hostileFee)) {
+		t.Errorf("the refusal echoed the node's fee into the --max-fee instruction: %v", err)
+	}
+	if !strings.Contains(err.Error(), "raise --max-fee") {
+		t.Errorf("the refusal does not tell the operator to choose a ceiling itself: %v", err)
 	}
 	// The transaction the node asked for was built and printed BEFORE the
 	// refusal, so the operator can see the number that was refused.
@@ -1874,13 +1922,104 @@ func TestReleaseForecastRefusesAHostileOverflow(t *testing.T) {
 	if _, ok := cooldownBlocks(stakingStatus{EpochBlocks: maxUint64, UnbondingEpochs: 2}); ok {
 		t.Fatal("cooldownBlocks accepted an epoch_blocks x unbonding_epochs product that overflows uint64")
 	}
-	if _, ok := releaseForecast(1, 0, stakingStatus{Height: maxUint64, EpochBlocks: 1, UnbondingEpochs: 1}, 1); ok {
+	if _, ok := releaseForecast(1, stakingStatus{Height: maxUint64, EpochBlocks: 1, UnbondingEpochs: 1}, 1); ok {
 		t.Fatal("releaseForecast accepted head+1 wrapping to zero")
 	}
-	if _, ok := releaseForecast(1, 0, stakingStatus{Height: 1, EpochBlocks: 1, UnbondingEpochs: 1}, maxUint64); ok {
+	if _, ok := releaseForecast(1, stakingStatus{Height: 1, EpochBlocks: 1, UnbondingEpochs: 1}, maxUint64); ok {
 		t.Fatal("releaseForecast accepted head+1+cooldown that overflows uint64")
 	}
-	if _, ok := releaseForecast(1, 0, stakingStatus{Height: maxUint64 - 1, EpochBlocks: maxUint64 - 1, UnbondingEpochs: 1}, 0); ok {
+	if _, ok := releaseForecast(1, stakingStatus{Height: maxUint64 - 1, EpochBlocks: maxUint64 - 1, UnbondingEpochs: 1}, 0); ok {
 		t.Fatal("releaseForecast accepted a round-up to the next boundary that overflows uint64")
 	}
+}
+
+// TestStdinIsTerminalUsesThePortableCharDeviceTest pins audit E-1's test. The
+// classifier must NOT compare against os.DevNull: on Windows a console handle
+// and NUL both stat with zero volume serial and index, so os.SameFile matched
+// and a real console was reported non-interactive. os.ModeCharDevice is the
+// portable answer. Both cases below are constructed from real files, not from
+// the runner's stdin.
+func TestStdinIsTerminalUsesThePortableCharDeviceTest(t *testing.T) {
+	pipe, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipe.Close()
+	defer pipeW.Close()
+	if stdinIsTerminal(pipe) {
+		t.Error("a pipe was reported as an interactive terminal: piped consent would be accepted")
+	}
+
+	regular, err := os.CreateTemp(t.TempDir(), "not-a-tty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer regular.Close()
+	if stdinIsTerminal(regular) {
+		t.Error("a regular file was reported as an interactive terminal")
+	}
+
+	// os.DevNull is a character device on Unix AND on Windows (Go's own
+	// TestFileStatNUL pins ModeDevice|ModeCharDevice for NUL). Reporting it
+	// true is the point of the portable test; the READ path is what refuses it,
+	// which the next test pins.
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	if !stdinIsTerminal(null) {
+		t.Error("the null device is a character device; the portable test must report it as one (a Windows console handle has the same stat shape, and that is the bug E-1 fixed)")
+	}
+}
+
+// TestRealAskConfirmationRefusesEveryNonTerminal runs the REAL askConfirmation
+// (not the stubbed seam) against constructed stdin states. The positive "yes"
+// path needs a terminal and cannot be built portably (a pty is Unix-only, and a
+// Windows conpty is a different API), so this covers every refusal the guard
+// exists for: a pipe carrying "yes", a regular file carrying "yes", and the
+// null device, which is a character device and therefore reaches the read.
+func TestRealAskConfirmationRefusesEveryNonTerminal(t *testing.T) {
+	old := os.Stdin
+	defer func() { os.Stdin = old }()
+
+	pipe, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipeW.WriteString("yes\n"); err != nil {
+		t.Fatal(err)
+	}
+	pipeW.Close()
+	os.Stdin = pipe
+	if answer, err := askConfirmation(); err != errNoAnswer || answer != "" {
+		t.Fatalf("a pipe carrying %q produced (%q, %v); want the errNoAnswer refusal: piped consent must never sign", "yes", answer, err)
+	}
+	pipe.Close()
+
+	regular, err := os.CreateTemp(t.TempDir(), "answers-yes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := regular.WriteString("yes\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := regular.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = regular
+	if answer, err := askConfirmation(); err != errNoAnswer || answer != "" {
+		t.Fatalf("a regular file carrying %q produced (%q, %v); want the errNoAnswer refusal", "yes", answer, err)
+	}
+	regular.Close()
+
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = null
+	if answer, err := askConfirmation(); err != errNoAnswer || answer != "" {
+		t.Fatalf("the null device produced (%q, %v); EOF must never look like consent", answer, err)
+	}
+	null.Close()
 }

@@ -118,13 +118,23 @@ var (
 // cooldown, and the accessor the committee derivation (M5 Task 2) uses.
 func (s *State) Bonded(a types.Address) uint64 { return s.bonds[a].Amount }
 
-// HasUnbonding reports whether the address holds ANY unbonding record, mature or
-// not. It is one map lookup, and it exists for the mempool's staking admission
-// (audit ST-5): a Withdraw from an address with no such record can never apply,
-// so the pool need not spend a slot and a signature check holding it. Maturity -
-// a height-dependent fact - is deliberately not decided here; execution still
-// judges it.
-func (s *State) HasUnbonding(a types.Address) bool { return len(s.unbonding[a]) > 0 }
+// HasMatureUnbonding reports whether the address holds at least one unbonding
+// record that applyWithdraw would release at height h (ReleaseHeight <= h), i.e.
+// whether a Withdraw in a block at h can possibly pay something. Audit C-3: the
+// pool used to admit a Withdraw on the height-agnostic "has any record at all"
+// test, which is true for an address whose only record is still in cooldown, so
+// one such address could park its per-sender cap of fee-free Withdraws that all
+// failed in SelectApplicable. This
+// is the same cheap shape, over a record list the state bounds at
+// UnbondingEpochs+2 entries (audit ST-4).
+func (s *State) HasMatureUnbonding(a types.Address, h uint64) bool {
+	for _, rec := range s.unbonding[a] {
+		if rec.ReleaseHeight <= h {
+			return true
+		}
+	}
+	return false
+}
 
 // BondOf returns a copy of the address's bond record and whether it holds one.
 // It is the record-level sibling of Bonded (which returns only the amount), for
@@ -179,6 +189,14 @@ func compareUnbonding(x, y Unbonding) int {
 // cannot wrap in any state a chain builds. A caller that needs the arithmetic
 // to be safe against a hand-built state must use checked adds, as the
 // committee derivation does.
+//
+// THE UNCHECKED ADDS ARE TEST-ONLY IN PRACTICE (audit C-5): no production caller
+// reads this or TotalUnbonding - /account reports per-address figures, the
+// emission credit reads balances, and the committee derivation sums checked. The
+// conservation tests are the consumers, and they use these to compare
+// balance + bonded + unbonding against the genesis supply in states they build
+// themselves. If a production reader is ever added, the checked form belongs with
+// it; this comment is the place that will be missed otherwise.
 func (s *State) TotalBonded() uint64 {
 	var total uint64
 	for _, b := range s.bonds {
@@ -361,17 +379,30 @@ func (s *State) applyBond(tx *types.Tx) error {
 // do not reach the balance, so they are neither spendable nor counted until the
 // release height.
 //
-// THE UNFUNDED PART IS DESTROYED, NOT RECORDED (audit ST-3). A genesis seat's
-// bond was written from no account (chain.genesisState), so recording its exit
-// would turn a grant of voting power into withdrawable money: one cooldown
-// after a chain starts, the operator would hold Power sparks nobody paid for,
-// outside TotalSupplySparks. The exit itself must stay legal - a genesis seat
-// is exactly what the rotation fixture unbonds, and a seat that cannot leave is
-// a seat that can never rotate - so the split is on the PROCEEDS, not on the
-// verb: the unfunded part is burned, the funded part becomes an unbonding
-// record. Bond.Unfunded carries the split, so a genesis seat that bonds its own
-// funds on top still withdraws those funds; Height == 0 alone would conflate
-// the two.
+// THE UNFUNDED PART IS DESTROYED, NOT RECORDED (audit ST-3), AND THE FUNDED
+// PART GOES FIRST (audit C-1). A genesis seat's bond was written from no account
+// (chain.genesisState), so recording its exit would turn a grant of voting power
+// into withdrawable money: one cooldown after a chain starts, the operator would
+// hold Power sparks nobody paid for, outside TotalSupplySparks. The exit itself
+// must stay legal - a genesis seat is exactly what the rotation fixture unbonds,
+// and a seat that cannot leave is a seat that can never rotate - so the split is
+// on the PROCEEDS, not on the verb: the unfunded part is burned, the funded part
+// becomes an unbonding record. Bond.Unfunded carries the split, so a genesis
+// seat that bonds its own funds on top still withdraws those funds; Height == 0
+// alone would conflate the two.
+//
+// WHICH PART GOES FIRST IS NOT COSMETIC. The split used to take the grant first
+// (`min(tx.Amount, bond.Unfunded)`), so a genesis operator that topped up with
+// its OWN coins could not recover any of them through a partial exit: any unbond
+// up to the grant's size was burned whole and recorded nothing, and the funded
+// coins only came back if the operator exited in one full-size step. The rule is
+// now FUNDED FIRST: the exit consumes the funded part of the bond up to
+// `tx.Amount`, and only the excess is the grant being destroyed. ST-3 still
+// holds exactly, because the bound is on the TOTAL and not on the order - the
+// funded sparks a bond can ever return are the funded sparks that were bonded
+// into it (`bond.Amount - bond.Unfunded` at any moment), and a grant spark is
+// still destroyed rather than recorded however many exits the bond is split
+// into. What the order changes is only whose coins come out first.
 //
 // It is DELIBERATELY FREE. A validator may hold nothing spendable (its whole
 // balance may be bonded), and an exit that needs a coin is an exit a zero-balance
@@ -422,13 +453,20 @@ func (s *State) applyUnbond(tx *types.Tx) error {
 		return err
 	}
 
-	// ST-3's split. The unfunded sparks leave the bond and are destroyed; only
-	// the funded remainder is owed to the address. `unfundedOut` can be the
-	// whole amount (a pure genesis seat, the rotation fixture's case) or zero
-	// (every bond a Bond transaction created); a hand-built state can put
-	// Unfunded above Amount, which min() floors.
-	unfundedOut := min(tx.Amount, bond.Unfunded)
-	fundedOut := tx.Amount - unfundedOut
+	// ST-3's split, FUNDED FIRST (audit C-1). The funded part of the bond leaves
+	// first and is what the address is owed; only an exit larger than that
+	// reaches the grant, which is destroyed. `unfundedOut` is zero for every bond
+	// a Bond transaction created, and can be the whole amount only for a pure
+	// genesis seat - the rotation fixture's case. A hand-built state can put
+	// Unfunded above Amount; the subtraction below then floors the funded part at
+	// zero rather than wrapping, and such a state was already outside the
+	// invariant Bond.Unfunded <= Bond.Amount.
+	fundedInBond := uint64(0)
+	if bond.Unfunded < bond.Amount {
+		fundedInBond = bond.Amount - bond.Unfunded
+	}
+	fundedOut := min(tx.Amount, fundedInBond)
+	unfundedOut := tx.Amount - fundedOut
 
 	// The funded part's record list, with both normalisations applied and every
 	// sum checked BEFORE the first write. ApplyTx's contract is that a rejected
@@ -732,6 +770,23 @@ func compareCandidates(x, y committeeCandidate) int {
 //
 // Powers are the derivation's output; the cap ratio itself is the consensus
 // config's (1/4 at four or more seats, 1/1 below - see powerCapMinSeats).
+//
+// THE CANDIDACY FLOOR IS NOT ENFORCED HERE, AND THAT IS DELIBERATE (audit C-4).
+// A bond is a candidate when its amount is POSITIVE; this function does not test
+// it against MinStake. The floor is a rule about how a bond can be CREATED, and
+// it is enforced at every writer of committed state: applyBond judges the
+// RESULTING bond, applyUnbond accepts a remainder of zero or at least MinStake,
+// chain.genesisState seeds a seat at exactly the Power its genesis document
+// names, and genesis.ParseCommitteeJSON refuses a file whose power is below
+// MinStakeSparks. Genesis.Validate itself accepts any positive power, because the
+// devnet and simnet fixtures deliberately seat one-spark validators: moving the
+// floor into this derivation would drop every fixture seat, leave those chains
+// with no committee at all (CommitteeAt errors, no proposer, the fixture cannot
+// run), and silently narrow a real chain's committee if a genesis document ever
+// slipped past the loader. Dropping a seat is also the wrong failure shape for a
+// pure function: a misconfigured genesis should be refused when it is LOADED,
+// with a message, not lose its seat at the first boundary. Pinned by
+// TestTheDerivationSeatsAnyPositiveBondAndTheWritersRefuseASubFloorOne.
 func (s *State) Committee() ([]genesis.Validator, error) {
 	if s.params.CommitteeSize <= 0 {
 		return nil, ErrZeroCommittee

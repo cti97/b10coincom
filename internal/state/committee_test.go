@@ -819,3 +819,69 @@ func TestSpareSeatsAdmitWithoutEvicting(t *testing.T) {
 		t.Fatal("the newcomer was already seated before it bonded")
 	}
 }
+
+// TestTheDerivationSeatsAnyPositiveBondAndTheWritersRefuseASubFloorOne is audit
+// C-4's decision, pinned. The audit asked whether `Committee` should enforce the
+// MIN_STAKE floor in the derivation; it must not, for three reasons the test
+// makes concrete:
+//
+//   - a positive bond IS a candidate, so this state (four floor bonds beside a
+//     one-spark bond, which is the devnet/simnet fixture's shape) derives five
+//     seats, not four;
+//   - the cap treats the small seat like any other seat, so the floor is not what
+//     keeps its power small - the cap is;
+//   - the floor has a home already: every writer of committed state refuses to
+//     create such a bond (applyBond on the result, applyUnbond on the remainder,
+//     genesisState from the document, ParseCommitteeJSON on the file). The last
+//     assertion here is the writer half, so the test fails if the derivation is
+//     "fixed" to drop the seat or if applyBond stops refusing one.
+func TestTheDerivationSeatsAnyPositiveBondAndTheWritersRefuseASubFloorOne(t *testing.T) {
+	keys := distinctKeys(t, 5)
+	specs := []stakeSpec{
+		{keys[0], 1_000 * b10},
+		{keys[1], 1_000 * b10},
+		{keys[2], 1_000 * b10},
+		{keys[3], 1_000 * b10},
+		{keys[4], 1},
+	}
+	// A REAL chain's parameter set, MinStake included: the derivation must seat the
+	// bond although its amount is far below the floor. (committeeParams leaves
+	// MinStake zero, which would make a floor-enforcing derivation indistinguishable
+	// from this one.)
+	s := NewWithParams(Params{CommitteeSize: 5, MinStake: 1_000 * b10})
+	for _, sp := range specs {
+		s.SetBond(types.AddressFromPub(sp.pub), Bond{Validator: sp.pub, Amount: sp.amount})
+	}
+	vals, err := s.Committee()
+	if err != nil {
+		t.Fatalf("the derivation refused a state holding a positive bond: %v", err)
+	}
+	if len(vals) != 5 {
+		t.Fatalf("the derivation seated %d of 5 positive bonds: the floor is being enforced where it does not belong (it belongs to the writers)", len(vals))
+	}
+	seat := genesis.SeatOfPubKey(vals, keys[4])
+	if seat < 0 {
+		t.Fatal("the derivation dropped the one-spark bond")
+	}
+	// The seat is real: it carries capped power in the committee's own arithmetic,
+	// which is why a sub-floor bond may never be created - not because the
+	// derivation would refuse it.
+	cfg := genesis.Validator{PubKey: vals[seat].PubKey, Power: vals[seat].Power}
+	if cfg.Power == 0 {
+		t.Fatal("the one-spark seat holds zero power in the derived committee")
+	}
+
+	// THE WRITER HALF: a Bond whose RESULT would be below the floor is refused by
+	// the transition that would create it, so no reachable state holds one.
+	p := stakingParams()
+	p.MinStake = 1_000 * b10
+	w := NewWithParams(p)
+	addr, pub, priv := keypair(t)
+	w.Set(addr, Account{Balance: 999*b10 + 2})
+	if err := w.ApplyTx(bondTx(t, pub, priv, addr, 0, 999*b10, 1)); !errors.Is(err, ErrStakeBelowMinimum) {
+		t.Fatalf("a Bond whose result is below MIN_STAKE: err = %v, want ErrStakeBelowMinimum", err)
+	}
+	if _, ok := w.BondOf(addr); ok {
+		t.Fatal("the refused Bond left a record behind")
+	}
+}

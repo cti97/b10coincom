@@ -26,11 +26,15 @@ package devnet
 //     announces from epoch 2 is admitted by that same term. Both are asserted
 //     against positive observables (a height adopted, a peer's attested
 //     height);
-//  5. K unbonds fully in epoch 2, so epoch 3 re-seats J. J's driver, which had
-//     halted at the unseated boundary, is rebuilt on the next adopted block,
+//  5. K unbonds fully in epoch 2, so epoch 3 re-seats J. J's engine is inert
+//     while it is seated nowhere, and its DRIVER was rebuilt on the adopted
+//     block that crossed the boundary (NewDriver admits an ever-seated key with
+//     an inert engine, audit B-1); once the chain re-seats it the rebuilt engine
 //     votes, and its precommit appears in a quorum-reaching certificate again
 //     - "counted again" is the certificate's arithmetic, not a height that
-//     moved.
+//     moved. (Before B-1 the rebuild was REFUSED for a rotated-out post-genesis
+//     key: the caller demoted the honest peer and kept the stale engine, which
+//     is what this file's earlier wording described as a halted driver.)
 //
 // The boundary is asserted on the SAME chain and the SAME head: a key that
 // never held a seat is still refused by committeeMemberAt (the HELLO gate) and

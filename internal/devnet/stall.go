@@ -28,6 +28,14 @@ package devnet
 // transport name) and cannot be inflated by a stranger: only a member's
 // verified HELLO reaches the table.
 //
+// A HEIGHT WHOSE NEXT COMMITTEE CANNOT BE DERIVED IS REPORTED AS THAT, WITH NO
+// QUORUM (audit B-4). The line used to fall back to the GENESIS committee, so on
+// a chain whose next epoch could not be derived it printed a quorum measured
+// against a set that may hold no seat at that height - wrong precisely in the
+// case it was printed. It now prints the height, the round, the derivation
+// failure and nothing numeric, because the honest statement is "this node cannot
+// judge a block here", not a quorum against the wrong seats.
+//
 // The tallies are the newest retained round that holds a VOTE, not necessarily
 // the current one (see stallLine): a stalled engine sits at StepPropose in a
 // round nobody else is in, and that round's empty tallies would be a constant
@@ -169,8 +177,26 @@ func (v *Validator) stallReportOnce() (string, bool) {
 		return "", false
 	}
 	w.round = round
-	power, quorum, total, peers, ok := v.stallQuorum(head + 1)
-	if !ok || power < quorum {
+	power, quorum, total, peers, err := v.stallQuorum(head + 1)
+	if err != nil {
+		// THE QUORUM IS NOT COMPUTED, AND THAT IS THE POINT (audit B-4). There
+		// used to be a fallback to the GENESIS committee here, so a chain whose
+		// next epoch could not be derived printed a quorum measured against a
+		// set that may hold no seat at that height at all - a number that is
+		// wrong in the one case it is printed. A diagnostic that can lie is
+		// worse than one that is silent, but silence would hide a height that
+		// cannot advance at all, so the line says exactly what is known: the
+		// committee for the next height cannot be derived, no quorum is
+		// reported, and this node cannot judge another block at this height.
+		w.reachable = false
+		if round < stallReportRounds {
+			return "", false
+		}
+		v.stall.fired = true
+		v.drv.Observe()
+		return v.stallUndeducibleLine(head, round, err), true
+	}
+	if power < quorum {
 		w.reachable = false
 		return "", false
 	}
@@ -194,21 +220,23 @@ func (v *Validator) stallReportOnce() (string, bool) {
 
 // stallQuorum sums the power this validator can reach at height: its own seat
 // (when it holds one there) plus the seat of every member whose signed HELLO is
-// fresh, and the quorum that power is measured against. ok=false only when the
-// committee itself cannot be resolved, in which case there is nothing sound to
-// report; the driver's own HaltError covers that case.
+// fresh, and the quorum that power is measured against. A non-nil error means
+// the committee for that height cannot be resolved, and in that case there is
+// nothing sound to report: the caller says so in one line instead of measuring a
+// quorum against some other set (audit B-4; the genesis fallback that used to be
+// here printed a quorum for seats that may hold no vote at that height).
 //
 // A rotated-out validator holds no seat at the height it is following: its own
 // power is zero there, so it reports only if the seats it can still hear from
 // hold quorum by themselves - which is the honest reading, because such a node
 // no longer votes and cannot be the reason a height fails to commit.
-func (v *Validator) stallQuorum(height uint64) (power, quorum, total uint64, peers []stallPeer, ok bool) {
+func (v *Validator) stallQuorum(height uint64) (power, quorum, total uint64, peers []stallPeer, err error) {
 	vals, err := v.cfgC.CommitteeAt(height)
-	if err != nil || len(vals) == 0 {
-		vals = v.cfgC.Committee
+	if err != nil {
+		return 0, 0, 0, nil, fmt.Errorf("the committee for height %d cannot be derived: %w", height, err)
 	}
 	if len(vals) == 0 {
-		return 0, 0, 0, nil, false
+		return 0, 0, 0, nil, fmt.Errorf("the committee for height %d seats no validator", height)
 	}
 	cfg := consensus.Config{Committee: vals}
 	total, quorum = cfg.TotalPower(), cfg.Quorum()
@@ -240,7 +268,21 @@ func (v *Validator) stallQuorum(height uint64) (power, quorum, total uint64, pee
 	// Deterministic output: the table is a map, and a log line that reorders
 	// itself run to run is not one you can diff.
 	sort.Slice(peers, func(i, j int) bool { return peers[i].Seat < peers[j].Seat })
-	return power, quorum, total, peers, true
+	return power, quorum, total, peers, nil
+}
+
+// stallUndeducibleLine is the line a stalled validator emits when the committee
+// for the next height cannot be derived at all (audit B-4). It deliberately
+// prints NO power and NO quorum: the only set available would be the genesis
+// committee, which may hold no seat at this height, so any number formed from it
+// would be the lie this finding is about. What it prints instead is the fact that
+// stops the height: which height, which round, and why the derivation failed.
+// The engine has halted for the same reason (Driver.HaltError), and the last
+// clause says so, because "no block" and "this node cannot judge a block" are
+// different diagnoses.
+func (v *Validator) stallUndeducibleLine(head uint64, round uint32, err error) string {
+	return fmt.Sprintf("b10coin: no block for %d rounds at height %d (round %d, step %s): the committee for height %d cannot be derived (%v), so no quorum is reported - a power figure measured against any other set would be wrong, and this node cannot judge a block at this height until the derivation succeeds; the driver reports the same cause as its halt error (see Driver.HaltError). The stall line is silent about tallies for the same reason: nothing was judged here",
+		stallReportRounds, head, round, v.drv.DiagStep(), head+1, err)
 }
 
 // stallLine formats the one line a stalled validator emits. It is a function so

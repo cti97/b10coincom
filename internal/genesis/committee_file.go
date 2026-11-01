@@ -117,6 +117,12 @@ type CommitteeFile struct {
 func ParseCommitteeJSON(b []byte) (*Genesis, error) {
 	var f CommitteeFile
 	dec := json.NewDecoder(strings.NewReader(string(b)))
+	// Refuse unknown fields (audit E-4). Without this the loader silently
+	// ignored them, and once committee_size became a real field a misspelling
+	// ("committee_sise") dropped the spare seat: on a full committee the next
+	// bonded newcomer then EVICTED a genesis seat instead of taking the spare.
+	// A typo must be an error, not a different chain.
+	dec.DisallowUnknownFields()
 	// Reject anything after the top-level object: a trailing blob is either a
 	// clobbered file or a hand-edit gone wrong, and silently taking the first
 	// object would hide that.

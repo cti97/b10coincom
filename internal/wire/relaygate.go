@@ -24,13 +24,14 @@ import (
 //	relay -> node   RelayGateNonceBytes random bytes ‖ the relay's own
 //	                address bytes                           (the challenge)
 //	node  -> relay  RelayGateProof(token, challenge)         (HMAC-SHA-256)
-//	relay -> node   RelayGateAccepted                        (proof matched)
+//	relay -> node   RelayGateConfirmation(token, challenge, proof)
 //
 // Everything here is FIXED-WIDTH or self-delimiting by construction, and the
-// relay never interprets a node's frame: it writes a constant, writes 32
-// random bytes it generated plus its own address, reads at most
-// RelayGateMACBytes and compares them in constant time. Its "parses nothing"
-// posture (pinned structurally by TestTheRelayCallsNoDecoder) is intact.
+// relay never interprets a node's frame: it writes a constant greeting, writes
+// 32 random bytes it generated plus its own address, reads at most
+// RelayGateMACBytes, compares them in constant time, and writes one more
+// fixed-width MAC over bytes it already holds. Its "parses nothing" posture
+// (pinned structurally by TestTheRelayCallsNoDecoder) is intact.
 //
 // What the challenge buys:
 //
@@ -45,20 +46,26 @@ import (
 //     That is a chosen-message oracle on HMAC-SHA-256 with a key of at least
 //     MinRelayAccessTokenBytes, not a disclosure: it yields no token bytes and
 //     no usable proof for any challenge the stranger did not choose.
+//   - A stranger CANNOT make the node install the link (audit D-1). The third
+//     frame is not a public constant: it is RelayGateConfirmation, an HMAC over
+//     the challenge and the node's proof, which only a party holding the token
+//     can compute. A relay that never gated cannot manufacture it, and a
+//     stranger looping greeting/challenge through one has nothing valid to
+//     send. The one residual is a full proxy: an attacker who can carry the
+//     node's proof to a GENUINE gated relay (holding the same token) and carry
+//     that relay's confirmation back can still interpose. No shared-secret gate
+//     without a relay identity can close that; it is documented in the deploy
+//     README, and it is strictly harder than the pre-D-1 loop.
 //
 // A relay WITHOUT a token sends nothing, so a token-configured node reads the
 // greeting, does not get it, refuses to answer and logs the refusal
 // (tcp.adoptRelay). A relay WITH a token closes the socket on a wrong proof, so
-// the node's read of RelayGateAccepted fails and the node logs that too.
+// the node's read of RelayGateConfirmation fails and the node logs that too.
 var (
 	// RelayGateGreeting is the first frame a token-configured relay sends to a
 	// connection it has accepted. Its presence is the relay's only claim: "I
 	// will ask for a proof". It carries no token material and no nonce.
 	RelayGateGreeting = []byte("b10coin-relay-gate-v1")
-	// RelayGateAccepted is the frame a relay sends after the proof matched,
-	// and ONLY then. It is how the node tells a refusal from a dead socket
-	// instead of redialling in silence.
-	RelayGateAccepted = []byte("b10coin-relay-gate-v1-ok")
 )
 
 // RelayGateProof is the answer to a gate challenge: HMAC-SHA-256 keyed by the
@@ -73,6 +80,26 @@ var (
 func RelayGateProof(token, challenge []byte) []byte {
 	m := hmac.New(sha256.New, token)
 	m.Write(challenge)
+	return m.Sum(nil)
+}
+
+// RelayGateConfirmation is the relay's half of the same keyed exchange: an
+// HMAC over the challenge and the node's proof, keyed by the token (audit
+// D-1). It replaces the old public constant accepted frame, which any
+// stranger on a token-less relay could loop into a token-configured node's
+// handshake to make the node install the link as gated. Only a party holding
+// the token can produce this value, so a token-configured node now learns
+// whether the far end really gates instead of taking a constant's word for it.
+//
+// It is still not a decode: the relay hashes bytes it already has (the
+// challenge it generated and the proof it just compared), exactly as it
+// hashes the challenge for RelayGateProof. The relay's "parses nothing"
+// posture is unchanged, and the node recomputes the same value from the same
+// three inputs.
+func RelayGateConfirmation(token, challenge, proof []byte) []byte {
+	m := hmac.New(sha256.New, token)
+	m.Write(challenge)
+	m.Write(proof)
 	return m.Sum(nil)
 }
 

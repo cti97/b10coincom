@@ -79,9 +79,12 @@ package devnet
 //     after hintHandshakeGraceWaves (8) waves - removed from the book, which
 //     returns its slot to the lifetime budget, and its maintainer is cancelled
 //     (tcp.TcpTransport.RemovePeer), which stops the redials. An address that
-//     has EVER produced a signed committee HELLO is proven and never evicted,
-//     so a peer that blips keeps its maintainer and the N-1 "a failed dial is
-//     an ordinary failure" rule still holds for real peers.
+//     has produced a signed committee HELLO is proven and survives that grace;
+//     it is retired only after hintProvenLifetimeWaves (120) with no further
+//     HELLO AND with no admitted connection carrying the member key that
+//     ADVERTISED it (audit D-4, N-6), so a peer that blips keeps its
+//     maintainer and the N-1 "a failed dial is an ordinary failure" rule still
+//     holds for a peer that is actually there.
 //
 // The receive path cannot starve an honest peer: it does O(8) bounded string
 // parses and map lookups, one signature verification and a non-blocking
@@ -92,6 +95,7 @@ package devnet
 // consumes no budget, so repeats are free to ignore and costly to nobody.
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
@@ -123,17 +127,36 @@ const (
 	// at once because a peer advertised them. 32 covers the 21-seat
 	// committee's 20 other members with slack. Unlike the per-member window it
 	// is a NODE-WIDE total: it is the amplification bound, not a fairness one.
-	// An address that never completes a handshake is evicted (see
-	// hintHandshakeGraceWaves), so the total is not "for the process's life" -
-	// it is the number of learned addresses the node keeps at any moment.
+	// Both an address that never completes a handshake and a proven address
+	// whose peer has been dead for hintProvenLifetimeWaves are evicted, so the
+	// total is not "for the process's life" - it is the number of learned
+	// addresses the node keeps at any moment.
 	maxLearnedPeerAddrs = 32
 	// hintHandshakeGraceWaves is how long a learned address may go without
 	// producing a signed committee HELLO before it is evicted: 4 s at the
 	// default wave, i.e. several redials of the maintainer's backoff curve. It
 	// is the bound that makes an attacker's addresses cost a few dials instead
-	// of a permanent slot (audit PX-1); an address that HAS completed a
-	// handshake is proven and is never evicted.
+	// of a permanent slot (audit PX-1).
 	hintHandshakeGraceWaves = 8
+	// hintProvenLifetimeWaves bounds a PROVEN learned address whose peer has
+	// gone away (audit D-4): 60 s at the default wave. Before this, one
+	// successful HELLO marked the address proven forever, so a member that
+	// rotated out, moved or died kept one of the 32 slots - and a maintainer
+	// redialling at the backoff ceiling - for the process's life.
+	//
+	// WHY THIS CANNOT EVICT A LIVE PEER: a live admitted peer sends a signed
+	// HELLO every wave (Validator.broadcastHello), which refreshes the entry's
+	// lastProven stamp, and the expiry additionally refuses to retire an entry
+	// whose ADVERTISING KEY still has an admitted connection. The match is on
+	// the key, not the address (audit N-6): when the peer's own inbound dial
+	// wins newcomerWins, the surviving connection is registered under its
+	// EPHEMERAL remote address, which is not the learned address, so an
+	// address match would retire a peer that is right there. Only when BOTH are
+	// true - 60 s with no HELLO from that key AND no admitted connection
+	// carrying it - is the entry retired. If the peer was merely away, the next
+	// PEER_EXCHANGE re-learns the address and a fresh maintainer starts; the
+	// cost of the bound is one re-learn, not a lost slot for the process life.
+	hintProvenLifetimeWaves = 120
 )
 
 // Hint-refusal reasons. They are distinct so a test can name WHY an address
@@ -287,13 +310,30 @@ func validatePeerHint(raw, own string, reserved []netip.AddrPort, allowLocal boo
 }
 
 // learnedHint is one address this node dialled because a member advertised it.
-// since is the wave it was learned in (the eviction clock); proven records
-// that a signed committee HELLO has arrived on a connection to that address,
-// which makes it a peer the node keeps dialling through its maintainer - a
-// proven address is never evicted, so an ordinary blip is still retried.
+// since is the wave it was learned in (the unproven eviction clock); proven
+// records that a signed committee HELLO has arrived on a connection to that
+// address, which makes it a peer the node keeps dialling through its maintainer
+// - a proven address survives the handshake grace, but is still bounded by
+// hintProvenLifetimeWaves once both its HELLOs and its connection are gone
+// (audit D-4).
 type learnedHint struct {
 	since  uint64
 	proven bool
+	// lastProven is the wave of the most recent verified committee HELLO from
+	// the ADVERTISING KEY below (audit D-4, N-6). It is only meaningful once
+	// proven is true; expireUnprovenHints retires a proven entry after
+	// hintProvenLifetimeWaves without one, provided no admitted connection
+	// still carries that key.
+	lastProven uint64
+	// key is the SIGNED member key that advertised this address. It is the
+	// entry's identity and what the liveness test below matches on (audit
+	// N-6): the address only says where this node DIALS, while the peer's own
+	// inbound dial can win newcomerWins and be registered under its ephemeral
+	// remote address instead of the advertised one. For a connection this node
+	// dialled to the advertised address, markHintProven also overwrites this
+	// with the key the verified HELLO carried, which is the same member in the
+	// honest case and removes the reliance on the advertisement's key.
+	key []byte
 }
 
 // peerHints is the learned-address bookkeeping. It is guarded by its own mutex
@@ -305,6 +345,13 @@ type peerHints struct {
 	// maxLearnedPeerAddrs: every entry in it is an address this node called
 	// AddPeer for, so the map's size is the dial bound made visible.
 	learned map[string]*learnedHint
+	// connKeys maps a LIVE transport name to the member key whose verified
+	// HELLO last arrived on it (audit N-6). It is what makes "is the member who
+	// advertised this address connected?" answerable when the connection's
+	// registry name is an ephemeral address rather than the address dialled. It
+	// is pruned against the transport's admitted peers on every update and
+	// every read, so it cannot outgrow the live connections.
+	connKeys map[transport.PeerID][]byte
 	// sources is the per-wave, PER ADVERTISING MEMBER adoption window
 	// (maxNewPeerHintsPerWave each). It is keyed by the signed validator key
 	// rather than the connection, because on the relay every member's frames
@@ -553,64 +600,151 @@ func (v *Validator) observePeerExchange(from transport.PeerID, p *wire.PeerExcha
 		//
 		// learned=true is audit PX-2's whole point: this dial exists because a
 		// PEER named the address, so the transport holds it out of Peers() and
-		// off every Broadcast until a signed committee HELLO bound to the
-		// connection's nonce arrives.
+		// off every Broadcast until a signed committee HELLO bound to this
+		// socket's two challenges arrives (audit PX-2, A-2).
 		if err := v.peerAdd(key, true); err != nil {
 			v.hintsRefused.Add(1)
 			continue
 		}
-		b.learned[key] = &learnedHint{since: wave}
+		b.learned[key] = &learnedHint{since: wave, key: append([]byte(nil), p.Validator...)}
 		admitted++
 		b.sources[source] = admitted
 		v.hintsAdopted.Add(1)
 	}
 }
 
-// markHintProven records that a signed committee HELLO arrived on the
-// connection under transport name from, and that the connection's address is
-// one this node learned from a hint: that address is a real peer and its
-// maintainer must never be retired. The address lookup happens OUTSIDE the
-// hint mutex (PeerAddr takes the transport mutex; the receive path takes them
-// in the other order) and a relay name simply does not match any learned
-// address.
-func (v *Validator) markHintProven(from transport.PeerID) {
+// markHintProven records that a signed committee HELLO from key arrived on the
+// connection under transport name from, and refreshes every learned address
+// that signed HELLO proves: the entry for the address this connection is
+// registered at (a connection this node dialled), and every entry ADVERTISED
+// BY that same key (audit N-6). The second form matters because when the
+// peer's own inbound dial wins newcomerWins, the live connection at this node
+// is registered under the peer's EPHEMERAL remote address, not the advertised
+// one: matching only the address retired a live peer after the proven lifetime
+// and re-learned it from the next advertisement. The key is the identity, the
+// address is only where the dial goes.
+//
+// The first transport lookup (PeerAddr) happens OUTSIDE the hint mutex and is
+// released before the book is written; the prune's Peers() runs under it, in
+// the documented book->transport order the dial path and expireUnprovenHints
+// already use, so the two locks never invert.
+//
+// ONE TRADE of key matching, stated: a key that is connected BY ANY PATH -
+// including the relay, where it shares one socket with every other member -
+// keeps every entry it advertised alive, even an address that has since gone
+// stale. That is one bounded slot and one backoff redial per live member, and
+// it is the price of not retiring a live peer; the entry still goes when the
+// key does.
+func (v *Validator) markHintProven(from transport.PeerID, key []byte) {
 	addr, ok := v.ttp.PeerAddr(from)
 	if !ok {
 		return
 	}
-	v.hints.mu.Lock()
-	if h := v.hints.learned[addr]; h != nil {
-		h.proven = true
+	wave := v.currentWave()
+	b := &v.hints
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.connKeys == nil {
+		b.connKeys = make(map[transport.PeerID][]byte)
 	}
-	v.hints.mu.Unlock()
+	b.connKeys[from] = append([]byte(nil), key...)
+	v.pruneConnKeysLocked()
+	if h := b.learned[addr]; h != nil {
+		h.proven = true
+		h.lastProven = wave
+		h.key = append(h.key[:0], key...)
+	}
+	for _, h := range b.learned {
+		if len(h.key) == len(key) && bytes.Equal(h.key, key) {
+			h.proven = true
+			h.lastProven = wave
+		}
+	}
 }
 
-// expireUnprovenHints retires learned addresses whose handshake never
-// completed. It is called once per wave (from beginWave) with the wave number
-// that has just begun: an address learned before wave-hintHandshakeGraceWaves
-// that has never carried a signed committee HELLO is removed from the book -
-// returning its lifetime-budget slot - and its maintainer is cancelled, so the
-// redials against it stop (audit PX-1).
+// expireUnprovenHints retires learned addresses that are no longer worth a
+// maintainer. It is called once per wave (from beginWave) with the wave number
+// that has just begun:
 //
-// The removals run outside the book's mutex: peerRemove takes the transport's,
-// and the dial path takes them in the opposite order.
+//   - an address that has never carried a signed committee HELLO is retired
+//     once wave-since reaches hintHandshakeGraceWaves (audit PX-1);
+//   - a PROVEN address is retired once wave-lastProven reaches
+//     hintProvenLifetimeWaves AND no admitted connection carries the member key
+//     that proved it (audit D-4, N-6). The key check is what makes this unable
+//     to evict a live peer: a connected member keeps a registration even if its
+//     HELLOs are temporarily lost, whichever direction its socket was dialled
+//     in, and a peer that is merely away re-learns the address from the next
+//     PEER_EXCHANGE.
+//
+// Removal happens while the book's mutex is held, together with the delete
+// (audit D-3). That is the whole ordering: the learn path
+// (observePeerExchange) holds the same mutex across its check-and-AddPeer, so a
+// re-learn cannot slip between the delete and the maintainer's retirement and
+// leave an entry with no maintainer. It is also the order the dial path already
+// uses (book mutex, then transport), and markHintProven drops the transport
+// mutex before taking the book's, so the two locks never invert.
 func (v *Validator) expireUnprovenHints(wave uint64) {
 	b := &v.hints
-	var stale []string
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	for key, h := range b.learned {
-		if h.proven || wave-h.since < hintHandshakeGraceWaves {
+		retire := false
+		if h.proven {
+			retire = wave-h.lastProven >= hintProvenLifetimeWaves && !v.peerConnectedByKey(h.key)
+		} else {
+			retire = wave-h.since >= hintHandshakeGraceWaves
+		}
+		if !retire {
 			continue
 		}
 		delete(b.learned, key)
-		stale = append(stale, key)
-	}
-	b.mu.Unlock()
-	for _, key := range stale {
 		if v.peerRemove != nil {
 			v.peerRemove(key)
 		}
 		v.hintsEvicted.Add(1)
+	}
+}
+
+// peerConnectedByKey reports whether an ADMITTED connection currently carries
+// the member key that proved a learned address (audit D-4, N-6). It matches the
+// key recorded when the HELLO was verified, NOT the connection's address: an
+// inbound connection that won newcomerWins is registered under the peer's
+// ephemeral remote address, so an address match retired a live peer. It reads
+// the transport's live registry through the pruned connKeys map, so it is the
+// fact that keeps a proven-but-quiet peer's maintainer alive. It is called with
+// the hint book's mutex held, which is the same book->transport order
+// observePeerExchange's dial uses. An empty key (an entry proven only by a test
+// stamp, never by a HELLO) is never "connected": there is no identity to match.
+func (v *Validator) peerConnectedByKey(key []byte) bool {
+	if len(key) == 0 {
+		return false
+	}
+	v.pruneConnKeysLocked()
+	for _, k := range v.hints.connKeys {
+		if bytes.Equal(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneConnKeysLocked drops the connection-key entries of connections the
+// transport no longer lists as admitted peers, so the map is bounded by the
+// live peer set rather than by every connection the process ever admitted. The
+// hint book's mutex must be held; Peers() takes the transport mutex, which is
+// the documented book->transport order.
+func (v *Validator) pruneConnKeysLocked() {
+	if len(v.hints.connKeys) == 0 {
+		return
+	}
+	live := make(map[transport.PeerID]struct{}, len(v.hints.connKeys))
+	for _, id := range v.ttp.Peers() {
+		live[id] = struct{}{}
+	}
+	for id := range v.hints.connKeys {
+		if _, ok := live[id]; !ok {
+			delete(v.hints.connKeys, id)
+		}
 	}
 }
 
@@ -645,8 +779,9 @@ func (v *Validator) PeerHintsDuplicates() uint64 { return v.hintsDuplicates.Load
 // spent.
 func (v *Validator) PeerHintsOverBudget() uint64 { return v.hintsOverBudget.Load() }
 
-// PeerHintsEvicted reports how many learned addresses were retired because
-// their handshake never completed. A nonzero count with a healthy mesh is
+// PeerHintsEvicted reports how many learned addresses were retired: one whose
+// handshake never completed, or a proven one whose peer has been gone past
+// hintProvenLifetimeWaves (audit D-4). A nonzero count with a healthy mesh is
 // normal churn; the point is that the slot (and the maintainer) is released
 // rather than held until restart.
 func (v *Validator) PeerHintsEvicted() uint64 { return v.hintsEvicted.Load() }
