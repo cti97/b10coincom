@@ -41,7 +41,9 @@ func pageServer(t *testing.T, g *genesis.Genesis) (*chain.Chain, *httptest.Serve
 		t.Fatalf("open chain: %v", err)
 	}
 	t.Cleanup(func() { c.Close() })
-	ts := httptest.NewServer(NewServer(c, mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)).Handler())
+	srv := NewServer(c, mempool.New(100, c.Genesis().Hash(), c.AdmissionHead))
+	withoutScanLimit(srv) // the pages are the subject here, not the scan bucket (audit R-1)
+	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return c, ts
 }

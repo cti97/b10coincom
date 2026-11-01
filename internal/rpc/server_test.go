@@ -1035,26 +1035,40 @@ func TestHistoryIsSafeDuringAppends(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	ts := httptest.NewServer(NewServer(c, mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)).Handler())
+	srv := NewServer(c, mempool.New(100, c.Genesis().Hash(), c.AdmissionHead))
+	withoutScanLimit(srv) // read safety is the subject, not the scan bucket (audit R-1)
+	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	_, priv := genesis.DevValidatorKey()
 	devPub, _ := genesis.DevAccountKey(0)
 	q := "?address=" + types.AddressFromPub(devPub).String() + "&blocks=50"
 
+	const rounds = 40
 	done := make(chan struct{})
+	served := 0
 	go func() {
 		defer close(done)
-		for i := 0; i < 40; i++ {
+		for i := 0; i < rounds; i++ {
+			// Every round must be answered and decoded: a reader that skipped
+			// failures could pass with a /history that never answered at all
+			// (audit T-1).
 			resp, err := http.Get(ts.URL + "/history" + q)
 			if err != nil {
-				continue
+				t.Errorf("GET /history during an append: %v", err)
+				return
 			}
 			var body historyResponse
 			err = json.NewDecoder(resp.Body).Decode(&body)
 			resp.Body.Close()
 			if err != nil {
-				continue
+				t.Errorf("decode /history during an append: %v", err)
+				return
 			}
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("GET /history during an append = %d, want 200", resp.StatusCode)
+				return
+			}
+			served++
 			if body.To != body.Head {
 				t.Errorf("reply window ends at %d but its head is %d", body.To, body.Head)
 				return
@@ -1080,7 +1094,7 @@ func TestHistoryIsSafeDuringAppends(t *testing.T) {
 			}
 		}
 	}()
-	for i := 0; i < 40; i++ {
+	for i := 0; i < rounds; i++ {
 		b, err := c.Build(priv, nil, c.Head().Header.Timestamp+1)
 		if err != nil {
 			t.Fatal(err)
@@ -1090,6 +1104,9 @@ func TestHistoryIsSafeDuringAppends(t *testing.T) {
 		}
 	}
 	<-done
+	if served != rounds {
+		t.Fatalf("only %d of %d /history reads during appends were answered", served, rounds)
+	}
 }
 
 // m5Status is a client written against M5: it knows the /status fields that

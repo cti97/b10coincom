@@ -10,6 +10,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"net/http"
@@ -172,6 +173,12 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{"method not allowed"})
 		return
 	}
+	// The scan bucket is charged before anything is parsed or read (audit
+	// R-1): a refused request costs one map lookup.
+	if !s.scanLimiter.allow(sourceHost(r.RemoteAddr)) {
+		writeJSON(w, http.StatusTooManyRequests, errorResponse{"too many scans from this source"})
+		return
+	}
 	q := r.URL.Query()
 	var want types.Address
 	filtered := false
@@ -189,10 +196,21 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResponse{err.Error()})
 		return
 	}
+	release, ok := s.acquireScanSlot()
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{"the node is busy scanning for other clients; retry shortly"})
+		return
+	}
+	defer release()
 	// One head read, once: the window is fixed before the scan, so appends
 	// during the scan cannot make the reply describe two different chains.
-	out, err := s.scanHistory(s.chain.Height(), want, filtered, blocks, maxHistoryEntries)
+	out, err := s.scanHistory(r.Context(), s.chain.Height(), want, filtered, blocks, maxHistoryEntries)
 	if err != nil {
+		if r.Context().Err() != nil {
+			// The client is gone (audit R-1): there is nobody to answer, and
+			// the scan stopped at the first block it would have read for them.
+			return
+		}
 		// Never echo err.Error(): a store failure names the data
 		// directory, the segment file and an offset.
 		writeJSON(w, http.StatusInternalServerError, errorResponse{"internal error: history unavailable"})
@@ -217,7 +235,7 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 // Bounds are the caller's: `blocks` is the window, `maxEntries` is the reply
 // cap. Both callers pass a constant or a clamped `blocks`, so the work per
 // request is never a function of the chain's length.
-func (s *Server) scanHistory(head uint64, want types.Address, filtered bool, blocks, maxEntries int) (historyResponse, error) {
+func (s *Server) scanHistory(ctx context.Context, head uint64, want types.Address, filtered bool, blocks, maxEntries int) (historyResponse, error) {
 	from, to := historyWindow(head, blocks)
 	out := historyResponse{Head: head, From: from, To: to, Txs: []historyEntry{}}
 	if filtered {
@@ -229,6 +247,12 @@ func (s *Server) scanHistory(head uint64, want types.Address, filtered bool, blo
 	out.Blocks = int(to - from + 1)
 	dropped := 0
 	for h := to; ; h-- {
+		// A client that has gone is not read for (audit R-1): the scan is
+		// up to maxHistoryBlocks disk reads and decodes, and WriteTimeout
+		// only ends the connection, never the goroutine doing them.
+		if err := ctx.Err(); err != nil {
+			return historyResponse{}, err
+		}
 		b, err := s.chain.BlockAt(h)
 		if err != nil {
 			// The caller turns this into a generic failure: err.Error() names

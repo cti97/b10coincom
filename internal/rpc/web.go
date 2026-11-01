@@ -21,6 +21,7 @@ package rpc
 
 import (
 	"bytes"
+	"context"
 	"embed"
 	"encoding/hex"
 	"errors"
@@ -361,8 +362,23 @@ func (s *Server) handleExplorer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	v, err := s.explorerView()
+	if !s.scanLimiter.allow(sourceHost(r.RemoteAddr)) {
+		// The explorer is the /history scan under another name, so it draws
+		// on the same per-source bucket (audit R-1).
+		http.Error(w, "too many scans from this source", http.StatusTooManyRequests)
+		return
+	}
+	release, ok := s.acquireScanSlot()
+	if !ok {
+		http.Error(w, "the node is busy scanning for other clients; retry shortly", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
+	v, err := s.explorerView(r.Context())
 	if err != nil {
+		if r.Context().Err() != nil {
+			return // the client is gone; the scan stopped for them (audit R-1)
+		}
 		// Never the error text: a store failure names the data directory, the
 		// segment file and an offset (audit O-8's rule, applied to the page).
 		http.Error(w, "the explorer page is unavailable on this node", http.StatusInternalServerError)
@@ -392,7 +408,7 @@ func (s *Server) handleExplorer(w http.ResponseWriter, r *http.Request) {
 // The head is then passed DOWN: recentBlocks and scanHistory both take it as a
 // parameter and never call Height() themselves, so every number on the page
 // describes the one snapshot the header names.
-func (s *Server) explorerView() (explorerView, error) {
+func (s *Server) explorerView(ctx context.Context) (explorerView, error) {
 	head, id, root := s.chain.HeadSnapshot()
 	blocks, err := s.recentBlocks(head, explorerBlocks)
 	if err != nil {
@@ -402,7 +418,7 @@ func (s *Server) explorerView() (explorerView, error) {
 	// filter, given the same window as the block table and its own entry cap.
 	// Reusing it is what keeps the page's `from`/`to`/`truncated` semantics
 	// identical to the wallet's instead of a second, drifting copy.
-	scan, err := s.scanHistory(head, types.Address{}, false, explorerBlocks, explorerTxs)
+	scan, err := s.scanHistory(ctx, head, types.Address{}, false, explorerBlocks, explorerTxs)
 	if err != nil {
 		return explorerView{}, err
 	}
