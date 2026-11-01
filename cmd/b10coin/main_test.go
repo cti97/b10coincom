@@ -796,9 +796,15 @@ type stakingStub struct {
 	account     stakingAccount
 	mu          sync.Mutex
 	fee         uint64 // the min_fee_sparks this node reports; 1 unless a test lies
+	chainID     string // the chain_id this node reports; a claim --key run needs the devnet's
 	posts       [][]byte
 	url         string
 	ts          *httptest.Server
+
+	// Reads, counted so a test can prove a refusal happened before the verb
+	// asked the node anything (M6 Task 1's local checks).
+	statusCalls  int
+	accountCalls int
 
 	// M6 Task 0: the history read. historyBody is served verbatim by
 	// /history; historyQuery and historyCalls record what the verb asked for,
@@ -810,14 +816,16 @@ type stakingStub struct {
 
 func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *stakingStub {
 	t.Helper()
-	s := &stakingStub{t: t, genesisHash: genesisHash, account: acc, fee: 1}
+	s := &stakingStub{t: t, genesisHash: genesisHash, account: acc, fee: 1, chainID: "stub-chain-1"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		fee := s.fee
+		chainID := s.chainID
+		s.statusCalls++
 		s.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"chain_id":         "stub-chain-1",
+			"chain_id":         chainID,
 			"height":           uint64(7),
 			"genesis_hash":     hex.EncodeToString(s.genesisHash[:]),
 			"min_fee_sparks":   fee,
@@ -828,6 +836,9 @@ func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *sta
 		})
 	})
 	mux.HandleFunc("/account/", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.accountCalls++
+		s.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(s.account)
 	})
 	mux.HandleFunc("/history", func(w http.ResponseWriter, r *http.Request) {
@@ -891,6 +902,22 @@ func (s *stakingStub) setFee(fee uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fee = fee
+}
+
+// setChainID makes the stub report a different chain_id. claim --key refuses
+// any chain but the compiled-in devnet's, because the puzzle parameters are
+// genesis state; a claim test therefore points this at genesis.Devnet().
+func (s *stakingStub) setChainID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chainID = id
+}
+
+// reads returns how many /status and /account reads the stub has served.
+func (s *stakingStub) reads() (status, account int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.statusCalls, s.accountCalls
 }
 
 // posted decodes the single transaction the verb submitted.
@@ -2344,5 +2371,594 @@ func TestHistoryOnAnEmptyChainSaysSo(t *testing.T) {
 	}
 	if !strings.Contains(out, "no transaction index") {
 		t.Fatalf("the no-index sentence is missing on an empty chain:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// M6 Task 1: send, claim --key, and the moved envelope
+// ---------------------------------------------------------------------------
+
+// sendTestSetup builds a key, a stub that reports that key's account, and a
+// recipient address that is not the sender's.
+func sendTestSetup(t *testing.T, balance, nonce uint64) (keyPath string, from types.Address, to types.Address, stub *stakingStub) {
+	t.Helper()
+	keyPath, _, from = stakingTestKey(t)
+	toPub, _ := genesis.DevAccountKey(1)
+	to = types.AddressFromPub(toPub)
+	stub = newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: from.String(), Balance: balance, Nonce: nonce,
+	})
+	return keyPath, from, to, stub
+}
+
+// TestSendVerbSubmitsATransferWithTheRightFields: the verb's whole job. The
+// stub reports a genesis hash that is NOT the compiled-in devnet one, so the
+// signature verifies against the REPORTED hash and not against devnet's.
+func TestSendVerbSubmitsATransferWithTheRightFields(t *testing.T) {
+	keyPath, _, from := stakingTestKey(t)
+	toPub, _ := genesis.DevAccountKey(1)
+	to := types.AddressFromPub(toPub)
+	var reported [32]byte
+	for i := range reported {
+		reported[i] = byte(0x70 + i)
+	}
+	stub := newStakingStub(t, reported, stakingAccount{
+		Address: from.String(), Balance: 5 * genesis.SparksPerB10, Nonce: 2,
+	})
+	out := captureStdout(t, func() {
+		if err := cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--yes"}); err != nil {
+			t.Fatalf("cmdSend: %v", err)
+		}
+	})
+	if !strings.Contains(out, "txid        ") {
+		t.Errorf("a posted send printed no txid:\n%s", out)
+	}
+	tx := stub.posted()
+	if tx.Type != types.TxTransfer {
+		t.Errorf("type = %d, want TxTransfer", tx.Type)
+	}
+	if tx.From != from {
+		t.Errorf("From = %s, want the key file's address %s", tx.From, from)
+	}
+	if tx.To != to {
+		t.Errorf("To = %s, want %s", tx.To, to)
+	}
+	if tx.Nonce != 2 {
+		t.Errorf("nonce = %d, want the stub's 2", tx.Nonce)
+	}
+	if tx.Fee != 1 {
+		t.Errorf("fee = %d, want the stub's min_fee_sparks 1", tx.Fee)
+	}
+	if want := uint64(50_000_000); tx.Amount != want {
+		t.Errorf("amount = %d, want %d sparks", tx.Amount, want)
+	}
+	h := tx.SigningHash(reported)
+	if !crypto.Verify(tx.PubKey, h[:], tx.Sig) {
+		t.Error("the signature does not verify against the REPORTED genesis hash")
+	}
+	devnet := tx.SigningHash(genesis.Devnet().Hash())
+	if crypto.Verify(tx.PubKey, devnet[:], tx.Sig) {
+		t.Error("the signature verifies against the compiled-in devnet hash: the verb assumed a chain instead of reading the node's")
+	}
+}
+
+// TestSendPostsExactlyThePrintedBytesPlusASignature: the preview is not a
+// summary rendered from a second source. Minus the signature, the posted
+// encoding is byte-identical to the printed hex, and the printed transaction
+// carries no signature at all.
+func TestSendPostsExactlyThePrintedBytesPlusASignature(t *testing.T) {
+	keyPath, from, to, stub := sendTestSetup(t, 5*genesis.SparksPerB10, 4)
+	out := captureStdout(t, func() {
+		if err := cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--yes"}); err != nil {
+			t.Fatalf("cmdSend: %v", err)
+		}
+	})
+	printed, raw := printedTx(t, out)
+	posted := stub.posted()
+	if len(printed.Sig) != 0 {
+		t.Fatal("the printed transaction carries a signature: it was printed after Sign, not before")
+	}
+	unsigned := *posted
+	unsigned.Sig = nil
+	if !bytes.Equal(unsigned.Encode(), raw) {
+		t.Errorf("the posted transaction is not the printed bytes plus a signature:\n printed %x\n posted  %x", raw, unsigned.Encode())
+	}
+	h := printed.SigningHash(genesis.Devnet().Hash())
+	if !crypto.Verify(posted.PubKey, h[:], posted.Sig) {
+		t.Error("the signature does not cover the PRINTED transaction's signing hash")
+	}
+	if printed.From != from {
+		t.Errorf("printed From = %s, want %s", printed.From, from)
+	}
+}
+
+// TestSendPreviewNamesTheRecipientAndTheAmount pins the preview's three facts:
+// the recipient (from the decoded bytes), the amount in sparks and b10, and the
+// fee line a TRANSFER has - the node's claim with the ceiling. The exit's "an
+// exit is free" and the claim's "a claim may not carry a fee" are different
+// facts and must not appear here.
+func TestSendPreviewNamesTheRecipientAndTheAmount(t *testing.T) {
+	keyPath, _, to, stub := sendTestSetup(t, 5*genesis.SparksPerB10, 0)
+	out := captureStdout(t, func() {
+		if err := cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--yes"}); err != nil {
+			t.Fatalf("cmdSend: %v", err)
+		}
+	})
+	for _, want := range []string{
+		"to          " + to.String(),
+		"50000000 sparks (0.5 b10)",
+		"the node's claim; ceiling 1",
+		"the recipient is credited when a block includes the transaction",
+		"the fee is burned",
+		"cannot be withdrawn",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the transfer preview does not contain %q:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"an exit is free", "a claim may not carry a fee"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("the transfer preview inherited %q, which is false for a transfer:\n%s", bad, out)
+		}
+	}
+}
+
+// TestSendRefusesAHostileFee: CL-1's attack on the transfer path. The stub
+// reports the TRUE genesis hash (so a signature would be valid on the real
+// chain) and a fee equal to the whole spendable balance minus the amount.
+// applyTransfer would burn it; the ceiling refuses before Sign, and the preview
+// shows the hostile number as evidence without instructing the operator to
+// copy it.
+func TestSendRefusesAHostileFee(t *testing.T) {
+	balance := uint64(5_000) * genesis.SparksPerB10
+	amount := uint64(1) * genesis.SparksPerB10
+	keyPath, from, to, stub := sendTestSetup(t, balance, 0)
+	hostileFee := balance - amount
+	stub.setFee(hostileFee)
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "1", "--yes"})
+	})
+	if err == nil {
+		t.Fatal("a transfer whose fee is the whole spendable balance was signed, not refused")
+	}
+	for _, want := range []string{"refusing to sign", "ceiling", "--max-fee"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must contain %q, got: %v", want, err)
+		}
+	}
+	if got := strings.Count(err.Error(), fmt.Sprint(hostileFee)); got != 1 {
+		t.Errorf("the node's fee appears %d times in the refusal, want exactly 1 (the report); the instruction must quote the ceiling: %v", got, err)
+	}
+	if strings.Contains(err.Error(), fmt.Sprintf("--max-fee %d", hostileFee)) {
+		t.Errorf("the refusal echoed the node's fee into the --max-fee instruction: %v", err)
+	}
+	printed, _ := printedTx(t, out)
+	if printed.Fee != hostileFee {
+		t.Errorf("the preview shows fee %d, want the node's hostile %d", printed.Fee, hostileFee)
+	}
+	if len(printed.Sig) != 0 {
+		t.Error("the printed transaction carries a signature: it was signed before the ceiling was enforced")
+	}
+	if status, account := stub.reads(); status == 0 || account == 0 {
+		t.Errorf("the hostile fee test expected the verb to read the node, got status=%d account=%d", status, account)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb POSTed %d transaction(s) after a fee-ceiling refusal", len(stub.posts))
+	}
+	_ = from
+}
+
+// TestSendRefusesMoreThanTheAccountCanCover: 0.5 b10 from 0.4 b10 is refused
+// with the shortfall, before signing.
+func TestSendRefusesMoreThanTheAccountCanCover(t *testing.T) {
+	keyPath, _, to, stub := sendTestSetup(t, 40_000_000, 0)
+	err := cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--yes"})
+	if err == nil {
+		t.Fatal("a transfer the account cannot cover was not refused")
+	}
+	if !strings.Contains(err.Error(), "short") {
+		t.Errorf("the refusal does not name the shortfall: %v", err)
+	}
+	if !strings.Contains(err.Error(), "short 10000001 sparks") {
+		t.Errorf("the shortfall is wrong: 50,000,000 + 1 - 40,000,000 = 10,000,001. Got: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transactions despite refusing", len(stub.posts))
+	}
+}
+
+// TestASendRefusalDoesNotLectureAboutStake: the bond's MIN_STAKE funding note
+// is true about a bond and misleading about a transfer. The refusal says how
+// short the send is and nothing about staking.
+func TestASendRefusalDoesNotLectureAboutStake(t *testing.T) {
+	keyPath, _, to, stub := sendTestSetup(t, 40_000_000, 0)
+	err := cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--yes"})
+	if err == nil {
+		t.Fatal("a transfer the account cannot cover was not refused")
+	}
+	if !strings.Contains(err.Error(), "short") {
+		t.Errorf("the refusal must name the shortfall: %v", err)
+	}
+	for _, bad := range []string{"no shipped genesis", "MIN_STAKE", "stake"} {
+		if strings.Contains(err.Error(), bad) {
+			t.Errorf("the transfer refusal lectures about staking (%q): %v", bad, err)
+		}
+	}
+	// The bond's check still carries the hint when it applies, which is what
+	// makes this a split rather than a deletion.
+	if err := checkSpendable(0, 10, 1, 100); err == nil || !strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("checkSpendable dropped the bond-only funding hint: %v", err)
+	}
+	if err := checkCover(0, 10, 1); err == nil || strings.Contains(err.Error(), "no shipped genesis") {
+		t.Fatalf("checkCover must not carry the bond hint: %v", err)
+	}
+}
+
+// TestSendRefusesZeroAmountSelfTransferAndABadAddress: three cheap local
+// refusals. Each must happen BEFORE the verb asks a node anything - a bad
+// command line is not a network error, and a self-transfer could never apply.
+func TestSendRefusesZeroAmountSelfTransferAndABadAddress(t *testing.T) {
+	keyPath, from, to, stub := sendTestSetup(t, 5*genesis.SparksPerB10, 0)
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"zero amount", []string{"--key", keyPath, "--to", to.String(), "--amount", "0"}, "zero sparks"},
+		{"self transfer", []string{"--key", keyPath, "--to", from.String(), "--amount", "0.5"}, "transfer to self"},
+		{"bad address", []string{"--key", keyPath, "--to", "not-an-address", "--amount", "0.5"}, "--to"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"--node", stub.url}, tc.args...)
+			err := cmdSend(args)
+			if err == nil {
+				t.Fatalf("%s was not refused", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("%s refusal does not contain %q: %v", tc.name, tc.want, err)
+			}
+			if status, account := stub.reads(); status != 0 || account != 0 {
+				t.Errorf("%s refused only after asking the node (status=%d account=%d)", tc.name, status, account)
+			}
+			if len(stub.posts) != 0 {
+				t.Errorf("%s posted %d transactions", tc.name, len(stub.posts))
+			}
+		})
+	}
+}
+
+// TestSendDryRunSignsAndPostsNothing: --dry-run builds and prints, then stops.
+// The confirmation is never asked, no byte is posted and the printed
+// transaction has no signature.
+func TestSendDryRunSignsAndPostsNothing(t *testing.T) {
+	keyPath, _, to, stub := sendTestSetup(t, 5*genesis.SparksPerB10, 0)
+	old := askConfirmation
+	asked := false
+	askConfirmation = func() (string, error) { asked = true; return "", errNoAnswer }
+	defer func() { askConfirmation = old }()
+
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--dry-run"})
+	})
+	if err != nil {
+		t.Fatalf("--dry-run must succeed without --yes: %v", err)
+	}
+	if asked {
+		t.Error("--dry-run asked for confirmation; it signs nothing and needs none")
+	}
+	if len(stub.posts) != 0 {
+		t.Fatalf("--dry-run POSTed %d transaction(s)", len(stub.posts))
+	}
+	if !strings.Contains(out, "NOT signed and NOT posted") {
+		t.Errorf("the dry run does not say plainly that nothing was signed or posted:\n%s", out)
+	}
+	if strings.Contains(out, "txid") {
+		t.Errorf("the dry run printed a txid:\n%s", out)
+	}
+	printed, _ := printedTx(t, out)
+	if len(printed.Sig) != 0 {
+		t.Error("--dry-run signed the transaction")
+	}
+	if printed.Type != types.TxTransfer {
+		t.Errorf("the dry run printed type %d, want a transfer", printed.Type)
+	}
+}
+
+// TestSendRefusesAZeroReportedMinFee: a zero-fee transfer could never apply,
+// because every shipped genesis sets at least one spark and genesis.Validate
+// refuses a zero minimum. A node reporting 0 is refused before signing.
+func TestSendRefusesAZeroReportedMinFee(t *testing.T) {
+	keyPath, _, to, stub := sendTestSetup(t, 5*genesis.SparksPerB10, 0)
+	stub.setFee(0)
+	err := cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--yes"})
+	if err == nil {
+		t.Fatal("a node reporting min_fee_sparks 0 was not refused")
+	}
+	if !strings.Contains(err.Error(), "min_fee_sparks 0") {
+		t.Errorf("the refusal does not name the reported zero fee: %v", err)
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the verb posted %d transaction(s) despite refusing", len(stub.posts))
+	}
+}
+
+// TestSendAmountIsParsedWithoutAFloat: 0.29 b10 is 29,000,000 sparks. The
+// float64 round trip uint64(ParseFloat("0.29")*1e8) is 28,999,999 - one spark
+// short - so a verb that parsed --amount through a float would post 28,999,999
+// here. (0.1 happens to round-trip and would NOT catch it, which is why this
+// row is 0.29 and not 0.1.)
+func TestSendAmountIsParsedWithoutAFloat(t *testing.T) {
+	keyPath, _, to, stub := sendTestSetup(t, 5*genesis.SparksPerB10, 0)
+	out := captureStdout(t, func() {
+		if err := cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.29", "--yes"}); err != nil {
+			t.Fatalf("cmdSend: %v", err)
+		}
+	})
+	tx := stub.posted()
+	if want := uint64(29_000_000); tx.Amount != want {
+		t.Fatalf("amount = %d, want %d sparks (0.29 b10); a float parse would post 28,999,999", tx.Amount, want)
+	}
+	if !strings.Contains(out, "29000000 sparks (0.29 b10)") {
+		t.Errorf("the preview does not render 29,000,000 sparks (0.29 b10):\n%s", out)
+	}
+	if strings.Contains(out, "28999999") {
+		t.Errorf("the preview rendered the one-spark-short float value:\n%s", out)
+	}
+}
+
+// claimTestSetup builds a key and a stub that reports the devnet chain ID (a
+// claim's puzzle parameters are genesis state, so claim --key refuses any other
+// chain) with the key's account at the given nonce.
+func claimTestSetup(t *testing.T, balance, nonce uint64) (keyPath string, addr types.Address, stub *stakingStub) {
+	t.Helper()
+	keyPath, _, addr = stakingTestKey(t)
+	stub = newStakingStub(t, genesis.Devnet().Hash(), stakingAccount{
+		Address: addr.String(), Balance: balance, Nonce: nonce,
+	})
+	stub.setChainID(genesis.Devnet().ChainID)
+	return keyPath, addr, stub
+}
+
+// TestClaimWithKeySignsForTheKeyFileAndUsesTheAccountsNonce: the whole point of
+// --key. The posted claim's From is the key file's address (not a fresh
+// ephemeral one), the nonce is the node's account nonce (not 0), the fee is 0
+// by consensus, the epoch is derived from the node's height, and the signature
+// verifies.
+func TestClaimWithKeySignsForTheKeyFileAndUsesTheAccountsNonce(t *testing.T) {
+	keyPath, addr, stub := claimTestSetup(t, 0, 1)
+	out := captureStdout(t, func() {
+		if err := cmdClaim([]string{"--node", stub.url, "--key", keyPath, "--yes"}); err != nil {
+			t.Fatalf("cmdClaim --key: %v", err)
+		}
+	})
+	tx := stub.posted()
+	if tx.Type != types.TxFaucetClaim {
+		t.Errorf("type = %d, want TxFaucetClaim", tx.Type)
+	}
+	if tx.From != addr {
+		t.Errorf("From = %s, want the key file's address %s", tx.From, addr)
+	}
+	if tx.Nonce != 1 {
+		t.Errorf("nonce = %d, want the node's account nonce 1", tx.Nonce)
+	}
+	if tx.Fee != 0 {
+		t.Errorf("fee = %d, want 0 (state.ErrClaimCarriesFee)", tx.Fee)
+	}
+	// The stub is at height 7 with 1000-block epochs:
+	// epoch = (7+1)/1000 + 1 = 1.
+	if tx.Epoch != 1 {
+		t.Errorf("epoch = %d, want (height+1)/epoch_blocks+1 = 1", tx.Epoch)
+	}
+	want := fmt.Sprintf("claimant    %x", addr[:])
+	if !strings.Contains(out, want) {
+		t.Errorf("the claim output does not name the claimant address %q:\n%s", want, out)
+	}
+	if !strings.Contains(out, "txid        ") {
+		t.Errorf("the posted claim printed no txid:\n%s", out)
+	}
+	h := tx.SigningHash(genesis.Devnet().Hash())
+	if !crypto.Verify(tx.PubKey, h[:], tx.Sig) {
+		t.Error("the claim's signature does not verify against the devnet genesis hash")
+	}
+}
+
+// TestClaimWithKeyGoesThroughTheEnvelope: claim --key is not a second signing
+// path. --dry-run posts nothing and signs nothing, a non-TTY run without --yes
+// refuses, --yes posts, and no key is written anywhere (it already is a file).
+func TestClaimWithKeyGoesThroughTheEnvelope(t *testing.T) {
+	keyPath, _, stub := claimTestSetup(t, 0, 0)
+	dir := filepath.Dir(keyPath)
+	before, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. --dry-run: prints, signs nothing, posts nothing.
+	var dryErr error
+	out := captureStdout(t, func() {
+		dryErr = cmdClaim([]string{"--node", stub.url, "--key", keyPath, "--dry-run"})
+	})
+	if dryErr != nil {
+		t.Fatalf("claim --key --dry-run: %v", dryErr)
+	}
+	if len(stub.posts) != 0 {
+		t.Fatalf("--dry-run POSTed %d claim(s)", len(stub.posts))
+	}
+	if !strings.Contains(out, "NOT signed and NOT posted") {
+		t.Errorf("the claim dry run does not say nothing was signed or posted:\n%s", out)
+	}
+	if strings.Contains(out, "queued on the node") {
+		t.Errorf("the claim dry run printed a queueing receipt for a claim it never sent:\n%s", out)
+	}
+	printed, _ := printedTx(t, out)
+	if len(printed.Sig) != 0 {
+		t.Error("--dry-run signed the claim")
+	}
+
+	// 2. No --yes on a non-TTY stdin: refuse before Sign. The state is
+	// CONSTRUCTED by replacing askConfirmation, never provoked by a race.
+	old := askConfirmation
+	askConfirmation = func() (string, error) { return "", errNoAnswer }
+	err = cmdClaim([]string{"--node", stub.url, "--key", keyPath})
+	askConfirmation = old
+	if err == nil {
+		t.Fatal("a non-interactive claim --key without --yes was signed")
+	}
+	for _, want := range []string{"refusing to sign", "--yes", "--dry-run"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must mention %q, got: %v", want, err)
+		}
+	}
+	if len(stub.posts) != 0 {
+		t.Errorf("the unconfirmed claim POSTed %d transaction(s)", len(stub.posts))
+	}
+
+	// 3. --yes posts exactly one claim.
+	if err := cmdClaim([]string{"--node", stub.url, "--key", keyPath, "--yes"}); err != nil {
+		t.Fatalf("claim --key --yes: %v", err)
+	}
+	if len(stub.posts) != 1 {
+		t.Fatalf("the confirmed claim posted %d transactions, want 1", len(stub.posts))
+	}
+
+	// 4. No new file appeared next to the key: --key reads the key it was
+	// given, it never writes one "for convenience".
+	after, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Errorf("claim --key created %d file(s) in the key's directory; it must write none", len(after)-len(before))
+	}
+}
+
+// TestClaimPreviewPrintsTheEpochAndThePowNonce: the claim's preview is not the
+// bond/exit preview with a different type line. It names the epoch as the
+// NODE's claim (the transaction's only time binding, signed) and the
+// locally-solved proof-of-work nonce, and the fee line says a claim may not
+// carry a fee rather than that an exit is free.
+func TestClaimPreviewPrintsTheEpochAndThePowNonce(t *testing.T) {
+	keyPath, _, stub := claimTestSetup(t, 0, 0)
+	out := captureStdout(t, func() {
+		if err := cmdClaim([]string{"--node", stub.url, "--key", keyPath, "--dry-run"}); err != nil {
+			t.Fatalf("claim --key --dry-run: %v", err)
+		}
+	})
+	for _, want := range []string{
+		"epoch       1  (the node's claim",
+		"pow nonce   ",
+		"solved the puzzle locally",
+		"a claim may not carry a fee",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the claim preview does not contain %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "an exit is free") {
+		t.Errorf("the claim preview inherited the exit's fee line:\n%s", out)
+	}
+	printed, _ := printedTx(t, out)
+	if got := fmt.Sprintf("epoch       %d", printed.Epoch); !strings.Contains(out, got) {
+		t.Errorf("the preview's epoch does not match the printed bytes (%d):\n%s", printed.Epoch, out)
+	}
+	if got := fmt.Sprintf("pow nonce   %d", printed.PowNonce); !strings.Contains(out, got) {
+		t.Errorf("the preview's pow nonce does not match the printed bytes (%d):\n%s", printed.PowNonce, out)
+	}
+}
+
+// TestClaimWithoutKeyIsUnchanged: without --key the ephemeral path still
+// solves the puzzle for a fresh key, still prints that key (or withholds it),
+// still has NO preview and NO confirmation, and posts a claim whose From is not
+// the key file's address.
+func TestClaimWithoutKeyIsUnchanged(t *testing.T) {
+	_, fileAddr, stub := claimTestSetup(t, 0, 0)
+	out := captureStdout(t, func() {
+		if err := cmdClaim([]string{"--node", stub.url}); err != nil {
+			t.Fatalf("cmdClaim (ephemeral): %v", err)
+		}
+	})
+	for _, want := range []string{
+		"claimant    ",
+		"public key  ",
+		"claim epoch ",
+		"pow nonce   ",
+		"txid        ",
+		"no key file, no keystore: the ephemeral signing key cannot be recovered later.",
+		"ephemeral key ",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the ephemeral claim output lost %q:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"transaction to sign", "  bytes       ", "NOT signed and NOT posted"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("the ephemeral claim gained %q, which belongs to the --key envelope:\n%s", bad, out)
+		}
+	}
+	tx := stub.posted()
+	if tx.Type != types.TxFaucetClaim {
+		t.Errorf("type = %d, want TxFaucetClaim", tx.Type)
+	}
+	if tx.Nonce != 0 {
+		t.Errorf("nonce = %d, want 0 (a fresh ephemeral key has never transacted)", tx.Nonce)
+	}
+	if tx.Fee != 0 {
+		t.Errorf("fee = %d, want 0", tx.Fee)
+	}
+	if tx.From == fileAddr {
+		t.Error("the ephemeral claim signed for the --key file's address")
+	}
+	if len(tx.Sig) == 0 {
+		t.Error("the ephemeral claim was posted without a signature")
+	}
+
+	// --print-key=false withholds the secret and says so; the claimant is
+	// still printed.
+	out = captureStdout(t, func() {
+		if err := cmdClaim([]string{"--node", stub.url, "--print-key=false"}); err != nil {
+			t.Fatalf("cmdClaim --print-key=false: %v", err)
+		}
+	})
+	if strings.Contains(out, "<- copy now only if you plan a follow-up transfer") {
+		t.Errorf("--print-key=false still printed the ephemeral key:\n%s", out)
+	}
+	if !strings.Contains(out, "ephemeral key withheld (--print-key=false)") {
+		t.Errorf("--print-key=false does not say the key was withheld:\n%s", out)
+	}
+}
+
+// TestNodeRefusesABlockTimeBelowOneSecond: the producer stamps blocks with
+// time.Now().Unix() and the chain requires strictly increasing timestamps, so
+// two blocks in one second stop the node. The refusal is cheap and names the
+// cause; the walkthrough copies commands, and 500ms would be a dead node.
+func TestNodeRefusesABlockTimeBelowOneSecond(t *testing.T) {
+	for _, bt := range []string{"500ms", "999ms", "0s"} {
+		d, perr := time.ParseDuration(bt)
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		err := checkProducerBlockTime(d)
+		if err == nil {
+			t.Fatalf("--block-time %s was accepted; it can only kill the node at the second block", bt)
+		}
+		for _, want := range []string{"below the 1s floor", "whole seconds", "strictly greater"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the --block-time %s refusal does not name %q: %v", bt, want, err)
+			}
+		}
+	}
+	// The command uses the same check before it binds a listener. It must
+	// refuse, not start a node that dies at height 1.
+	if err := cmdNode([]string{"--dir", t.TempDir(), "--http", "127.0.0.1:0", "--block-time", "500ms"}); err == nil {
+		t.Fatal("cmdNode accepted --block-time 500ms")
+	}
+	// 1s is the floor and is accepted by the check (the node itself is not
+	// started here: the suite binds real ports and this test does not need one).
+	if err := checkProducerBlockTime(time.Second); err != nil {
+		t.Errorf("1s must be accepted: %v", err)
 	}
 }

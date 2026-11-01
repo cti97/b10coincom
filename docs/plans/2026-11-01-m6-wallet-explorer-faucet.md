@@ -162,7 +162,7 @@ func addTxConfirmationFlags(fs *flag.FlagSet) (yes, dryRun *bool)
 // ---- the CLI surface after M6 ---------------------------------------------
 //   b10coin keygen  --out PATH
 //   b10coin node    --dir PATH --http ADDR --block-time DUR
-//   b10coin claim   --node URL [--key PATH] [--print-key=false]
+//   b10coin claim   --node URL [--key PATH] [--print-key=false] [--yes | --dry-run]
 //   b10coin balance --node URL (--key PATH | --address ADDR)
 //   b10coin history --node URL (--key PATH | --address ADDR) [--blocks N]
 //   b10coin send    --node URL --key PATH --to ADDRESS --amount 0.5 [--max-fee 1] [--yes|--dry-run]
@@ -227,8 +227,8 @@ height      7
 
 ```text
 history for b10n6bx7... (blocks 1..7, scanned 7, newest first)
-     7  transfer      49999999 sparks (0.49999999 b10)  fee 1  to   b10n4m...
-     1  faucet claim 100000000 sparks (1 b10)            fee 0  from -
+     7  transfer        50000000 sparks (0.5 b10)  fee 1  to   b10n4m...
+     1  faucet claim           0 sparks (0 b10)  fee 0  from -
 ```
 
 **Invariants and constraints.**
@@ -310,8 +310,9 @@ history for b10n6bx7... (blocks 1..7, scanned 7, newest first)
   well-formed window whose `to == head` and whose entries are a subset of that
   window. Fails on a torn read or a half-written response.
 - `TestBalanceVerbPrintsSparksAndB10Exactly`: an account holding
-  `10_000_000` sparks prints `10000000 sparks (0.1 b10)`. A float64 conversion
-  prints `9999999` for a tenth of a b10, so this row kills it.
+  `29_000_000` sparks prints `29000000 sparks (0.29 b10)`. A float64 conversion
+  prints `28999999` for 0.29 b10, one spark short, so this row kills it. (0.1
+  DOES round-trip and would not catch the defect; do not use it here.)
 - `TestBalanceOutputFormatIsStable`: the label column is the one the walkthrough
   greps (`address`, `balance`, `nonce`, `bonded`, `unbonding`, `chain`,
   `height`). Fails if a label is renamed, which would break Task 4's commands.
@@ -328,7 +329,7 @@ history for b10n6bx7... (blocks 1..7, scanned 7, newest first)
 - The scan matches `From` only: bob's query returns nothing.
 - A faucet claim is reported as a transfer to the zero address: the
   both-parties test's entry list gains a phantom.
-- `balance` divides sparks by a float: the 0.1-b10 row prints 9,999,999.
+- `balance` divides sparks by a float: the 0.29-b10 row prints 28,999,999.
 - The handler calls `s.chain.State()` per block: the append-during-read test
   finds a reply whose entries are outside its own window.
 - `/status` renames `min_fee_sparks` instead of adding `claim_amount_sparks`:
@@ -402,9 +403,12 @@ func cmdSend(args []string) error
 //   --max-fee SPARKS  default defaultMaxFeeSparks (1)
 //   --yes | --dry-run shared with stake/unstake/withdraw
 
-// cmd/b10coin/main.go — cmdClaim gains one optional flag.
+// cmd/b10coin/main.go — cmdClaim gains --key, plus the envelope's two flags,
+// which bind --key only (the ephemeral claim has no preview and never asks).
 //   --key PATH        sign the claim with this key file; absent = today's
 //                     ephemeral path, byte-identical in output and behaviour.
+//                     With --key, an ephemeral-only --yes/--dry-run is refused
+//                     rather than accepted and ignored.
 ```
 
 `send` builds one `types.Tx{Type: types.TxTransfer, From, PubKey, To, Nonce,
@@ -841,10 +845,11 @@ export NODE=http://127.0.0.1:$PORT
 mkdir -p "$WORK"
 $B10 keygen --out "$WORK/alice.key"
 BOB=$($B10 keygen --out "$WORK/bob.key" | sed -n 's/^seat address //p')
-$B10 node --dir "$WORK/data" --http "127.0.0.1:$PORT" --block-time 500ms >"$WORK/node.log" 2>&1 &
+$B10 node --dir "$WORK/data" --http "127.0.0.1:$PORT" --block-time 1s >"$WORK/node.log" 2>&1 &
 echo $! >"$WORK/node.pid"
 for i in $(seq 1 50); do $B10 balance --node "$NODE" --key "$WORK/alice.key" >/dev/null 2>&1 && break; sleep 0.2; done
 $B10 claim --node "$NODE" --key "$WORK/alice.key" --yes
+for i in $(seq 1 40); do $B10 balance --node "$NODE" --key "$WORK/alice.key" | grep -q '100000000 sparks' && break; sleep 0.5; done
 $B10 balance --node "$NODE" --key "$WORK/alice.key"
 $B10 send --node "$NODE" --key "$WORK/alice.key" --to "$BOB" --amount 0.5 --yes
 for i in $(seq 1 40); do $B10 balance --node "$NODE" --address "$BOB" | grep -q '50000000 sparks' && break; sleep 0.5; done
@@ -853,13 +858,25 @@ $B10 balance --node "$NODE" --address "$BOB"
 kill "$(cat "$WORK/node.pid")"
 ```
 
-Two things about that block are load-bearing and must not be "tidied":
+The points below are load-bearing and must not be "tidied":
 
 - `BOB` is parsed from `keygen`'s own output (`seat address <addr>`), because
   the address is not known until the key exists. A hard-coded address would be
   a second source of truth, and the doc would break on the next keygen change.
-- The two wait loops are commands a human needs too: a node takes a moment to
-  bind, and a transfer appears only when a block includes it. They are bounded
+- `--block-time 1s` is the floor, not a preference: the producer stamps each
+  block with `time.Now().Unix()` (whole seconds) and `chain.Append` requires
+  every timestamp to be strictly greater than its parent's, so `500ms` is
+  accepted and then stops the node with `chain: block timestamp is not valid
+  for its parent` (reproduced on a real node at height 1). `b10coin node`
+  refuses a sub-second interval for exactly this reason.
+- `claim --key` carries `--yes` because it signs through the same envelope as
+  `send`: without it a non-interactive run (the acceptance script, cron, CI)
+  refuses by design. An ephemeral `claim` takes no `--yes`; the walkthrough
+  does not use that path.
+- The THREE wait loops are commands a human needs too: a node takes a moment
+  to bind, a claim is only QUEUED by `claim` and paid when a later block
+  applies it (so a `send` immediately after would find 0 sparks and refuse),
+  and a transfer appears only when a block includes it. They are bounded
   so a stuck run fails instead of hanging.
 
 **Invariants and constraints.**
@@ -989,8 +1006,10 @@ Behaviour, in order:
 - The script is added to the CI acceptance job as one more step beside the four
   `devnet` commands (`.github/workflows/ci.yml:141-144`), so "the suite performs
   it every run" is literally true. It must finish well inside CI's job timeouts;
-  the walkthrough is a handful of blocks at 500 ms, so the whole run is tens of
-  seconds, and `B10COIN_TIMEOUT` bounds it.
+  the walkthrough is a handful of blocks at 1 s, so the whole run is tens of
+  seconds, and `B10COIN_TIMEOUT` bounds it. The interval is at least 1 s
+  because the producer's stamps are whole seconds and the chain requires
+  strictly increasing timestamps: two blocks inside one second stop the node.
 - The script must not run under `set -e` for the extracted block, and must not
   inherit a caller's `CDPATH`, `IFS` or `B10`/`WORK`/`PORT` — it exports them
   explicitly.
