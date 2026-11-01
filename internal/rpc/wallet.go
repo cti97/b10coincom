@@ -191,31 +191,55 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	// One head read, once: the window is fixed before the scan, so appends
 	// during the scan cannot make the reply describe two different chains.
-	head := s.chain.Height()
+	out, err := s.scanHistory(s.chain.Height(), want, filtered, blocks, maxHistoryEntries)
+	if err != nil {
+		// Never echo err.Error(): a store failure names the data
+		// directory, the segment file and an offset.
+		writeJSON(w, http.StatusInternalServerError, errorResponse{"internal error: history unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// scanHistory is THE one backward scan over a bounded block window. /history
+// and the explorer both call it, so the window arithmetic, the entry cap and
+// the `from`/`to`/`blocks`/`truncated` semantics exist exactly once: the
+// explorer grows no second source of truth about how far back it looked
+// (design decision 2 - there is no index, so the scanned window is the honest
+// answer).
+//
+// head is a PARAMETER and is never read here. A caller that displays a head
+// must scan the head it displayed: if this function took its own Height()
+// reading, a block committed between the caller's read and the scan would make
+// the reply describe a chain the caller's own page does not show - the torn
+// pair Task 2 removed from the faucet page.
+//
+// Bounds are the caller's: `blocks` is the window, `maxEntries` is the reply
+// cap. Both callers pass a constant or a clamped `blocks`, so the work per
+// request is never a function of the chain's length.
+func (s *Server) scanHistory(head uint64, want types.Address, filtered bool, blocks, maxEntries int) (historyResponse, error) {
 	from, to := historyWindow(head, blocks)
 	out := historyResponse{Head: head, From: from, To: to, Txs: []historyEntry{}}
 	if filtered {
 		out.Address = want.String()
 	}
 	if from == 0 && to == 0 {
-		writeJSON(w, http.StatusOK, out)
-		return
+		return out, nil
 	}
 	out.Blocks = int(to - from + 1)
 	dropped := 0
 	for h := to; ; h-- {
 		b, err := s.chain.BlockAt(h)
 		if err != nil {
-			// Never echo err.Error(): a store failure names the data
-			// directory, the segment file and an offset.
-			writeJSON(w, http.StatusInternalServerError, errorResponse{"internal error: history unavailable"})
-			return
+			// The caller turns this into a generic failure: err.Error() names
+			// the data directory, the segment file and an offset.
+			return historyResponse{}, err
 		}
 		for i := range b.Txs {
 			if filtered && !historyMatches(&b.Txs[i], want) {
 				continue
 			}
-			if len(out.Txs) >= maxHistoryEntries {
+			if len(out.Txs) >= maxEntries {
 				dropped++
 				continue
 			}
@@ -226,5 +250,5 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	out.Truncated = dropped > 0
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
 }

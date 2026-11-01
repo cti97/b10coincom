@@ -294,6 +294,7 @@ func (s *Server) Handler() http.Handler {
 	// no listener, no authentication and no write path, so the node's single
 	// loopback-bound --http address serves them beside the JSON API.
 	mux.HandleFunc("/faucet", s.handleFaucet)
+	mux.HandleFunc("/explorer", s.handleExplorer)
 	mux.HandleFunc("/tx", s.handleTx)
 	return mux
 }

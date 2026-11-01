@@ -22,6 +22,7 @@ package rpc
 import (
 	"bytes"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"html/template"
@@ -43,11 +44,22 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
+// pageFuncs are the only functions a template in this package may call. `b10`
+// is genesis.FormatB10, so an amount on a page is rendered by the same integer
+// arithmetic the CLI and /history use; a template that divided by 10^8 itself
+// would be a second, floating-point source of truth for money.
+var pageFuncs = template.FuncMap{
+	"b10": genesis.FormatB10,
+}
+
 // pageTemplates is parsed once. A broken template panics at startup rather than
 // on the first unauthenticated request; the rendered pages are covered by tests.
-var pageTemplates = template.Must(template.ParseFS(templateFS, "templates/*.html"))
+var pageTemplates = template.Must(template.New("pages").Funcs(pageFuncs).ParseFS(templateFS, "templates/*.html"))
 
-const faucetTemplateName = "faucet.html"
+const (
+	faucetTemplateName   = "faucet.html"
+	explorerTemplateName = "explorer.html"
+)
 
 // defaultNodeURL is cmd/b10coin's --node default. It is only the fallback for a
 // Host that cannot safely be printed into a command line.
@@ -264,4 +276,185 @@ func dnsName(h string) bool {
 		return false
 	}
 	return true
+}
+
+// ---- the explorer (Task 3) -------------------------------------------------
+
+// The page's two bounds. They are constants, not query parameters: GET /explorer
+// is unauthenticated and outside the /tx limiter, and ST-10 is the precedent for
+// what an unbounded read on such a route costs (an /account read capped once).
+// A request may therefore never widen the scan, whatever it puts in the query.
+const (
+	// explorerBlocks bounds BOTH loops: the blocks table reads at most this
+	// many blocks, and the transaction scan covers at most this many heights.
+	// 20 disk reads for the table plus 20 for the scan is a constant cost,
+	// well inside the HTTP server's 10 s write timeout, and independent of the
+	// chain's length.
+	explorerBlocks = 20
+	// explorerTxs bounds the transaction TABLE independently of the window: a
+	// window of 20 blocks can hold far more transactions than one page should
+	// render, so the view carries `truncated` when the cap dropped some, the
+	// way /history does.
+	explorerTxs = 20
+)
+
+// explorerBlock is one row of the blocks table. Time is the header's own unix
+// seconds: the page does not convert it, so there is no timezone to be wrong
+// about (and no date library to add).
+type explorerBlock struct {
+	Height uint64
+	Hash   string // hex
+	Time   int64  // unix seconds, as the header carries it
+	Txs    int
+	Root   string // hex, the block's state root
+}
+
+// explorerView is everything the page renders, copied out of the chain before
+// any rendering happens: the template touches no chain method, so nothing can
+// be re-read halfway through a page.
+//
+// The five window fields are NOT decoration. design decision 5 says every page
+// states what it cannot do, and the first thing this page cannot do is see the
+// whole chain: /history reports `from`/`to`/`blocks`/`truncated` for exactly
+// that reason, and this page reports the same four numbers from the same scan.
+type explorerView struct {
+	ChainID   string
+	Height    uint64
+	HeadHash  string
+	StateRoot string
+	Blocks    []explorerBlock // newest first
+	Txs       []historyEntry  // newest first; the Task 0 entry type, reused
+	CannotDo  []string        // the fixed limit list, rendered as a <ul>
+
+	BlocksShown int    // len(Blocks): how many the table actually holds
+	TxFrom      uint64 // lowest height the transaction scan covered
+	TxTo        uint64 // == Height
+	TxBlocks    int    // heights actually scanned for transactions; 0 on a genesis-only chain
+	TxTruncated bool   // the entry cap dropped transactions from that window
+}
+
+// explorerCannotDo is the page's fixed limit list (design decision 5). The
+// wording is a deliverable rather than decoration: TestExplorerStatesWhatItCannotDo
+// asserts these sentences, and every one of them is a property of this code - no
+// search box exists, no index exists, the window is bounded, times are not
+// converted - so a page that dropped one would be lying by omission.
+var explorerCannotDo = []string{
+	"It has no search. There is no box to type into and no query to send: the page shows this node's head and the recent window below it, and nothing else.",
+	"It has no address lookup. To see one address's balance and transactions, run \"b10coin balance\" or \"b10coin history\" against this node; this page cannot be asked about an address.",
+	"It has no transaction index, so it cannot answer \"where is transaction X?\". There is no /tx/{id} route, and this page lists only transactions a block in the scanned window actually included.",
+	// The two caps are interpolated rather than written out, so the sentence
+	// cannot drift from the bound the handler applies: changing explorerBlocks
+	// changes the page's claim about it in the same commit.
+	fmt.Sprintf("It has no pagination and no next page. It shows at most %d blocks and at most %d transactions per request; older blocks are reachable through the JSON API at /block/{height}, one height at a time.", explorerBlocks, explorerTxs),
+	"The transaction list covers only the block window stated above it, never the whole chain. \"truncated: yes\" there means more transactions matched in that window than the page shows; it never means nothing else happened.",
+	"Times are unix seconds exactly as the block header carries them. The page does not convert them, so there is no timezone to be wrong about and no calendar to disagree with the chain.",
+	"A transaction appears here only once a block has included it. A transaction still in the mempool, or one that never lands, is not shown and is not promised.",
+	"It is one node's view of one chain at one moment, not a network view. Another node may be at a different height; this page does not reconcile the difference and cannot tell you the network's head.",
+	"It cannot verify anything for you. It reads blocks this node already accepted; it does not re-validate them and it is not a light client.",
+}
+
+// handleExplorer serves the page. GET only: the page has no state to change, so
+// any other method is refused by name rather than treated as a read.
+func (s *Server) handleExplorer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	v, err := s.explorerView()
+	if err != nil {
+		// Never the error text: a store failure names the data directory, the
+		// segment file and an offset (audit O-8's rule, applied to the page).
+		http.Error(w, "the explorer page is unavailable on this node", http.StatusInternalServerError)
+		return
+	}
+	// Render into a buffer, then write once: a reader must see either the whole
+	// document or a clean error, never a truncated page.
+	var buf bytes.Buffer
+	if err := pageTemplates.ExecuteTemplate(&buf, explorerTemplateName, v); err != nil {
+		http.Error(w, "the explorer page could not be rendered", http.StatusInternalServerError)
+		return
+	}
+	pageHeader(w)
+	w.WriteHeader(http.StatusOK)
+	_, _ = buf.WriteTo(w)
+}
+
+// explorerView reads everything the page shows.
+//
+// The head, its ID and the state root of that head come from HeadSnapshot,
+// which takes them in ONE read-locked critical section. Reading Height() and
+// then Head() (or State()) is two acquisitions, and a block committed between
+// them pairs the new height with the old hash and root - exactly the torn pair
+// Task 2 replaced with AdmissionHead on the faucet page. This page displays all
+// three, so it needs the one accessor that returns all three together.
+//
+// The head is then passed DOWN: recentBlocks and scanHistory both take it as a
+// parameter and never call Height() themselves, so every number on the page
+// describes the one snapshot the header names.
+func (s *Server) explorerView() (explorerView, error) {
+	head, id, root := s.chain.HeadSnapshot()
+	blocks, err := s.recentBlocks(head, explorerBlocks)
+	if err != nil {
+		return explorerView{}, err
+	}
+	// The transaction list is the ONE scan /history uses, with no address
+	// filter, given the same window as the block table and its own entry cap.
+	// Reusing it is what keeps the page's `from`/`to`/`truncated` semantics
+	// identical to the wallet's instead of a second, drifting copy.
+	scan, err := s.scanHistory(head, types.Address{}, false, explorerBlocks, explorerTxs)
+	if err != nil {
+		return explorerView{}, err
+	}
+	return explorerView{
+		ChainID:     s.chain.Genesis().ChainID,
+		Height:      head,
+		HeadHash:    hex.EncodeToString(id[:]),
+		StateRoot:   hex.EncodeToString(root[:]),
+		Blocks:      blocks,
+		Txs:         scan.Txs,
+		CannotDo:    explorerCannotDo,
+		BlocksShown: len(blocks),
+		TxFrom:      scan.From,
+		TxTo:        scan.To,
+		TxBlocks:    scan.Blocks,
+		TxTruncated: scan.Truncated,
+	}, nil
+}
+
+// recentBlocks renders the newest n blocks at or below head, newest first.
+//
+// head is a parameter for the reason given on explorerView. The loop counts
+// DOWN from head+1 with the bound fixed first, so height 0 is rendered exactly
+// once and no uint64 underflow is possible: `for h := head; h >= 0; h--` would
+// never terminate (uint64 has no negative), which is why the bound is computed
+// before the loop rather than tested inside it.
+func (s *Server) recentBlocks(head uint64, n int) ([]explorerBlock, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	lo := uint64(0)
+	if head >= uint64(n) {
+		lo = head - uint64(n) + 1
+	}
+	out := make([]explorerBlock, 0, n)
+	for h := head + 1; h > lo; {
+		h--
+		b, err := s.chain.BlockAt(h)
+		if err != nil {
+			// Refused, not skipped. A short table with a silent gap would
+			// read as "the chain has fewer blocks", which is a lie about the
+			// chain rather than an admission that this node cannot serve it.
+			return nil, err
+		}
+		id := b.ID()
+		out = append(out, explorerBlock{
+			Height: b.Header.Height,
+			Hash:   hex.EncodeToString(id[:]),
+			Time:   b.Header.Timestamp,
+			Txs:    len(b.Txs),
+			Root:   hex.EncodeToString(b.Header.StateRoot[:]),
+		})
+	}
+	return out, nil
 }
