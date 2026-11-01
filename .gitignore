@@ -35,3 +35,7 @@ coverage.out
 
 # Node data directory created by `b10coin node` (regenerable).
 /b10coin-data/
+
+# The walkthrough's default WORK directory (docs/2026-11-01-m6-walkthrough.md):
+# keys, chain data and a pid file, all regenerable, none of it tracked.
+/walkthrough/
