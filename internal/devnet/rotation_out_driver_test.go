@@ -161,10 +161,7 @@ func TestARotatedOutPostGenesisNodeRebuildsItsDriver(t *testing.T) {
 	if got := v.BlocksAdopted(); got != 1 {
 		t.Fatalf("the adoption did not count as one block (adopted=%d): catch-up moved the chain and the observable must say so", got)
 	}
-	v.peerHMu.Lock()
-	demoted := v.peerH[string(evictorPub)].demoted
-	v.peerHMu.Unlock()
-	if demoted != 0 {
+	if demoted := anyPathDemoted(v, string(evictorPub)); demoted != 0 {
 		t.Fatalf("the honest member that served the adopted block was demoted until wave %d: a local rebuild failure is not the peer's fault", demoted)
 	}
 
@@ -213,10 +210,7 @@ func TestARotatedOutPostGenesisNodeRebuildsItsDriver(t *testing.T) {
 	if v.drv != rebuilt {
 		t.Fatal("the driver was replaced although the committee for the fresh height cannot be derived")
 	}
-	v.peerHMu.Lock()
-	demoted = v.peerH[string(evictorPub)].demoted
-	v.peerHMu.Unlock()
-	if demoted != 0 {
+	if demoted := anyPathDemoted(v, string(evictorPub)); demoted != 0 {
 		t.Fatalf("the member was demoted for a rebuild failure caused by this node's own undeducible committee (until wave %d)", demoted)
 	}
 

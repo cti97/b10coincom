@@ -138,14 +138,14 @@ func TestOneMembersFailureDoesNotDemoteOthersBehindTheSameRelay(t *testing.T) {
 	if liarSt == nil {
 		t.Fatal("the lying member has no own entry: selection is keyed on the shared transport name, not the member identity")
 	}
-	if liarSt.demoted <= wave {
-		t.Fatalf("the lying member was not demoted (demoted=%d wave=%d)", liarSt.demoted, wave)
+	if d := liarSt.paths[relay].demoted; d <= wave {
+		t.Fatalf("the lying member's relay path was not demoted (demoted=%d wave=%d)", d, wave)
 	}
 	if honestSt == nil {
 		t.Fatal("the honest member has no own entry: selection is keyed on the shared transport name, not the member identity")
 	}
-	if honestSt.demoted != 0 {
-		t.Fatalf("the HONEST member behind the same relay name was demoted (demoted=%d): one bad actor penalised its honest peers", honestSt.demoted)
+	if d := honestSt.paths[relay].demoted; d != 0 {
+		t.Fatalf("the HONEST member behind the same relay name was demoted (demoted=%d): one bad actor penalised its honest peers", d)
 	}
 	// The honest member is still selectable, and still through the relay name.
 	who, via, h := v.tallestPeer()
@@ -218,14 +218,14 @@ func TestADemotionKeepsTheHighWaterMark(t *testing.T) {
 	v := startQuietValidator(t)
 	who := memberKey(v, 1)
 	v.recordHeight(who, "v1", 5)
-	v.substantiatePeer(who, 5)
+	v.substantiatePeer(who, "v1", 5)
 
 	v.beginWave()
-	v.demotePeer(who, 2) // a transient failure whose pull reached only height 2
+	v.demotePeer(who, "v1", 2) // a transient failure whose pull reached only height 2
 
 	v.peerHMu.Lock()
 	st := v.peerH[who]
-	got, demoted := st.substantiated, st.demoted
+	got, demoted := st.substantiated, st.paths["v1"].demoted
 	wave := v.wave
 	v.peerHMu.Unlock()
 	if got != 5 {

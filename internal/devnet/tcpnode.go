@@ -214,8 +214,22 @@ type peerAttestation struct {
 	height        uint64           // HIGHEST announced height; a stale replay cannot lower it (audit A-3)
 	substantiated uint64           // highest height a pull from this peer reached (a HIGH-WATER mark: a transient failure never lowers it - F3)
 	seen          uint64           // wave of the latest HELLO
-	demoted       uint64           // skip selection while demoted > the current wave
 	via           transport.PeerID // transport name the latest fresh HELLO arrived on
+	// paths is every transport name a fresh HELLO from this member has arrived
+	// on, each with its own demotion clock. A member can be heard on more than
+	// one socket - its own dial, the relay, and (audit A-2) a socket that
+	// another member relays its handshake through - and a pull that one socket
+	// leaves unanswered says nothing about the others. Demoting the MEMBER for
+	// one socket's silence is what let a relaying member starve a node of a
+	// peer it could still reach; demoting the SOCKET rotates the pull to the
+	// member's next path instead.
+	paths map[transport.PeerID]*peerPath
+}
+
+// peerPath is one socket a member's HELLO has arrived on.
+type peerPath struct {
+	seen    uint64 // wave of the latest HELLO on this socket
+	demoted uint64 // skip this socket while demoted > the current wave
 }
 
 // Validator is one running networked validator.
@@ -1286,7 +1300,7 @@ func (v *Validator) recordHeight(who string, via transport.PeerID, height uint64
 	}
 	st := v.peerH[who]
 	if st == nil {
-		st = &peerAttestation{height: height, via: via}
+		st = &peerAttestation{height: height, via: via, paths: make(map[transport.PeerID]*peerPath)}
 		v.peerH[who] = st
 	} else if height >= st.height {
 		st.height = height
@@ -1297,6 +1311,20 @@ func (v *Validator) recordHeight(who string, via transport.PeerID, height uint64
 	// the pull target away from a fresher attestation. The entry still expires
 	// peerHeightTTL waves after the LAST frame, replay or not.
 	st.seen = v.wave
+	// Every socket this member is heard on is a path a pull may take; the
+	// socket's own demotion clock survives the refresh, so a replayed HELLO on
+	// a socket that just answered nothing does not put it back in rotation.
+	for id, p := range st.paths {
+		if p.seen+peerHeightTTL < v.wave {
+			delete(st.paths, id)
+		}
+	}
+	p := st.paths[via]
+	if p == nil {
+		p = &peerPath{}
+		st.paths[via] = p
+	}
+	p.seen = v.wave
 }
 
 // peerWindow is the selection cap's unit: one response window, read off the
@@ -1331,8 +1359,9 @@ func (v *Validator) tallestPeer() (who string, via transport.PeerID, h uint64) {
 		if st.seen+peerHeightTTL < v.wave {
 			continue // not refreshed within a few waves: expired
 		}
-		if st.demoted > v.wave {
-			continue // a pull from this member proved nothing: rotate away
+		path := v.pathForLocked(st)
+		if path == "" {
+			continue // every socket this member is heard on is sitting out a demotion
 		}
 		ch := st.height
 		base := st.substantiated
@@ -1343,10 +1372,31 @@ func (v *Validator) tallestPeer() (who string, via transport.PeerID, h uint64) {
 			ch = base + win
 		}
 		if ch > h || (ch == h && (who == "" || id < who)) {
-			who, via, h = id, st.via, ch
+			who, via, h = id, path, ch
 		}
 	}
 	return who, via, h
+}
+
+// pathForLocked picks the socket a pull for this member goes down: the one its
+// freshest attestation arrived on when that socket is not demoted, otherwise
+// the lexicographically first fresh socket that is not. The caller holds
+// peerHMu. "" means no socket is available.
+func (v *Validator) pathForLocked(st *peerAttestation) transport.PeerID {
+	eligible := func(id transport.PeerID) bool {
+		p := st.paths[id]
+		return p != nil && p.seen+peerHeightTTL >= v.wave && p.demoted <= v.wave
+	}
+	if eligible(st.via) {
+		return st.via
+	}
+	var best transport.PeerID
+	for id := range st.paths {
+		if eligible(id) && (best == "" || id < best) {
+			best = id
+		}
+	}
+	return best
 }
 
 // demotePeer skips a member for a few waves after a pull from it failed to
@@ -1356,14 +1406,19 @@ func (v *Validator) tallestPeer() (who string, via transport.PeerID, h uint64) {
 // must not drop the selection cap it earned (round 7, F3). A member that once
 // served 100 and then blips keeps a cap of at least 100; the demotion, not a
 // lowered cap, is what rotates it away meanwhile.
-func (v *Validator) demotePeer(who string, reached uint64) {
+func (v *Validator) demotePeer(who string, via transport.PeerID, reached uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
 	st := v.peerH[who]
 	if st == nil {
 		return
 	}
-	st.demoted = v.wave + peerDemoteWaves
+	// The SOCKET sits out, not the member (audit A-2): the pull that proved
+	// nothing went down this one path, and the member's other sockets - its
+	// own dial, the relay - are still the honest ways to reach it.
+	if p := st.paths[via]; p != nil {
+		p.demoted = v.wave + peerDemoteWaves
+	}
 	if reached > st.substantiated {
 		st.substantiated = reached
 	}
@@ -1372,7 +1427,7 @@ func (v *Validator) demotePeer(who string, reached uint64) {
 // substantiatePeer records a pull that reached the member's attested height and
 // clears any demotion: a member that served what it claimed is trusted again.
 // substantiated is the high-water mark, never lowered.
-func (v *Validator) substantiatePeer(who string, reached uint64) {
+func (v *Validator) substantiatePeer(who string, via transport.PeerID, reached uint64) {
 	v.peerHMu.Lock()
 	defer v.peerHMu.Unlock()
 	st := v.peerH[who]
@@ -1382,7 +1437,9 @@ func (v *Validator) substantiatePeer(who string, reached uint64) {
 	if reached > st.substantiated {
 		st.substantiated = reached
 	}
-	st.demoted = 0
+	if p := st.paths[via]; p != nil {
+		p.demoted = 0
+	}
 }
 
 // maybeCatchUp pulls from the tallest attested peer when it stands above our
@@ -1452,12 +1509,14 @@ func (v *Validator) maybeCatchUp() {
 		}
 	}
 	if err != nil || (after < peerH && after == before) {
-		// Demote the MEMBER, not the transport name: an honest member behind
-		// the same relay must not be penalised for this one's failure (F1).
-		v.demotePeer(who, after)
+		// Demote this member's PATH, not the transport name and not the whole
+		// member: an honest member behind the same relay must not be penalised
+		// for this one's failure (F1), and this member's other sockets must
+		// not be penalised for this socket's silence (audit A-2).
+		v.demotePeer(who, via, after)
 		return
 	}
-	v.substantiatePeer(who, after)
+	v.substantiatePeer(who, via, after)
 }
 
 // enqueueSync hands a BLOCK_SYNC request to the async server (installed as

@@ -91,26 +91,28 @@ const MaxHelloNonceBytes = 64
 // attacker cannot transplant, because the third node never generated it and
 // will never accept a HELLO that quotes it.
 //
-// What makes the pair the SOCKET's own is the EXCHANGE that produces it, not
-// the concatenation (audit A-2): tcp.exchangeNonce is commit-then-reveal, so
-// each end sends a hash of its challenge BEFORE it may learn the peer's. The
-// attack this closes is an ORDERING, not a forgery: a member that could learn
-// A's challenge first and then present it to B could make A sign the pair B
-// checks. Committed first, the two constraints a successful transplant needs -
-// M's half at A must be B's challenge, and M's half at B must be A's challenge
-// - cannot both be met, because each value is fixed before the other is
-// learned. A reveal that does not match the commitment ends the socket, so the
-// substitution cannot be made after the fact either.
+// The EXCHANGE that produces the pair (tcp.exchangeNonce) is commit-then-reveal,
+// which stops a challenge from being substituted after the peer has seen it.
+// It does NOT make the pair the socket's own against a party holding two
+// sockets (audit A-2, fix review): a member M connected to both A and B can
+// copy each node's commitment and reveal to the other, so A and B end up
+// holding the same pair and A's HELLO verifies on M's socket at B. The
+// commitment binds only the challenge, never the identities at the socket's
+// ends, and over plaintext TCP between parties that have not yet authenticated
+// each other no exchanged value can bind them: M is, for this purpose, the
+// wire.
 //
-// WHAT THIS IS NOT, stated so it is not mistaken for identity binding: it ties
-// a HELLO to the two CHALLENGES of a socket, not to the identities at its ends.
-// A party that CONTROLS the byte stream - the relay, where one socket carries
-// every member's frames, or a transparent proxy at an address the operator
-// dialled - can carry a genuine handshake through and still forward whatever
-// frame it likes. That is the documented relay residual (audit A-3) and the
-// plaintext-TCP boundary; no challenge value can supply what the bytes cannot
-// authenticate. On such a link both halves are empty (nil), which is exactly
-// what tcp.PeerChallenges/ConnNonces report there.
+// WHAT THIS IS, then: it ties a HELLO to the two CHALLENGES of a socket, which
+// makes a CAPTURED frame useless on any other socket. What it is not is
+// identity binding. A party that CONTROLS the byte stream - the relay, where
+// one socket carries every member's frames, a transparent proxy at an address
+// the operator dialled, or the two-socket member above - can carry a genuine
+// handshake through and forward whatever frame it likes. That is the documented
+// residual (audit A-3 for the relay, A-2 for the two-socket member), and the
+// harm it could do to catch-up is closed in the node's attestation table
+// instead: a silent pull demotes the SOCKET it went down, never the member
+// (devnet.demotePeer). On a relay link both halves are empty (nil), which is
+// exactly what tcp.PeerChallenges/ConnNonces report there.
 func HelloBinding(sender, receiver []byte) []byte {
 	out := make([]byte, 0, len(sender)+len(receiver))
 	out = append(out, sender...)

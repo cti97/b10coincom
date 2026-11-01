@@ -1,33 +1,33 @@
 package devnet
 
-// Audit A-2 (fix review, section 6 item 1), the REAL attacker order, kept as the
-// test that fails on the pre-fix transport and passes afterwards.
+// Audit A-2: what commit-then-reveal closes, and what it does not.
 //
 // A committee member M collects a HELLO that ANOTHER member A signed, and
-// presents it at a third node B on M's OWN socket. Once B admits that socket,
-// B records A's height `via` it, and every catch-up pull for A goes to M, which
-// answers nothing: A is demoted and is never a usable sync source at B.
+// presents it at a third node B on M's OWN socket. This test pins the ordering
+// the commitment DOES close - M chooses its own half at A, learns A's
+// challenge, then tries to present A's challenge at B and B's at A - and shows
+// that A refuses a reveal that does not hash to M's commitment.
 //
-// The review's sequencing is an ORDER of handshakes, not a race:
+// It does NOT show that M cannot succeed at all, because M can (fix review,
+// section 3): instead of choosing its own half, M copies A's commitment to B
+// and B's commitment to A, relays the two reveals, and A and B end up holding
+// the same challenge pair. That is a relay, not a substitution, and no value
+// exchanged over plaintext TCP between unauthenticated parties can prevent it.
+// The harm it could do is closed where it can be: a silent pull demotes the
+// SOCKET it went down, never the member (hello_relay_path_test.go), so A's
+// genuine path at B keeps serving.
+//
+// The ordering pinned here, step by step:
 //
 //  1. M has a socket to A (A dials it through an operator-configured AddPeer,
-//     the same path a seated member's signed hint reaches). Under the flawed
-//     exchange A wrote its challenge aL first; M learned it and held the socket
-//     mid-handshake. Under commit-then-reveal M must send a COMMITMENT before
-//     A reveals aL, so M fixes its own half blind - and it may still learn aL
-//     before revealing that half, which is the strongest ordering available;
+//     the same path a seated member's signed hint reaches). M commits its own
+//     half BEFORE A reveals aL, then learns aL;
 //  2. M dials B and presents aL as its own challenge. B's expected HELLO
 //     binding is now HelloBinding(aL, bL);
-//  3. M answers A with bL. On the pre-fix exchange A's signing binding becomes
-//     HelloBinding(aL, bL) and step 4 succeeds. Under commit-then-reveal A
-//     rejects that reveal: it does not hash to the commitment M made before it
-//     could know aL;
-//  4. A's production broadcastHello signs over aL||bL (pre-fix). M forwards the
-//     frame to B, which sees a matching binding, a member key and a valid
-//     signature, admits the socket as A and records A `via` it.
-//
-// The previous version of this test committed a constant challenge to B before
-// it had seen A's - the reversed order - and so passed for the wrong reason.
+//  3. M can only reveal the half it committed to A, so A's HELLO is bound to
+//     aL||blind, not the aL||bL pair B demands; a reveal of bL instead closes
+//     the socket;
+//  4. A's HELLO forwarded to B is refused: the binding does not match.
 //
 // The state is CONSTRUCTED: B and A are quiet validators (one wave an hour, no
 // automatic ticks); every HELLO is driven by hand.

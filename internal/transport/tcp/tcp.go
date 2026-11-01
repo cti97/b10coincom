@@ -1430,25 +1430,33 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*co
 // that does not hash to the commitment (and closes the socket), so a challenge
 // cannot be substituted after the fact.
 //
-// WHY THE COMMITMENT, in one line: the old exchange wrote the local challenge
-// before reading the peer's, so a member M on two sockets could order the
-// handshakes - learn A's challenge first, present it to B, then send B's to A -
-// and make A sign the pair B checks. With the commitment, M's half at A is
-// fixed before it can learn A's challenge, and its half at B is fixed before
-// it can learn B's. A transplant needs M's half at A to BE B's challenge and
-// its half at B to BE A's challenge; each value would have to be known before
-// the other is learned, which is circular. M's choices degrade to an honest
-// per-socket challenge it cannot match to anything else.
+// WHAT THE COMMITMENT BUYS, exactly: a challenge cannot be SUBSTITUTED after
+// the peer has seen it. The old exchange wrote the local challenge before
+// reading the peer's, so a peer could read ours, choose its own in reply, and
+// later present a different value; the commitment fixes each half before the
+// other is revealed, and a reveal that does not hash to it closes the socket.
+//
+// WHAT IT DOES NOT BUY, stated so nobody relies on it (audit A-2, fix review):
+// it does not stop a party that holds TWO sockets from relaying one honest
+// node's handshake to another. The commitment binds only the challenge, not
+// the identities at the socket's ends, and each side sends its commitment
+// before reading the peer's; a member M with a socket to A and a socket to B
+// can copy A's commitment to B and B's to A, relay the reveals, and leave A
+// and B holding the same challenge pair, so A's HELLO verifies on M's socket
+// at B. No value exchanged over plaintext TCP between parties that have not
+// yet authenticated each other can prevent that: M is, for this purpose, the
+// wire. The harm that relay could do - making B send its catch-up pulls for A
+// down M's socket, and demoting A when M answers nothing - is closed where it
+// can be, in the node's catch-up table, which demotes the SOCKET a silent
+// pull went down and keeps the member's other paths (devnet.demotePeer).
 //
 // A failed read, a frame of the wrong width, a failed write, or a reveal that
 // does not match its commitment ends the connection; the maintainer treats it
 // as an ordinary failure and redials. ONE deadline (a fresh HandshakeTimeout)
 // covers the whole exchange, so the extra step adds frames, not time: no round
 // can wait past it. The frames are plaintext, so an observer learns the
-// values; freshness across connections is what makes them useless elsewhere,
-// and a party that CONTROLS the byte stream (relay, transparent proxy) can
-// still carry a genuine handshake through - the documented A-3 residual, not
-// something a challenge exchange can close.
+// values; freshness across connections is what makes a CAPTURED frame useless
+// elsewhere, and the relay residual above is the limit of what freshness can do.
 func (t *TcpTransport) exchangeNonce(nc net.Conn, c *conn) error {
 	local := make([]byte, connectionNonceBytes)
 	if _, err := cryptorand.Read(local); err != nil {
