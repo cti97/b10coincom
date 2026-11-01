@@ -213,6 +213,11 @@ type Store struct {
 	last  uint64   // highest height present, corrupt ones included
 	have  bool
 	index map[uint64]int64 // height -> record offset within its segment
+	// indexMu guards index, last and have (audit R-2). Append writes them
+	// under the chain's write lock; Read used to look the offset up under the
+	// chain's READ lock, which the chain no longer holds across a disk read,
+	// so the store must serialise its own index against its own appends.
+	indexMu sync.RWMutex
 
 	// lock is the exclusive data-directory lock, held from Open until Close.
 	// See dirlock.go: it keeps a second process (or a second open Store in
@@ -748,9 +753,11 @@ func (s *Store) scanSegment(name string, final bool) error {
 			return fmt.Errorf("%w: checksum mismatch in %s at offset %d%s", ErrCorruptRecord, name, off, repairHint(final, path, off))
 		}
 		h := s.last + 1
+		s.indexMu.Lock()
 		s.index[h] = off
 		s.last = h
 		s.have = true
+		s.indexMu.Unlock()
 		off = recEnd
 	}
 	return nil
@@ -818,9 +825,11 @@ func (s *Store) Append(height uint64, payload []byte) error {
 		_ = s.file.Truncate(off)
 		return err
 	}
+	s.indexMu.Lock()
 	s.index[height] = off
 	s.last = height
 	s.have = true
+	s.indexMu.Unlock()
 	return nil
 }
 
@@ -858,7 +867,9 @@ func writeRecord(f *os.File, payload []byte) error {
 // used to allocate the entire segment (up to a gibibyte in the theoretical
 // worst case) to return one block; the cost is now the record's own size.
 func (s *Store) Read(height uint64) ([]byte, error) {
+	s.indexMu.RLock()
 	off, ok := s.index[height]
+	s.indexMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("%w: %d", ErrNotFound, height)
 	}
@@ -946,7 +957,11 @@ func (s *Store) touchReaderLocked(name string) {
 }
 
 // Height returns the highest stored height.
-func (s *Store) Height() (uint64, bool) { return s.last, s.have }
+func (s *Store) Height() (uint64, bool) {
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
+	return s.last, s.have
+}
 
 // scanLocks rebuilds the lock index from the lock log.
 //

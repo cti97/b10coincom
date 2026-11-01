@@ -41,6 +41,14 @@ type statusResponse struct {
 	EpochBlocks     uint64 `json:"epoch_blocks"`
 	UnbondingEpochs uint64 `json:"unbonding_epochs"`
 	CommitteeSize   int    `json:"committee_size"`
+
+	// M6: the amount one faucet claim pays, in sparks. APPENDED, never a
+	// rename or a repurposing, so a client written against M5 keeps parsing
+	// this body - the contract stated above. The wallet's read commands do
+	// not need it; the walkthrough and the faucet page do, and re-deriving it
+	// from a compiled-in assumption is exactly the second source of truth
+	// /status exists to prevent.
+	ClaimAmountSparks uint64 `json:"claim_amount_sparks"`
 }
 
 // accountResponse is the /account/{address} view: the spendable account plus
@@ -169,6 +177,20 @@ const (
 	txRatePerSecond  = 64
 	txRateMaxSources = 4096
 
+	// The scan endpoints (/history and /explorer, audit R-1) get their own,
+	// smaller bucket: one request is up to maxHistoryBlocks disk reads and
+	// decodes, so a source is allowed a few windows per second, not sixty-four.
+	// Sources are bounded the same way as the transaction limiter's.
+	scanRateBurst     = 16
+	scanRatePerSecond = 4
+	// maxConcurrentScans bounds how many block scans run at once across every
+	// source (audit R-1). The limiter bounds the rate per source; this bounds
+	// the work in flight, which is what a client that opens requests and drops
+	// them would otherwise multiply: every historical read serialises on the
+	// store, so N abandoned scans are N windows of reads queued on one mutex.
+	// A refused request costs nothing and is told to retry (503).
+	maxConcurrentScans = 4
+
 	// maxTxBodyBytes bounds one POST /tx body (audit O-8). A canonical valid
 	// transaction is at most ~163 bytes (a transfer: type, 20-byte address,
 	// 33-byte framed 32-byte key, two u64s, 20-byte recipient, u64 amount,
@@ -253,6 +275,11 @@ type Server struct {
 	chain     *chain.Chain
 	mempool   *mempool.Mempool
 	txLimiter *sourceLimiter
+	// scanLimiter bounds the per-source rate of block scans (audit R-1).
+	scanLimiter *sourceLimiter
+	// scanSlots holds one token per scan in flight; a send that would block
+	// means every slot is busy and the request is refused, never queued.
+	scanSlots chan struct{}
 	// genesisHash is the chain's immutable genesis identifier, computed once
 	// at construction (audit CL-4): /status used to re-hash the whole genesis
 	// on every request. Genesis cannot change under a running chain, so the
@@ -265,7 +292,20 @@ func NewServer(c *chain.Chain, mp *mempool.Mempool) *Server {
 		chain:       c,
 		mempool:     mp,
 		txLimiter:   newSourceLimiter(txRateBurst, txRatePerSecond, txRateMaxSources),
+		scanLimiter: newSourceLimiter(scanRateBurst, scanRatePerSecond, txRateMaxSources),
+		scanSlots:   make(chan struct{}, maxConcurrentScans),
 		genesisHash: c.Genesis().Hash(),
+	}
+}
+
+// acquireScanSlot takes a scan slot without waiting. ok is false when every
+// slot is busy; otherwise release must be called when the scan is done.
+func (s *Server) acquireScanSlot() (release func(), ok bool) {
+	select {
+	case s.scanSlots <- struct{}{}:
+		return func() { <-s.scanSlots }, true
+	default:
+		return nil, false
 	}
 }
 
@@ -281,6 +321,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/block/", s.handleBlock)
 	mux.HandleFunc("/account/", s.handleAccount)
+	mux.HandleFunc("/history", s.handleHistory)
+	// The pages (M6 Tasks 2 and 3) are HANDLERS on this same server: they add
+	// no listener, no authentication and no write path, so the node's single
+	// loopback-bound --http address serves them beside the JSON API.
+	mux.HandleFunc("/faucet", s.handleFaucet)
+	mux.HandleFunc("/explorer", s.handleExplorer)
 	mux.HandleFunc("/tx", s.handleTx)
 	return mux
 }
@@ -310,6 +356,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		EpochBlocks:     g.Params.EpochBlocks,
 		UnbondingEpochs: g.Params.UnbondingEpochs,
 		CommitteeSize:   g.Params.CommitteeSize,
+
+		ClaimAmountSparks: g.Params.ClaimAmountSparks,
 	})
 }
 

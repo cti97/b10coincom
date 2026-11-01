@@ -577,19 +577,22 @@ exit **only in full**, which is what `unstake` without `--amount` does.
 > (10^11 sparks) in **spendable funds**. The only funding path is the faucet:
 > **1 b10 per claim, one claim per key per epoch, at most 8 claims per block**,
 > funded by emission at **0.5 b10 per block**. The faucet's balance is the
-> real constraint, not the epoch length: **2,000 blocks** of emission produce
-> the 1,000 b10, and 1,000 claims from 1,000 distinct keys at 8 per block take
-> **125 blocks** — about **2,125 blocks**, roughly 71 minutes at 2 s blocks (a
-> healthy committee commits faster; measure two `/status` readings a minute
-> apart). This recipe used to say "1,000 epochs, one million blocks, 23 days",
-> which wrongly divided by the one-claim-per-key rule instead of issuing one
-> claim per key: the old figure was about **470× too long**. It is still not a
-> path this deployment can walk today: `b10coin claim` signs with a fresh
-> ephemeral key each run and never saves it, and there is no `transfer` verb,
-> so each claim lands at a new address and cannot be accumulated. **No shipped
-> command funds an operator's key with `MIN_STAKE`**; the numbers above
-> describe what the protocol allows a client holding 1,000 keys and a transfer
-> path. The arithmetic is in the repository README's
+> real constraint, not the epoch length: **2,002 blocks** of emission produce
+> the 1,001 b10 that pays 1,001 claims of 1 b10 (100,100,000,000 ÷ 50,000,000),
+> and 1,001 claims at 8 per block take **126 blocks**, which fit inside that
+> window. The sweep needs 1,001 claims and transfers rather than 1,000 because
+> each transfer burns a 1-spark fee: 1,001 × (10^8 − 1) = 100,099,998,999
+> sparks ≥ 10^11. That is about **67 minutes** at 2 s blocks (a healthy
+> committee commits faster; measure two `/status` readings a minute apart).
+> This recipe used to say
+> "1,000 epochs, one million blocks, 23 days", which wrongly divided by the
+> one-claim-per-key rule instead of issuing one claim per key: the old figure
+> was about **500× too long**. Since M6 the path exists — `claim --key` signs a
+> claim for a key file the operator holds, and `send` transfers the result —
+> but it is ~2,000 commands long, not a path a deployment walks in practice.
+> **No shipped genesis funds an operator's key with `MIN_STAKE`**; the numbers
+> above describe what the protocol allows a client holding 1,001 keys and a
+> transfer path. The arithmetic is in the repository README's
 > [Staking](../../README.md#staking) section.
 
 > **⚠️ A bond is a seat, and a seat without a node is a wasted seat — a halt on

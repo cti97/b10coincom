@@ -142,6 +142,18 @@ jobs:
       - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1
       - run: go run ./cmd/b10coin devnet --validators 4 --blocks 100
       - run: go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto
+      # M6's acceptance artefact (design decision 1): the walkthrough is an
+      # executable proof, not a narrative. The script extracts the one ```sh
+      # fence from docs/2026-11-01-m6-walkthrough.md, builds its own binary
+      # into a temp dir (never bin/, so it cannot test a stale one), runs the
+      # fence against a fresh node on a port below the ephemeral range, and
+      # asserts the balances, the transfer preview/receipt and the history
+      # window the doc promises. A fence-count failure, a missing promised
+      # line, or a command that does not run exits non-zero. It kills its node
+      # and removes its temp dir on every path, including timeout and signal.
+      # Adds about 4 s to this job (measured 3.5 s wall including the cached
+      # build, one Argon2id claim solve and two 1-second block ticks).
+      - run: ./scripts/acceptance-walkthrough.sh
 
   # The supply-chain/lint gate (the audit's B-1): formatting, module hygiene,
   # staticcheck and govulncheck. The two external tools are pinned by exact

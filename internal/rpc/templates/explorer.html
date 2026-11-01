@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>b10coin explorer — {{.ChainID}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; max-width: 62rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.9rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #8884; vertical-align: top; }
+  th { white-space: nowrap; font-weight: 600; }
+  code { background: #8881; padding: 0 0.2rem; word-break: break-all; }
+  .none { color: #8889; }
+  .window { background: #8881; padding: 0.7rem 0.9rem; }
+  .limits { border-top: 1px solid #8884; margin-top: 2.2rem; padding-top: 0.5rem; }
+</style>
+</head>
+<body>
+<h1>b10coin explorer</h1>
+<p>One server-rendered page over this node's committed blocks. It reads blocks the node already accepted; it signs nothing, submits nothing, and it has no search.</p>
+
+<h2>The chain right now</h2>
+<table>
+  <tr><th>Chain</th><td>{{.ChainID}}</td></tr>
+  <tr><th>Head height</th><td>{{.Height}}</td></tr>
+  <tr><th>Head hash</th><td><code>{{.HeadHash}}</code></td></tr>
+  <tr><th>Head state root</th><td><code>{{.StateRoot}}</code></td></tr>
+</table>
+<p>The height, the head hash and the state root above were read together, in one lock, so they describe the same block even while this node keeps appending.</p>
+
+<h2>Recent blocks</h2>
+<p>At most 20 blocks, newest first: {{.BlocksShown}} shown, from height {{.Height}} downwards.</p>
+<table>
+  <tr><th>Height</th><th>Hash</th><th>Tx count</th><th>Time (unix seconds)</th><th>State root</th></tr>
+  {{range .Blocks}}
+  <tr data-height="{{.Height}}">
+    <td>{{.Height}}</td>
+    <td><code>{{.Hash}}</code></td>
+    <td>{{.Txs}}</td>
+    <td>{{.Time}}</td>
+    <td><code>{{.Root}}</code></td>
+  </tr>
+  {{else}}
+  <tr><td colspan="5" class="none">This node reports no block at all, which should be impossible: a chain has a genesis block.</td></tr>
+  {{end}}
+</table>
+
+<h2>Recent transactions</h2>
+{{if .TxBlocks}}
+<p class="window">Window scanned: blocks {{.TxFrom}} to {{.TxTo}} inclusive, {{.TxBlocks}} block(s) read from the head. At most 20 transactions are shown. Truncated: {{if .TxTruncated}}yes — more matched in that window than this page shows{{else}}no — every transaction in that window is listed below{{end}}.</p>
+{{else}}
+<p class="window">This chain holds only its genesis block, which carries no transactions, so there is no window to scan.</p>
+{{end}}
+<table>
+  <tr><th>Transaction</th><th>Block</th><th>Type</th><th>From</th><th>To</th><th>Amount</th><th>Fee</th></tr>
+  {{range .Txs}}
+  <tr data-txid="{{.TxID}}">
+    <td><code>{{.TxID}}</code></td>
+    <td>{{.Height}}</td>
+    <td>{{.Type}}</td>
+    <td><code>{{.From}}</code></td>
+    <td>{{if .To}}<code>{{.To}}</code>{{else}}<span class="none">no recipient</span>{{end}}</td>
+    <td>{{b10 .Amount}} b10 = {{.Amount}} sparks</td>
+    <td>{{b10 .Fee}} b10 = {{.Fee}} sparks</td>
+  </tr>
+  {{else}}
+  <tr><td colspan="7" class="none">No transaction in the scanned window. That is what this node saw in those blocks; it is not a statement that the chain has no transactions.</td></tr>
+  {{end}}
+</table>
+
+<section class="limits">
+<h2>What this page cannot do</h2>
+<ul>
+  {{range .CannotDo}}<li>{{.}}</li>
+  {{end}}
+</ul>
+</section>
+
+<p>Server-rendered HTML: no JavaScript, no external asset, no stylesheet from anywhere else, and no link out. Nothing on this page accepts input.</p>
+</body>
+</html>
