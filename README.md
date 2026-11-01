@@ -411,7 +411,7 @@ bails out if the node it is talking to runs a different chain.
 |---|---|---|
 | `--node URL` | `http://127.0.0.1:8645` | HTTP RPC of the node to submit the claim to |
 | `--dir PATH` | `./b10coin-data` | accepted for uniformity with the other commands, and deliberately **never read**: the claim command never touches the data directory, reads nothing from it and writes nothing (with `--key` it reads the key file you name and nothing else) |
-| `--key PATH` | *unset* | sign the claim with this key file (`b10coin keygen`) so the coins land on an address you hold. Without it the claim signs with an ephemeral key it prints and never saves |
+| `--key PATH` | *unset* | sign the claim with this key file (`b10coin keygen`) so the coins land on an address you hold. Without it the claim signs with an ephemeral key it never saves and, unless `--print-key` is given, never prints |
 | `--print-key` | `false` | print the ephemeral signing key to stdout so a follow-up transfer is possible. Off by default (audit W-6): stdout is captured by shells, CI logs and journalctl, and `claim --key` is the shipped path to coins you can spend. Without it the ephemeral key is unrecoverable. No effect with `--key`, whose key is already a file |
 | `--yes` / `--dry-run` | *off* | the shared transaction envelope's confirmation flags. They apply to `--key` only: the ephemeral claim prints no preview and asks for no confirmation, so either flag without `--key` is refused rather than silently ignored |
 

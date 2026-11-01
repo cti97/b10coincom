@@ -89,7 +89,7 @@ Usage:
                  [--allow-local-peer-hints]                              (accept loopback/private peer hints: private-range and single-host networks only)
                  --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
-  b10coin claim  --node URL [--key PATH] [--print-key=false] [--yes | --dry-run]
+  b10coin claim  --node URL [--key PATH] [--print-key] [--yes | --dry-run]
                                                         Solve the faucet puzzle and send one claim; with --key the coins land on a key you hold
   b10coin balance --node URL (--key PATH | --address ADDR)
                                                         Read one account's balance, nonce and bond from the node
@@ -126,11 +126,11 @@ connections. HOW the committee is named decides whose keys sign:
 Without any of those flags the node is the M1 producer: one chain, no round
 protocol.
 
-Without --key, the claim command signs with an ephemeral key that is printed
-and never stored: the key signs exactly this claim and is printed once so it
-can be reused for a follow-up transfer. Because stdout is captured by shells,
-CI logs and journalctl, --print-key=false withholds the key: safe when no
-follow-up transfer is planned, and the claimant address is still printed.
+Without --key, the claim command signs with an ephemeral key that is never
+stored and, by default, never printed: stdout is captured by shells, CI logs
+and journalctl, and a claim you intend to spend from should use --key. Pass
+--print-key to print the key once for a follow-up transfer; the claimant
+address is printed either way.
 With --key PATH the claim signs for that key file, through the same
 print-confirm-sign envelope as the staking verbs, so its coins are spendable by
 a key you hold (claim --dry-run prints the transaction and stops).
@@ -427,7 +427,7 @@ func cmdClaim(args []string) error {
 	// the safe choice for any run that does not intend a follow-up transfer
 	// (audit O-10). The claimant ADDRESS is printed either way.
 	printKey := fs.Bool("print-key", false, "print the ephemeral signing key to stdout (off by default, so the secret stays out of shell history, CI logs and journalctl; without it the key is unrecoverable and no follow-up transfer from this claimant is possible - use --key for a claim you intend to spend from). No effect with --key, whose key is already a file")
-	keyPath := fs.String("key", "", "sign the claim with this key file (b10coin keygen) so the claimed coins land on an address you hold; absent, the claim signs with an ephemeral key it prints and never saves")
+	keyPath := fs.String("key", "", "sign the claim with this key file (b10coin keygen) so the claimed coins land on an address you hold; absent, the claim signs with an ephemeral key it never saves and, unless --print-key is given, never prints")
 	// The envelope's confirmation surface. It applies to --key only: the
 	// ephemeral claim prints no preview and never asks, so a --yes or
 	// --dry-run accepted there and ignored would be a flag that lies.
