@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -798,6 +799,13 @@ type stakingStub struct {
 	posts       [][]byte
 	url         string
 	ts          *httptest.Server
+
+	// M6 Task 0: the history read. historyBody is served verbatim by
+	// /history; historyQuery and historyCalls record what the verb asked for,
+	// so a test can assert the window and the echo check without a chain.
+	historyBody  *walletHistory
+	historyQuery url.Values
+	historyCalls int
 }
 
 func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *stakingStub {
@@ -822,6 +830,18 @@ func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *sta
 	mux.HandleFunc("/account/", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(s.account)
 	})
+	mux.HandleFunc("/history", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		body := s.historyBody
+		s.historyQuery = r.URL.Query()
+		s.historyCalls++
+		s.mu.Unlock()
+		if body == nil {
+			_ = json.NewEncoder(w).Encode(walletHistory{Txs: []walletHistoryEntry{}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	})
 	mux.HandleFunc("/tx", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -840,6 +860,29 @@ func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *sta
 	t.Cleanup(s.ts.Close)
 	s.url = s.ts.URL
 	return s
+}
+
+// setAccount replaces the account the stub reports, so one node can answer two
+// reads with two different balances.
+func (s *stakingStub) setAccount(acc stakingAccount) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.account = acc
+}
+
+// setHistory replaces the body /history serves.
+func (s *stakingStub) setHistory(h walletHistory) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.historyBody = &h
+}
+
+// historyAsked returns the last query the verb sent to /history and how many
+// requests it made.
+func (s *stakingStub) historyAsked() (url.Values, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.historyQuery, s.historyCalls
 }
 
 // setFee makes the stub report a different min_fee_sparks - the hostile node's
@@ -2022,4 +2065,284 @@ func TestRealAskConfirmationRefusesEveryNonTerminal(t *testing.T) {
 		t.Fatalf("the null device produced (%q, %v); EOF must never look like consent", answer, err)
 	}
 	null.Close()
+}
+
+// ---------------------------------------------------------------------------
+// M6 Task 0: the read verbs
+// ---------------------------------------------------------------------------
+
+// balanceLine pulls the value of one labelled line out of the verb's output.
+func balanceLine(t *testing.T, out, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, label) {
+			return strings.TrimPrefix(line, label)
+		}
+	}
+	t.Fatalf("the balance output has no %q line:\n%s", label, out)
+	return ""
+}
+
+// TestBalanceVerbPrintsSparksAndB10Exactly pins the money render: sparks first,
+// and the b10 value produced by an INTEGER division. The 29,000,000 row is the
+// one that catches a float: 0.29 does not survive a float64 round trip, so
+// uint64(float64(sparks)/1e8*1e8) is 28,999,999 - one spark short. (0.1 DOES
+// survive it, which is why the plan's 10,000,000 example cannot catch the
+// mutant on its own; both rows are here.)
+func TestBalanceVerbPrintsSparksAndB10Exactly(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	var gh [32]byte
+	s := newStakingStub(t, gh, stakingAccount{Address: addr.String(), Balance: 10_000_000, Nonce: 1})
+	out := captureStdout(t, func() {
+		if err := cmdBalance([]string{"--node", s.url, "--key", keyPath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got := balanceLine(t, out, "balance"); !strings.Contains(got, "10000000 sparks (0.1 b10)") {
+		t.Fatalf("balance line = %q, want 10000000 sparks (0.1 b10)", got)
+	}
+
+	// The value a float loses a spark on. --address also exercises the read
+	// without a key file.
+	s.setAccount(stakingAccount{Address: addr.String(), Balance: 29_000_000, Nonce: 2})
+	out = captureStdout(t, func() {
+		if err := cmdBalance([]string{"--node", s.url, "--address", addr.String()}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got := balanceLine(t, out, "balance"); !strings.Contains(got, "29000000 sparks (0.29 b10)") {
+		t.Fatalf("balance line = %q, want 29000000 sparks (0.29 b10)", got)
+	}
+	if strings.Contains(out, "28999999") {
+		t.Fatalf("the balance render lost a spark to a float:\n%s", out)
+	}
+	// Whole b10 renders without a fraction, not as "1.00000000".
+	s.setAccount(stakingAccount{Address: addr.String(), Balance: 100_000_000, Nonce: 3})
+	out = captureStdout(t, func() {
+		if err := cmdBalance([]string{"--node", s.url, "--key", keyPath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got := balanceLine(t, out, "balance"); !strings.Contains(got, "100000000 sparks (1 b10)") {
+		t.Fatalf("balance line = %q, want 100000000 sparks (1 b10)", got)
+	}
+}
+
+// TestBalanceOutputFormatIsStable pins every label the M6 walkthrough greps, in
+// order and with their padding: renaming one breaks a documented command.
+func TestBalanceOutputFormatIsStable(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	var gh [32]byte
+	s := newStakingStub(t, gh, stakingAccount{
+		Address: addr.String(), Balance: 100_000_000, Nonce: 1,
+		Bonded: 1_400 * genesis.SparksPerB10, UnbondingTotal: 2,
+	})
+	out := captureStdout(t, func() {
+		if err := cmdBalance([]string{"--node", s.url, "--key", keyPath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	want := []string{
+		"address     " + addr.String(),
+		"balance     100000000 sparks (1 b10)",
+		"nonce       1",
+		"bonded      140000000000 sparks (1400 b10)",
+		"unbonding   2 records",
+		"chain       stub-chain-1",
+		"height      7",
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != len(want) {
+		t.Fatalf("balance printed %d lines, want %d:\n%s", len(lines), len(want), out)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Fatalf("balance line %d = %q, want %q", i, lines[i], want[i])
+		}
+	}
+}
+
+// TestBalanceRefusesANodeNamingAnotherAccount: the verb may only show the
+// account it asked for. A node that answers with a different address is
+// refused BEFORE anything is printed.
+func TestBalanceRefusesANodeNamingAnotherAccount(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	_, _, other := stakingTestKey(t)
+	var gh [32]byte
+	s := newStakingStub(t, gh, stakingAccount{Address: other.String(), Balance: 100_000_000, Nonce: 1})
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdBalance([]string{"--node", s.url, "--key", keyPath})
+	})
+	if err == nil {
+		t.Fatal("a node answering for another account was accepted")
+	}
+	if !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("the refusal reads %q; it must say it refused", err)
+	}
+	if strings.Contains(out, "balance") {
+		t.Fatalf("the refused verb still printed a balance:\n%s", out)
+	}
+	if addr == other {
+		t.Fatal("the two test keys derived the same address")
+	}
+}
+
+// TestBalanceRefusesBothOrNeitherAddressFlag: --key and --address are
+// alternatives, and a read with neither has nothing to read.
+func TestBalanceRefusesBothOrNeitherAddressFlag(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	var gh [32]byte
+	s := newStakingStub(t, gh, stakingAccount{Address: addr.String()})
+	for _, args := range [][]string{
+		{"--node", s.url},
+		{"--node", s.url, "--key", keyPath, "--address", addr.String()},
+	} {
+		if err := cmdBalance(args); err == nil {
+			t.Fatalf("balance %v was accepted", args)
+		}
+	}
+}
+
+// TestHistoryVerbPrintsTheWindowAndItsLimit pins the two things design
+// decision 5 makes a deliverable: the window the node actually scanned, and
+// the no-index sentence, on EVERY run.
+func TestHistoryVerbPrintsTheWindowAndItsLimit(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	toPub, _, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	to := types.AddressFromPub(toPub).String()
+	var gh [32]byte
+	s := newStakingStub(t, gh, stakingAccount{Address: addr.String()})
+	s.setHistory(walletHistory{
+		Address: addr.String(), Head: 7, From: 1, To: 7, Blocks: 7,
+		Txs: []walletHistoryEntry{
+			{TxID: strings.Repeat("ab", 32), Height: 7, Type: "transfer", From: addr.String(), To: to, Amount: 49_999_999, Fee: 1},
+			{TxID: strings.Repeat("cd", 32), Height: 1, Type: "faucet claim", From: addr.String(), Amount: 100_000_000},
+		},
+	})
+	out := captureStdout(t, func() {
+		if err := cmdHistory([]string{"--node", s.url, "--key", keyPath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, want := range []string{
+		"blocks 1..7, scanned 7, newest first",
+		"49999999 sparks (0.49999999 b10)",
+		"to   " + to,
+		"100000000 sparks (1 b10)",
+		"faucet claim",
+		"no transaction index",
+		"not a complete account history",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("history output is missing %q:\n%s", want, out)
+		}
+	}
+	// The default window is the CLI's too, and it reaches the node as a
+	// positive number (a zero would be a 400 at the handler).
+	q, calls := s.historyAsked()
+	if calls != 1 {
+		t.Fatalf("history made %d requests, want 1", calls)
+	}
+	if q.Get("blocks") != "100" {
+		t.Fatalf("history asked for blocks=%q, want the default 100", q.Get("blocks"))
+	}
+	if q.Get("address") != addr.String() {
+		t.Fatalf("history asked for address=%q, want %s", q.Get("address"), addr)
+	}
+
+	// --blocks is passed through.
+	out = captureStdout(t, func() {
+		if err := cmdHistory([]string{"--node", s.url, "--address", addr.String(), "--blocks", "3"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	q, _ = s.historyAsked()
+	if q.Get("blocks") != "3" {
+		t.Fatalf("history --blocks 3 sent blocks=%q", q.Get("blocks"))
+	}
+	if !strings.Contains(out, "no transaction index") {
+		t.Fatalf("the no-index sentence vanished on a non-default window:\n%s", out)
+	}
+
+	// From the RECIPIENT's side the same entry names the sender, not the
+	// reader's own address: "to <self>" tells a reader nothing.
+	s.setHistory(walletHistory{
+		Address: addr.String(), Head: 7, From: 1, To: 7, Blocks: 7,
+		Txs: []walletHistoryEntry{
+			{Height: 7, Type: "transfer", From: to, To: addr.String(), Amount: 49_999_999, Fee: 1},
+		},
+	})
+	out = captureStdout(t, func() {
+		if err := cmdHistory([]string{"--node", s.url, "--key", keyPath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "from "+to) {
+		t.Fatalf("a received transfer does not name its sender:\n%s", out)
+	}
+	if strings.Contains(out, "to   "+addr.String()) {
+		t.Fatalf("a received transfer is reported as going to the reader himself:\n%s", out)
+	}
+}
+
+// TestHistoryRefusesAZeroWindowBeforeAskingTheNode: --blocks 0 is refused by
+// the CLI itself, so an invalid window costs no request.
+func TestHistoryRefusesAZeroWindowBeforeAskingTheNode(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	var gh [32]byte
+	s := newStakingStub(t, gh, stakingAccount{Address: addr.String()})
+	if err := cmdHistory([]string{"--node", s.url, "--key", keyPath, "--blocks", "0"}); err == nil {
+		t.Fatal("history --blocks 0 was accepted")
+	}
+	if _, calls := s.historyAsked(); calls != 0 {
+		t.Fatalf("history --blocks 0 made %d request(s); it must refuse before the read", calls)
+	}
+}
+
+// TestHistoryRefusesAnotherAccountsReply: the node echoes the address it
+// answered for, and a reply for somebody else must not be printed as this
+// account's history.
+func TestHistoryRefusesAnotherAccountsReply(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	_, _, other := stakingTestKey(t)
+	var gh [32]byte
+	s := newStakingStub(t, gh, stakingAccount{Address: addr.String()})
+	s.setHistory(walletHistory{Address: other.String(), Head: 7, From: 1, To: 7, Blocks: 7, Txs: []walletHistoryEntry{}})
+	var err error
+	out := captureStdout(t, func() {
+		err = cmdHistory([]string{"--node", s.url, "--key", keyPath})
+	})
+	if err == nil {
+		t.Fatal("a history reply for another address was accepted")
+	}
+	if !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("the refusal reads %q; it must say it refused", err)
+	}
+	if strings.Contains(out, "history for") {
+		t.Fatalf("the refused verb still printed a history:\n%s", out)
+	}
+}
+
+// TestHistoryOnAnEmptyChainSaysSo: head 0 is not an error and not a lie about
+// a window that does not exist.
+func TestHistoryOnAnEmptyChainSaysSo(t *testing.T) {
+	keyPath, _, addr := stakingTestKey(t)
+	var gh [32]byte
+	s := newStakingStub(t, gh, stakingAccount{Address: addr.String()})
+	s.setHistory(walletHistory{Address: addr.String(), Head: 0, Txs: []walletHistoryEntry{}})
+	out := captureStdout(t, func() {
+		if err := cmdHistory([]string{"--node", s.url, "--key", keyPath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "no blocks to scan") {
+		t.Fatalf("an empty chain was not reported as an empty window:\n%s", out)
+	}
+	if !strings.Contains(out, "no transaction index") {
+		t.Fatalf("the no-index sentence is missing on an empty chain:\n%s", out)
+	}
 }

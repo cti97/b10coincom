@@ -51,6 +51,10 @@ func main() {
 		err = cmdNode(os.Args[2:])
 	case "claim":
 		err = cmdClaim(os.Args[2:])
+	case "balance":
+		err = cmdBalance(os.Args[2:])
+	case "history":
+		err = cmdHistory(os.Args[2:])
 	case "stake":
 		err = cmdStake(os.Args[2:])
 	case "unstake":
@@ -86,6 +90,10 @@ Usage:
                  --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
   b10coin claim  --node URL [--dir PATH]                Solve the faucet puzzle and send one claim
+  b10coin balance --node URL (--key PATH | --address ADDR)
+                                                        Read one account's balance, nonce and bond from the node
+  b10coin history --node URL (--key PATH | --address ADDR) [--blocks N]
+                                                        List that account's transactions in the node's last N blocks
   b10coin stake  --node URL --key PATH --amount 1000 [--max-fee SPARKS] [--yes | --dry-run]
                                                         Bond b10 to this key's committee seat (signed tx, printed first)
   b10coin unstake --node URL --key PATH [--amount 1000] [--yes | --dry-run]
@@ -120,6 +128,24 @@ stored: the key signs exactly this claim and is printed once so it can be
 reused for a follow-up transfer. Because stdout is captured by shells, CI
 logs and journalctl, --print-key=false withholds the key: safe when
 no follow-up transfer is planned, and the claimant address is still printed.
+
+balance and history are READ verbs: clients of the node, not a second chain.
+balance is one /status read plus one /account/{address} read; history is one
+/history read. Neither opens a data directory, a store or a block file, and
+neither signs or posts anything. BALANCE is what the node reports, in sparks
+with the exact b10 render beside it (an integer division, never a float).
+
+HISTORY IS A BOUNDED BACKWARD SCAN, NOT AN ACCOUNT LEDGER. There is no
+transaction index in the store, so history asks the node to scan at most
+--blocks blocks back from its head (default 100, maximum 500; the node clamps
+a larger request and the header reports what it actually scanned). What it
+prints is therefore activity inside that window - not the account's whole past.
+A window with no transfers does not prove an account never transacted, and a
+transaction older than the window cannot be reached by asking for more than
+500 blocks; run the verb again later, or read the blocks. The window line and
+the no-index sentence are printed on every run, not only when the reply was
+cut short. The numbers themselves come from the node: the CLI has no
+independent copy of the chain and cannot check them.
 
 The staking verbs are ORDINARY signed transactions, not a side channel: they
 read /status for the chain's genesis hash and stake parameters and

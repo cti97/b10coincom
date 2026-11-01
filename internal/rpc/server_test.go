@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -705,4 +706,499 @@ func TestTheUnbondingWindowIsBoundedByTheLimit(t *testing.T) {
 			t.Fatalf("limit %s parsed to %d, want at least 1", ask, got)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// M6 Task 0: the history read
+// ---------------------------------------------------------------------------
+
+// getHistory reads /history with the given raw query and returns the decoded
+// body, failing on anything but 200.
+func getHistory(t *testing.T, ts *httptest.Server, query string) historyResponse {
+	t.Helper()
+	resp, err := http.Get(ts.URL + "/history?" + query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET /history?%s = %d, want 200: %s", query, resp.StatusCode, body)
+	}
+	var body historyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("GET /history?%s: %v", query, err)
+	}
+	return body
+}
+
+// TestStatusReportsTheClaimAmount: /status carries the claim amount in sparks.
+// The field is ADDITIVE (see statusResponse's contract), so the M5 fields must
+// still be there in the same bodies - the existing status test asserts those,
+// and this one asserts the new one beside them.
+func TestStatusReportsTheClaimAmount(t *testing.T) {
+	_, ts := testServer(t)
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	want := genesis.Devnet().Params.ClaimAmountSparks
+	field, ok := fields["claim_amount_sparks"]
+	if !ok {
+		t.Fatalf("/status is missing claim_amount_sparks; body: %s", raw)
+	}
+	var got uint64
+	if err := json.Unmarshal(field, &got); err != nil {
+		t.Fatalf("claim_amount_sparks is not a JSON number: %s", field)
+	}
+	if got != want {
+		t.Fatalf("claim_amount_sparks = %d, want the genesis claim amount %d", got, want)
+	}
+	// The M5 fields this task must not disturb are still present, in the same
+	// body, under the same names.
+	for _, key := range []string{"chain_id", "height", "head_hash", "state_root", "mempool",
+		"genesis_hash", "min_fee_sparks", "min_stake_sparks", "epoch_blocks", "unbonding_epochs", "committee_size"} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("/status lost the %q field while gaining claim_amount_sparks; body: %s", key, raw)
+		}
+	}
+}
+
+// TestHistoryReportsATransferToBothParties constructs a real transfer in a
+// committed block and reads it back from both ends. A scan that matches only
+// From, or that swaps the two, tells one party nothing and the other the wrong
+// direction.
+func TestHistoryReportsATransferToBothParties(t *testing.T) {
+	s, ts := testServer(t)
+	c := s.chain
+	g := c.Genesis()
+	alicePub, alicePriv := genesis.DevAccountKey(0)
+	bobPub, _ := genesis.DevAccountKey(1)
+	alice := types.AddressFromPub(alicePub)
+	bob := types.AddressFromPub(bobPub)
+
+	tx := &types.Tx{
+		Type: types.TxTransfer, From: alice, PubKey: alicePub,
+		Nonce: 0, Fee: g.Params.MinFeeSparks, To: bob, Amount: 50_000_000,
+	}
+	signTx(t, c, tx, alicePriv)
+	appendBlock(t, c, []types.Tx{*tx}, g.Time+1)
+	if c.Height() != 1 {
+		t.Fatalf("height = %d, want 1", c.Height())
+	}
+	id := tx.ID()
+	wantTxID := hex.EncodeToString(id[:])
+
+	for _, side := range []struct {
+		name string
+		addr types.Address
+	}{
+		{"the sender", alice},
+		{"the recipient", bob},
+	} {
+		body := getHistory(t, ts, "address="+side.addr.String())
+		if body.Head != 1 || body.To != 1 || body.From != 1 || body.Blocks != 1 {
+			t.Fatalf("%s: window = head %d, %d..%d, scanned %d; want head 1, 1..1, scanned 1",
+				side.name, body.Head, body.From, body.To, body.Blocks)
+		}
+		if len(body.Txs) != 1 {
+			t.Fatalf("%s: history holds %d entries, want the one transfer", side.name, len(body.Txs))
+		}
+		e := body.Txs[0]
+		if e.TxID != wantTxID {
+			t.Errorf("%s: txid = %s, want %s", side.name, e.TxID, wantTxID)
+		}
+		if e.Type != "transfer" {
+			t.Errorf("%s: type = %q, want transfer", side.name, e.Type)
+		}
+		if e.From != alice.String() {
+			t.Errorf("%s: from = %s, want the sender %s", side.name, e.From, alice)
+		}
+		if e.To != bob.String() {
+			t.Errorf("%s: to = %s, want the recipient %s (the direction must not be swapped)", side.name, e.To, bob)
+		}
+		if e.Amount != 50_000_000 || e.Fee != g.Params.MinFeeSparks || e.Height != 1 {
+			t.Errorf("%s: entry = %+v, want amount 50000000, fee %d, height 1", side.name, e, g.Params.MinFeeSparks)
+		}
+	}
+
+	// A third address does not see it.
+	otherPub, _, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := getHistory(t, ts, "address="+types.AddressFromPub(otherPub).String())
+	if len(body.Txs) != 0 {
+		t.Fatalf("an unrelated address sees %d entries, want 0", len(body.Txs))
+	}
+
+	// A non-transfer carries NO recipient on the wire. A bond's To decodes as
+	// the zero address, and printing that would tell a reader the stake went
+	// to account zero.
+	bond := &types.Tx{
+		Type: types.TxBond, From: alice, PubKey: alicePub,
+		Nonce: 1, Fee: g.Params.MinFeeSparks, Amount: 1_000 * genesis.SparksPerB10,
+	}
+	signTx(t, c, bond, alicePriv)
+	appendBlock(t, c, []types.Tx{*bond}, g.Time+2)
+	body = getHistory(t, ts, "address="+alice.String())
+	if len(body.Txs) != 2 {
+		t.Fatalf("the sender's history holds %d entries after a transfer and a bond, want 2", len(body.Txs))
+	}
+	if body.Txs[0].Type != "bond" {
+		t.Fatalf("newest entry is %q, want the bond at height 2", body.Txs[0].Type)
+	}
+	if body.Txs[0].To != "" {
+		t.Fatalf("a bond reports to=%q; a non-transfer must carry no recipient", body.Txs[0].To)
+	}
+	if body.Txs[1].Type != "transfer" || body.Txs[1].To != bob.String() {
+		t.Fatalf("the transfer entry = %+v, want type transfer to %s", body.Txs[1], bob)
+	}
+
+	// A zero address in To must never match a query: a bond is not a transfer
+	// to account zero.
+	var zero types.Address
+	body = getHistory(t, ts, "address="+zero.String())
+	if len(body.Txs) != 0 {
+		t.Fatalf("a query for the zero address matched %d entries; a zero To is 'no recipient', not an account", len(body.Txs))
+	}
+}
+
+// TestHistoryWindowIsBoundedAndSaysWhatItScanned pins the three bounds: the
+// requested window is honoured and reported, an over-large request is clamped
+// to the maximum, and the entry cap sets truncated instead of growing the
+// reply. The last phase is also the DoS check: an account with more matching
+// transactions than the cap does not produce a larger body.
+func TestHistoryWindowIsBoundedAndSaysWhatItScanned(t *testing.T) {
+	// The request rule, as a pure function: absent takes the default, a value
+	// above the maximum is clamped rather than refused.
+	got, err := historyBlocks(url.Values{})
+	if err != nil || got != defaultHistoryBlocks {
+		t.Fatalf("absent blocks = %d, %v; want %d, nil", got, err, defaultHistoryBlocks)
+	}
+	got, err = historyBlocks(url.Values{"blocks": {"10000"}})
+	if err != nil || got != maxHistoryBlocks {
+		t.Fatalf("blocks=10000 = %d, %v; want the clamped %d", got, err, maxHistoryBlocks)
+	}
+
+	s, ts := testServer(t)
+	c := s.chain
+	g := c.Genesis()
+	for i := 1; i <= 3; i++ {
+		appendBlock(t, c, nil, g.Time+int64(i))
+	}
+	body := getHistory(t, ts, "")
+	if body.Head != 3 || body.From != 1 || body.To != 3 || body.Blocks != 3 {
+		t.Fatalf("3-block chain: window = head %d, %d..%d, scanned %d; want head 3, 1..3, scanned 3",
+			body.Head, body.From, body.To, body.Blocks)
+	}
+	if body.Txs == nil {
+		t.Fatal("txs is null; it must be an empty list so a client need not special-case it")
+	}
+
+	// A smaller window is what is scanned and what is reported.
+	body = getHistory(t, ts, "blocks=2")
+	if body.Head != 3 || body.From != 2 || body.To != 3 || body.Blocks != 2 {
+		t.Fatalf("blocks=2: window = head %d, %d..%d, scanned %d; want head 3, 2..3, scanned 2",
+			body.Head, body.From, body.To, body.Blocks)
+	}
+
+	// The entry cap: 300 matching transfers, newest 200 kept, truncated set,
+	// but the WINDOW is still fully scanned and reported - "I stopped
+	// looking" (from/blocks) must not be confused with "I dropped some".
+	alicePub, alicePriv := genesis.DevAccountKey(0)
+	bobPub, _ := genesis.DevAccountKey(1)
+	alice := types.AddressFromPub(alicePub)
+	nonce := uint64(0)
+	for b := 0; b < 3; b++ {
+		txs := make([]types.Tx, 0, 100)
+		for i := 0; i < 100; i++ {
+			tx := &types.Tx{
+				Type: types.TxTransfer, From: alice, PubKey: alicePub,
+				Nonce: nonce, Fee: g.Params.MinFeeSparks,
+				To: types.AddressFromPub(bobPub), Amount: 1,
+			}
+			nonce++
+			signTx(t, c, tx, alicePriv)
+			txs = append(txs, *tx)
+		}
+		appendBlock(t, c, txs, g.Time+int64(10+b))
+	}
+	body = getHistory(t, ts, "address="+alice.String()+"&blocks=500")
+	if body.Blocks != 6 || body.From != 1 || body.To != 6 {
+		t.Fatalf("after the cap: window = %d..%d, scanned %d; want 1..6, scanned 6 (the whole window is scanned, only the entries are capped)",
+			body.From, body.To, body.Blocks)
+	}
+	if len(body.Txs) != maxHistoryEntries {
+		t.Fatalf("300 matches returned %d entries, want the cap %d", len(body.Txs), maxHistoryEntries)
+	}
+	if !body.Truncated {
+		t.Fatal("truncated = false after the entry cap dropped matches")
+	}
+	// Newest first: the two newest blocks fill the cap and the oldest block's
+	// 100 matches are the ones dropped.
+	if body.Txs[0].Height != 6 || body.Txs[len(body.Txs)-1].Height != 5 {
+		t.Fatalf("entries run %d..%d, want newest first, 6 down to 5 with the cap filled",
+			body.Txs[0].Height, body.Txs[len(body.Txs)-1].Height)
+	}
+	for _, e := range body.Txs {
+		if e.Height < 5 {
+			t.Fatalf("an entry at height %d survived the cap; only the newest %d may be kept", e.Height, maxHistoryEntries)
+		}
+	}
+}
+
+// TestHistoryBlocksClampsTheScanAtTheMaximum is the endpoint-level face of the
+// clamp: 505 committed blocks, one request for 10000, and the reply reports
+// exactly maxHistoryBlocks scanned - the handler never walks the whole chain.
+func TestHistoryBlocksClampsTheScanAtTheMaximum(t *testing.T) {
+	s, ts := testServer(t)
+	c := s.chain
+	g := c.Genesis()
+	for i := 1; i <= maxHistoryBlocks+5; i++ {
+		appendBlock(t, c, nil, g.Time+int64(i))
+	}
+	body := getHistory(t, ts, "blocks=10000")
+	if body.Head != maxHistoryBlocks+5 {
+		t.Fatalf("head = %d, want %d", body.Head, maxHistoryBlocks+5)
+	}
+	if body.Blocks != maxHistoryBlocks {
+		t.Fatalf("scanned %d blocks, want the %d maximum", body.Blocks, maxHistoryBlocks)
+	}
+	if body.To != maxHistoryBlocks+5 || body.From != 6 {
+		t.Fatalf("window = %d..%d, want 6..%d (the newest %d blocks)", body.From, body.To, maxHistoryBlocks+5, maxHistoryBlocks)
+	}
+}
+
+// TestHistoryRefusesAZeroOrGarbageWindow: a window the handler cannot honour is
+// a 400, not a silently different answer, and a garbage address is not echoed
+// back raw.
+func TestHistoryRefusesAZeroOrGarbageWindow(t *testing.T) {
+	_, ts := testServer(t)
+	for _, query := range []string{"blocks=0", "blocks=x", "blocks=-1", "blocks=1.5"} {
+		resp, err := http.Get(ts.URL + "/history?" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("GET /history?%s = %d, want 400 (body: %s)", query, resp.StatusCode, body)
+		}
+	}
+	const rawAddr = "not-an-address"
+	resp, err := http.Get(ts.URL + "/history?address=" + rawAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("GET /history?address=%s = %d, want 400", rawAddr, resp.StatusCode)
+	}
+	if strings.Contains(string(body), rawAddr) {
+		t.Fatalf("the 400 echoes the raw address back: %s", body)
+	}
+	// Anything but GET is a 405 with the same shape every other read returns.
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		req, err := http.NewRequest(method, ts.URL+"/history", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("%s /history = %d, want 405", method, resp.StatusCode)
+		}
+	}
+}
+
+// TestHistoryIsSafeDuringAppends runs the history read while the node loop
+// appends. Every reply must be a well-formed window of its OWN head: to ==
+// head, from <= to, the block count matching the window, and every entry
+// inside it. Under -race this also proves the per-block lock discipline.
+func TestHistoryIsSafeDuringAppends(t *testing.T) {
+	c, err := chain.Open(genesis.Devnet(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ts := httptest.NewServer(NewServer(c, mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)).Handler())
+	defer ts.Close()
+	_, priv := genesis.DevValidatorKey()
+	devPub, _ := genesis.DevAccountKey(0)
+	q := "?address=" + types.AddressFromPub(devPub).String() + "&blocks=50"
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 40; i++ {
+			resp, err := http.Get(ts.URL + "/history" + q)
+			if err != nil {
+				continue
+			}
+			var body historyResponse
+			err = json.NewDecoder(resp.Body).Decode(&body)
+			resp.Body.Close()
+			if err != nil {
+				continue
+			}
+			if body.To != body.Head {
+				t.Errorf("reply window ends at %d but its head is %d", body.To, body.Head)
+				return
+			}
+			if body.From > body.To {
+				t.Errorf("reply window is inverted: %d..%d", body.From, body.To)
+				return
+			}
+			if body.Head > 0 {
+				if body.Blocks == 0 || body.Blocks != int(body.To-body.From+1) {
+					t.Errorf("reply says %d blocks for window %d..%d", body.Blocks, body.From, body.To)
+					return
+				}
+			} else if body.Blocks != 0 {
+				t.Errorf("empty chain reported %d scanned blocks", body.Blocks)
+				return
+			}
+			for _, e := range body.Txs {
+				if e.Height < body.From || e.Height > body.To {
+					t.Errorf("entry at height %d is outside the reported window %d..%d", e.Height, body.From, body.To)
+					return
+				}
+			}
+		}
+	}()
+	for i := 0; i < 40; i++ {
+		b, err := c.Build(priv, nil, c.Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-done
+}
+
+// m5Status is a client written against M5: it knows the /status fields that
+// shipped then and ignores anything added. It is deliberately a separate type
+// rather than a subset of statusResponse, because what it proves is that the
+// wire body still satisfies a client compiled before this milestone.
+type m5Status struct {
+	ChainID         string `json:"chain_id"`
+	Height          uint64 `json:"height"`
+	HeadHash        string `json:"head_hash"`
+	StateRoot       string `json:"state_root"`
+	Mempool         int    `json:"mempool"`
+	GenesisHash     string `json:"genesis_hash"`
+	MinFeeSparks    uint64 `json:"min_fee_sparks"`
+	MinStakeSparks  uint64 `json:"min_stake_sparks"`
+	EpochBlocks     uint64 `json:"epoch_blocks"`
+	UnbondingEpochs uint64 `json:"unbonding_epochs"`
+	CommitteeSize   int    `json:"committee_size"`
+}
+
+// TestTheNewFieldsAreAdditiveForAnOldClient: the M6 change to a shipped body is
+// ONE appended /status field. An M5 client must keep parsing, with every field
+// it knows intact and unchanged - and /account must not have changed at all.
+func TestTheNewFieldsAreAdditiveForAnOldClient(t *testing.T) {
+	_, ts := testServer(t)
+	g := genesis.Devnet()
+
+	resp, err := http.Get(ts.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old m5Status
+	if err := json.Unmarshal(raw, &old); err != nil {
+		t.Fatalf("an M5 client cannot parse the M6 /status body: %v\n%s", err, raw)
+	}
+	if old.ChainID != g.ChainID || old.Height != 0 {
+		t.Fatalf("an M5 client reads chain %q at height %d, want %q at 0", old.ChainID, old.Height, g.ChainID)
+	}
+	hash := g.Hash()
+	if old.GenesisHash != hex.EncodeToString(hash[:]) {
+		t.Fatalf("an M5 client reads genesis_hash %q, want %x", old.GenesisHash, hash)
+	}
+	if old.MinFeeSparks != g.Params.MinFeeSparks || old.MinStakeSparks != g.Params.MinStakeSparks ||
+		old.EpochBlocks != g.Params.EpochBlocks || old.UnbondingEpochs != g.Params.UnbondingEpochs ||
+		old.CommitteeSize != g.Params.CommitteeSize {
+		t.Fatalf("an M5 client reads changed stake params: %+v", old)
+	}
+
+	// The one change is an ADDITION: exactly one key beyond the M5 set.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	m5 := []string{"chain_id", "height", "head_hash", "state_root", "mempool",
+		"genesis_hash", "min_fee_sparks", "min_stake_sparks", "epoch_blocks", "unbonding_epochs", "committee_size"}
+	m6 := append(append([]string{}, m5...), "claim_amount_sparks")
+	if len(fields) != len(m6) {
+		t.Fatalf("/status carries %d keys, want the %d M5 keys plus claim_amount_sparks: %v", len(fields), len(m5), keysOf(fields))
+	}
+	for _, k := range m6 {
+		if _, ok := fields[k]; !ok {
+			t.Fatalf("/status is missing %q: %v", k, keysOf(fields))
+		}
+	}
+	for _, k := range m5 {
+		if _, ok := fields[k]; !ok {
+			t.Fatalf("/status lost the M5 key %q: %v", k, keysOf(fields))
+		}
+	}
+
+	// /account's body is exactly what M5 shipped, key for key.
+	freshPub, _, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.Get(ts.URL + "/account/" + types.AddressFromPub(freshPub).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accFields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &accFields); err != nil {
+		t.Fatal(err)
+	}
+	wantAccount := []string{"address", "balance", "nonce", "bonded", "bond_unfunded", "unbonding", "unbonding_total"}
+	if len(accFields) != len(wantAccount) {
+		t.Fatalf("/account carries %d keys, want the %d M5 fields: %v", len(accFields), len(wantAccount), keysOf(accFields))
+	}
+	for _, k := range wantAccount {
+		if _, ok := accFields[k]; !ok {
+			t.Fatalf("/account is missing the M5 field %q: %v", k, keysOf(accFields))
+		}
+	}
+}
+
+func keysOf(m map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

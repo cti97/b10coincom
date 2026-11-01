@@ -41,6 +41,14 @@ type statusResponse struct {
 	EpochBlocks     uint64 `json:"epoch_blocks"`
 	UnbondingEpochs uint64 `json:"unbonding_epochs"`
 	CommitteeSize   int    `json:"committee_size"`
+
+	// M6: the amount one faucet claim pays, in sparks. APPENDED, never a
+	// rename or a repurposing, so a client written against M5 keeps parsing
+	// this body - the contract stated above. The wallet's read commands do
+	// not need it; the walkthrough and the faucet page do, and re-deriving it
+	// from a compiled-in assumption is exactly the second source of truth
+	// /status exists to prevent.
+	ClaimAmountSparks uint64 `json:"claim_amount_sparks"`
 }
 
 // accountResponse is the /account/{address} view: the spendable account plus
@@ -281,6 +289,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/block/", s.handleBlock)
 	mux.HandleFunc("/account/", s.handleAccount)
+	mux.HandleFunc("/history", s.handleHistory)
 	mux.HandleFunc("/tx", s.handleTx)
 	return mux
 }
@@ -310,6 +319,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		EpochBlocks:     g.Params.EpochBlocks,
 		UnbondingEpochs: g.Params.UnbondingEpochs,
 		CommitteeSize:   g.Params.CommitteeSize,
+
+		ClaimAmountSparks: g.Params.ClaimAmountSparks,
 	})
 }
 
