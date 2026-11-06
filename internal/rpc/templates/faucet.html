@@ -57,6 +57,8 @@
 <p>Claiming means solving the Argon2id puzzle on your own machine and signing with the key that will receive the coins, so the command runs locally:</p>
 <pre>{{.Command}}</pre>
 <p>Replace <code>&lt;path&gt;</code> with the key file <code>b10coin keygen --out</code> wrote, and run it from a terminal on the machine that holds the key. It prints the transaction and asks you to confirm before it signs.</p>
+<p>That command works against <strong>this</strong> node whatever chain it runs — {{.ChainID}} here, not only the devnet: the claim signs over the genesis hash the node reports (see <code>/status</code>'s <code>genesis_hash</code>), and the amount it pays is the chain's own parameter, the {{.ClaimAmountB10}} b10 above. There is no devnet-only condition to meet.</p>
+<p>One thing this page cannot check for you: a node whose key holds <strong>no committee seat</strong> accepts a claim and never proposes a block that carries it — a transaction reaches a block only through the node it was posted to. The claim command prints a warning when the node it reached says it holds no seat; in that case post the same bytes to a validator that does.</p>
 
 <section class="limits">
 <h2>What this page cannot do</h2>
@@ -68,7 +70,7 @@
   <li>It cannot guarantee payment. Eligibility is the claim rule; the block that applies your claim also needs the faucet to hold the amount at that moment, and a claim whose block cannot pay it is dropped rather than held.</li>
   <li>It cannot solve the Argon2id puzzle for you. Solving for anonymous requests would make this node's CPU the faucet's cost and turn it into a free-claim oracle, which is the whole reason the puzzle exists.</li>
   <li>It cannot show history, search the chain or recover a lost key; it reports one address at the current head.</li>
-  <li>It is unauthenticated and bound to the node's loopback address. Exposing that address to the internet exposes this page and the node's transaction endpoint together.</li>
+  <li>It is unauthenticated. The <code>--http</code> default binds the server to <code>127.0.0.1</code>, but that is the operator's choice, not a property of this page: a node started with <code>--http 0.0.0.0:8645</code> serves this page — and the node's transaction endpoint — to every network that can reach that port.</li>
 </ul>
 </section>
 

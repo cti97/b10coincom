@@ -653,10 +653,15 @@ func feeCeilingReason(maxFee uint64) string {
 // the fee read back from them, honours --dry-run, and asks for confirmation -
 // all before Sign. posted=false means nothing was signed and nothing was sent:
 // either a dry run (no error) or a refusal (an error).
-func (t *walletTarget) submit(tx *types.Tx, o txOptions, prov txProvenance) (txid string, posted bool, err error) {
+//
+// It returns the node's whole receipt, not just the txid, so every verb can
+// report the same second fact: a node that holds no seat admits the bytes and
+// will never include them, and the caller prints that warning beside the txid
+// (testrun S-2).
+func (t *walletTarget) submit(tx *types.Tx, o txOptions, prov txProvenance) (rc txReceipt, posted bool, err error) {
 	built, err := buildTx(tx)
 	if err != nil {
-		return "", false, err
+		return txReceipt{}, false, err
 	}
 
 	// PRINT BEFORE SIGNING, FROM THE SAME BYTES THAT WILL BE SIGNED.
@@ -666,17 +671,17 @@ func (t *walletTarget) submit(tx *types.Tx, o txOptions, prov txProvenance) (txi
 	// before any signature exists. It must not depend on the reported
 	// min_fee_sparks being honest: the ceiling is this CLI's own number.
 	if built.tx.Fee > o.maxFee {
-		return "", false, fmt.Errorf("refusing to sign: the node at %s puts a fee of %d spark on this transaction, above %s. Nothing was signed. If you deliberately accept a higher fee, raise --max-fee to a number YOU choose above %d; do not copy the fee the node reported",
+		return txReceipt{}, false, fmt.Errorf("refusing to sign: the node at %s puts a fee of %d spark on this transaction, above %s. Nothing was signed. If you deliberately accept a higher fee, raise --max-fee to a number YOU choose above %d; do not copy the fee the node reported",
 			t.base, built.tx.Fee, feeCeilingReason(o.maxFee), o.maxFee)
 	}
 
 	if o.dryRun {
 		fmt.Println("dry run: the transaction above was NOT signed and NOT posted.")
-		return "", false, nil
+		return txReceipt{}, false, nil
 	}
 
 	if err := confirmTransaction(o.yes); err != nil {
-		return "", false, err
+		return txReceipt{}, false, err
 	}
 
 	// Sign the decoded transaction and post its canonical re-encoding. The
@@ -684,11 +689,11 @@ func (t *walletTarget) submit(tx *types.Tx, o txOptions, prov txProvenance) (txi
 	// same bytes printed above; the only bytes added are the signature.
 	hash := built.tx.SigningHash(t.genesis)
 	built.tx.Sig = crypto.Sign(t.priv, hash[:])
-	txid, err = postTxHex(t.base+"/tx", built.tx.Encode())
+	rc, err = postTxHex(t.base+"/tx", built.tx.Encode())
 	if err != nil {
-		return "", false, err
+		return txReceipt{}, false, err
 	}
-	return txid, true, nil
+	return rc, true, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -809,12 +814,13 @@ func cmdSend(args []string) error {
 		Amount: amount,
 	}
 	effect := "the recipient is credited when a block includes the transaction; the fee is burned (it pays no one) and the signature cannot be withdrawn"
-	txid, posted, err := t.submit(tx, txOptions{maxFee: *maxFee, yes: *yes, dryRun: *dryRun}, txProvenance{amount: "from --amount", effect: effect})
+	rc, posted, err := t.submit(tx, txOptions{maxFee: *maxFee, yes: *yes, dryRun: *dryRun}, txProvenance{amount: "from --amount", effect: effect})
 	if err != nil {
 		return err
 	}
 	if posted {
-		fmt.Printf("txid        %s\n", txid)
+		fmt.Printf("txid        %s\n", rc.TxID)
+		printSeatWarning(rc)
 		// There is deliberately no /tx/{id} route to wait on: inclusion is a
 		// property of a later block, and a wait loop here would hide that.
 		fmt.Println("send does not wait for a block: the recipient's balance changes only when a block includes the transaction. Poll `b10coin balance --address` (there is no /tx/{id} route to wait on).")
@@ -833,28 +839,26 @@ func cmdSend(args []string) error {
 // turns a printed key into a file).
 //
 // The epoch is derived from the node's height and is the transaction's only
-// time binding; the puzzle parameters are genesis state, so the chain ID must
-// still be the compiled-in devnet's. The claim goes through submit: printed
-// first, fee ceiling enforced on the decoded fee, --dry-run before the
-// confirmation, confirmation before the signature.
+// time binding, and the signature is bound to the genesis hash the NODE reports
+// (walletTarget.genesis, read from /status and checked to be 32 bytes) - the
+// same binding every other signing verb uses. There is deliberately no
+// chain-ID equality check and no "must be the devnet's hash" check (testrun
+// S-3): `claim` follows the genesis of the node it is pointed at, which is what
+// makes a committee-file or simnet chain claimable, and the hash it signs over
+// is read rather than assumed. The puzzle's cost and target are the compiled-in
+// fixture tuning, which every chain a node of this build can open carries (see
+// cmdClaim's comment); the node is the verifier, so a claim solved against
+// another tuning cannot apply.
+//
+// The claim goes through submit: printed first, fee ceiling enforced on the
+// decoded fee, --dry-run before the confirmation, confirmation before the
+// signature.
 func claimWithKey(nodeURL, keyPath string, yes, dryRun bool) error {
+	// The puzzle's tuning only: the chain identity and epoch come from the node.
 	g := genesis.Devnet()
 	t, err := connectWalletNode(nodeURL, keyPath)
 	if err != nil {
 		return err
-	}
-	// The claim only verifies on the chain whose parameters solved it; a
-	// different chain would refuse it anyway, so say so here.
-	if t.status.ChainID != g.ChainID {
-		return fmt.Errorf("the node at %s runs chain %q, not the devnet genesis %q", nodeURL, t.status.ChainID, g.ChainID)
-	}
-	// The chain ID is a string any node can claim; the genesis hash is the
-	// value the signature binds to (audit W-1). This verb holds the real one,
-	// so a node reporting the devnet's name over another chain's genesis
-	// would get a claim that verifies on that other chain if this were not
-	// checked.
-	if want := g.Hash(); t.genesis != want {
-		return fmt.Errorf("the node at %s reports chain %q but a genesis hash (%x) that is not the devnet's (%x); refusing to sign for a chain this claim was not solved for", nodeURL, t.status.ChainID, t.genesis[:8], want[:8])
 	}
 	if t.status.EpochBlocks == 0 {
 		return fmt.Errorf("the node reports epoch_blocks 0: the claim's epoch cannot be derived")
@@ -876,7 +880,7 @@ func claimWithKey(nodeURL, keyPath string, yes, dryRun bool) error {
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
-	txid, posted, err := t.submit(tx, txOptions{maxFee: 0, yes: yes, dryRun: dryRun}, txProvenance{
+	rc, posted, err := t.submit(tx, txOptions{maxFee: 0, yes: yes, dryRun: dryRun}, txProvenance{
 		effect: "the claim is paid from the faucet when a block includes it; it is one claim per key per epoch, and the signature cannot be withdrawn",
 	})
 	if err != nil {
@@ -893,7 +897,8 @@ func claimWithKey(nodeURL, keyPath string, yes, dryRun bool) error {
 		// posted.
 		return nil
 	}
-	fmt.Printf("txid        %s\n", txid)
+	fmt.Printf("txid        %s\n", rc.TxID)
+	printSeatWarning(rc)
 	fmt.Println("the claim is queued on the node; it is paid when the node's next block applies it.")
 	return nil
 }

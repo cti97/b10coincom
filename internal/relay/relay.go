@@ -40,6 +40,18 @@
 //     never a fixed cap on throughput: the sole sender of a queue faces a
 //     share of the whole capacity and, while the queue has room, loses
 //     nothing;
+//   - a SIZE RESERVATION inside that same byte budget (testrun N-1): a frame
+//     larger than smallFrameBytes may not occupy the queue's last
+//     smallFrameReserveBytes, and the writer takes consensus-sized frames
+//     before bulk. It is the one classification the relay makes, and it reads
+//     a length the relay already parses. It exists because the fair share
+//     above cannot help: the same peers both vote and serve catch-up, so the
+//     traffic that crowds a receiver's queue out comes from the very senders
+//     whose votes it drowns, and a BLOCK_SYNC response plus a second one fills
+//     a 2 MiB queue by itself. Total bytes and frames are unchanged - the
+//     reservation is a sub-limit on bulk, not new capacity - and a frame
+//     cannot buy the reserved room without carrying fewer bytes, which is what
+//     a consensus frame does and a catch-up response cannot;
 //   - MaxConns and MaxConnsPerIP at accept, the latter grouped by source
 //     PREFIX (IPv6 /64, IPv4 /24): a stranger is bounded in how many slots it
 //     can hold, total and per group, so one routed prefix cannot bypass the
@@ -212,6 +224,56 @@ const (
 	// binding bound for any frame above ~512 bytes. The relay still parses
 	// nothing: this counts frames, never their content.
 	DefaultWriteQueueFrames = 4096
+	// smallFrameBytes is the largest frame the write queue treats as
+	// consensus-sized, and it is the ONE frame property the reservation below
+	// sorts by. It is a SIZE, not a type: the relay reads a frame's length
+	// before it allocates anything (wire.ReadFrame), so classifying by length
+	// is the same class of observation as the byte budget itself - and it is
+	// the only class of observation that can tell the two honest flows apart,
+	// because they differ in size by construction and in nothing else the
+	// relay is allowed to see.
+	//
+	// THE ARITHMETIC. Everything the consensus path depends on must fit under
+	// it: a vote is tag + height + round + 32-byte block ID + 32-byte key +
+	// 64-byte Ed25519 signature plus varint prefixes and the envelope, ~150
+	// bytes (consensus.EncodeVote); a HELLO is <= 64 bytes of socket binding
+	// plus chain id, key and signature, ~250 bytes (wire.MaxHelloNonceBytes);
+	// a BLOCK_SYNC request and a PEER_EXCHANGE are a few hundred bytes; and a
+	// proposal is an envelope plus a block plus a justification of at most
+	// quorum prevotes - an empty devnet block is ~250 bytes and seven
+	// justification votes are ~1 KiB, so a transaction-free proposal is
+	// ~1.5 KiB. 4 KiB clears all of them with room for a short transaction
+	// list, and everything above it carries real block weight: a BLOCK_SYNC
+	// response serving DefaultMaxBlocksPerResponse (64) devnet blocks is
+	// ~160 KiB and may be wire.MaxFrameBytes in one frame. A frame over the
+	// line is bulk BY CONSTRUCTION - it cannot be made small without carrying
+	// fewer bytes - which is what makes the reservation ungameable.
+	smallFrameBytes = 4 << 10
+	// smallFrameReserveBytes is the part of a connection's write-queue byte
+	// budget that ONLY frames of at most smallFrameBytes may occupy: bulk is
+	// capped at WriteQueueBytes - smallFrameReserveBytes, so the last of it is
+	// always available to a consensus frame however much catch-up traffic the
+	// relay is carrying.
+	//
+	// WHY THIS SIZE. The delay that the reservation exists to remove is the
+	// queued bytes divided by the RECEIVER's own relay byte budget
+	// (tcp.DefaultRelayBytesPerSec, 512 KiB/s - the rate at which a node's
+	// relay reader actually services the socket, and therefore the rate at
+	// which the relay's writer can put bytes on the wire). 64 KiB at 512
+	// KiB/s is 125 ms, inside one base round timeout of the shipped ladder
+	// (200 ms: internal/devnet's consensusTimeoutBaseMS); 128 KiB would be
+	// 250 ms and past it. It is also ~1.6 s of the whole committee's consensus
+	// traffic at 10 seats (10 nodes x ~650 bytes per height x 6 heights/s is
+	// ~40 KiB/s), and it holds ~330 vote-sized frames, so a burst of votes is
+	// absorbed rather than refused. A quarter of the budget is the ceiling on
+	// it, so a small queue reserves proportionally and no queue reserves more
+	// than bulk can spare.
+	//
+	// IT IS A SUB-LIMIT, NEVER NEW CAPACITY: the queue's byte budget, its frame
+	// bound and its entry ring are all exactly what they were, and everything
+	// reserved for consensus is subtracted from what bulk may hold, so
+	// Options.MaxPinnedBytes is unchanged to the byte.
+	smallFrameReserveBytes = 64 << 10
 	// queuedFrameEntryBytes is the exact in-memory cost of ONE entry in a
 	// connection's queue ring - a sender pointer plus a payload slice header.
 	// It is stated as a constant so the derivation can include it, and pinned
@@ -564,6 +626,16 @@ type sendQ struct {
 	limit         int // total queued payload bytes admitted
 	maxFrameBytes int // the frame bound the share floors itself at
 	maxFrames     int // entry-ring length: the per-frame memory bound
+	// smallMax is the size at or under which a frame is consensus-sized
+	// (smallFrameBytes). It is read on every push and every pop and is a
+	// length, never a payload byte.
+	smallMax int
+	// reserve is the part of limit that only consensus-sized frames may
+	// occupy, and bulkLimit is limit-reserve: the most payload bulk frames
+	// may hold between them. Both are derived once, here, so a reader can
+	// re-run the arithmetic from the two options above.
+	reserve   int
+	bulkLimit int
 
 	mu     sync.Mutex
 	ents   []sentFrame // ring buffer, fixed length maxFrames
@@ -586,7 +658,13 @@ type sendQ struct {
 	// cannot keep refilling past its share (audit F2). A queue that has never
 	// been refused room keeps the whole-budget allowance for its sole sender.
 	contended bool
-	ready     chan struct{} // cap 1: signalled on empty -> non-empty
+	// smallN is how many of the n live entries are consensus-sized (at most
+	// smallMax bytes). It exists so the writer can skip the search for a
+	// consensus frame entirely on the bulk-only queues that carry catch-up
+	// traffic, which is the common case during a catch-up and the one where
+	// the search would be longest.
+	smallN int
+	ready  chan struct{} // cap 1: signalled on empty -> non-empty
 }
 
 // newSendQ derives the bounds from the options: limit is the byte budget as
@@ -602,15 +680,35 @@ func newSendQ(limit, maxFrameBytes, maxFrames int) *sendQ {
 		// that can carry anything at all.
 		maxFrames = 1
 	}
+	// The reservation is a QUARTER of the budget at most, so an operator who
+	// shrinks --write-queue-bytes cannot accidentally reserve all of it; and
+	// never less than one byte, so the boundary stays a boundary even for the
+	// socket-free queue tests' three-entry budgets.
+	reserve := smallFrameReserveBytes
+	if quarter := limit / 4; reserve > quarter {
+		reserve = quarter
+	}
+	if reserve < 1 {
+		reserve = 1
+	}
 	return &sendQ{
 		limit:         limit,
 		maxFrameBytes: maxFrameBytes,
 		maxFrames:     maxFrames,
+		smallMax:      smallFrameBytes,
+		reserve:       reserve,
+		bulkLimit:     limit - reserve,
 		ents:          make([]sentFrame, maxFrames),
 		from:          make(map[shareAccount]int),
 		ready:         make(chan struct{}, 1),
 	}
 }
+
+// small reports whether a frame of n bytes is consensus-sized, i.e. may use
+// the reserved part of the budget and is written before bulk. It reads a
+// length; it is the only classification the relay makes, and it needs no byte
+// of the payload to answer.
+func (s *sendQ) small(n int) bool { return n <= s.smallMax }
 
 // shareFor returns the allowance one sender account is held to when
 // `senders` distinct accounts can contend for this queue: an equal fraction
@@ -664,9 +762,27 @@ func (s *sendQ) shareFor(senders int) int {
 // (only on the empty-to-non-empty transition) signalled; a refused frame
 // costs a boolean, which is what keeps a wedged receiver from stalling the
 // sender's forwarding path.
+//
+// THE SIZE RESERVATION (testrun N-1). A frame larger than smallFrameBytes may
+// not occupy the queue's last smallFrameReserveBytes, whatever the byte budget
+// and the sender's share would otherwise allow; a consensus-sized frame may use
+// the whole budget exactly as before. So the reservation is never new capacity
+// and never a weaker bound - it takes room from bulk and gives none to
+// anybody - and it is ungameable without parsing: a frame is small only by
+// BEING small, and the length it is classified on is the length the relay must
+// already read to bound the frame at all. A peer that wants the reserved room
+// has to carry fewer bytes in the frame, which is exactly what a consensus
+// frame does and what a catch-up response cannot.
+//
+// The refusal of a BULK frame by that reservation deliberately does not set
+// s.contended: the contention the share exists to answer is one account
+// crowding another out, and the reservation refusing bulk is the queue being
+// partitioned, not shared. Only a refusal that the share or the ring caused,
+// with another account holding bytes, turns the sticky share on.
 func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 	acct := shareAccountOf(sender)
 	share := s.shareFor(senders)
+	small := s.small(len(b))
 	s.mu.Lock()
 	// Actual contention is the bytes another account is holding in this
 	// queue - OR the fact that this queue has already denied someone room
@@ -680,8 +796,18 @@ func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 	if !s.contended && s.bytes-s.from[acct] == 0 {
 		allow = s.limit
 	}
+	// laneRefused is true only when the RESERVATION is what denies this frame
+	// room - a bulk frame that would cross into the reserved bytes. It is
+	// separated from a budget refusal because the two are attributed
+	// differently: the reservation is the queue being partitioned, while a
+	// budget refusal with another account holding bytes is the queue being
+	// shared (audit F2's sticky share). A consensus-sized frame's lane IS the
+	// whole budget, so the reservation can never refuse one.
+	overBudget := s.bytes+len(b) > s.limit
+	laneRefused := !small && !overBudget && s.bytes+len(b) > s.bulkLimit
 	ok := len(b) <= s.limit &&
-		s.bytes+len(b) <= s.limit &&
+		!overBudget &&
+		!laneRefused &&
 		s.n < s.maxFrames &&
 		s.from[acct]+len(b) <= allow
 	if ok {
@@ -692,6 +818,9 @@ func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 		s.lastPush = now
 		s.ents[(s.head+s.n)%s.maxFrames] = sentFrame{sender: sender, b: b}
 		s.n++
+		if small {
+			s.smallN++
+		}
 		s.bytes += len(b)
 		s.from[acct] += len(b)
 		if s.n == 1 { // the transitions the writer can be asleep across
@@ -700,32 +829,92 @@ func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 			default: // a token is already pending: the wake is not lost
 			}
 		}
-	} else if s.bytes-s.from[acct] > 0 {
+	} else if !laneRefused && s.bytes-s.from[acct] > 0 {
 		// This sender was refused room that ANOTHER account is holding:
 		// that is the queue being shared, and it is the observable that
 		// turns the equal share on for good (audit F2). A refusal with no
 		// other account in the queue (the sender is at its own share, or the
-		// frame is oversized, or the ring is full of its own frames) says
-		// nothing about sharing and does not set it.
+		// ring is full of its own frames) says nothing about sharing and does
+		// not set it - and neither does the reservation, which is the queue
+		// being partitioned rather than shared (testrun N-1).
 		s.contended = true
 	}
 	s.mu.Unlock()
 	return ok
 }
 
-// pop takes the oldest admitted frame, refunding its bytes to the budget and
-// to its sender account. It is non-blocking: nothing to take returns false,
-// and the writer goes back to sleep on ready.
+// smallPos returns the ring OFFSET (from head) of the oldest consensus-sized
+// entry, or -1 when none is queued. The scan is bounded by smallN's caller:
+// the writer only asks when smallN says there is one to find, and then only
+// walks the bulk frames in front of it.
+func (s *sendQ) smallPos() int {
+	if s.smallN == 0 {
+		return -1
+	}
+	for i := 0; i < s.n; i++ {
+		if s.small(len(s.ents[(s.head+i)%s.maxFrames].b)) {
+			return i
+		}
+	}
+	return -1
+}
+
+// promote moves the entry at ring offset i (i > 0) to the head, shifting the
+// entries in front of it one place later. It preserves the relative order of
+// EVERY other entry: only a consensus-sized frame overtakes anything, and what
+// it overtakes is bulk. So per-sender order among consensus frames is
+// untouched, per-sender order among bulk frames is untouched, and the only
+// order the queue no longer keeps is bulk-before-consensus from the same
+// sender - which the wire does not depend on (votes are tallied by height,
+// round and block ID, and a BLOCK_SYNC response is matched by nonce), and which
+// is the delay this exists to remove.
+func (s *sendQ) promote(i int) {
+	if i <= 0 {
+		return
+	}
+	at := func(k int) int { return (s.head + k) % s.maxFrames }
+	saved := s.ents[at(i)]
+	for k := i; k > 0; k-- {
+		s.ents[at(k)] = s.ents[at(k-1)]
+	}
+	s.ents[at(0)] = saved
+}
+
+// pop takes the next frame to write, refunding its bytes to the budget and to
+// its sender account. It is non-blocking: nothing to take returns false, and
+// the writer goes back to sleep on ready.
+//
+// The WRITE ORDER is the other half of the reservation: when any
+// consensus-sized frame is queued it is taken first (oldest such frame first),
+// so bulk - which the puller re-requests and can therefore wait - never delays
+// a vote by more than the consensus frames queued ahead of it. Without this,
+// reserving the room would only convert a lost vote into a late one: the vote
+// would sit behind every byte of bulk already in the queue, and the receiver's
+// own relay byte budget paces that drain at 512 KiB/s.
+//
+// The irreducible residual, stated rather than glossed: a consensus frame that
+// arrives while a bulk frame is ALREADY being written waits for the rest of
+// that frame, because a socket cannot carry two frames at once. That is one
+// frame's drain (typically ~160 KiB = ~0.3 s at a node's 512 KiB/s relay read
+// budget, at worst one MaxFrameBytes frame) instead of the whole queue, and no
+// parse-free queue can shorten it further: the alternative is fragmenting
+// frames, which is the one thing the wire's framing forbids.
 func (s *sendQ) pop() (sentFrame, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.n == 0 {
 		return sentFrame{}, false
 	}
+	if i := s.smallPos(); i > 0 {
+		s.promote(i)
+	}
 	f := s.ents[s.head]
 	s.ents[s.head] = sentFrame{}
 	s.head = (s.head + 1) % s.maxFrames
 	s.n--
+	if s.small(len(f.b)) {
+		s.smallN--
+	}
 	s.bytes -= len(f.b)
 	acct := shareAccountOf(f.sender)
 	s.from[acct] -= len(f.b)

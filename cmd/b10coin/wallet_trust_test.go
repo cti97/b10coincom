@@ -12,26 +12,40 @@ import (
 	"github.com/cti97/b10coincom/internal/types"
 )
 
-func TestClaimWithKeyRefusesANodeWhoseGenesisIsNotTheDevnets(t *testing.T) {
+// Audit W-1's rule, restated for testrun S-3. The protection W-1 asked for is
+// that a claim is BOUND to the chain it was verified for, so it can never be
+// replayed on another chain: the verb signs over the genesis hash the NODE
+// reports, and a claim signed for one chain is unusable on any other. That is
+// the same "useless, not dangerous" binding `send` and the staking verbs have
+// always had (the genesis hash IS the chain binding).
+//
+// It used to enforce that by REFUSING any hash but the compiled-in devnet's,
+// which also refused every honest committee-file and simnet chain and made the
+// README's funding path unwalkable (S-3). The test now asserts the binding
+// itself instead of the refusal, so a node that names the devnet but reports
+// another hash still cannot get a claim that works on the devnet.
+func TestClaimWithKeyIsBoundToTheNodesGenesisNotTheDevnets(t *testing.T) {
 	keyPath, addr, _ := claimTestSetup(t, 0, 0)
-	// The node names the devnet chain but reports another genesis hash: a
-	// claim signed over that hash would verify on that other chain (audit W-1).
+	// The node names the devnet chain but reports another genesis hash: the
+	// name is a string any node can claim, and the hash is what the signature
+	// binds (audit W-1).
 	var other [32]byte
 	other[0] = 0x5a
 	stub := newStakingStub(t, other, stakingAccount{Address: addr.String()})
 	stub.setChainID(genesis.Devnet().ChainID)
-	err := cmdClaim([]string{"--node", stub.url, "--key", keyPath, "--yes"})
-	if err == nil {
-		t.Fatal("claim --key signed for a node whose genesis hash is not the devnet's")
+	if err := cmdClaim([]string{"--node", stub.url, "--key", keyPath, "--yes"}); err != nil {
+		t.Fatalf("claim --key: %v", err)
 	}
-	if !strings.Contains(err.Error(), "genesis") {
-		t.Fatalf("the refusal does not name the genesis mismatch: %v", err)
+	tx := stub.posted()
+	h := tx.SigningHash(other)
+	if !crypto.Verify(tx.PubKey, h[:], tx.Sig) {
+		t.Error("the claim does not verify over the genesis hash the node reported")
 	}
-	stub.mu.Lock()
-	n := len(stub.posts)
-	stub.mu.Unlock()
-	if n != 0 {
-		t.Fatalf("%d transactions were posted despite the refusal", n)
+	if dev := genesis.Devnet().Hash(); dev != other {
+		hDev := tx.SigningHash(dev)
+		if crypto.Verify(tx.PubKey, hDev[:], tx.Sig) {
+			t.Error("the claim also verifies on the devnet genesis hash: a claim signed for one chain must be unusable on another")
+		}
 	}
 }
 

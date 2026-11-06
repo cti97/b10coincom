@@ -20,7 +20,12 @@
 #   exit 0  the requested halves passed
 #   exit 1  a fence is unbalanced, a brief is broken, or the brief tool is absent
 #           and --parity-only was not given
-#   exit 2  bad invocation or unreadable plan
+#   exit 2  bad invocation, unreadable plan, or the parity half's interpreter is
+#           absent. A missing TOOL is not a broken plan: the golang image has no
+#           python3, and this used to report "PLAN IS BROKEN" (testrun
+#           2026-11-06). --parity-only does NOT remove the dependency - the fence
+#           half IS scripts/plan_parity.py; what the flag skips is the SDD
+#           skill's brief extraction, which is not in this repository.
 set -uo pipefail
 
 parity_only=no
@@ -55,6 +60,16 @@ fi
 [ -f "$plan" ] || { echo "no such plan: $plan" >&2; exit 2; }
 
 fail=0
+
+# 0. The fence half runs through scripts/plan_parity.py. On a machine without
+#    python3 (the golang image, for one) the old path called the interpreter,
+#    caught its failure, and printed "PLAN IS BROKEN" - a verdict about the PLAN
+#    produced by a missing TOOL. Name the absence instead (testrun 2026-11-06).
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "check-plan.sh: python3 is required for the fence-parity half (scripts/plan_parity.py) and is not on PATH." >&2
+  echo "               This is a missing interpreter, not a broken plan; install python3 (or run this guard where it exists)." >&2
+  exit 2
+fi
 
 # 1. Fence parity, per task section. A section with an odd count is a defect even
 #    when the file-wide total is even, because the sections after it stay inverted.

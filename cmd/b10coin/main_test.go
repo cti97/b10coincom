@@ -872,7 +872,9 @@ type stakingStub struct {
 	account     stakingAccount
 	mu          sync.Mutex
 	fee         uint64 // the min_fee_sparks this node reports; 1 unless a test lies
-	chainID     string // the chain_id this node reports; a claim --key run needs the devnet's
+	chainID     string // the chain_id this node reports (claim follows it: testrun S-3)
+	height      uint64 // the height this node reports; 7 unless a test says otherwise
+	epochBlocks uint64 // the epoch_blocks this node reports; 1000 unless a test lies
 	posts       [][]byte
 	url         string
 	ts          *httptest.Server
@@ -900,21 +902,23 @@ type stakingStub struct {
 
 func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *stakingStub {
 	t.Helper()
-	s := &stakingStub{t: t, genesisHash: genesisHash, account: acc, fee: 1, chainID: "stub-chain-1"}
+	s := &stakingStub{t: t, genesisHash: genesisHash, account: acc, fee: 1, chainID: "stub-chain-1", height: 7, epochBlocks: 1_000}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		fee := s.fee
 		chainID := s.chainID
+		height := s.height
+		epochBlocks := s.epochBlocks
 		s.statusCalls++
 		s.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"chain_id":         chainID,
-			"height":           uint64(7),
+			"height":           height,
 			"genesis_hash":     hex.EncodeToString(s.genesisHash[:]),
 			"min_fee_sparks":   fee,
 			"min_stake_sparks": uint64(100_000_000_000),
-			"epoch_blocks":     uint64(1_000),
+			"epoch_blocks":     epochBlocks,
 			"unbonding_epochs": uint64(2),
 			"committee_size":   1,
 		})
@@ -997,13 +1001,31 @@ func (s *stakingStub) setFee(fee uint64) {
 	s.fee = fee
 }
 
-// setChainID makes the stub report a different chain_id. claim --key refuses
-// any chain but the compiled-in devnet's, because the puzzle parameters are
-// genesis state; a claim test therefore points this at genesis.Devnet().
+// setChainID makes the stub report a different chain_id. The signing verbs do
+// not compare it with anything (claim used to, until testrun S-3): the genesis
+// hash is the binding, and a chain_id is a string any node can claim.
 func (s *stakingStub) setChainID(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.chainID = id
+}
+
+// pointAt makes the stub report a chain that is NOT the devnet: its own genesis
+// hash, chain ID, height and epoch length. A test uses it to prove a verb
+// derives from the NODE's numbers rather than from compiled-in ones (testrun
+// S-3: claim signs over the reported hash and epochs on the reported length).
+func (s *stakingStub) pointAt(hash [32]byte, chainID string, height, epochBlocks uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.genesisHash, s.chainID, s.height, s.epochBlocks = hash, chainID, height, epochBlocks
+}
+
+// setEpochBlocks changes one reported parameter on its own, for the refusal a
+// zero epoch length must produce.
+func (s *stakingStub) setEpochBlocks(n uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.epochBlocks = n
 }
 
 // setTxReply makes the stub answer POST /tx with this status and RAW body,
@@ -2915,9 +2937,10 @@ func TestSendAmountIsParsedWithoutAFloat(t *testing.T) {
 	}
 }
 
-// claimTestSetup builds a key and a stub that reports the devnet chain ID (a
-// claim's puzzle parameters are genesis state, so claim --key refuses any other
-// chain) with the key's account at the given nonce.
+// claimTestSetup builds a key and a stub reporting the devnet's chain ID and
+// genesis hash, with the key's account at the given nonce. The chain ID is not
+// a gate any more (testrun S-3); it is named here because these tests are about
+// the devnet's shape, and the tests below point the stub at a foreign chain.
 func claimTestSetup(t *testing.T, balance, nonce uint64) (keyPath string, addr types.Address, stub *stakingStub) {
 	t.Helper()
 	keyPath, _, addr = stakingTestKey(t)

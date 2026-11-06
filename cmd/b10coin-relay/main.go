@@ -84,7 +84,19 @@ THE TRUST TRADE — read before running one
   receiver's queue (the budget divided among the sender groups contending for
   it: one uncontended sender may use the whole queue, while two connections
   from one host share one account and cannot split a receiver's budget),
-  and two socket deadlines (--read-timeout, --write-timeout). A frame over
+  and, inside that same budget, a SIZE reservation: the last 64 KiB of every
+  queue is reserved for frames of at most 4 KiB, and the writer sends those
+  first. The fair share is per sender and cannot separate a peer's 160 KiB
+  BLOCK_SYNC response from the same peer's 150-byte vote; frame size can, and
+  it is a length the relay already reads. Bulk is therefore capped at
+  --write-queue-bytes minus 64 KiB while a consensus-sized frame still uses the
+  whole budget - a sub-limit on bulk, never extra capacity, so the memory
+  bound below is unchanged, and a frame cannot reach the reserved room without
+  carrying fewer bytes. 64 KiB at a node's 512 KiB/s relay read budget is
+  125 ms, inside the 200 ms base round timeout. The residual is one bulk frame
+  already in the writer's hand when a vote arrives.
+  The other two bounds are socket deadlines (--read-timeout, --write-timeout).
+  A frame over
   the bound ends its connection; a dial past either connection bound is
   closed at accept. (Zero or negative for any knob selects its default.)
 
@@ -127,8 +139,8 @@ enforce any of it)
                    + write-queue-frames x 32
                    + 2 x max-frame-bytes)
 
-  At the defaults: 32 x (2 MiB + 4096 x 32 B + 2 x 1 MiB) = 32 x 4.125 MiB
-  = 132 MiB. (Two earlier claims in this space were wrong: the first omitted
+  At the defaults: 32 x (2 MiB + 4096 x 32 B + 2 x 1.0625 MiB) = 32 x 4.25
+  MiB = 136 MiB. (Two earlier claims in this space were wrong: the first omitted
   the write-queue factor - 256 conns could each queue 64 FRAMES x 1 MiB =
   16 GiB aggregate, not the 256 MiB documented; the second omitted the
   per-frame ENTRY cost, so a 2 MiB byte budget admitted ~2 million one-byte
@@ -137,6 +149,19 @@ enforce any of it)
   MaxPinnedBytes computes exactly it.) Slots are additionally bounded per
   source PREFIX by --max-conns-per-ip (default 8), so one host - or one
   routed prefix - cannot hold the registry.
+
+  THE PER-PREFIX CAP IS THE ONE THAT CATCHES HONEST COMMITTEES. A Docker
+  bridge, a LAN and one home NAT each put every validator behind ONE IPv4 /24,
+  so a committee of more than 8 on one prefix has its extra dials closed at
+  accept - and because the cap is applied at accept, BEFORE the access-token
+  gate is announced, those nodes log an EOF during the relay handshake and
+  retry with backoff. They do not stall the chain: the validators that did
+  connect still commit (8 of 10 in the 2026-11-06 run), so the symptom is a
+  committee smaller than it should be. Raise --max-conns-per-ip above the
+  number of validators behind that prefix (16 for ten on one bridge), or give
+  each validator its own prefix. The default is deliberately NOT raised: it is
+  the number of registry slots one host may hold, and the memory derivation
+  above is per-slot.
 
   --access-token-file (default unset) enables the relay's own access control
   (audit N-8, PX-3, D-1). When set, the file's bytes (a trailing newline is

@@ -161,6 +161,19 @@ With --key PATH the claim signs for that key file, through the same
 print-confirm-sign envelope as the staking verbs, so its coins are spendable by
 a key you hold (claim --dry-run prints the transaction and stops).
 
+The claim FOLLOWS THE GENESIS OF THE NODE IT IS POINTED AT: it reads /status for
+that chain's genesis hash and epoch length, signs over the hash the node
+reports, and derives the claim's epoch from the epoch length the node reports.
+A committee-file chain and a simnet committee are therefore claimable exactly as
+the devnet is, and a claim can never be signed over a hash this CLI assumed.
+The puzzle's TUNING (Argon2id cost and target) is the one parameter that is not
+on the wire; every chain a node of this build can open carries the devnet
+fixture's tuning (the devnet genesis, the simnet committee and the committee-file
+loader all start from it), and the node is the verifier: the state machine
+re-derives the digest with its own parameters, so a claim solved against another
+tuning cannot apply and is dropped by the proposer's applicability filter rather
+than riding a block.
+
 balance and history are READ verbs: clients of the node, not a second chain.
 balance is one /status read plus one /account/{address} read; history is one
 /history read. Neither opens a data directory, a store or a block file, and
@@ -168,10 +181,13 @@ neither signs or posts anything. BALANCE is what the node reports, in sparks
 with the exact b10 render beside it (an integer division, never a float).
 
 HISTORY IS A BOUNDED BACKWARD SCAN, NOT AN ACCOUNT LEDGER. There is no
-transaction index in the store, so history asks the node to scan at most
---blocks blocks back from its head (default 100, maximum 500; the node clamps
-a larger request and the header reports what it actually scanned). What it
-prints is therefore activity inside that window - not the account's whole past.
+transaction index in the store, so history scans at most --blocks blocks back
+from the node's head (default 100, maximum 500). Above 500 this verb REFUSES,
+here, before the node is asked (exit 1) - the 500 is the node's per-request
+bound, and a hand-written client that asks for more has its request clamped to
+500 rather than served; the header reports what the node actually scanned.
+What it prints is therefore activity inside that window - not the account's
+whole past.
 A window with no transfers does not prove an account never transacted, and a
 transaction older than the window cannot be reached by asking for more than
 500 blocks; run the verb again later, or read the blocks. The window line and
@@ -213,6 +229,24 @@ default ceiling bounds that loss to one spark. There is deliberately no
 made for a different node's chain is useless there and invalid on the chain
 the operator meant - useless, not dangerous. HTTP redirects are refused for
 the same reason.
+
+A TRANSACTION IS NOT GOSSIPED, and that decides where you post it. The wire
+carries proposals, votes, HELLOs, block sync and peer exchange; no message
+carries a transaction between nodes. A block is built from the LOCAL mempool of
+the validator whose turn it is to propose, so a transaction reaches the chain
+only through the node you posted it to, and only when that node's turn comes:
+on a SEATED validator it waits for that turn (one height in the committee size,
+roughly one in ten at ten seats), and on an UNSEATED node it waits forever -
+the pool of a node whose key holds no committee seat never feeds a block. The
+2026-11-06 ten-node run measured it: an Unbond posted to a displaced seat sat in
+that node's mempool for 400 blocks, and the same bytes posted to a seated
+validator applied in 12 seconds. Every signing verb therefore prints the node's
+own verdict beside the txid: POST /tx reports "seated": true|false for the
+node's signing key at the height the transaction would have to be carried at
+(head+1), and when that is false it adds a warning sentence naming the height,
+which these verbs print on stderr. "seated": false is still a 200 - the
+transaction was admitted, and the txid is a receipt for admission only. Post
+the same bytes to a seated validator.
 `)
 }
 
@@ -469,27 +503,39 @@ func cmdClaim(args []string) error {
 		return fmt.Errorf("--yes and --dry-run apply to --key: the ephemeral claim prints no preview and asks for no confirmation, so neither flag would mean anything. Give --key PATH to sign for a key file through the envelope")
 	}
 
-	// The puzzle's parameters are GENESIS state, not carried on the wire:
-	// claimant and verifier must agree on them, so the command solves with
-	// the same compiled-in devnet parameters an M2 node runs.
+	// The puzzle's COST AND TARGET are genesis state and are the one thing on
+	// this path that is not reported by /status, so the command solves with the
+	// compiled-in fixture tuning. That is correct rather than assumed: every
+	// chain a node of this build can open carries it (genesis.Devnet(), and
+	// simnet.Committee and genesis.ParseCommitteeJSON, which both start from
+	// Devnet() and override only the identity, the validator list and the seat
+	// count - the committee-file loader deliberately keeps the monetary and
+	// puzzle parameters). The chain is the verifier: the state machine
+	// re-derives the digest with its own parameters, so a claim solved against
+	// a different tuning cannot apply and is dropped by the proposer's
+	// applicability filter instead of riding a block. Everything ELSE is the
+	// node's (testrun S-3): the genesis hash
+	// the signature binds to and the epoch length the claim's epoch is derived
+	// from are read below, because signing over a compiled-in hash is exactly
+	// what made this command refuse every chain but the devnet.
 	g := genesis.Devnet()
 
 	base := strings.TrimRight(*nodeURL, "/")
-	var status struct {
-		ChainID string `json:"chain_id"`
-		Height  uint64 `json:"height"`
-	}
-	if err := getJSON(base+"/status", &status); err != nil {
-		return fmt.Errorf("cannot read the node's status at %s: %w", base+"/status", err)
-	}
-	// The claim only verifies on the chain whose parameters solved it; a
-	// different chain would refuse it anyway, so say so here.
-	if status.ChainID != g.ChainID {
-		return fmt.Errorf("the node at %s runs chain %q, not the devnet genesis %q", *nodeURL, status.ChainID, g.ChainID)
+	// readStatus is the same read the staking verbs use: it reports the
+	// chain's identity, its epoch length and its 32-byte genesis hash, and
+	// refuses a node that does not report one (a node from before M5).
+	status, genesisHash, err := readStatus(base)
+	if err != nil {
+		return err
 	}
 	// The claim must carry the epoch of the block that will apply it: the
-	// block at the node's head+1 (epoch(h) = h/EpochBlocks + 1).
-	epoch := (status.Height+1)/g.Params.EpochBlocks + 1
+	// block at the node's head+1 (epoch(h) = h/EpochBlocks + 1), at the
+	// length the NODE reports - not at the compiled-in one, which on a chain
+	// started with --epoch-blocks would name the wrong epoch.
+	if status.EpochBlocks == 0 {
+		return fmt.Errorf("the node at %s reports epoch_blocks 0: the claim's epoch cannot be derived", *nodeURL)
+	}
+	epoch := (status.Height+1)/status.EpochBlocks + 1
 
 	pub, priv, err := crypto.GenerateKey()
 	if err != nil {
@@ -511,10 +557,15 @@ func cmdClaim(args []string) error {
 		Epoch:    epoch,
 		PowNonce: pow,
 	}
-	sigHash := tx.SigningHash(g.Hash())
+	// Signed over the hash the NODE reported (testrun S-3). This used to be
+	// g.Hash(), the compiled-in devnet genesis, guarded by a chain-ID equality
+	// check - so the command could only ever sign for one chain. The genesis
+	// hash IS the chain binding, and reading it from the node is what the
+	// --key path always did; the ephemeral path now does the same.
+	sigHash := tx.SigningHash(genesisHash)
 	tx.Sig = crypto.Sign(priv, sigHash[:])
 
-	txid, err := postTxHex(base+"/tx", tx.Encode())
+	rc, err := postTxHex(base+"/tx", tx.Encode())
 	if err != nil {
 		return err
 	}
@@ -523,31 +574,60 @@ func cmdClaim(args []string) error {
 	fmt.Printf("public key  %x\n", pub)
 	fmt.Printf("claim epoch %d\n", epoch)
 	fmt.Printf("pow nonce   %d\n", pow)
-	fmt.Printf("txid        %s\n", txid)
+	fmt.Printf("txid        %s\n", rc.TxID)
 	fmt.Println("no key file, no keystore: the ephemeral signing key cannot be recovered later.")
 	if *printKey {
 		fmt.Printf("ephemeral key %x  <- copy now only if you plan a follow-up transfer\n", priv)
 	} else {
 		fmt.Println("the signing key was not printed (pass --print-key to see it); no follow-up transfer from this claimant is possible without it")
 	}
+	printSeatWarning(rc)
 	fmt.Println("the claim is queued on the node; it is paid when the node's next block applies it.")
 	return nil
 }
 
+// The read paths retry a 503 (testrun 2026-11-06, Info). A 503 from this node
+// is its own "the node is busy scanning for other clients; retry shortly",
+// i.e. the four-slot scan semaphore working as designed (audit R-1/S-8), not a
+// refusal of the request. The CLI used to surface it as exit 1: with 20
+// parallel mixed requests to one node, 4 of 5 `b10coin history` runs failed on
+// a reply that told them in so many words to retry. Only the GET paths use
+// getJSON (the signing verbs' POST has postTxHex), and a GET is idempotent, so
+// a bounded exponential backoff costs a delay and nothing else. No jitter: the
+// caller is one CLI process, and the node's own slots are what it is waiting
+// for.
+const (
+	busyRetries = 3
+	busyBackoff = 50 * time.Millisecond
+)
+
 func getJSON(url string, into any) error {
-	resp, err := claimHTTP.Get(url)
-	if err != nil {
-		return err
+	for attempt := 0; ; attempt++ {
+		resp, err := claimHTTP.Get(url)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable && attempt < busyRetries {
+			// Busy, not broken: back off outside the request's timeout and
+			// ask again. The final attempt falls through to the error below,
+			// so a node that stays busy is still reported with its own
+			// sentence instead of being waited on forever.
+			time.Sleep(busyBackoff << attempt)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			// The status line and the body are both the node's text: quote them so
+			// a reply cannot clear the screen or forge a line of this CLI's output
+			// on the read paths (/status, /account, /history) as well (audit S-13).
+			return fmt.Errorf("%s: %s", safeText(resp.Status), safeText(strings.TrimSpace(string(body))))
+		}
+		if readErr != nil {
+			return readErr
+		}
+		return json.NewDecoder(bytes.NewReader(body)).Decode(into)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		// The status line and the body are both the node's text: quote them so
-		// a reply cannot clear the screen or forge a line of this CLI's output
-		// on the read paths (/status, /account, /history) as well (audit S-13).
-		return fmt.Errorf("%s: %s", safeText(resp.Status), safeText(strings.TrimSpace(string(body))))
-	}
-	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(into)
 }
 
 // txidHexLen is the length of a hex-encoded 32-byte transaction ID.
@@ -575,8 +655,41 @@ func validTxID(s string) bool {
 	return true
 }
 
-// postTxHex submits the canonical hex encoding of one transaction and
-// returns the node's txid.
+// txReceipt is one POST /tx answer: the admitted transaction's id, and the
+// node's word on whether it can ever be included (testrun S-2).
+//
+// Seated is a POINTER because "this node did not say" and "this node said
+// false" are different facts, and only one of them is worth a warning. A node
+// from before this milestone, or one built without a signing key, leaves it
+// nil; Warning is non-empty exactly when the node explained a refusal to
+// propose.
+type txReceipt struct {
+	TxID    string
+	Seated  *bool
+	Warning string
+}
+
+// printSeatWarning writes the node's own explanation when its /tx reply says it
+// holds no seat at the height the transaction needed. It goes to STDERR, beside
+// a txid that stays on stdout: the txid is a true receipt for what happened
+// (admission), and the warning is the part an operator must not miss - the
+// transaction is parked, and the same bytes posted to a seated validator are
+// what reaches a block.
+//
+// The sentence is the NODE's, not this CLI's: the node knows the height it
+// judged and whether it could derive a committee at all, and there is exactly
+// one copy of that reasoning (internal/rpc's seatStatus). This function only
+// frames it and says what to do with the bytes.
+func printSeatWarning(rc txReceipt) {
+	if rc.Warning == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "WARNING: %s\n", rc.Warning)
+	fmt.Fprintln(os.Stderr, "WARNING: nothing on this node will include it; the txid above is not a promise. Post the same bytes to a seated validator (b10coin --node <that node's URL> with the same verb), or start a node whose key the committee seats.")
+}
+
+// postTxHex submits the canonical hex encoding of one transaction and returns
+// the node's receipt.
 //
 // EVERY node-chosen string on this path is either validated or quoted. The
 // txid must be a canonical 32-byte hash (validTxID) or the submission is
@@ -584,33 +697,48 @@ func validTxID(s string) bool {
 // server also chooses) go through safeText, so a hostile node cannot move the
 // cursor, clear the screen or start a new line inside an error message. There
 // is no raw echo of node bytes left on this path (audit S-13).
-func postTxHex(url string, raw []byte) (string, error) {
+//
+// The seat fields are additive and optional: a node that does not report them
+// yields Seated == nil and no warning, so an older node keeps working (M5's
+// additive /status contract, applied to this reply).
+func postTxHex(url string, raw []byte) (txReceipt, error) {
 	resp, err := claimHTTP.Post(url, "application/octet-stream", strings.NewReader(hex.EncodeToString(raw)))
 	if err != nil {
-		return "", err
+		return txReceipt{}, err
 	}
 	defer resp.Body.Close()
 	var out struct {
-		TxID  string `json:"txid"`
-		Error string `json:"error"`
+		TxID    string `json:"txid"`
+		Error   string `json:"error"`
+		Seated  *bool  `json:"seated"`
+		Warning string `json:"warning"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return "", fmt.Errorf("%s: unreadable reply: %w", safeText(resp.Status), err)
+		return txReceipt{}, fmt.Errorf("%s: unreadable reply: %w", safeText(resp.Status), err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		if out.Error != "" {
-			return "", fmt.Errorf("%s: %s", safeText(resp.Status), safeText(out.Error))
+			return txReceipt{}, fmt.Errorf("%s: %s", safeText(resp.Status), safeText(out.Error))
 		}
-		return "", fmt.Errorf("%s", safeText(resp.Status))
+		return txReceipt{}, fmt.Errorf("%s", safeText(resp.Status))
 	}
 	if !validTxID(out.TxID) {
 		// The bad value is quoted, never echoed: it is exactly the string that
 		// must not reach the terminal raw, and quoting keeps its ESC/CR bytes
 		// visible as escapes instead of executing them.
-		return "", fmt.Errorf("%s: the node's reply carried a txid that is not 64 lowercase hex characters (%s); refusing to print it as a receipt",
+		return txReceipt{}, fmt.Errorf("%s: the node's reply carried a txid that is not 64 lowercase hex characters (%s); refusing to print it as a receipt",
 			safeText(resp.Status), safeText(out.TxID))
 	}
-	return out.TxID, nil
+	// A warning is prose chosen by the node, printed on the operator's terminal:
+	// same rule as every other node-supplied string here, one line, no control
+	// bytes (safeText), and only when the node also said it is unseated - a
+	// warning without `seated: false` is a contradiction this CLI will not
+	// invent a meaning for.
+	rc := txReceipt{TxID: out.TxID, Seated: out.Seated}
+	if out.Seated != nil && !*out.Seated && out.Warning != "" {
+		rc.Warning = safeText(out.Warning)
+	}
+	return rc, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -650,7 +778,7 @@ func postTxHex(url string, raw []byte) (string, error) {
 // It is returned at the point a verb refuses for lack of funds or stake, so an
 // operator meets it with the command in hand rather than in a doc they have not
 // opened yet.
-const stakingFundingNote = "no shipped genesis gives an operator's key MIN_STAKE in spendable funds: the faucet pays one claim per key per epoch, so the 1,001-claim, 1,001-transfer path to this balance is ~2,002 blocks of emission (README \"Staking\" derives it), not a starting balance"
+const stakingFundingNote = "no shipped genesis gives an operator's key MIN_STAKE in spendable funds: the faucet pays one claim per key per epoch, so the path to this balance is 1,001 claims (b10coin claim --key) from 1,001 keys plus 1,001 transfers (b10coin send) into one address, ~2,002 blocks of emission (README \"Staking\" derives it), not a starting balance. claim follows the genesis of whichever node it is pointed at, so this path exists on a committee chain too - or list the key in the committee file and skip it"
 
 // fundingNote returns the MIN_STAKE hint, prefixed for appending to a refusal,
 // ONLY when the account's spendable balance is itself below MIN_STAKE.
@@ -859,12 +987,13 @@ func cmdStake(args []string) error {
 	if t.status.EpochBlocks > 0 {
 		effect = fmt.Sprintf("the bond is applied when a block includes it; the seat it buys is considered at the next epoch boundary (every %d blocks as this node reports it), never mid-epoch", t.status.EpochBlocks)
 	}
-	txid, posted, err := t.submit(tx, txOptions{maxFee: *maxFee, yes: *yes, dryRun: *dryRun}, txProvenance{amount: "from --amount", effect: effect})
+	rc, posted, err := t.submit(tx, txOptions{maxFee: *maxFee, yes: *yes, dryRun: *dryRun}, txProvenance{amount: "from --amount", effect: effect})
 	if err != nil {
 		return err
 	}
 	if posted {
-		fmt.Printf("txid        %s\n", txid)
+		fmt.Printf("txid        %s\n", rc.TxID)
+		printSeatWarning(rc)
 	}
 	return nil
 }
@@ -943,12 +1072,13 @@ func cmdUnstake(args []string) error {
 	effect := unbondEffect(amount, t.account.Bonded, t.account.BondUnfunded, t.status)
 	// An exit carries fee 0 by consensus, so its ceiling is 0: any non-zero
 	// fee this verb somehow built would be refused rather than signed.
-	txid, posted, err := t.submit(tx, txOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{amount: amountSource, effect: effect})
+	rc, posted, err := t.submit(tx, txOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{amount: amountSource, effect: effect})
 	if err != nil {
 		return err
 	}
 	if posted {
-		fmt.Printf("txid        %s\n", txid)
+		fmt.Printf("txid        %s\n", rc.TxID)
+		printSeatWarning(rc)
 	}
 	return nil
 }
@@ -1015,7 +1145,7 @@ func cmdWithdraw(args []string) error {
 	// An exit carries fee 0 by consensus, so its ceiling is 0. The payout is
 	// the state's (applyWithdraw derives it from every matured record), and the
 	// node's count is shown as the node's claim, not as a field of the bytes.
-	txid, posted, err := t.submit(tx, txOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{
+	rc, posted, err := t.submit(tx, txOptions{maxFee: 0, yes: *yes, dryRun: *dryRun}, txProvenance{
 		note: fmt.Sprintf("%d matured record(s), %s b10 (%d sparks), released to the spendable balance",
 			matured, genesis.FormatB10(total), total),
 	})
@@ -1023,7 +1153,8 @@ func cmdWithdraw(args []string) error {
 		return err
 	}
 	if posted {
-		fmt.Printf("txid        %s\n", txid)
+		fmt.Printf("txid        %s\n", rc.TxID)
+		printSeatWarning(rc)
 		fmt.Printf("withdraw    %d matured record(s), %s b10 (%d sparks), back to the spendable balance\n", matured, genesis.FormatB10(total), total)
 	}
 	fmt.Println("withdraw releases EVERY record that is mature when the block applies; a second withdraw of the same record pays nothing.")
@@ -1208,10 +1339,14 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	}
 	defer c.Close()
 
-	_, priv := genesis.DevValidatorKey()
+	pub, priv := genesis.DevValidatorKey()
 	mp := mempool.New(10_000, c.Genesis().Hash(), c.AdmissionHead)
 	n := node.New(c, priv, mp)
-	srv := rpc.NewServer(c, mp)
+	// The producer signs every block and holds the chain's only seat, so its
+	// POST /tx can say so (testrun S-2); a server built without the key would
+	// have to stay silent, which on the one node that includes everything
+	// would be the wrong kind of quiet.
+	srv := rpc.NewServerWithSigningKey(c, mp, pub)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1438,7 +1573,10 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers,
 		fmt.Fprintln(os.Stderr, strings.Repeat("=", 72))
 	}
 
-	srv := rpc.NewServer(v.Chain(), v.Pool())
+	// The signing key goes in with the chain and the pool: POST /tx is where an
+	// operator learns that a transaction posted here has nowhere to go, and
+	// only this node can say whether its own key holds a seat (testrun S-2).
+	srv := rpc.NewServerWithSigningKey(v.Chain(), v.Pool(), v.SigningKey())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

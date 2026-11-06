@@ -429,9 +429,25 @@ delivered — Ctrl-C still reaches the same clean path.
 
 Solves the faucet puzzle locally and submits one claim to a running node (the
 `node` command's default HTTP address is the claim command's default target).
-The puzzle's parameters are genesis state, not carried on the wire: the claim
-command solves with the compiled-in devnet parameters an M2 node runs, and it
-bails out if the node it is talking to runs a different chain.
+**The claim follows the genesis of the node it is pointed at**: it reads
+`/status` for that chain's genesis hash and epoch length, signs over the hash
+the node reports, and derives the claim's epoch from the length the node
+reports — so a committee-file chain and a simnet committee are claimable exactly
+as the devnet is, and a claim is never signed for a chain this CLI assumed.
+(The 2026-11-06 test run is why: the command used to refuse every chain whose ID
+was not `b10coin-devnet-1`, which meant no shipped command could fund a key on a
+chain built by the deploy recipe. The decision and its reasoning are in
+[decisions-2026-11-06-s2-s3.md](docs/decisions-2026-11-06-s2-s3.md).)
+
+The puzzle's **cost and target** are the one part of the parameters that is not
+on the wire, and the command solves with the compiled-in fixture tuning. That is
+correct rather than assumed: every chain a node of this build can open carries
+it — the devnet genesis defines it, and both the simnet committee and the
+committee-file loader start from `genesis.Devnet()` and override only the
+identity, the validator list and the seat count. The node is the verifier — the
+state machine re-derives the digest with its own parameters — so a claim solved
+against another tuning cannot apply; it is dropped by the proposer's
+applicability filter instead of riding a block.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -513,6 +529,39 @@ The recipient is credited only when a block includes the transaction; the
 `send` refuses a zero amount, a self-transfer, a bad address, a fee above the
 ceiling, and a balance that cannot cover `amount + fee` — all before anything is
 signed.
+
+#### Where a transaction has to be posted
+
+**A transaction is not gossiped**, and that is a property of the protocol, not a
+gap to be filled in silence. The wire carries proposals, votes, HELLOs, block
+sync and peer exchange — no message type carries a transaction at all. A block
+is built from the **local mempool of the validator whose turn it is to
+propose**: `POST /tx` puts the transaction in that one node's pool, and only
+that node can put it in a block. Two consequences follow, and both change what
+an operator should do:
+
+- **Post to a validator that holds a seat.** A node whose key is not in the
+  committee at the coming height never proposes, so its pool never feeds a
+  block: a transaction posted there is **accepted with a txid and waits
+  forever**. The measurement this section comes from: an `Unbond` posted to a
+  displaced (unseated) seat sat in that node's mempool for **400 blocks**, and
+  the same bytes posted to a seated validator applied in **12 seconds**.
+- **Even on a seated validator, a transaction waits for that node's proposer
+  turn** — one height in the committee size, so roughly **one height in ten** at
+  ten seats. The txid is the receipt for *acceptance*; inclusion is a later
+  block, observed with `balance` or `history`.
+
+Since the 2026-11-06 test run, `POST /tx` says which case you are in. Its reply
+carries `"seated": true|false` for the node's own signing key, evaluated at the
+height the transaction would have to be carried at (head + 1, so an epoch
+boundary is already the next epoch's committee), and when it is `false` a
+`warning` sentence naming the height and what the pool now means. The wallet
+verbs print that warning beside the txid, on stderr. `"seated": false` is still
+a **200**: the transaction really was admitted, and a refusal would tell a
+client its bytes were wrong when they are fine — what the operator needs to know
+is that admission was the last thing that will happen to it, and to post the
+same bytes to a seated validator. A node built without a signing key (a test, an
+embedded reader) reports neither field rather than guessing.
 
 ### `b10coin stake`, `b10coin unstake`, `b10coin withdraw`
 
@@ -622,10 +671,19 @@ no longer a dead end: `claim --key PATH` signs a claim for a key file the
 operator holds, and `send` transfers the result. The path to a bond therefore
 exists, but it is long: **1,001 claims from 1,001 keys, then 1,001 transfers
 into one address**, because each transfer burns its 1-spark fee —
-1,001 × 10^8 − 1,001 = 100,099,998,999 sparks ≥ 10^11 — paid for by **2,002
-blocks** of 0.5 b10/block emission, about **67 minutes** at 2 s blocks. The
-walkthrough takes one claim and one send, not this path, and M6 does not shorten
-it. The refusal messages say no shipped genesis funds the key and point at
+1,001 × 10^8 − 1,001 = 100,099,998,999 sparks ≥ 10^11 — paid by **2,002
+blocks** of 0.5 b10/block emission, about **67 minutes** at 2 s blocks.
+
+That path is walkable **on any chain a node of this build can open**, not only
+on the devnet fixture: `claim` follows the genesis of the node it is pointed at
+(see [`b10coin claim`](#b10coin-claim)), so the arithmetic above — which is the
+shipped parameters' 1 b10 per claim — applies to a committee-file chain too, and
+the claim amount a page or a node reports is the chain's own parameter. There is
+also a **cheaper route** for an operator who can edit the committee file: list
+the key there. A genesis seat is a genesis bond — which is what the deploy
+recipe does — and then no claims are needed at all. The walkthrough takes one
+claim and one send, not this path, and M6 does not shorten it. The refusal
+messages say no shipped genesis funds the key and point at
 [Staking](#staking), which carries the derivation.
 
 ### `b10coin-relay`
@@ -711,6 +769,32 @@ residual is stated rather than glossed: a flooder that fills the queue
 *before* another sender has queued anything can still occupy all of it, and
 that late sender's frames drop until the backlog drains; a receiver too slow
 to drain it is ended by the write timeout below, which is what bounds the pin.
+
+**A size reservation keeps consensus frames out of the bulk.** The fair share
+is per *sender*, and in a catch-up it does not help: the peers that answer
+BLOCK_SYNC are the same peers that vote, so one sender legitimately sends both
+a 160 KiB response and a 150-byte vote, and two such responses fill a 2 MiB
+queue between them. Frame **size** is the one property that separates the two
+flows, and it is the one the relay already reads (the length prefix), so a
+queue now keeps its last **64 KiB** free of frames larger than **4 KiB**: bulk
+(catch-up responses, transaction-bearing proposals) may hold
+`write-queue-bytes - 64 KiB`, while a consensus-sized frame (a vote, a HELLO,
+a peer exchange, a sync request, a transaction-free proposal) may use the whole
+budget exactly as before. The writer also takes consensus-sized frames first,
+so the reservation does not merely turn a dropped vote into a late one. It is
+a **sub-limit on bulk, never new capacity**: the byte budget, the frame count,
+the entry ring and therefore `MaxPinnedBytes` are unchanged to the byte, and
+nothing is decoded to enforce it. It cannot be gamed without parsing either: a
+frame reaches the reserved room only by *being* at most 4 KiB, and no header
+can make a 160 KiB response small. 64 KiB is sized from the receiving node's
+own relay byte budget (`tcp.Options.RelayBytesPerSec`, default 512 KiB/s,
+audit PX-4): its drain is 125 ms, inside the 200 ms base round timeout, and it
+holds ~330 vote-sized frames. The irreducible residual is one bulk frame
+already in the writer's hand — the socket cannot carry another frame in the
+middle of one — so a vote that arrives mid-response waits for the rest of that
+frame (typically ~0.3 s, at worst one `--max-frame-bytes` frame) rather than for
+the whole queue.
+
 And two socket-level timers
 bound how long a connection may *hold* what it has taken — nothing is parsed to
 enforce them. The per-frame read timeout (`--read-timeout`, default 120
@@ -745,7 +829,14 @@ heap and the full registry over **1 GiB**, against a documented 128 MiB, and
 `MemoryMax=256M` was 4× too small. This derivation has all three terms, the
 frame cap is what bounds the entries structurally, and
 `relay.Options.MaxPinnedBytes` computes exactly it from the option fields.)
-`--max-conns-per-ip` additionally bounds slots per source prefix, and TCP
+`--max-conns-per-ip` additionally bounds slots per source prefix — and the
+operators it can surprise are the honest ones: a Docker bridge, a LAN or one
+home NAT puts every validator behind ONE IPv4 `/24`, so a committee bigger than
+8 on one prefix loses the rest at accept, and the node that lost its dial says
+EOF (its message now names this cap beside the token; the relay's
+`RefusedConns` counter confirms it). The bound is not raised by default because
+it is the number of registry slots one host may hold — raise the flag instead,
+and TCP
 keepalive (`--keepalive`, default 15 seconds) reaps a half-open connection —
 a peer that vanished without closing, e.g. a power cut — after the kernel's
 unanswered probes, again without the relay looking at any byte. In production
@@ -764,8 +855,8 @@ backoff. Bandwidth is kilobytes per second.
 | `--external-allowlist` | *off* | acknowledge that a wildcard `--addr` with no token is safe because something outside this process restricts who can reach the port — a cloud security group, a ufw allowlist, or the shipped systemd unit's `IPAddressDeny`/`IPAddressAllow`. Without it that combination exits 2 before a listener exists (audit S-16) |
 | `--max-frame-bytes N` | `1114112` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic). The default is `wire.MaxFrameBytes`: one max-size block (`types.MaxBlockBytes`, 1 MiB) plus 64 KiB for the envelope a message may wrap around it — a certificate at the 255-seat committee ceiling is 36,975 bytes — because a bound equal to the block bound would sever exactly the max-size blocks validators are entitled to propose |
 | `--max-conns N` | `32` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
-| `--max-conns-per-ip N` | `8` | how many of those slots one source **prefix** may hold — the IPv6 `/64` or IPv4 `/24`, IPv4-mapped IPv6 unmapped, masked — so a routed prefix cannot bypass the cap by rotating addresses; a dial from a prefix at its cap is closed at accept |
-| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than its contention-relative allowance — its equal share of the queue budget (`limit/senders`) once another account holds bytes there, and the whole budget while none does, so a lone sender uses the whole budget, a sharing sender is held to its share, and two connections from one host share one account. Residual: a flooder that fills the queue before another sender queues anything can occupy all of it until the write timeout reaps a slow receiver |
+| `--max-conns-per-ip N` | `8` | how many of those slots one source **prefix** may hold — the IPv6 `/64` or IPv4 `/24`, IPv4-mapped IPv6 unmapped, masked — so a routed prefix cannot bypass the cap by rotating addresses; a dial from a prefix at its cap is closed at accept. **The consequence for validators behind one NAT, LAN or Docker bridge:** they share one IPv4 `/24`, so they share this budget, and a group of more than 8 loses the extra connections at the door — 2 of 10 validators on one bridge were refused in the 2026-11-06 run. Those validators commit without the refused ones (8 of 10 still reach quorum), so the symptom is *fewer validators than you started*, not a stalled chain. The default is deliberately not raised: the cap is the registry bound one host can hold. Raise it above the number of validators behind that prefix (`--max-conns-per-ip 16` for ten on one bridge), or run one prefix per validator. The node's refusal message names this cap as well as the token, because a refused dial is closed **before** the relay announces the access-token gate, so a node sees only EOF (testrun N-2) |
+| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than its contention-relative allowance — its equal share of the queue budget (`limit/senders`) once another account holds bytes there, and the whole budget while none does, so a lone sender uses the whole budget, a sharing sender is held to its share, and two connections from one host share one account. The last **64 KiB** of it is reserved for frames of at most **4 KiB** (votes, HELLOs, peer exchange, sync requests, transaction-free proposals) and bulk is capped at `N - 64 KiB`; the writer drains consensus-sized frames first. Residual: a flooder that fills the queue before another sender queues anything can occupy all of it until the write timeout reaps a slow receiver, and a frame queued while a bulk write is already in progress waits for the rest of that write |
 | `--write-queue-frames N` | `4096` | per-connection write-queue bound in **frames**: the entry ring, so the queue's per-frame memory is structural (a byte budget alone admits ~2 million one-byte entries). Counted into `relay.Options.MaxPinnedBytes` at 32 bytes each |
 | `--write-timeout SECONDS` | `30` | per-connection write deadline, anchored to when the queue became non-empty: the backlog must drain to empty within it, so a never-reading sink **and** a slow-reading one are ended and their queued bytes and entry ring released |
 | `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |
@@ -959,12 +1050,45 @@ and the jump that would pull it forward needs 2 of the 4 seats ahead — if the
 next node is already stopping, only one is. So restart the members within one
 block time of each other, or one at a time **waiting for the chain to advance
 before stopping the next**, or expect the wait; [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
-has the operator's version. A node that has spent eight rounds at one height
-while the seats it can reach hold a quorum now says so, once per height:
-`b10coin: no block for 8 rounds at height H (round R, step S): quorum reachable
-with P of T power (quorum Q), yet nothing commits; peers=…; tallies …` — with
-the per-round vote tallies and the peers it sees, so the stall is no longer
-silent.
+has the operator's version. The same divergence explains a slow **first**
+start: a ten-validator committee brought up one container at a time, a few
+seconds apart, sat at height 0 for about 53 s (rounds 16–34) in the 2026-11-06
+Docker run before the ladder closed it — no block was lost, because none had
+been produced yet. Start the members together, or wait for the chain to
+advance before starting the next. A node now says so, once per height, when a
+height has been undecided for **eight rounds *and* 30 seconds** of its own
+clock — two shapes, because they mean different things and have different
+fixes:
+
+- **while the seats it can reach hold a quorum:** `b10coin: no block for N
+  rounds at height H (round R, step S): quorum reachable with P of T power
+  (quorum Q), yet nothing commits; peers=…; tallies …` — the per-round vote
+  tallies and the peers it sees;
+- **when they do not:** `… and the quorum is UNREACHABLE: this node can reach P
+  of T power and the quorum is Q … the committee for height H+1 DOES derive (S
+  seats), so the cause is not a missing derivation: it is seats with no node
+  behind them … the K seat(s) it hears nothing from are K[seatN power=X, …]` —
+  the seats an operator has to go and start, named with the power they hold.
+
+The second line is what makes a **permanent** halt diagnosable: two bonded keys
+with no nodes behind them (above) leave a state that no round, restart or wait
+can clear, because the `Unbond` that would free a seat can only travel in a
+block this height refuses. It is also distinct from the third shape, a height
+whose next committee cannot be derived at all: that one prints the derivation
+failure and **no** quorum, because a power figure measured against any other set
+would be wrong.
+
+Thirty seconds is the point of the time threshold: eight rounds alone pass in
+about 4 s at the shipped ladder (200 ms base + 100 ms step), so the line used to
+fire on seconds-long hiccups — 40 lines in four bursts during normal ten-seat
+running and 20 during the documented one-at-a-time restart, whose longest gap was
+8.4 s — while a stall that matters holds for minutes. It also does not fire on a
+node that is **merely catching up**: a fresh peer announcing a height above ours
+means there are certified blocks still to fetch, which is not a stall. Peers are
+named by their **genesis seat** (`seat0`, `seat1`, … — the `--index` name and the
+transport's `vN`), not by their position in the committee at that height: the
+stake-then-key derivation reorders that committee at every boundary, so an
+index-based list renames the same node at every epoch.
 
 **That stall and the 3-seat stall are two different faults, and the difference
 is worth keeping straight.** The 3-seat one (fixed by `5af2174`, pinned in
@@ -1249,22 +1373,38 @@ quorum threshold decide it.
   three bonds are `MIN_STAKE` (`quorumFor(3·MIN_STAKE) = 2·MIN_STAKE + 1`), and
   far less when the dead seat is a whale bond against one-spark fixture seats.
   Nothing can commit; the chain halts at the epoch boundary.
-- **Four or more seats: the chain keeps committing without it.** At four seats
-  the one-quarter cap applies, so no seat holds more than 1/4 of the total power:
-  dropping the seat that has no signer leaves **at least 3/4 of the power**,
-  which is above the 2/3 threshold. At four seats that is exactly 3 of 4 power
-  (`quorumFor(4) = 3`, and three seats hold 3/4 > 2/3). With equal seats the
-  threshold needs at most `floor(2N/3)+1` of the N, and the `N-1` survivors
-  always supply that many for `N >= 4` — exactly at 4, 5 and 6 seats, with slack
-  above that. (Two silent seats are still fatal up to six seats: `(N-2)/N > 2/3`
-  needs `N >= 7`.) Only the node that lost its seat stops voting: it keeps its
+- **Four or more seats, ONE silent seat: the chain keeps committing.** At four
+  seats the one-quarter cap applies, so no seat holds more than 1/4 of the total
+  power: dropping the one seat that has no signer leaves **at least 3/4 of the
+  power**, which is above the 2/3 threshold whatever the seat sizes are. At four
+  equal seats that is exactly 3 of 4 power (`quorumFor(4) = 3`, and three seats
+  hold 3/4 > 2/3). Only the node that lost its seat stops voting: it keeps its
   links and can still adopt certified blocks, but it can no longer propose or
   vote, and nothing waits for it.
+- **TWO silent seats are NOT safe, and the old rule here was wrong.** It said
+  two silent seats are tolerated from `N >= 7`, which counts *seats* as if they
+  carried equal power: `(N-2)/N > 2/3` needs `N >= 7` only when every seat holds
+  the same share. **The cap makes seats unequal by construction** — it clamps a
+  large bond down to a quarter of the seated total — so the power test, not the
+  seat count, is the one that decides: the live share must exceed two thirds of
+  the total, and two seats pinned at the cap hold half of it between them. That
+  half is below two thirds at **every** N. The 2026-11-06 Docker run measured it:
+  on a ten-seat fixture chain, two keys bonded 10^11 each with no node behind
+  either. The cap's fixed point is 4 + 4 of a 16 total against the eight power-1
+  fixture seats (`quorumFor(16) = 11`), so eight of sixteen power stayed live
+  and the chain halted at the boundary — for over nine minutes, with no
+  transaction able to free the seats. With ONE such bond the same chain runs at
+  **exactly** quorum: the fixed point is 3 + 9 of 12, `quorumFor(12) = 9`, and
+  nine live seats supply 9 — one further failure anywhere below is fatal. A
+  chain in that state now says so in its own log line (see
+  [Consensus](#consensus)); it does not fix it.
 
 Either way the seat is wasted, and the deployment is one further failure from a
 stall — so stake only with the key whose node will run as that validator, and
-keep every genesis key's node running. The three-seat recipe halts; the
-four-seat recipes lose one seat's worth of safety margin and keep finalising.
+keep every genesis key's node running. The three-seat recipe halts; a
+four-or-more-seat recipe loses one seat's worth of safety margin and keeps
+finalising, and loses finality outright if a second seat goes silent while both
+of them sit at the cap.
 
 **The end-to-end run behind these claims** (one process, a devnet-parameter
 chain, the fixture key file described above): `stake --amount 1000` submitted a
@@ -1305,7 +1445,7 @@ by `cmd` alone.
 | `internal/chain` | Owns the canonical chain: validates and appends blocks, replays them on startup — requiring each stored block to claim its stored position and link its predecessor — and verifies the recomputed state root against each committed header; internal state is mutex-guarded for RPC concurrency. M5 adds `CommitteeAt(h)`: the one per-height committee (an epoch's seats, memoised when its deciding state is committed), read by consensus, the certificate gate and the vote router |
 | `internal/mempool` | Bounded, deduplicated set of pending signed transactions, safe for concurrent use, one validation error per transaction. Admission is **stateful** against the head state a block would execute now (audit R-1): a faucet claim is refused for a wrong epoch, an already-spent claim marker, a wrong nonce or a missing cheap outer puzzle before any Argon2id evaluation; claims are capped in a sub-pool separate from transfers and per sender, and a claim `Take` keeps skipping ages out. A full pool refuses a new transaction rather than evicting an older one |
 | `internal/node` | Wires chain and mempool into block production; in M1 one node appends exactly one block per tick, evicting only unapplicable transactions |
-| `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size, and since M5 `genesis_hash`, `min_fee_sparks`, `min_stake_sparks`, `epoch_blocks`, `unbonding_epochs`, `committee_size` — fields are added, never renamed), `GET /block/{height}`, `GET /account/{address}` (balance, nonce, bonded, `bond_unfunded`, and each unbonding record's `amount` and `release_height`; the unbonding list takes `?limit=`/`?offset=` and reports `unbonding_total`, and no reply carries more than 256 records), and `POST /tx` (hex-encoded canonical transaction bytes). M6 adds `GET /history?address=…&blocks=…` (the bounded backward scan the wallet reads; `address` is optional for the explorer's feed), the server-rendered `GET /faucet` and `GET /explorer` pages on the same listener (no second listener, no JavaScript), and `claim_amount_sparks` on `/status` |
+| `internal/rpc` | HTTP JSON API: `GET /status` (chain ID, height, head hash, state root, mempool size, and since M5 `genesis_hash`, `min_fee_sparks`, `min_stake_sparks`, `epoch_blocks`, `unbonding_epochs`, `committee_size` — fields are added, never renamed), `GET /block/{height}`, `GET /account/{address}` (balance, nonce, bonded, `bond_unfunded`, and each unbonding record's `amount` and `release_height`; the unbonding list takes `?limit=`/`?offset=` and reports `unbonding_total`, and no reply carries more than 256 records), and `POST /tx` (hex-encoded canonical transaction bytes; since the 2026-11-06 test run the reply also carries `seated` and, on an unseated node, `warning` — see [Where a transaction has to be posted](#where-a-transaction-has-to-be-posted)). M6 adds `GET /history?address=…&blocks=…` (the bounded backward scan the wallet reads; `address` is optional for the explorer's feed), the server-rendered `GET /faucet` and `GET /explorer` pages on the same listener (no second listener, no JavaScript), and `claim_amount_sparks` on `/status` |
 | `internal/consensus` | The M3 BFT engine: the four-phase round (propose, prevote, precommit, commit), signed vote tallies with one vote per validator, the two-thirds-of-TOTAL-power quorum, precommit locking unlockable only by a verified justification, and the power-cap, proposer-selection and escalation-timeout parameters. M4 adds BLOCK_SYNC catch-up and a certificate log: a commit certificate is persisted to the data directory, so a restarted validator still serves the evidence for blocks it adopted before it restarted |
 | `internal/transport` | The Transport boundary (Broadcast/OnMessage/Peers) the engine speaks over, so the simulated network and M4's real one are interchangeable |
 | `internal/transport/sim` | The deterministic simulated network: seeded latency, jitter, loss, reordering and partitions over a virtual clock |
@@ -1438,7 +1578,11 @@ pair: it runs the same release script with `--only linux/arm64` and copies
 the result into `bin/` under the names the recipe's scp lines use, so a
 version bump never breaks the recipe (and
 `scripts/deploy/build.sh linux/amd64` produces the relay an amd64 VPS wants —
-see its §2). CI (`.github/workflows/ci.yml`) runs the release build for every
+see its §2). **A wrapper run replaces `dist/`:** `scripts/build-release.sh`
+starts every run by wiping it (its header says so, and the wrapper's does
+too), so copy a full six-target release out before running the wrapper if you
+want to keep it — `dist/` then holds only the one target that run built. CI
+(`.github/workflows/ci.yml`) runs the release build for every
 target and asserts every artifact on every push, so the Pi binary cannot rot
 silently. The version the binaries print comes from `internal/version`; no
 build-flag override adds a second source of truth. The Pi is the *acceptance*
@@ -1460,9 +1604,10 @@ restart`, or reboot them together), because a one-at-a-time restart leaves
 their rounds apart and can keep the chain at one head for minutes — the
 2026-10-30 Docker re-run measured 4 to 6.5 minutes. If you must restart one
 at a time, wait for the chain to advance after each restart before stopping
-the next. A node now logs the stall once per height (`b10coin: no block for 8
-rounds at height …`) and, at startup, the round it resumes at (`consensus
-resuming height H at round R …`), and
+the next. A node now logs the stall once per height (`b10coin: no block for N
+rounds at height …`, after eight rounds **and** 30 s at that height) and, at
+startup, the round it resumes at (`consensus resuming height H at round R …`),
+and
 [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
 has the operator's procedure.
 
