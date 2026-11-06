@@ -1136,6 +1136,25 @@ func (s *Store) scanRounds() error {
 // offset of its record. The payloads are NOT kept in memory - see the Store
 // doc - so this pass rebuilds an index, not an archive.
 //
+// It STREAMS the log (audit S-12), the way scanSegment streams the block
+// segments: one fixed-width header read per record, the offset indexed, the
+// payload skipped byte for byte. The old pass called os.ReadFile, so Open
+// allocated the whole log - every certificate payload of every committed height
+// - in ONE make before it had indexed anything. That is the one log whose size
+// is not bounded by a prune (there is no PruneCerts: serving an old height's
+// certificate is why the file exists), so it is the one log where that cost
+// compounds for the life of the chain: ~2.1 KB per height at ~15 precommits is
+// ~2.1 GB at a million heights, which is an OOM kill at Open on the machines
+// the README targets, after which the node cannot restart at all.
+//
+// The cost of skipping the payload is that this pass cannot verify the
+// trailer checksum over it. That is a deliberate trade and it is safe: the
+// length prefix carries its own checksum, verified here BEFORE the length is
+// trusted, so no corrupt record can mis-frame the records after it; and CertAt
+// re-verifies the whole record's checksum before serving it, so a corrupt
+// payload is an ABSENT certificate at read time, never a wrong one. Framing
+// corruption - a header that disagrees with the file - still stops the scan.
+//
 // The error policy is the block log's, not the lock log's: what a torn tail
 // can destroy here is archival evidence for one height, never a safety
 // promise. A certificate that never completed means this node cannot serve
@@ -1145,30 +1164,47 @@ func (s *Store) scanRounds() error {
 // a record whose length cannot be trusted cannot be framed at all.
 func (s *Store) scanCerts() error {
 	path := filepath.Join(s.dir, certLogName)
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil // no certificate was ever recorded
 	}
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := fi.Size()
 	// The segment header, as in the two logs above. A pre-header certificate
 	// log is refused as an unrecognised format rather than truncated: the
 	// archive is not a safety promise, but a truncated log would silently
 	// renumber the heights it indexes, which is worse than refusing to read it.
-	headLen := min(int64(len(raw)), int64(SegmentHeaderLen))
-	switch err := classifySegmentHeader(raw[:headLen]); {
+	headLen := min(size, int64(SegmentHeaderLen))
+	var head [SegmentHeaderLen]byte
+	if headLen > 0 {
+		if _, err := f.ReadAt(head[:headLen], 0); err != nil {
+			return err
+		}
+	}
+	switch err := classifySegmentHeader(head[:headLen]); {
 	case err == nil:
 	case errors.Is(err, errTornRecord):
+		_ = f.Close()
 		return s.truncateTail(path, 0)
 	default:
 		return fmt.Errorf("%w%s", err, formatHint(path))
 	}
 	off := int64(SegmentHeaderLen)
-	for off < int64(len(raw)) {
-		n, recEnd, err := frame(raw, off, -1)
+	var key [certHeightLen]byte
+	for off < size {
+		n, recEnd, err := readRecordAt(f, size, off, -1)
 		if err != nil {
 			if errors.Is(err, errTornRecord) {
+				// Close before truncating: Windows refuses os.Truncate while a
+				// handle is open. The deferred Close then no-ops.
+				_ = f.Close()
 				return s.truncateTail(path, off)
 			}
 			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, certLogName, err)
@@ -1176,17 +1212,15 @@ func (s *Store) scanCerts() error {
 		if n < certHeightLen {
 			return fmt.Errorf("%w: certificate record at offset %d of %s carries %d bytes, too few for its height", ErrCorruptRecord, off, certLogName, n)
 		}
-		payStart := off + RecordHeaderLen
-		framed := raw[off : payStart+n : payStart+n]
-		want := binary.BigEndian.Uint32(raw[payStart+n : recEnd])
-		if crc32.Checksum(framed, crcTable) != want {
-			return fmt.Errorf("%w: certificate record checksum mismatch at offset %d of %s", ErrCorruptRecord, off, certLogName)
+		// The height key is the only payload byte this pass needs: everything
+		// after it is opaque to the store, and CertAt reads it back on demand.
+		if _, err := f.ReadAt(key[:], off+RecordHeaderLen); err != nil {
+			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, certLogName, err)
 		}
-		height := binary.BigEndian.Uint64(raw[payStart : payStart+certHeightLen])
 		// Newest wins: a height is certified once, and the store's PutCert
 		// refuses to append a second record for it, so only a hand-written
 		// file can present two.
-		s.certIndex[height] = off
+		s.certIndex[binary.BigEndian.Uint64(key[:])] = off
 		off = recEnd
 	}
 	return nil
@@ -1233,36 +1267,41 @@ func (s *Store) CertAt(height uint64) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	// The record was framed by scanCerts/PutCert, but the file lives on disk:
-	// re-validate rather than trusting the offset, and report absence (never
-	// a panic, never a short read) if it no longer holds.
-	header := make([]byte, RecordHeaderLen)
-	if _, err := s.certFile.ReadAt(header, off); err != nil {
+	// The record was framed by scanCerts/PutCert, but the file lives on disk, so
+	// re-validate rather than trusting the offset (audit S-12). Frame it against
+	// the file's CURRENT size FIRST: the length prefix is a number the file
+	// states, and a stale offset or an edited log can leave it claiming a
+	// payload the file does not hold. Allocating on that number's word is how a
+	// 54-byte file asks for 64 MiB. A record that does not frame is an absence,
+	// never a panic and never a short read.
+	fi, err := s.certFile.Stat()
+	if err != nil {
 		return nil, false
 	}
-	if crc32.Checksum(header[:lengthFieldLen], crcTable) != binary.BigEndian.Uint32(header[lengthFieldLen:]) {
+	n, _, err := readRecordAt(s.certFile, fi.Size(), off, -1)
+	if err != nil || n < certHeightLen || uint64(n) > uint64(math.MaxInt) {
 		return nil, false
 	}
-	n := binary.BigEndian.Uint64(header[:lengthFieldLen])
-	if n < certHeightLen || n > uint64(math.MaxInt) {
+	// One read of the whole framed record, now that its width is known to fit.
+	rec := make([]byte, RecordHeaderLen+int(n)+RecordTrailerLen)
+	if _, err := s.certFile.ReadAt(rec, off); err != nil {
 		return nil, false
 	}
-	body := make([]byte, n)
-	if _, err := s.certFile.ReadAt(body, off+RecordHeaderLen); err != nil {
+	payEnd := RecordHeaderLen + int(n)
+	if crc32.Checksum(rec[:payEnd], crcTable) != binary.BigEndian.Uint32(rec[payEnd:]) {
 		return nil, false
 	}
-	framed := make([]byte, 0, RecordHeaderLen+int(n))
-	framed = append(framed, header...)
-	framed = append(framed, body...)
-	var trailer [RecordTrailerLen]byte
-	if _, err := s.certFile.ReadAt(trailer[:], off+RecordHeaderLen+int64(n)); err != nil {
-		return nil, false
-	}
-	if crc32.Checksum(framed, crcTable) != binary.BigEndian.Uint32(trailer[:]) {
+	pay := rec[RecordHeaderLen:payEnd]
+	// The record at this offset must be the record for this height. Two records
+	// swapped in place keep every checksum valid - the framing moves with the
+	// bytes - so the height key is the only thing that can tell, and serving
+	// another height's certificate under this one would be an answer that is
+	// wrong rather than absent.
+	if binary.BigEndian.Uint64(pay[:certHeightLen]) != height {
 		return nil, false
 	}
 	out := make([]byte, n-certHeightLen)
-	copy(out, body[certHeightLen:])
+	copy(out, pay[certHeightLen:])
 	return out, true
 }
 
