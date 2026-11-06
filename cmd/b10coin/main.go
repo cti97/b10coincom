@@ -586,20 +586,48 @@ func cmdClaim(args []string) error {
 	return nil
 }
 
+// The read paths retry a 503 (testrun 2026-11-06, Info). A 503 from this node
+// is its own "the node is busy scanning for other clients; retry shortly",
+// i.e. the four-slot scan semaphore working as designed (audit R-1/S-8), not a
+// refusal of the request. The CLI used to surface it as exit 1: with 20
+// parallel mixed requests to one node, 4 of 5 `b10coin history` runs failed on
+// a reply that told them in so many words to retry. Only the GET paths use
+// getJSON (the signing verbs' POST has postTxHex), and a GET is idempotent, so
+// a bounded exponential backoff costs a delay and nothing else. No jitter: the
+// caller is one CLI process, and the node's own slots are what it is waiting
+// for.
+const (
+	busyRetries = 3
+	busyBackoff = 50 * time.Millisecond
+)
+
 func getJSON(url string, into any) error {
-	resp, err := claimHTTP.Get(url)
-	if err != nil {
-		return err
+	for attempt := 0; ; attempt++ {
+		resp, err := claimHTTP.Get(url)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusServiceUnavailable && attempt < busyRetries {
+			// Busy, not broken: back off outside the request's timeout and
+			// ask again. The final attempt falls through to the error below,
+			// so a node that stays busy is still reported with its own
+			// sentence instead of being waited on forever.
+			time.Sleep(busyBackoff << attempt)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			// The status line and the body are both the node's text: quote them so
+			// a reply cannot clear the screen or forge a line of this CLI's output
+			// on the read paths (/status, /account, /history) as well (audit S-13).
+			return fmt.Errorf("%s: %s", safeText(resp.Status), safeText(strings.TrimSpace(string(body))))
+		}
+		if readErr != nil {
+			return readErr
+		}
+		return json.NewDecoder(bytes.NewReader(body)).Decode(into)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		// The status line and the body are both the node's text: quote them so
-		// a reply cannot clear the screen or forge a line of this CLI's output
-		// on the read paths (/status, /account, /history) as well (audit S-13).
-		return fmt.Errorf("%s: %s", safeText(resp.Status), safeText(strings.TrimSpace(string(body))))
-	}
-	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(into)
 }
 
 // txidHexLen is the length of a hex-encoded 32-byte transaction ID.
