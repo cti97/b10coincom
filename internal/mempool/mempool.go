@@ -38,13 +38,20 @@ var (
 )
 
 // MaxFaucetClaimsPerBlock bounds how many faucet claims the pool will hand to a
-// single block. A claim costs a full Argon2id evaluation to verify - ~0.125 s
-// at the testnet tuning (8 MiB x 1 pass; a Pi-4 estimate pending
+// single block when the chain's own bound is no tighter. A claim costs a full
+// Argon2id evaluation to verify - ~0.125 s at the testnet tuning (8 MiB x 1
+// pass; a Pi-4 estimate pending
 // re-measurement, cost basis in Testnet's tuning comment) - and a block is
 // attacker-chosen input, so without a bound a pool full of claims that passed
 // the cheap outer puzzle would still hand block production a large multiple of
 // Argon2id work per block. Ordinary transactions are not bounded here: they are
 // cheap to validate and the block size limits already cap them.
+//
+// It is a CEILING, not the bound actually used: Take hands out
+// min(this, state.Params().MaxClaimsPerBlock) claims, because the state's
+// parameter is the consensus rule and a genesis may legally set it lower than
+// this constant (audit S-6). A genesis that sets it HIGHER cannot raise the
+// pool's hand-out past this value.
 //
 // The value 8 is a judgment call, not a derivation. At the testnet tuning it
 // permits a worst-case block of 8 x ~0.125 s = ~1.0 s of Argon2id work against
@@ -554,21 +561,34 @@ func (m *Mempool) forget(e entry) {
 }
 
 // Take removes and returns up to max transactions, in insertion order. At
-// most MaxFaucetClaimsPerBlock of them are faucet claims: each claim costs a
-// full Argon2id evaluation to verify, so claims encountered beyond that bound
-// are skipped and left in the pool for a later block instead of being handed
-// over or dropped. A non-positive max removes nothing and returns an empty
-// slice.
+// most claimBoundLocked() of them are faucet claims: each claim costs a full
+// Argon2id evaluation to verify, so claims encountered beyond that bound are
+// skipped and left in the pool for a later block instead of being handed over
+// or dropped. The bound is the STATE's own per-block claim parameter where it
+// engages one (audit S-6) capped by this package's anti-amplification courtesy,
+// never the constant alone. A non-positive max removes nothing and returns an
+// empty slice.
 //
-// A claim that Take passes over ages: after MaxClaimAgeBlocks skips it is
+// A claim that Take passes over ages: after claimAgeLimitLocked skips it is
 // dropped. Only claims age, and only from being skipped - the policy never
 // evicts a transaction to make room for a newer one, so a fresh flood cannot
-// push out an older honest transaction.
+// push out an older honest transaction. The age limit follows the hand-out
+// rate, so lowering the bound to the state's does not age out claims that are
+// merely waiting their turn.
 func (m *Mempool) Take(max int) []types.Tx {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if max <= 0 {
 		return []types.Tx{}
+	}
+	claimBound := MaxFaucetClaimsPerBlock
+	ageLimit := uint32(MaxClaimAgeBlocks)
+	// The head is consulted only when a claim is actually pending: a claim-free
+	// Take is the common case and needs neither the chain's read lock nor the
+	// bound. m.claims is maintained by insert/forget, so it cannot miss one.
+	if m.claims > 0 {
+		claimBound = m.claimBoundLocked()
+		ageLimit = m.claimAgeLimitLocked(claimBound)
 	}
 	var out []types.Tx
 	keep := m.txs[:0]
@@ -578,10 +598,10 @@ func (m *Mempool) Take(max int) []types.Tx {
 		// The total still respects max, and once it is reached everything
 		// remaining stays in the pool - claims and transfers alike. A claim
 		// past the per-block claim bound is skipped by the same path.
-		if len(out) >= max || (e.tx.Type == types.TxFaucetClaim && claims >= MaxFaucetClaimsPerBlock) {
+		if len(out) >= max || (e.tx.Type == types.TxFaucetClaim && claims >= claimBound) {
 			if e.tx.Type == types.TxFaucetClaim {
 				e.skipped++
-				if e.skipped > MaxClaimAgeBlocks {
+				if e.skipped > ageLimit {
 					m.forget(e)
 					continue
 				}
@@ -602,6 +622,61 @@ func (m *Mempool) Take(max int) []types.Tx {
 		out = []types.Tx{}
 	}
 	return out
+}
+
+// claimBoundLocked is how many faucet claims ONE Take may hand to a block: the
+// state machine's own per-block bound where the head state engages one, capped
+// by the pool's anti-amplification courtesy. The state bound is the CONSENSUS
+// rule - state.ApplyBlock refuses a block carrying more, before evaluating any
+// puzzle - so the pool must never hand out more than it. A genesis may legally
+// set MaxClaimsPerBlock below 8, and before this the pool always handed out up
+// to 8: the chain refused the over-bound block, the batch was re-added, and the
+// proposer never proposed at all (audit S-6).
+//
+// The value comes from the SAME HeadView admission already uses, under the same
+// lock: Add calls m.head() while holding m.mu, so this adds no lock, no lock
+// order and no snapshot of its own. It cannot be stale either - state.Params is
+// set once when a state is created from genesis and never written
+// (NewWithParams stores it, Clone copies it), so every state a chain ever holds,
+// including the head, carries the same bound. That is unlike the
+// height-dependent rules admission reads from the same view, whose value does
+// advance with the head. A ZERO bound means "not engaged" for legacy
+// unparameterised states (state.ApplyBlock skips the check there), so the
+// courtesy constant stays the only bound in that case, exactly as before.
+func (m *Mempool) claimBoundLocked() int {
+	bound := MaxFaucetClaimsPerBlock
+	if st, _ := m.head(); st != nil {
+		if p := st.Params().MaxClaimsPerBlock; p > 0 && p < uint64(bound) {
+			bound = int(p)
+		}
+	}
+	return bound
+}
+
+// claimAgeLimitLocked is the number of skips after which a passed-over claim is
+// dropped. MaxClaimAgeBlocks is the floor, but it is only large enough while
+// the hand-out rate is the courtesy constant: a genesis bound below it drains
+// the claim sub-pool more slowly, and a claim merely waiting its turn must not
+// age out (at a bound of 1 a full 64-claim sub-pool needs 64 blocks to drain,
+// and a fixed 32-skip limit would destroy half of it).
+//
+// The limit is therefore the most blocks a claim can spend waiting behind the
+// bound: at least one claim is handed out per Take while any remain (the bound
+// is never below 1), so a claim that was at position p when it was admitted is
+// taken by block ceil((p+1)/bound) and accumulates at most
+// ceil(maxClaims/bound)-1 skips. It is derived from the pool's claim CAPACITY,
+// not from the current pending count, because the count shrinks as the front
+// drains and a shrinking limit would age out exactly the claims that have
+// waited longest. With the shipped rate (8) and capacity (64) this is 8, so the
+// MaxClaimAgeBlocks floor keeps the shipped behaviour unchanged.
+func (m *Mempool) claimAgeLimitLocked(claimBound int) uint32 {
+	limit := uint32(MaxClaimAgeBlocks)
+	if claimBound > 0 {
+		if need := (m.maxClaims + claimBound - 1) / claimBound; need > int(limit) {
+			limit = uint32(need)
+		}
+	}
+	return limit
 }
 
 // Remove drops a transaction by ID, used when a block includes it.
