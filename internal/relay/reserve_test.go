@@ -100,32 +100,44 @@ func laneRelay(t *testing.T, senders int) (*Relay, *conn) {
 	return r, recv
 }
 
-// senderOf returns the i-th registered non-receiver connection, so a test
-// addresses the same senders forward derived the share from.
-func senderOf(t *testing.T, r *Relay, recv *conn, i int) *conn {
+// sendersOf snapshots the registered non-receiver connections ONCE, so a
+// construction can round-robin over a FIXED sender list.
+//
+// This is the determinism the loss pin needs, not a convenience. Reading the
+// registry map afresh on every offer - `senderOf(..., i%3)` in the first
+// version - is not a round-robin: `range r.conns` visits the map in a fresh
+// random order on EVERY call, so the same index names a different sender on
+// every frame. When the random sequence offered one sender its seventh bulk
+// frame before the queue reached its ceiling, that sender's equal share
+// (shareFor(3) = limit/3 = 1114112 bytes, six bulk frames) refused it, the
+// fill stopped at 7, 9, 10 or 11 frames instead of 12, and the remainder the
+// loss pin read off it became whatever the map order produced. The slice's
+// order here is still the map's order - the senders are identical in every
+// property the queue observes - but it does not change within one
+// construction, so the fill's arithmetic is fixed.
+func sendersOf(t *testing.T, r *Relay, recv *conn) []*conn {
 	t.Helper()
-	n := 0
+	var senders []*conn
 	for c := range r.conns {
-		if c == recv {
-			continue
+		if c != recv {
+			senders = append(senders, c)
 		}
-		if n == i {
-			return c
-		}
-		n++
 	}
-	t.Fatalf("sender %d not found in a registry of %d", i, len(r.conns))
-	return nil
+	if len(senders) == 0 {
+		t.Fatal("no sender is registered: the construction never formed")
+	}
+	return senders
 }
 
 // fillBulk offers bulk frames through the real forward path, round-robin over
-// three senders, until the queue refuses one. It returns the number admitted.
-func fillBulk(t *testing.T, r *Relay, recv *conn, frame []byte) int {
+// the fixed sender list, until the queue refuses one. It returns the number
+// admitted.
+func fillBulk(t *testing.T, r *Relay, recv *conn, senders []*conn, frame []byte) int {
 	t.Helper()
 	admitted := 0
 	for i := 0; ; i++ {
 		before := recv.q.bytes
-		r.forward(senderOf(t, r, recv, i%3), frame)
+		r.forward(senders[i%len(senders)], frame)
 		if recv.q.bytes == before {
 			return admitted
 		}
@@ -148,7 +160,8 @@ func fillBulk(t *testing.T, r *Relay, recv *conn, frame []byte) int {
 func TestRelayBulkTrafficDoesNotDelayConsensusFrames(t *testing.T) {
 	r, recv := laneRelay(t, 3)
 	q := recv.q
-	adm := fillBulk(t, r, recv, make([]byte, bulkFrameBytes))
+	senders := sendersOf(t, r, recv)
+	adm := fillBulk(t, r, recv, senders, make([]byte, bulkFrameBytes))
 	if adm < 3 {
 		t.Fatalf("the queue took only %d bulk frames: the catch-up construction never formed", adm)
 	}
@@ -164,7 +177,7 @@ func TestRelayBulkTrafficDoesNotDelayConsensusFrames(t *testing.T) {
 	lost := 0
 	for i := 0; i < 10; i++ {
 		before := q.bytes
-		r.forward(senderOf(t, r, recv, i%3), vote)
+		r.forward(senders[i%len(senders)], vote)
 		if q.bytes == before {
 			lost++
 		}
@@ -199,39 +212,68 @@ func TestRelayBulkTrafficDoesNotDelayConsensusFrames(t *testing.T) {
 }
 
 // TestRelayBulkTrafficDoesNotEvictConsensusFrames is N-1's LOSS pin: the same
-// catch-up shape filled to the byte budget. Before the reservation the queue
+// catch-up shape filled to its byte ceiling. Before the reservation the queue
 // reaches exactly its limit (the bulk lane and the budget were the same thing),
 // and every consensus frame offered behind it is REFUSED - a permanent loss,
 // which is the state a stalled quorum cannot recover from. With the
 // reservation the frame that would cross the boundary is the BULK one, and the
 // consensus frames fit.
+//
+// THE REMAINDER IS DERIVED, NOT OBSERVED. The first version of this test read
+// `rest := limit - q.bytes` after a fill that re-read the registry map on every
+// offer, and asserted rest was "the remainder a single bulk frame can top up".
+// It was not, sometimes: the map order is random per iteration, so the
+// supposedly round-robin fill could refuse one sender's seventh bulk frame
+// (its equal share is six) before the queue reached its ceiling. The fill then
+// stopped at 7, 9, 10 or 11 frames and rest became 622592, 458752 or 294912
+// bytes depending on the run - this test's reported flake. The fill now
+// round-robins over a fixed sender list, so the whole-frame count below is a
+// property of the queue's arithmetic, and the closure it implies is asserted
+// explicitly rather than assumed.
 func TestRelayBulkTrafficDoesNotEvictConsensusFrames(t *testing.T) {
 	r, recv := laneRelay(t, 3)
 	q := recv.q
-	adm := fillBulk(t, r, recv, make([]byte, bulkFrameBytes))
+	senders := sendersOf(t, r, recv)
+	adm := fillBulk(t, r, recv, senders, make([]byte, bulkFrameBytes))
 	if adm == 0 {
 		t.Fatal("no bulk frame was admitted: the construction never formed")
 	}
-	// The last frame of the byte budget, in bulk size: before the fix this one
-	// is admitted (it fits the budget exactly) and takes the queue to its
-	// limit; after the fix it is the frame the reservation refuses.
+
+	// BULK SATURATED ITS LANE, and the number is derived from the queue's own
+	// bounds: the bulk ceiling holds bulkLimit/bulkFrameBytes WHOLE bulk
+	// frames, and the fill must stop exactly there - on the frame that would
+	// cross the ceiling. Stopping earlier means the per-sender share refused
+	// the fill before the reservation could be observed (the flake);
+	// stopping later means bulk is inside the reserved bytes.
+	whole := q.bulkLimit / bulkFrameBytes
+	if want := whole * bulkFrameBytes; q.bytes != want {
+		t.Fatalf("the fill stopped at %d bytes, want the %d whole %d-byte bulk frames the %d-byte ceiling holds (%d bytes): the construction is not the one this test pins", q.bytes, whole, bulkFrameBytes, q.bulkLimit, want)
+	}
+	// THE CLOSURE. The byte budget's remainder is the frame that would TOP THE
+	// QUEUE UP to its limit: it is bulk by size, and at most one bulk frame,
+	// so it is exactly the frame the reservation - not the byte budget - must
+	// refuse. Asserted rather than assumed, because a remainder that were not
+	// bulk could not probe the reservation at all.
 	rest := q.limit - q.bytes
-	if rest <= 0 || rest >= bulkFrameBytes {
-		t.Fatalf("the fill left %d bytes of budget, which is not the remainder a single bulk frame can top up - the construction is not the one this test pins", rest)
+	if rest <= smallFrameBytes || rest > bulkFrameBytes {
+		t.Fatalf("the byte budget's remainder is %d bytes, which is not one bulk frame (threshold %d, bulk frame %d): the arithmetic no longer closes", rest, smallFrameBytes, bulkFrameBytes)
 	}
 	bulkAt := q.bytes
-	// The frame that would take the queue to its byte limit. Before the fix
-	// this is admitted (it fits the budget exactly); after it, this is the
-	// frame the reservation refuses.
-	r.forward(senderOf(t, r, recv, 0), make([]byte, rest))
+	// Before the fix this frame is admitted (it fits the byte budget exactly)
+	// and the queue is full; with the fix it is refused, because it is bulk
+	// and it would enter the bytes the reservation keeps for consensus.
+	r.forward(senders[0], make([]byte, rest))
 	full := q.bytes
+	if full != bulkAt {
+		t.Fatalf("a %d-byte bulk frame was admitted with %d of its %d-byte budget queued, %d bytes of it reserved: bulk crossed the lane", rest, bulkAt, q.limit, q.reserve)
+	}
 
 	// THE MEASUREMENT: ten consensus frames offered into whatever is left.
 	vote := make([]byte, voteFrameBytes)
 	lost := 0
 	for i := 0; i < 10; i++ {
 		before := q.bytes
-		r.forward(senderOf(t, r, recv, i%3), vote)
+		r.forward(senders[i%len(senders)], vote)
 		if q.bytes == before {
 			lost++
 		}
@@ -243,12 +285,12 @@ func TestRelayBulkTrafficDoesNotEvictConsensusFrames(t *testing.T) {
 		t.Fatalf("the queue holds %d bytes against a %d-byte budget", q.bytes, q.limit)
 	}
 	if full > q.bulkLimit {
-		t.Fatalf("a %d-byte bulk frame was admitted into the last %d bytes of the %d-byte budget (queue %d, bulk ceiling %d): bulk crossed the reservation", rest, rest, q.limit, full, q.bulkLimit)
+		t.Fatalf("bulk reached %d bytes, past the %d-byte ceiling of the %d-byte budget: bulk crossed the reservation", full, q.bulkLimit, q.limit)
 	}
 	if st := r.Stats(); st.Dropped == 0 {
 		t.Fatal("nothing was refused at the bulk ceiling: the construction never reached the state it pins")
 	}
-	t.Logf("bulk stopped at %d bytes (ceiling %d, budget %d, reservation %d); 10 consensus frames admitted, %d refused", bulkAt, q.bulkLimit, q.limit, q.reserve, lost)
+	t.Logf("bulk stopped at %d bytes (ceiling %d, budget %d, reservation %d); the %d-byte top-up frame was refused; 10 consensus frames admitted, %d refused", bulkAt, q.bulkLimit, q.limit, q.reserve, rest, lost)
 }
 
 // TestRelayBulkStillDrainsAndKeepsItsOrder is the no-regression pin for the
@@ -259,7 +301,8 @@ func TestRelayBulkTrafficDoesNotEvictConsensusFrames(t *testing.T) {
 func TestRelayBulkStillDrainsAndKeepsItsOrder(t *testing.T) {
 	r, recv := laneRelay(t, 3)
 	q := recv.q
-	adm := fillBulk(t, r, recv, make([]byte, bulkFrameBytes))
+	senders := sendersOf(t, r, recv)
+	adm := fillBulk(t, r, recv, senders, make([]byte, bulkFrameBytes))
 	if adm < 3 {
 		t.Fatalf("only %d bulk frames were admitted: a single lagging peer's catch-up must still fill the queue", adm)
 	}
@@ -270,7 +313,7 @@ func TestRelayBulkStillDrainsAndKeepsItsOrder(t *testing.T) {
 	for i := 0; i < votes; i++ {
 		v := make([]byte, voteFrameBytes)
 		v[0] = byte(i)
-		r.forward(senderOf(t, r, recv, i%2), v)
+		r.forward(senders[i%len(senders)], v)
 	}
 
 	for i := 0; i < votes; i++ {
