@@ -343,3 +343,73 @@ as YAML, its shell was read line by line, and every command in it was executed
 locally where the host allows (the identity outputs, the signing sequence with
 a real key, the checksum refusals), but the runner, `actions/upload-artifact`
 and the tag gate are exercised only by the next tagged push.
+
+**The S-12 and S-20 round (this section is theirs too).** Recorded on 2026-11-06
+by the branch that closed the last two findings.
+
+**S-12 is real as described, and one degree worse than written.** `scanCerts`
+did call `os.ReadFile`, so `Open` allocated the whole certificate log in one
+`make` before indexing anything, while the `Store` doc promised records were
+"read back on demand" and the file has no prune of any kind (`PruneLocks` and
+`PruneRounds` exist; there is no `PruneCerts`, and there should not be - serving
+an old height's certificate is what the file is for). Measured on the shipped
+fixture, `Open` over a 10,000-record log of 512-byte payloads allocated
+**5,965,416 bytes** (596.5 B per record, i.e. the payload); over 200 records of
+4 KiB it allocated **844,768 bytes** against 35,968 for the same count of
+64-byte records. After streaming: **758,720 bytes** over the 10,000-record log
+(75.9 B per record, the index entry alone) and **19,760** over the 4 KiB log
+against 19,920 for the narrow one - the payload width no longer enters the
+number at all. `internal/store/cert_alloc_test.go` holds that comparison plus
+`BenchmarkOpenCertLog`, and each was confirmed to fail against the old code.
+
+**What S-12 did not say: `CertAt` had the same hole from the other side.** The
+report named only `Open`. `CertAt` read the length prefix, checked its own
+checksum, and then `make([]byte, n)` **before** consulting the file's length, so
+a single edited or stale header made a 54-byte log request 64 MiB (measured:
+**67,108,880 bytes**). It now frames the record against the file's current size
+first, reusing `readRecordAt`, the same framing policy the scans apply, and
+additionally refuses a record whose height key is not the height it was indexed
+at - two equal-width records swapped in place keep every checksum valid, so the
+key is the only thing that can tell (measured before: `CertAt(1)` served height
+2's certificate). Both are tested and both tests were confirmed to fail against
+the old code.
+
+The cost of the streaming fix is stated where it belongs, on `scanCerts`: `Open`
+no longer verifies the trailer checksum over a certificate payload, because it
+no longer reads one. Framing is unaffected (the length prefix carries its own
+checksum, checked before the length is trusted), and `CertAt` re-verifies the
+whole record before serving, so corruption is now an absent certificate at read
+time instead of a failed start. That is the archive's own error policy - evidence
+for one height, never a safety promise - applied one step further.
+
+**S-20 is real, and it is bounded - so it is accepted, not capped.** Nothing
+deletes from `everSeated`, and it is monotone on purpose (RT-3/RT-7). What the
+report did not work out is that only two paths insert: the genesis seats at
+`Open`, and the derived committee in `memoCommitteeLocked`, which runs once per
+epoch boundary. The set is therefore exactly the union of the genesis seats and
+the committees this chain has recorded, which bounds it **structurally**:
+
+```
+|everSeated| <= len(genesis.Validators) + CommitteeSize x epochs elapsed
+```
+
+On the shipped testnet parameters an epoch is 10,000 blocks of 2,000 ms -
+20,000 s - so the ceiling is 21 seats per epoch, about 91 keys a day and about
+33,100 a year; at the measured 67-88 bytes per entry that is about 3 MB a year,
+and a gibibyte would need ~11.9 million entries, or ~360 years of a fully funded
+committee rotating at its ceiling. Each of those keys must additionally hold
+MIN_STAKE = 10^11 sparks (1,000 b10) to be seatable at all. The finding's
+closing clause - "rate-limited by whoever can afford MIN_STAKE bonds" - is the
+one part that is wrong: a bond is necessary and **not sufficient**. A key that
+bonds and loses the seat draw is never admitted, which is now pinned by
+`internal/chain/s20_everseated_test.go` with a constructed five-candidate,
+four-seat fixture (verified: the 3x key is seated and admitted, the 1x key is
+bonded, excluded, and not admitted).
+
+A cap was rejected rather than measured against: enforcing one means refusing
+HELLO/BLOCK_SYNC to a key that is legitimately seated once the set is full, or
+evicting an entry - and an evicted entry is a rotated-out honest validator that
+this set exists to keep admitting. Both are the RT-3 freeze the project has
+already paid for once. The structural bound above is enforced by the shape of
+the code instead of by a number someone can tune wrong, and the arithmetic is
+recorded on the field so the next reader can re-derive it rather than trust it.

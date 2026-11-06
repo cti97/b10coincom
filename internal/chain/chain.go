@@ -127,6 +127,39 @@ type Chain struct {
 	// stays a permitted peer forever, exactly as a genesis key already did
 	// (audit RT-7); see committeeMemberAt's comment for what that admits and
 	// what it does not. Guarded by mu like committees.
+	//
+	// BOUNDED, AND WHY THERE IS NO EVICTION (audit S-20). Only two paths insert
+	// here - the genesis seats at Open and the derived committee in
+	// memoCommitteeLocked, which runs once per epoch boundary - so the set is
+	// always exactly the union of the genesis seats and the committees this
+	// chain has recorded. That gives a structural bound, not an economic one:
+	//
+	//	|everSeated| <= len(genesis.Validators) + CommitteeSize x epochs elapsed
+	//
+	// because each recorded committee contributes at most CommitteeSize keys and
+	// a committee is recorded once per epoch. On the shipped testnet parameters
+	// (CommitteeSize 21, EpochBlocks 10,000, BlockTimeMS 2,000) an epoch is
+	// 20,000 s - 5 h 33 m - so the ceiling is 21 seats per epoch, about 91 keys a
+	// day and about 33,100 a year. Measured on 2026-11-06, an entry of this map
+	// (a 32-byte ed25519 key plus the map's share of key and value slots) is
+	// 67-88 bytes of heap at a million entries, so the ceiling is about 3 MB a
+	// year; a gibibyte needs ~11.9 million entries, which is ~360 years of a
+	// fully funded committee rotating at that ceiling. Each of those keys must
+	// separately hold MIN_STAKE = 10^11 sparks (1,000 b10) to be seatable at all,
+	// so the flow is also gated by capital: 21,000 b10 working capital rotating
+	// through bond, seat, unbond.
+	//
+	// A cap was considered and REJECTED. Enforcing one means either refusing
+	// HELLO/BLOCK_SYNC to a key that is legitimately seated once the set is
+	// full, or evicting an entry - and an entry that is evicted is a rotated-out
+	// honest validator that this set exists precisely to keep admitting (audit
+	// RT-3). That is the freeze this project has already paid for once, and it
+	// buys nothing here: the structural bound above is enforced by the shape of
+	// the code rather than by a number someone can tune wrong. Pruning "keys
+	// whose bond is gone and whose epoch is past" was also rejected: the bond log
+	// is not retained, so that condition is not knowable at admission time
+	// without a second unbounded index, and getting it wrong un-admits an honest
+	// key on exactly the same path.
 	everSeated map[string]struct{}
 }
 
