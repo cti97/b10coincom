@@ -57,6 +57,8 @@
 <p>Claiming means solving the Argon2id puzzle on your own machine and signing with the key that will receive the coins, so the command runs locally:</p>
 <pre>{{.Command}}</pre>
 <p>Replace <code>&lt;path&gt;</code> with the key file <code>b10coin keygen --out</code> wrote, and run it from a terminal on the machine that holds the key. It prints the transaction and asks you to confirm before it signs.</p>
+<p>That command works against <strong>this</strong> node whatever chain it runs — {{.ChainID}} here, not only the devnet: the claim signs over the genesis hash the node reports (see <code>/status</code>'s <code>genesis_hash</code>), and the amount it pays is the chain's own parameter, the {{.ClaimAmountB10}} b10 above. There is no devnet-only condition to meet.</p>
+<p>One thing this page cannot check for you: a node whose key holds <strong>no committee seat</strong> accepts a claim and never proposes a block that carries it — a transaction reaches a block only through the node it was posted to. The claim command prints a warning when the node it reached says it holds no seat; in that case post the same bytes to a validator that does.</p>
 
 <section class="limits">
 <h2>What this page cannot do</h2>
