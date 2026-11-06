@@ -214,10 +214,20 @@ const waitForDeadline = 30 * time.Second
 // a flake.
 func waitFor(t *testing.T, ok func() bool, what string) {
 	t.Helper()
-	deadline := time.Now().Add(waitForDeadline)
+	waitForWithin(t, waitForDeadline, ok, what)
+}
+
+// waitForWithin is waitFor with a budget the CALLER derives from the mechanism
+// it is bounding (testrun 2026-11-06, T-2). A generic second count is the wrong
+// unit for an observable whose latency is set by one of the relay's own timers:
+// the bound should be a multiple of that timer, so a reader can see what it
+// measures, and a test that needs a different multiple states why.
+func waitForWithin(t *testing.T, budget time.Duration, ok func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
 	for !ok() {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s (waited %s)", what, waitForDeadline)
+			t.Fatalf("%s (waited %s)", what, budget)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1343,6 +1353,12 @@ func TestRelayOptionDefaultsPinTheOperatorNumbers(t *testing.T) {
 func TestRelayAKeepaliveSinkCannotPinASlotOrMemory(t *testing.T) {
 	const (
 		frameBytes = 64 << 10 // the flood frame; budget and reader both bound below it
+		// writeTimeout is the knob under test, shrunk from the 30s default.
+		writeTimeout = 500 * time.Millisecond
+		// keepEvery is the sink's keepalive cadence: far inside ReadTimeout,
+		// which is what makes the keepalive stream proof the READ deadline was
+		// being fed right up to the close.
+		keepEvery = 100 * time.Millisecond
 	)
 	baseline := runtime.NumGoroutine()
 	r := startRelay(t, Options{
@@ -1350,7 +1366,7 @@ func TestRelayAKeepaliveSinkCannotPinASlotOrMemory(t *testing.T) {
 		MaxConns:        2, // the WHOLE point: when the sink is reaped, its slot must be really free
 		MaxConnsPerIP:   8, // loopback dials share one IP; the cap must not pre-empt this scenario
 		WriteQueueBytes: frameBytes * 4,
-		WriteTimeout:    500 * time.Millisecond, // the knob under test, shrunk from the 30s default
+		WriteTimeout:    writeTimeout,
 		ReadTimeout:     3 * time.Second,
 	})
 	addr := r.Addr().String()
@@ -1437,15 +1453,17 @@ func TestRelayAKeepaliveSinkCannotPinASlotOrMemory(t *testing.T) {
 			select {
 			case <-keepStop:
 				return
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(keepEvery):
 			}
 		}
 	}()
 
 	// The flood: 64 KiB frames, continuously, far beyond the sink's budget
 	// and buffers. The relay drains the flooder promptly and (budget, then
-	// the sink's wedged writer) drops or backpressures toward the sink -
-	// Dropped must rise, proving the queue budget actually bit.
+	// the sink's wedged writer) drops or backpressures toward the sink.
+	// Whether the drop or the reap comes first depends on how fast this
+	// goroutine is scheduled against the writer's 500 ms deadline; the drop
+	// counter is logged after the reap and not required (see there).
 	floodDone := make(chan struct{})
 	go func() {
 		defer close(floodDone)
@@ -1466,27 +1484,49 @@ func TestRelayAKeepaliveSinkCannotPinASlotOrMemory(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 	}()
-	// Dropped>0 proves the byte budget actually bit before the reaping is
-	// asserted; without this premise the reaping could be ordinary silence.
-	waitFor(t, func() bool {
-		return r.Stats().Dropped > 0
-	}, "the flood dropping against the sink's byte budget")
-
 	// THE reaping: the sink is gone within (backpressure latency +
-	// WriteTimeout), its keepalives notwithstanding.
-	waitFor(t, func() bool { return r.Stats().Conns == 1 },
+	// WriteTimeout), its keepalives notwithstanding. The budget is DERIVED
+	// from the mechanism, not chosen: writeTimeout is the only timer that can
+	// end a never-reading peer whose keepalives keep its read deadline fed, so
+	// the reap must land within a small multiple of it. (The generic 30 s this
+	// used to wait - already lengthened from 10 s once - measured nothing;
+	// testrun 2026-11-06, T-2.)
+	//
+	// The wait used to gate on `Dropped > 0` FIRST, and that is the race it
+	// could lose: the relay may reap the sink before the flood has queued more
+	// than the byte budget, and finish() unregisters the connection, so no
+	// later push can ever drop. Both outcomes are correct relay behaviour; the
+	// byte budget's own determinism is pinned by the queue tests
+	// (TestRelayAByteBudgetAdmitsExactlyItsBound and friends), so the reap -
+	// the property this test owns - is what is waited for here, and the drop
+	// counter is reported below rather than required.
+	waitForWithin(t, 20*writeTimeout, func() bool { return r.Stats().Conns == 1 },
 		"the never-reading sink being reaped (registry down to the flooder only) within backpressure+write-timeout")
 	// The keepalive's own testimony: at least one of the sink's fresh
 	// 5-byte keepalives FAILED - the connection was closed by the write
 	// deadline while the keepalive stream was live. (Without the keepalive
 	// stream, this would be the ordinary read-deadline reaping; the premise
 	// that the keepalives were being sent and REJECTED is what makes this
-	// the write deadline's work.)
+	// the write deadline's work. The goroutine only stops on a failed write,
+	// so a successful keepalive at T refreshed the READ deadline at T, and a
+	// failure at T+ε cannot be that deadline firing at T+3s.)
 	select {
 	case err := <-keepFailed:
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			t.Fatalf("the sink's keepalive timed out instead of being rejected: the relay stopped reading the sink, which is not the write-deadline ending this test pins: %v", err)
+		}
 		t.Logf("sink keepalive failed as required after %d sent: %v", sent.Load(), err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("the sink was reaped but none of its keepalive writes ever failed within 5s - it did not keep keepaliving (test premise gone)")
+	case <-time.After(20 * keepEvery):
+		t.Fatal("the sink was reaped but none of its keepalive writes ever failed - it did not keep keepaliving (test premise gone)")
+	}
+	// Which of the two bounded outcomes came first is a SCHEDULING fact, not a
+	// property, so it is reported and not asserted: under a loaded host the
+	// reap can beat the flood to the byte budget, and under an idle one the
+	// drop lands first. Either way the sink is gone and its slot is free.
+	if st := r.Stats(); st.Dropped > 0 {
+		t.Logf("the sink's byte budget bit before the reap: Forwarded=%d Dropped=%d", st.Forwarded, st.Dropped)
+	} else {
+		t.Logf("the reap beat the sink's byte budget: Forwarded=%d Dropped=0 (the budget's determinism is pinned by the queue tests)", st.Forwarded)
 	}
 	// The freed slot is genuinely reusable: with MaxConns 2, this dial is
 	// exactly the one the pre-fix state could never admit.

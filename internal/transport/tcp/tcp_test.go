@@ -416,11 +416,26 @@ func TestSendDeliversToExactlyOnePeer(t *testing.T) {
 // goroutine; parking that callback stops r from reading its socket, the
 // kernel receive buffer fills, s's writer blocks in Write, and s's bounded
 // queue fills - after which every further Broadcast must return while r is
-// still not reading. The assertions are: the whole batch returns within 3s
-// (measured, not assumed), every single Broadcast within 500ms, and at least
-// one enqueue was dropped past the bound - which only a BOUNDED queue can
-// produce, so the green path carries its own proof.
+// still not reading. The assertions are: every single Broadcast within
+// broadcastBound (measured, not assumed), and at least one enqueue was
+// dropped past the bound - which only a BOUNDED queue can produce, so the
+// green path carries its own proof.
+//
+// There is deliberately no assertion on the SUM of the calls (testrun
+// 2026-11-06, T-2). A sum of wall-clock durations measures how much scheduler
+// this host gave the loop, not whether the sender was blocked: 60 calls at
+// ~40 ms each is 2.6 s on a loaded `-race` host while no call came near the
+// bound, which says the host was busy, not that the peer blocked anything.
+// The per-call bound is the contract ("never block beyond the queue bound"),
+// and it is what a blocked sender violates.
 func TestASlowReaderDoesNotBlockTheSender(t *testing.T) {
+	const (
+		// broadcastBound is the queue bound one Broadcast must respect: the
+		// sender's bounded queue is full, so the call may not wait for a peer.
+		broadcastBound = 500 * time.Millisecond
+		// broadcasts is far more than the queue and kernel buffers absorb.
+		broadcasts = 60
+	)
 	r := listen(t, Options{LocalID: "r"})
 	// The BOUND lives on the sender: it is s's per-connection queue that must
 	// fill while r is not reading.
@@ -453,7 +468,7 @@ func TestASlowReaderDoesNotBlockTheSender(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for i := 0; i < 60; i++ { // 15 MiB in flight: far beyond queue + kernel buffers
+		for i := 0; i < broadcasts; i++ { // 15 MiB in flight: far beyond queue + kernel buffers
 			start := time.Now()
 			_ = s.Broadcast(msg)
 			mu.Lock()
@@ -461,10 +476,16 @@ func TestASlowReaderDoesNotBlockTheSender(t *testing.T) {
 			mu.Unlock()
 		}
 	}()
+	// The batch's total budget is the per-call bound summed over the calls:
+	// even if every call spent the WHOLE bound (which the per-call assertion
+	// forbids), the batch would finish inside this. A sender that blocks on
+	// the peer fails the per-call check; one that never returns at all fails
+	// here instead of hanging the suite.
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("a batch of Broadcasts did not return within 3s while the peer was not reading: the sender was blocked on a slow peer")
+	case <-time.After(broadcasts * broadcastBound):
+		t.Fatalf("a batch of %d Broadcasts did not return within %d x %s while the peer was not reading: the sender was blocked on a slow peer",
+			broadcasts, broadcasts, broadcastBound)
 	}
 
 	// Exactly one frame was (or is being) processed by r; everything after it
@@ -478,18 +499,18 @@ func TestASlowReaderDoesNotBlockTheSender(t *testing.T) {
 	}
 
 	mu.Lock()
-	var total time.Duration
+	var slowest time.Duration
 	for _, tm := range timings {
-		total += tm.d
-		if tm.d > 500*time.Millisecond {
+		if tm.d > slowest {
+			slowest = tm.d
+		}
+		if tm.d > broadcastBound {
 			mu.Unlock()
 			t.Fatalf("Broadcast #%d took %v while the peer was not reading (must never block beyond its queue bound)", tm.n, tm.d)
 		}
 	}
 	mu.Unlock()
-	if total > 2*time.Second {
-		t.Fatalf("the whole broadcast batch took %v against a wedged peer", total)
-	}
+	t.Logf("slowest of %d Broadcasts: %v (bound %v)", len(timings), slowest, broadcastBound)
 
 	dropped := int64(0)
 	s.mu.Lock()
