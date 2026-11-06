@@ -1050,9 +1050,15 @@ and the jump that would pull it forward needs 2 of the 4 seats ahead — if the
 next node is already stopping, only one is. So restart the members within one
 block time of each other, or one at a time **waiting for the chain to advance
 before stopping the next**, or expect the wait; [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
-has the operator's version. A node now says so, once per height, when a height
-has been undecided for **eight rounds *and* 30 seconds** of its own clock — two
-shapes, because they mean different things and have different fixes:
+has the operator's version. The same divergence explains a slow **first**
+start: a ten-validator committee brought up one container at a time, a few
+seconds apart, sat at height 0 for about 53 s (rounds 16–34) in the 2026-11-06
+Docker run before the ladder closed it — no block was lost, because none had
+been produced yet. Start the members together, or wait for the chain to
+advance before starting the next. A node now says so, once per height, when a
+height has been undecided for **eight rounds *and* 30 seconds** of its own
+clock — two shapes, because they mean different things and have different
+fixes:
 
 - **while the seats it can reach hold a quorum:** `b10coin: no block for N
   rounds at height H (round R, step S): quorum reachable with P of T power
@@ -1572,7 +1578,11 @@ pair: it runs the same release script with `--only linux/arm64` and copies
 the result into `bin/` under the names the recipe's scp lines use, so a
 version bump never breaks the recipe (and
 `scripts/deploy/build.sh linux/amd64` produces the relay an amd64 VPS wants —
-see its §2). CI (`.github/workflows/ci.yml`) runs the release build for every
+see its §2). **A wrapper run replaces `dist/`:** `scripts/build-release.sh`
+starts every run by wiping it (its header says so, and the wrapper's does
+too), so copy a full six-target release out before running the wrapper if you
+want to keep it — `dist/` then holds only the one target that run built. CI
+(`.github/workflows/ci.yml`) runs the release build for every
 target and asserts every artifact on every push, so the Pi binary cannot rot
 silently. The version the binaries print comes from `internal/version`; no
 build-flag override adds a second source of truth. The Pi is the *acceptance*

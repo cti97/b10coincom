@@ -70,7 +70,7 @@
   <li>It cannot guarantee payment. Eligibility is the claim rule; the block that applies your claim also needs the faucet to hold the amount at that moment, and a claim whose block cannot pay it is dropped rather than held.</li>
   <li>It cannot solve the Argon2id puzzle for you. Solving for anonymous requests would make this node's CPU the faucet's cost and turn it into a free-claim oracle, which is the whole reason the puzzle exists.</li>
   <li>It cannot show history, search the chain or recover a lost key; it reports one address at the current head.</li>
-  <li>It is unauthenticated and bound to the node's loopback address. Exposing that address to the internet exposes this page and the node's transaction endpoint together.</li>
+  <li>It is unauthenticated. The <code>--http</code> default binds the server to <code>127.0.0.1</code>, but that is the operator's choice, not a property of this page: a node started with <code>--http 0.0.0.0:8645</code> serves this page — and the node's transaction endpoint — to every network that can reach that port.</li>
 </ul>
 </section>
 

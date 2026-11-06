@@ -92,11 +92,17 @@ jobs:
       # was wrong for the second report in a row. 120 m (7,200 s) clears the
       # full 6,707 s with about eight minutes of headroom, for both the plain
       # and the -race binary (same ceilings, slower execution). It is still far
-      # above the measured healthy pass:
-      # internal/devnet takes 104 s alone, 177 s in the full suite and 201 s
-      # under -race on the audit host, and that healthy pass is the only run
-      # that should ever finish. A timeout this large is a bound on a
-      # pathological run, never an expectation.
+      # above the measured healthy pass, and that pass is HOST-DEPENDENT,
+      # because most of internal/devnet's time is real-time consensus waits
+      # rather than CPU: on a 12-CPU Apple Silicon host (go1.27.3,
+      # GOMAXPROCS=2, load ~3.5 during the run) internal/devnet takes 61 s
+      # alone, 69 s in the full suite and 86 s in the full suite under -race.
+      # The 16-CPU Windows + Docker host of the 2026-11-06 run measured
+      # 104 / 177 / 201 s for the same three. A loaded host multiplies both
+      # again (that run's rotation demo went from ~8 s to 65-91 s at load
+      # 117), so the timeout is sized for the slowest runner, never for one
+      # host's number. A timeout this large is a bound on a pathological run,
+      # never an expectation.
       - run: go vet ./...
       - run: go test -timeout 120m -count=1 ./...
       - run: go test -race -timeout 120m -count=1 ./...
@@ -134,10 +140,16 @@ jobs:
       # unbonds mid-epoch, six seats become five at the boundary, and the
       # Nakamoto coefficient is computed from committed state at each one. It
       # was missing here while the README claimed four (M5 re-run, 2026-10-30).
-      # It adds about 8 s (measured: 105 blocks, six in-process validators, two
-      # rotation boundaries) to a job already running the suite and the race
-      # suite, so keeping the milestone check is far cheaper than deleting it
-      # from the README to make the count true.
+      # It adds about 8 s on a quiet host (measured: 105 blocks, six in-process
+      # validators, two rotation boundaries: 8.3-8.4 s wall and 3.0-3.5 s user
+      # CPU for the prebuilt binary over three runs, 9.2 s including `go run`'s
+      # link, on a 12-CPU Apple Silicon host at load ~3.9). It is bound by the
+      # block timers and by host load, not by the work: the 2026-11-06 Docker
+      # run measured 65-91 s wall for the same command on 16 CPUs at load 117,
+      # against 14 s of user CPU. So 8 s is a range with a condition, not a
+      # promise - but on any quiet runner this is seconds, and keeping the
+      # milestone check is far cheaper than deleting it from the README to make
+      # the count true.
       - run: go run ./cmd/b10coin devnet --blocks 100
       - run: go run ./cmd/b10coin devnet --blocks 100 --claims 1
       - run: go run ./cmd/b10coin devnet --validators 4 --blocks 100

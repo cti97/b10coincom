@@ -386,7 +386,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/history", s.handleHistory)
 	// The pages (M6 Tasks 2 and 3) are HANDLERS on this same server: they add
 	// no listener, no authentication and no write path, so the node's single
-	// loopback-bound --http address serves them beside the JSON API.
+	// --http address (loopback by default; an operator who binds 0.0.0.0 is
+	// choosing to expose them, and the faucet page now says so) serves them
+	// beside the JSON API.
 	mux.HandleFunc("/faucet", s.handleFaucet)
 	mux.HandleFunc("/explorer", s.handleExplorer)
 	mux.HandleFunc("/tx", s.handleTx)
