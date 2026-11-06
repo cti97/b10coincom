@@ -78,14 +78,14 @@ func BenchmarkSelectApplicable10000(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		valid, overBudget, err := c.SelectApplicable(txs)
+		valid, retry, err := c.SelectApplicable(txs)
 		if err != nil {
 			b.Fatal(err)
 		}
-		if len(valid)+len(overBudget) != len(txs) {
-			b.Fatalf("SelectApplicable accounted for %d of %d candidates", len(valid)+len(overBudget), len(txs))
+		if len(valid)+len(retry) != len(txs) {
+			b.Fatalf("SelectApplicable accounted for %d of %d candidates", len(valid)+len(retry), len(txs))
 		}
-		if len(overBudget) == 0 {
+		if len(retry) == 0 {
 			b.Fatalf("a 10,000-transfer batch fit a %d-byte block: the byte budget did not bind", types.MaxBlockBytes)
 		}
 	}

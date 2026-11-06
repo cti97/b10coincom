@@ -20,32 +20,34 @@ func TestSelectApplicableStopsAtTheByteBudget(t *testing.T) {
 	const candidates = 7_000
 	c, txs := selectFixture(t, 16, candidates)
 
-	selected, overBudget, err := c.SelectApplicable(txs)
+	selected, retry, err := c.SelectApplicable(txs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(overBudget) == 0 {
+	if len(retry) == 0 {
 		t.Fatalf("all %d candidates were selected: the byte budget did not bind", candidates)
 	}
 	if len(selected) == 0 {
 		t.Fatal("the filter selected nothing: a byte budget that admits no transaction at all is not a budget")
 	}
 	// The split is a PREFIX: what fits comes first, what does not comes after,
-	// in the caller's order. A caller re-adds overBudget and expects the pool's
-	// order (and therefore its nonce ordering) to survive.
+	// in the caller's order. A caller re-adds retry and expects the pool's order
+	// to survive. This fixture is one sender with strictly increasing nonces, so
+	// the per-sender ordering audit S-17 added is the identity here and the
+	// prefix property is unaffected.
 	for i := range selected {
 		if selected[i].ID() != txs[i].ID() {
 			t.Fatalf("selected[%d] is not candidates[%d]: the split is not a prefix", i, i)
 		}
 	}
-	for i := range overBudget {
-		if overBudget[i].ID() != txs[len(selected)+i].ID() {
-			t.Fatalf("overBudget[%d] is not candidates[%d]: the remainder is not the tail", i, len(selected)+i)
+	for i := range retry {
+		if retry[i].ID() != txs[len(selected)+i].ID() {
+			t.Fatalf("retry[%d] is not candidates[%d]: the remainder is not the tail", i, len(selected)+i)
 		}
 	}
-	if len(selected)+len(overBudget) != candidates {
-		t.Fatalf("%d selected + %d over budget = %d, want all %d candidates accounted for",
-			len(selected), len(overBudget), len(selected)+len(overBudget), candidates)
+	if len(selected)+len(retry) != candidates {
+		t.Fatalf("%d selected + %d retried = %d, want all %d candidates accounted for",
+			len(selected), len(retry), len(selected)+len(retry), candidates)
 	}
 	// The selected prefix, encoded the way a block encodes it, fits.
 	weight := types.BlockOverheadBytes

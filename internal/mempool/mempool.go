@@ -318,8 +318,11 @@ func (m *Mempool) Add(txs []types.Tx) []error {
 // pool's own state, so it cannot be bypassed by sending more transactions; the
 // nonce floor refuses a transaction whose replay counter has already been spent
 // by the head state. A future nonce is still admitted: it may become applicable
-// when its predecessors land, and the block filter is what evicts a transaction
-// that never does.
+// when its predecessors land. The block filter orders each sender's batch by
+// nonce before selecting it and returns a still-ahead candidate to the pool
+// instead of dropping it (audit S-17); a transaction that never becomes
+// applicable ages out through the same capacity and per-sender bounds as any
+// other unapplied one.
 //
 // The transfer's balance rule is deliberately NOT duplicated here: a transfer
 // is admitted on its bytes and judged at execution. The staking types are the
