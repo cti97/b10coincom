@@ -542,13 +542,48 @@ func getJSON(url string, into any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+		// The status line and the body are both the node's text: quote them so
+		// a reply cannot clear the screen or forge a line of this CLI's output
+		// on the read paths (/status, /account, /history) as well (audit S-13).
+		return fmt.Errorf("%s: %s", safeText(resp.Status), safeText(strings.TrimSpace(string(body))))
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(into)
 }
 
+// txidHexLen is the length of a hex-encoded 32-byte transaction ID.
+const txidHexLen = 64
+
+// validTxID reports whether s is exactly the canonical hex form of a 32-byte
+// transaction ID: 64 characters, all lowercase. This is not cosmetic. The txid
+// is the only string a signing verb prints as a RECEIPT, and it is printed
+// after the signature; the node chooses every byte of it. A node that returns
+// ANSI escapes or a newline in that field can erase the lines the CLI just
+// printed (including the ones saying what was signed) and write a forged
+// receipt in their place (audit S-13, the class W-2 closed for /history rows).
+// A value that is not a well-formed hash has no business being printed, and a
+// receipt this CLI cannot check must not be presented as one.
+func validTxID(s string) bool {
+	if len(s) != txidHexLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // postTxHex submits the canonical hex encoding of one transaction and
 // returns the node's txid.
+//
+// EVERY node-chosen string on this path is either validated or quoted. The
+// txid must be a canonical 32-byte hash (validTxID) or the submission is
+// refused; the error body and the HTTP status line (whose reason phrase the
+// server also chooses) go through safeText, so a hostile node cannot move the
+// cursor, clear the screen or start a new line inside an error message. There
+// is no raw echo of node bytes left on this path (audit S-13).
 func postTxHex(url string, raw []byte) (string, error) {
 	resp, err := claimHTTP.Post(url, "application/octet-stream", strings.NewReader(hex.EncodeToString(raw)))
 	if err != nil {
@@ -560,16 +595,20 @@ func postTxHex(url string, raw []byte) (string, error) {
 		Error string `json:"error"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return "", fmt.Errorf("%s: unreadable reply: %w", resp.Status, err)
+		return "", fmt.Errorf("%s: unreadable reply: %w", safeText(resp.Status), err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		if out.Error != "" {
-			return "", fmt.Errorf("%s: %s", resp.Status, out.Error)
+			return "", fmt.Errorf("%s: %s", safeText(resp.Status), safeText(out.Error))
 		}
-		return "", fmt.Errorf("%s", resp.Status)
+		return "", fmt.Errorf("%s", safeText(resp.Status))
 	}
-	if out.TxID == "" {
-		return "", fmt.Errorf("%s: reply carried no txid", resp.Status)
+	if !validTxID(out.TxID) {
+		// The bad value is quoted, never echoed: it is exactly the string that
+		// must not reach the terminal raw, and quoting keeps its ESC/CR bytes
+		// visible as escapes instead of executing them.
+		return "", fmt.Errorf("%s: the node's reply carried a txid that is not 64 lowercase hex characters (%s); refusing to print it as a receipt",
+			safeText(resp.Status), safeText(out.TxID))
 	}
 	return out.TxID, nil
 }
