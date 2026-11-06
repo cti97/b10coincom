@@ -150,6 +150,19 @@ enforce any of it)
   source PREFIX by --max-conns-per-ip (default 8), so one host - or one
   routed prefix - cannot hold the registry.
 
+  THE PER-PREFIX CAP IS THE ONE THAT CATCHES HONEST COMMITTEES. A Docker
+  bridge, a LAN and one home NAT each put every validator behind ONE IPv4 /24,
+  so a committee of more than 8 on one prefix has its extra dials closed at
+  accept - and because the cap is applied at accept, BEFORE the access-token
+  gate is announced, those nodes log an EOF during the relay handshake and
+  retry with backoff. They do not stall the chain: the validators that did
+  connect still commit (8 of 10 in the 2026-11-06 run), so the symptom is a
+  committee smaller than it should be. Raise --max-conns-per-ip above the
+  number of validators behind that prefix (16 for ten on one bridge), or give
+  each validator its own prefix. The default is deliberately NOT raised: it is
+  the number of registry slots one host may hold, and the memory derivation
+  above is per-slot.
+
   --access-token-file (default unset) enables the relay's own access control
   (audit N-8, PX-3, D-1). When set, the file's bytes (a trailing newline is
   trimmed) are the PRE-SHARED TOKEN, and at least 16 bytes are required: a

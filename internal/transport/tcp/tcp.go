@@ -1714,7 +1714,7 @@ func (t *TcpTransport) readHello(nc net.Conn, addr string) (transport.PeerID, er
 func (t *TcpTransport) adoptRelay(nc net.Conn, addr string) (*conn, error) {
 	if len(t.opts.RelayAccessToken) > 0 {
 		if err := t.readGateFrame(nc, addr, wire.RelayGateGreeting,
-			"the relay did not announce the access-token gate, so no proof was sent (a relay without a token would forward whatever it received to every peer)"); err != nil {
+			"the relay did not announce the access-token gate, so no proof was sent (a relay started without --access-token-file has no gate to announce, and a relay without a token would forward whatever it received to every peer). THE SAME EOF HAS A SECOND CAUSE, and it is not the token: the relay applies --max-conns and --max-conns-per-ip AT ACCEPT, before it announces anything, so a dial it refuses is closed with no greeting - the per-source-PREFIX cap is 8 by default and every validator behind one IPv4 /24 shares it (a Docker bridge, a LAN, one NAT), which loses the connections above 8 with exactly this symptom. If the relay's refused-connection counter is rising, raise --max-conns-per-ip above the number of validators behind that prefix instead of changing the token"); err != nil {
 			return nil, err
 		}
 		challenge, err := t.readGateChallenge(nc, addr)
