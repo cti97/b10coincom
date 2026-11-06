@@ -114,26 +114,57 @@ Two answers are likely:
 Copy the binaries to the machine that runs each, then install (the static
 binaries need no runtime packages; current 64-bit Raspberry Pi OS and any
 current Debian/Ubuntu VPS run them as-is — the relay "as-is" only once it is
-the architecture-matched file from the branch above). **Copy `bin/SHA256SUMS`
+the architecture-matched file from the branch above). **Copy the checksum file
 too, and verify on the target before installing** — `scripts/deploy/build.sh`
-writes it over the stable names it produced, and the target check is what
-turns "I copied the right bytes" from a hope into a check (audit B-2;
-`--ignore-missing` lets the one checksum file serve a machine that received
-only some of the artifacts):
+writes one per target, over exactly the two stable-name files that run built,
+and the target check is what turns "I copied the right bytes" from a hope into
+a check (audit B-2, S-11).
+
+The file is `bin/SHA256SUMS-linux-arm64` for the Pi pair and
+`bin/SHA256SUMS-linux-amd64` for the amd64 VPS pair — one per build, not one
+shared file with `--ignore-missing`. That flag is why the old recipe verified
+nothing: on a Pi that received only the node binary it **silently skipped the
+relay line**, so "checksums OK" was printed by a check that had not checked the
+file you were about to install. A missing entry must be a refusal, not a pass.
+
+If `scripts/deploy/build.sh` was run with `B10COIN_RELEASE_SIGN_KEY` set (see
+`make release` in the top-level README), a `bin/SHA256SUMS-linux-arm64.minisig`
+sits beside the file. **Copy it and `b10coin.pub` too, and verify the signature
+FIRST** — a checksum file proves only that the bytes did not rot on the way; it
+cannot prove who built them, because whoever could replace the binary could
+replace the checksum as well. The signature is the only one of the two that
+answers that:
 
 ```sh
 # from the build machine — replace pi@ and vps@ with your real SSH targets
-scp bin/SHA256SUMS bin/b10coin-relay-linux-amd64 vps@example.com:/tmp/    # x86_64 VPS (uname -m above)
-# scp bin/SHA256SUMS bin/b10coin-relay-linux-arm64 vps@example.com:/tmp/  # aarch64 VPS: that line instead
+scp bin/SHA256SUMS-linux-amd64 bin/b10coin-relay-linux-amd64 vps@example.com:/tmp/    # x86_64 VPS (uname -m above)
+# scp bin/SHA256SUMS-linux-arm64 bin/b10coin-relay-linux-arm64 vps@example.com:/tmp/  # aarch64 VPS: that line instead
 for p in 192.0.2.11 192.0.2.12 192.0.2.13; do
-    scp bin/SHA256SUMS bin/b10coin-linux-arm64 pi@$p:/tmp/
+    scp bin/SHA256SUMS-linux-arm64 bin/b10coin-linux-arm64 pi@$p:/tmp/
 done
+# only when the build was signed — the .minisig and the published key:
+# scp bin/SHA256SUMS-linux-arm64.minisig b10coin.pub pi@$p:/tmp/
 ```
 
-On the VPS (verify FIRST; a mismatch stops the install):
+On the VPS (verify FIRST; a mismatch stops the install). Step 1 verifies the
+signature **when one was copied**; step 2 checks the one artifact you are about
+to install, naming it:
 
 ```sh
-cd /tmp && sha256sum -c --ignore-missing SHA256SUMS
+cd /tmp
+# 1. signature over the checksum file itself; a no-op only when the build was unsigned
+if [ -f SHA256SUMS-linux-amd64.minisig ]; then minisign -Vm SHA256SUMS-linux-amd64 -p b10coin.pub; fi
+# 2. the named artifact. This form FAILS CLOSED: GNU sha256sum -c exits 0 on
+#    EMPTY input, so a bare `grep ... | sha256sum -c -` would pass when the
+#    entry is missing — the same silent skip as --ignore-missing, one layer down.
+sums=SHA256SUMS-linux-amd64 name=b10coin-relay-linux-amd64
+line=$(grep -E "^[0-9a-f]{64}  $name\$" "$sums") || line=
+if [ -z "$line" ]; then
+    echo "REFUSED: $sums has no checksum for $name" >&2
+    false
+else
+    printf '%s\n' "$line" | sha256sum -c -
+fi
 sudo useradd --system --home-dir /var/lib/b10coin --shell /usr/sbin/nologin b10coin || true
 sudo mkdir -p /opt/b10coin
 sudo install -m 0755 /tmp/b10coin-relay-linux-amd64 /opt/b10coin/b10coin-relay   # -arm64 on an aarch64 VPS
@@ -147,7 +178,16 @@ systemd's `StateDirectory` only guarantees the directory once the unit first
 starts:
 
 ```sh
-cd /tmp && sha256sum -c --ignore-missing SHA256SUMS
+cd /tmp
+if [ -f SHA256SUMS-linux-arm64.minisig ]; then minisign -Vm SHA256SUMS-linux-arm64 -p b10coin.pub; fi  # no-op when unsigned
+sums=SHA256SUMS-linux-arm64 name=b10coin-linux-arm64
+line=$(grep -E "^[0-9a-f]{64}  $name\$" "$sums") || line=
+if [ -z "$line" ]; then
+    echo "REFUSED: $sums has no checksum for $name" >&2
+    false
+else
+    printf '%s\n' "$line" | sha256sum -c -
+fi
 sudo useradd --system --home-dir /var/lib/b10coin --shell /usr/sbin/nologin b10coin || true
 sudo mkdir -p /opt/b10coin
 sudo install -m 0755 /tmp/b10coin-linux-arm64 /opt/b10coin/b10coin

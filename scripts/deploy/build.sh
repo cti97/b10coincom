@@ -7,6 +7,11 @@
 #     scripts/deploy/build.sh                 → bin/b10coin-linux-arm64       (+ relay)  — the Pis
 #     scripts/deploy/build.sh linux/amd64     → bin/b10coin-relay-linux-amd64            — the e.g. amd64 VPS
 #
+# Each run also writes bin/SHA256SUMS-<os>-<arch> covering EXACTLY the two files
+# that run built (never a glob over bin/, which is what let a stale binary pick
+# up a fresh checksum — audit S-11), and signs it when B10COIN_RELEASE_SIGN_KEY
+# is set, so the recipe can verify both identity and provenance on the target.
+#
 # The release script owns the build flags, the .exe suffix, the version (from
 # internal/version — no flags), and every artifact assertion (count ==
 # target count, each artifact file(1)-checked to really report its own
@@ -20,6 +25,11 @@
 set -eu
 
 cd "$(dirname "$0")/../.."
+
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
 
 osarch=${1:-linux/arm64}
 os=${osarch%/*}
@@ -74,23 +84,69 @@ done
 
 file "bin/b10coin-$os-$arch$ext" "bin/b10coin-relay-$os-$arch$ext"
 
-# bin/SHA256SUMS over the STABLE names, so the recipe can copy a checksum file
-# to each machine and verify what it copied ON THE TARGET (audit B-2; the
-# README told operators to verify and gave them nothing to verify against).
-# Regenerated over every b10coin-* file present, so a later invocation for a
-# second target (e.g. the amd64 relay for an amd64 VPS) ADDS its pair instead
-# of replacing the file. dist/SHA256SUMS still covers the versioned artifacts.
+# A checksum file over the STABLE names, so the recipe can copy one to each
+# machine and verify what it copied ON THE TARGET (audit B-2; the README told
+# operators to verify and gave them nothing to verify against).
+#
+# It covers EXACTLY the two files this run just built, named explicitly — never
+# `b10coin-*` (audit S-11). That glob was the defect, not a shortcut: bin/
+# survives between runs, so a week-old leftover binary in it got a fresh, valid
+# checksum, and "verified on the target" then proved only that the bytes had
+# not rotted — not that any build had produced them. A checksum file must
+# describe a BUILD, not a directory listing.
+#
+# PER TARGET rather than one shared bin/SHA256SUMS: two invocations (the Pi
+# pair, then the amd64 relay for a VPS) would otherwise either overwrite each
+# other's evidence or merge pairs from different builds into one file that
+# vouches for both. `SHA256SUMS-<os>-<arch>` is written by the run that
+# produced those bytes and by nothing else.
+sums="SHA256SUMS-$os-$arch"
+# Remove this target's PREVIOUS file first, so a run that fails below cannot
+# leave an older checksum file describing binaries this run has overwritten.
+rm -f "bin/$sums" "bin/$sums.minisig"
+
 if command -v sha256sum >/dev/null 2>&1; then
     sum="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then
     sum="shasum -a 256"
 else
-    echo "FAIL: neither sha256sum nor shasum is available to write bin/SHA256SUMS" >&2
-    exit 1
+    fail "neither sha256sum nor shasum is available to write bin/$sums"
 fi
-( cd bin && $sum b10coin-* > SHA256SUMS ) || {
-    echo "FAIL: writing bin/SHA256SUMS failed" >&2
-    exit 1
-}
-echo "checksums  bin/SHA256SUMS covers $(wc -l < bin/SHA256SUMS | tr -d ' ') stable-name artifact(s); verify on each target with: sha256sum -c --ignore-missing SHA256SUMS"
-echo "OK: $osarch pair in bin/ under stable names (built via scripts/build-release.sh; dist/ also holds the versioned copies and their SHA256SUMS)"
+( cd bin && $sum "b10coin-$os-$arch$ext" "b10coin-relay-$os-$arch$ext" > "$sums" ) ||
+    fail "writing bin/$sums failed"
+lines=$(wc -l < "bin/$sums" | tr -d ' ')
+[ "$lines" -eq 2 ] ||
+    fail "bin/$sums covers $lines artifact(s), want 2 (exactly the $osarch pair this run built)"
+# The file must hold for these bytes before it is offered as evidence.
+( cd bin && $sum -c "$sums" >/dev/null ) ||
+    fail "bin/$sums does not verify against the artifacts it names"
+
+# SIGNING (audit S-11): sign the checksum file when the operator supplies a
+# key, with the same discipline as scripts/build-release.sh — no key, no
+# signature, stated loudly at the end; key set and no .minisig is a FAILURE,
+# not a quiet downgrade. The signature is what turns "these bytes did not rot
+# in transit" into "these bytes came from the holder of this key", which is the
+# only claim that survives the build machine itself being untrusted.
+signing="UNSIGNED"
+if [ -n "${B10COIN_RELEASE_SIGN_KEY:-}" ]; then
+    [ -f "$B10COIN_RELEASE_SIGN_KEY" ] ||
+        fail "B10COIN_RELEASE_SIGN_KEY is set but '$B10COIN_RELEASE_SIGN_KEY' is not a file"
+    command -v minisign >/dev/null 2>&1 ||
+        fail "B10COIN_RELEASE_SIGN_KEY is set but minisign is not installed (see https://jedisct1.github.io/minisign/)"
+    minisign -Sm "bin/$sums" -s "$B10COIN_RELEASE_SIGN_KEY" -t "b10coin deploy artifacts $osarch" >/dev/null ||
+        fail "minisign failed to sign bin/$sums"
+    [ -f "bin/$sums.minisig" ] ||
+        fail "minisign reported success but wrote no bin/$sums.minisig"
+    signing="signed (bin/$sums.minisig)"
+fi
+
+printf 'checksums  bin/%s covers exactly the pair this run built: %s %s\n' \
+    "$sums" "b10coin-$os-$arch$ext" "b10coin-relay-$os-$arch$ext"
+echo "verify on the target BEFORE installing, naming the file you copied: the block form is"
+echo "in scripts/deploy/README.md section 2, and it is the single source for that command."
+echo "Do NOT use --ignore-missing, and do NOT pipe grep straight into 'sha256sum -c': GNU's"
+echo "-c exits 0 on EMPTY input, so either would PASS when the entry is missing."
+if [ "$signing" = "UNSIGNED" ]; then
+    echo "NOTE: bin/$sums is UNSIGNED (no B10COIN_RELEASE_SIGN_KEY); export it, as for make release, to sign this file too." >&2
+fi
+echo "OK: $osarch pair in bin/ under stable names (built via scripts/build-release.sh; dist/ also holds the versioned copies and their SHA256SUMS); release $signing"
