@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/cti97/b10coincom/internal/types"
 )
 
 var (
@@ -27,6 +29,42 @@ var (
 // carry: 2^32-1 bytes. It is an int64, not an int, so the bound is exact on a
 // 32-bit target too, where an int cannot even hold the value being compared.
 const MaxFramePayload int64 = 1<<32 - 1
+
+// MaxFrameEnvelopeBytes is the headroom a frame bound must carry OVER a
+// max-size block's encoding, for everything a message adds on top of the block
+// it carries:
+//
+//   - a commit certificate at the committee ceiling: 255 seats x 145 encoded
+//     precommit bytes = 36,975;
+//   - a re-proposal's justification, which is that same certificate again;
+//   - the proposal / sync-response framing around both (tens of bytes).
+//
+// 64 KiB covers the 36,975-byte ceiling with ~28 KiB to spare, so a max-size
+// legal block fits a frame whether it arrives as a proposal (with or without a
+// justification) or as one BLOCK_SYNC unit with its certificate. The
+// derivation is asserted by the triangle invariant test; it cannot live in a
+// computed constant here because the certificate ceiling is genesis/consensus
+// policy and consensus imports this package, not the other way round (audit
+// S-2, S-3).
+const MaxFrameEnvelopeBytes = 64 << 10
+
+// MaxFrameBytes is the largest canonical frame every shipped transport accepts
+// by default, and the ONE frame bound the tcp transport, the relay and the
+// syncer's answer budget all share.
+//
+// THE TRIANGLE (audit S-2). A block may be as large as types.MaxBlockBytes and
+// it is its SIGNED encoding that goes on the wire, so a frame bound equal to
+// the block bound leaves no room for anything wrapped around the block. That is
+// exactly what shipped: both bounds were 1 MiB, a max-size legal block's
+// proposal envelope encoded to 1,048,580 bytes (+4 over the bound) and a single
+// sync unit carrying it with a three-vote certificate to 1,049,014 (+438), so a
+// legal max-size block could neither be proposed nor pulled - the receiver
+// skipped the frame and the puller read the silence as "caught up".
+//
+// It is DERIVED from the block bound rather than written down twice, so raising
+// MaxBlockBytes carries the frame bound with it instead of silently reopening
+// the gap it exists to close.
+const MaxFrameBytes = types.MaxBlockBytes + MaxFrameEnvelopeBytes
 
 // WritableLen reports why a payload of n bytes cannot be framed on this wire,
 // or nil when it can. It exists so every write path refuses an unframable

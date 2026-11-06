@@ -706,8 +706,9 @@ hold, at one instant, at most: its write-queue **payload** budget
 writer's hand (≤ `max-frame-bytes`); and the single frame in its reader's
 hand (≤ `max-frame-bytes`); the aggregate over the registry is therefore
 `max-conns × (write-queue-bytes + write-queue-frames × 32 + 2 × max-frame-bytes)`.
-At the defaults:
-**32 × (2 MiB + 4096 × 32 B + 2 × 1 MiB) = 32 × 4.125 MiB = 132 MiB**. (Two
+At the defaults (the frame bound is one max-size block plus its envelope, see
+`--max-frame-bytes` below):
+**32 × (2 MiB + 4096 × 32 B + 2 × 1.0625 MiB) = 32 × 4.25 MiB = 136 MiB**. (Two
 earlier claims on this spot were wrong. The first omitted the write-queue
 factor entirely: 256 conns could each queue 64 *frames* × 1 MiB = 64 MiB —
 **16 GiB**, not the 256 MiB documented — and hold it *indefinitely*, a sink
@@ -729,7 +730,7 @@ relay with exponential backoff. Bandwidth is kilobytes per second.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--addr ADDR` | `:7001` | listen address (all interfaces — validators must reach this one) |
-| `--max-frame-bytes N` | `1048576` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic) |
+| `--max-frame-bytes N` | `1114112` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic). The default is `wire.MaxFrameBytes`: one max-size block (`types.MaxBlockBytes`, 1 MiB) plus 64 KiB for the envelope a message may wrap around it — a certificate at the 255-seat committee ceiling is 36,975 bytes — because a bound equal to the block bound would sever exactly the max-size blocks validators are entitled to propose |
 | `--max-conns N` | `32` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
 | `--max-conns-per-ip N` | `8` | how many of those slots one source **prefix** may hold — the IPv6 `/64` or IPv4 `/24`, IPv4-mapped IPv6 unmapped, masked — so a routed prefix cannot bypass the cap by rotating addresses; a dial from a prefix at its cap is closed at accept |
 | `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than its contention-relative allowance — its equal share of the queue budget (`limit/senders`) once another account holds bytes there, and the whole budget while none does, so a lone sender uses the whole budget, a sharing sender is held to its share, and two connections from one host share one account. Residual: a flooder that fills the queue before another sender queues anything can occupy all of it until the write timeout reaps a slow receiver |

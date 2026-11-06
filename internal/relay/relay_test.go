@@ -1271,7 +1271,10 @@ func TestRelayDoesNotDeduplicateARepeatedFrame(t *testing.T) {
 func TestRelayOptionDefaultsPinTheOperatorNumbers(t *testing.T) {
 	got := New(Options{}).opts
 	want := Options{
-		MaxFrameBytes:    1 << 20,
+		// wire.MaxFrameBytes: one max-size block plus the envelope a message
+		// may wrap around it (audit S-2). A frame bound equal to the block
+		// bound severs exactly the max-size blocks a validator may propose.
+		MaxFrameBytes:    wire.MaxFrameBytes,
 		MaxConns:         32,
 		MaxConnsPerIP:    8,
 		WriteQueueBytes:  2 << 20,
@@ -1289,20 +1292,20 @@ func TestRelayOptionDefaultsPinTheOperatorNumbers(t *testing.T) {
 	// derivation's output at the defaults, so a changed default either moves
 	// the documents' number with it or fails here. The derivation includes
 	// the per-frame ENTRY ring (audit N-2's re-opened term): 32 x (2 MiB
-	// payload + 4096 x 32 B entries + 2 x 1 MiB hands) = 132 MiB.
-	wantBound := 32 * (2<<20 + 4096*queuedFrameEntryBytes + 2*(1<<20))
+	// payload + 4096 x 32 B entries + 2 x wire.MaxFrameBytes hands) = 136 MiB.
+	wantBound := 32 * (2<<20 + 4096*queuedFrameEntryBytes + 2*wire.MaxFrameBytes)
 	if bound := got.MaxPinnedBytes(); bound != wantBound {
-		t.Fatalf("MaxPinnedBytes() = %d bytes at the defaults, want %d (32 conns x (2 MiB payload + 4096 x 32 B entries + 2 x 1 MiB hands)) - the derived pin the README, --help and the unit's MemoryMax quote has drifted",
+		t.Fatalf("MaxPinnedBytes() = %d bytes at the defaults, want %d (32 conns x (2 MiB payload + 4096 x 32 B entries + 2 x wire.MaxFrameBytes hands)) - the derived pin the README, --help and the unit's MemoryMax quote has drifted",
 			bound, wantBound)
 	}
-	if wantBound != 132<<20 {
-		t.Fatalf("the derived default bound is %d bytes, expected the documented 132 MiB (%d) - the constants and the documents have diverged", wantBound, 132<<20)
+	if wantBound != 136<<20 {
+		t.Fatalf("the derived default bound is %d bytes, expected the documented 136 MiB (%d) - the constants and the documents have diverged", wantBound, 136<<20)
 	}
 	// And the bound is really a derivation: changing one input moves it (a
 	// hardcoded constant would silently break the arithmetic).
 	custom := got
 	custom.MaxConns = 8
-	if bound := custom.MaxPinnedBytes(); bound != 8*(2<<20+4096*queuedFrameEntryBytes+2*(1<<20)) {
+	if bound := custom.MaxPinnedBytes(); bound != 8*(2<<20+4096*queuedFrameEntryBytes+2*wire.MaxFrameBytes) {
 		t.Fatalf("MaxPinnedBytes() = %d with MaxConns 8, want %d - the bound is not derived from the options", bound, 8*(2<<20+4096*queuedFrameEntryBytes+2*(1<<20)))
 	}
 	// The entry term is not decorative: dropping the frame cap from the

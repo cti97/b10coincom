@@ -46,10 +46,11 @@
 // dials and can end, each side evicting the other's winner, with none.
 //
 // The handshake ID frame is bounded at maxHandshakeIDBytes - a few hundred
-// bytes, not the transport's 1 MiB frame bound. A first frame that large is
-// a refusal (audit N-1: the identity read is where a stranger first meets a
-// validator's listener; a 1 MiB "identity" is nothing a legitimate peer
-// ever opens with), and the connection ends instead of being read.
+// bytes, not the transport's frame bound (wire.MaxFrameBytes). A first frame
+// that large is a refusal (audit N-1: the identity read is where a stranger
+// first meets a validator's listener; a block-sized "identity" is nothing a
+// legitimate peer ever opens with), and the connection ends instead of being
+// read.
 //
 // Two further rules exist because a deterministic name is otherwise a free
 // handle (audit N-1, whose first fix introduced exactly that):
@@ -93,24 +94,28 @@ import (
 )
 
 const (
-	// DefaultMaxFrameBytes bounds a frame at 1 MiB. Consensus messages are
-	// hundreds of bytes; only a BLOCK_SYNC response (Task 4) approaches
-	// block payloads, and a devnet block is well under this. Every node in
-	// an honest run uses the same default, but the knob exists because a
-	// peer with a smaller bound must be able to say "too big, try less"
-	// without being disconnected for it (the oversized frame is skipped, and
-	// the connection lives on - see the reader).
-	DefaultMaxFrameBytes = 1 << 20
+	// DefaultMaxFrameBytes bounds a frame at one max-size block plus what a
+	// message may wrap around it (wire.MaxFrameBytes). Consensus messages are
+	// hundreds of bytes; the one frame that approaches block payloads is a
+	// proposal carrying a full block and a BLOCK_SYNC response carrying blocks
+	// with their certificates, and both must fit or the block they carry is
+	// silently skipped (audit S-2). Every node in an honest run uses the same
+	// default, but the knob exists because a peer with a smaller bound must be
+	// able to say "too big, try less" without being disconnected for it (the
+	// oversized frame is skipped, and the connection lives on - see the
+	// reader).
+	DefaultMaxFrameBytes = wire.MaxFrameBytes
 	// DefaultWriteQueueSize is the bound that keeps Broadcast from ever
 	// waiting on a slow peer: 128 frames is far beyond everything one round
 	// of consensus produces, so an honest peer never drops, and a wedged
 	// peer costs the sender buffered memory only.
 	//
 	// The worst case, spelled out with the arithmetic because the bound is
-	// in FRAMES, not bytes: 128 frames x (DefaultMaxFrameBytes 1 MiB
-	// payload + a frame header) = just over 128 MiB of bufferable memory PER
-	// WEDGED PEER CONNECTION, if every queued frame were at today's size
-	// limit. With current consensus traffic (hundreds of bytes per frame)
+	// in FRAMES, not bytes: 128 frames x (DefaultMaxFrameBytes - one
+	// max-size block plus its envelope - plus a frame header) = ~136 MiB of
+	// bufferable memory PER WEDGED PEER CONNECTION, if every queued frame
+	// were at the size limit. With current consensus traffic (hundreds of
+	// bytes per frame)
 	// the same 128-frame bound caps a wedged peer at tens of KiB. When Task
 	// 4 puts block-sized frames on the wire, this number - or a byte-level
 	// companion bound - must be revisited along with it; until then the
@@ -199,7 +204,7 @@ const (
 	// before the connection is ended. Pre-fix the writer had no deadline, so
 	// a sink that never read parked the writer forever, pinning the frame in
 	// its hand and the rest of the bounded queue behind it. A frame at the
-	// 1 MiB bound writes inside it at ~280 kbit/s; honest frames are
+	// frame bound writes inside it at ~300 kbit/s; honest frames are
 	// hundreds of bytes.
 	DefaultWriteTimeout = 30 * time.Second
 	// DefaultRateLimitPerSec and DefaultRateLimitBurst are the per-connection
@@ -566,7 +571,8 @@ func newByteBucket(perSec, burst int) *byteBucket {
 // reserve charges n bytes and reports how long the caller must wait before
 // they are paid for (zero when the bucket had room). A frame larger than the
 // burst is allowed through with a wait of one frame's overage: refusing it
-// would be a drop, and the frame-size bound already caps it at 1 MiB.
+// would be a drop, and the frame-size bound (wire.MaxFrameBytes) already
+// caps it at one max-size block plus its envelope.
 func (b *byteBucket) reserve(n int) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()

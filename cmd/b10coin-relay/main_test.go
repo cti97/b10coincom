@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cti97/b10coincom/internal/relay"
+	"github.com/cti97/b10coincom/internal/wire"
 )
 
 // TestRunHelpPrintsTheTrustTrade: the brief requires the trust trade in
@@ -89,7 +90,9 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 		t.Fatalf("default --addr = %q, want \":7001\"", addr)
 	}
 	want := relay.Options{
-		MaxFrameBytes:    1 << 20,
+		// wire.MaxFrameBytes: one max-size block plus its envelope, so the
+		// relay never severs a frame a validator is entitled to send.
+		MaxFrameBytes:    wire.MaxFrameBytes,
 		MaxConns:         32,
 		MaxConnsPerIP:    8,
 		WriteQueueBytes:  2 << 20,

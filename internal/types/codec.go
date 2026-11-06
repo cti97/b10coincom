@@ -77,6 +77,14 @@ func (e *Encoder) VarBytes(b []byte) {
 	e.buf = append(e.buf, b...)
 }
 
+// varintLen is how many bytes Len would write for n. It exists so a caller that
+// must know an encoded size without allocating the encoding (the producer's
+// per-block byte budget) measures the SAME prefix the encoder writes.
+func varintLen(n int) int {
+	var b [binary.MaxVarintLen64]byte
+	return binary.PutUvarint(b[:], uint64(n))
+}
+
 func (e *Encoder) Raw(b []byte) { e.buf = append(e.buf, b...) }
 
 func (e *Encoder) Fixed32(v [HashSize]byte) { e.buf = append(e.buf, v[:]...) }

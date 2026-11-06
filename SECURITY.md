@@ -64,7 +64,8 @@ advisory is yours unless you prefer otherwise.
   the accepted frame, and then keep a link that was never gated. "The relay is
   gated" describes this node's configuration, not who owns the address. The
   gate answer is read under a fixed 32-byte bound (`wire.RelayGateMACBytes`),
-  never the 1 MiB frame bound, and the relay still decodes nothing on that path.
+  never the frame bound (`wire.MaxFrameBytes`), and the relay still decodes
+  nothing on that path.
   (Audit PX-9: the *frame bound* item is fixed; the endpoint-trust boundary is
   the documented residual.)
 - **HELLO admission is a union, and a rotated-out genesis seat keeps it.** A

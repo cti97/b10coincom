@@ -343,7 +343,7 @@ is **not** the health signal. The relay instead logs a counters line on a
 60-second timer and on `SIGUSR1` (audit N-9):
 
 ```
-b10coin-relay forwarding on :7001 (max frame 1048576, max conns 32 (8 per prefix), queue 2097152 bytes / 4096 frames, read timeout 2m0s, write timeout 30s, keepalive 15s, access token off)
+b10coin-relay forwarding on :7001 (max frame 1114112, max conns 32 (8 per prefix), queue 2097152 bytes / 4096 frames, read timeout 2m0s, write timeout 30s, keepalive 15s, access token off)
 b10coin-relay stats: conns=3 forwarded=18244 dropped=0 refused=0 unauthorized=0
 ```
 
@@ -356,8 +356,8 @@ numbers.
 
 At the relay's defaults the memory a stranger can pin is
 `max-conns × (write-queue-bytes + write-queue-frames × 32 + 2 × max-frame-bytes)`
-= 32 × (2 MiB payload + 4096 × 32 B entry ring + 2 × 1 MiB hands) =
-**32 × 4.125 MiB = 132 MiB** (one write-queue payload budget, the queue's
+= 32 × (2 MiB payload + 4096 × 32 B entry ring + 2 × 1.0625 MiB hands) =
+**32 × 4.25 MiB = 136 MiB** (one write-queue payload budget, the queue's
 per-frame entry ring, and the one frame in each of the writer's and reader's
 hands, per connection), held at most one read- or write-timeout — the unit's
 `MemoryMax=256M` sits above that plus the runtime. The per-prefix cap (`8`

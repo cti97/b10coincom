@@ -596,6 +596,29 @@ func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
 // this filter is what makes that impossible by construction rather than by
 // two implementations that must be kept in step by hand.
 //
+// THE BYTE BUDGET LIVES HERE (audit S-3). A block is legal only if it is under
+// BOTH types.MaxTxsPerBlock and types.MaxBlockBytes, and the count ceiling is
+// the looser of the two: the pool can hand a producer 10,000 applicable
+// transfers whose framed weight is 1,650,212 bytes, so a filter that judged
+// only applicability assembled blocks that chain.Build spent a full state
+// transition on before ValidateStructure refused them with ErrBlockTooLarge -
+// and node.Run then exited. The budget is accumulated from the SAME encoded
+// size the block will carry (types.Tx.FramedSize, measured from Encode) plus
+// the signed block's fixed overhead, so the selected list can never exceed
+// MaxBlockBytes, and it is charged only for transactions that APPLY: an evicted
+// candidate costs the block no room.
+//
+// It is enforced here, not in Build, because the caller's slice is the pool's
+// bookkeeping. Truncating inside Build would drop transactions the caller had
+// already removed from the pool with Take, and nothing would put them back;
+// the budget returns them as overBudget instead, and the caller's contract is
+// to RETURN THEM TO THE POOL they came from (both producers re-add them before
+// the head moves, because the nonce floor of an appended block would refuse
+// them afterwards). An over-budget transaction is NOT an inapplicable one: it
+// is valid, it is eligible, and it belongs in a later block - losing it would
+// make a full mempool a silent transaction shredder. Every transaction not in
+// selected and not in overBudget was evicted for inapplicability, alone.
+//
 // The filter's base is Probe(nil) - the state a block at head+1 with no
 // transactions would produce: the SAME transition Build runs, height advanced
 // and emission credited. Hand-cloning the head state (the old filter) probed
@@ -631,21 +654,37 @@ func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
 // An error return means the empty head+1 transition itself failed, so nothing
 // applies and every candidate was lost by the caller's bookkeeping; the caller
 // is expected to return its candidates to wherever they came from.
-func (c *Chain) SelectApplicable(candidates []types.Tx) ([]types.Tx, error) {
+//
+// overBudget is a sub-slice of candidates, in the caller's order, and must not
+// be mutated. It is empty whenever the candidates fit a block.
+func (c *Chain) SelectApplicable(candidates []types.Tx) (selected, overBudget []types.Tx, err error) {
 	// Probe returns a fresh state (advanceLocked clones before applying), so it
 	// is the caller's to mutate; no further clone is needed.
 	base, err := c.Probe(nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	valid := make([]types.Tx, 0, len(candidates))
+	// used is the encoded size the block would have: the signed overhead plus
+	// every selected transaction's framed weight. It is compared before a
+	// candidate is applied, because a candidate that does not fit must not
+	// touch the running base: the next block is assembled against the state the
+	// SELECTED transactions produce, and a probe that included a transaction the
+	// block does not carry would judge its successors against a state that never
+	// happened.
+	used := types.BlockOverheadBytes
+	selected = make([]types.Tx, 0, len(candidates))
 	for i := range candidates {
+		size := candidates[i].FramedSize()
+		if used+size > types.MaxBlockBytes {
+			return selected, candidates[i:], nil
+		}
 		if err := base.ApplyTx(&candidates[i]); err != nil {
 			continue // evict: it cannot apply at this state, leaving base unchanged
 		}
-		valid = append(valid, candidates[i])
+		selected = append(selected, candidates[i])
+		used += size
 	}
-	return valid, nil
+	return selected, nil, nil
 }
 
 // Build constructs and signs a candidate block. It does not mutate the

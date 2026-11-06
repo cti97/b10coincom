@@ -165,6 +165,17 @@ func (tx *Tx) Encode() []byte {
 	return e.Bytes()
 }
 
+// FramedSize is how many bytes tx costs inside a block's canonical encoding: its
+// own encoding plus the minimal varint length prefix Block.Encode writes in
+// front of each transaction. It is the unit the producer's per-block byte budget
+// accumulates (chain.SelectApplicable), and it is measured from Encode() rather
+// than written down, so a change to a field's width cannot leave the budget
+// measuring a size the wire no longer produces.
+func (tx *Tx) FramedSize() int {
+	n := len(tx.Encode())
+	return varintLen(n) + n
+}
+
 // VerifySignature checks that PubKey matches From and that Sig is valid over
 // the chain identifier and the body. genesisHash must be the genesis hash of
 // the chain this transaction is being judged for: a transaction signed for

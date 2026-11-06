@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
@@ -21,10 +22,15 @@ type Node struct {
 	proposer ed25519.PrivateKey
 	mempool  *mempool.Mempool
 	now      func() time.Time
+	// logf is the producer's log sink. It is a field, not a call to the log
+	// package in Run, so a test can assert that a failing tick logs exactly
+	// once per episode without swapping the process-global logger out from
+	// under any other test in the same binary (audit S-3).
+	logf func(format string, args ...any)
 }
 
 func New(c *chain.Chain, proposer ed25519.PrivateKey, mp *mempool.Mempool) *Node {
-	return &Node{chain: c, proposer: proposer, mempool: mp, now: time.Now}
+	return &Node{chain: c, proposer: proposer, mempool: mp, now: time.Now, logf: log.Printf}
 }
 
 // RunOnce produces at most one block from the current mempool and appends
@@ -43,6 +49,13 @@ func New(c *chain.Chain, proposer ed25519.PrivateKey, mp *mempool.Mempool) *Node
 // batch (Take removes everything it returned, so a transaction dropped here
 // is gone for good. Claims past MaxFaucetClaimsPerBlock are never returned -
 // they stay in the pool untouched, outside this eviction path entirely).
+//
+// Transactions the block's BYTE BUDGET could not hold are a different case and
+// are put straight back (audit S-3): they are valid and eligible, they simply
+// did not fit this block, and SelectApplicable reports them rather than
+// dropping them. The re-add happens BEFORE Build, while the pool's nonce floor
+// is still the pre-block one - a re-add after Append would be refused, because
+// the block that did not carry them moved the nonce floor past them.
 func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 	if timestamp == 0 {
 		timestamp = n.now().Unix()
@@ -53,11 +66,22 @@ func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 	// a policy written twice here and there could drift into a fork. Only the
 	// bookkeeping around it is node's own.
 	candidates := n.mempool.Take(types.MaxTxsPerBlock)
-	valid, err := n.chain.SelectApplicable(candidates)
+	valid, overBudget, err := n.chain.SelectApplicable(candidates)
 	if err != nil {
 		// Nothing applies at a state whose head+1 transition fails; park
 		// the candidates back in the mempool rather than lose them.
 		return nil, reAdd(n.mempool, candidates, err)
+	}
+	if len(overBudget) > 0 {
+		// Return the transactions the byte budget excluded. A failure here is
+		// reported rather than swallowed: it means the pool refused a
+		// transaction it had already admitted, so the block attempt is
+		// abandoned and everything still in hand goes back with it. Returning
+		// the error costs one tick; ignoring it would lose the transaction
+		// silently.
+		if rerr := reAdd(n.mempool, overBudget, nil); rerr != nil {
+			return nil, reAdd(n.mempool, valid, rerr)
+		}
 	}
 
 	b, err := n.chain.Build(n.proposer, valid, timestamp)
@@ -91,33 +115,56 @@ func reAdd(mp *mempool.Mempool, txs []types.Tx, cause error) error {
 	if len(stranded) == 0 {
 		return cause
 	}
+	if cause == nil {
+		// A re-add with no previous failure (the over-budget path): there is no
+		// cause to wrap, and fmt's %w with a nil error prints "%!w(<nil>)".
+		return fmt.Errorf("%d of %d valid transactions could not be re-added to the mempool and are lost: %v",
+			len(stranded), len(txs), stranded)
+	}
 	return fmt.Errorf("%w (in addition, %d of %d valid transactions could not be re-added to the mempool and are lost: %v)",
 		cause, len(stranded), len(txs), stranded)
 }
 
 // Run produces blocks every interval until ctx is cancelled.
 //
-// ERROR POLICY (audit O-7), stated because it is a deliberate choice: the
-// first RunOnce error STOPS the loop and is returned to main, which exits the
-// process. RunOnce itself already returns the block's candidates to the pool
-// on a failed attempt (reAdd), but the pool is in memory and is NOT persisted,
-// so a restart begins empty and any transaction still pending is lost. That
-// is acceptable for a storage or wiring failure that needs operator attention
-// (continuing to tick against a broken store would only lose more); callers
-// that want the node to survive transient failures must restart it. There is
-// deliberately no retry-with-backoff here: an error this loop can see is not
-// classified as transient, and guessing wrong would hide a real fault.
+// ERROR POLICY (audit S-3, superseding O-7): a RunOnce error is LOGGED ONCE and
+// the loop carries on to the next tick. It is NOT returned to main.
+//
+// The pre-fix policy exited the process on the first failure, on the reasoning
+// that an error this loop can see is not transient and guessing wrong would
+// hide a real fault. That reasoning had one gap that mattered: it made a
+// PRODUCER bound (a block the node could not build) into an outage for every
+// node holding a full mempool, and an outage is the wrong answer to "this tick
+// could not build". A producer that cannot build should try again - the pool is
+// re-derived on every attempt and the head does not move, so the next tick is a
+// genuinely different attempt, and a bound that was momentarily too tight (the
+// byte budget, a re-add race, a transient store write) heals itself.
+//
+// The log is LATCHED to one line per failure episode: the condition is retried
+// every tick, and a line per tick at a two-second interval would bury it. A
+// success clears the latch, so a node that fails, recovers and fails again says
+// so twice. Nothing is swallowed - the line carries the error and the retry
+// interval - and ctx cancellation is still returned, so a clean shutdown is
+// still distinguishable from a running node.
 func (n *Node) Run(ctx context.Context, interval time.Duration) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var failing bool
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
 			if _, err := n.RunOnce(0); err != nil {
-				return err
+				if !failing {
+					failing = true
+					if n.logf != nil {
+						n.logf("b10coin: block production failed; retrying every %s until one succeeds (this line is logged once per failure episode): %v", interval, err)
+					}
+				}
+				continue
 			}
+			failing = false
 		}
 	}
 }

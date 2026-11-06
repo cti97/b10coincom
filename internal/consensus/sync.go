@@ -88,14 +88,18 @@ import (
 	"github.com/cti97/b10coincom/internal/wire"
 )
 
-// DefaultMaxBlocksPerResponse is the bound a Syncer carries when it is built
-// through NewSyncer. With a devnet block (a ~250-byte header and, today, no
-// transaction load) a full window plus its certificates (three ~180-byte
-// precommits per block) encodes to well under the tcp transport's 1 MiB frame
-// bound, so a default-window response can never be silently dropped by the
-// frame layer for size. A deployment whose blocks carry real transaction
-// weight must lower this knob: the bound is in BLOCKS, not bytes, and the
-// frame bound is the enforcement point behind it.
+// DefaultMaxBlocksPerResponse is the COUNT bound a Syncer carries when it is
+// built through NewSyncer.
+//
+// It is not, and never was, a size guarantee (audit S-2). With a devnet block
+// (a ~250-byte header and no transaction load) a full window plus its
+// certificates encodes to a few tens of kilobytes, but a window of legal
+// blocks carrying real transaction weight does not: at ~2.2 KB of certificate
+// per unit a 64-height window fits one frame only while blocks stay below
+// ~14 KB. The BYTE bound that makes a response framable is MaxResponseBytes
+// (wire.MaxFrameBytes by default) and Answer enforces it by serving a shorter
+// range; this constant bounds the count, so the response decoder's per-unit
+// allocation stays bounded independently of the byte budget.
 const DefaultMaxBlocksPerResponse = 64
 
 // DefaultReplyWait is the deadline a pull waits on ONE response frame when
@@ -187,6 +191,12 @@ var (
 	// the seen-set window. Serving it again would let one signed request make
 	// the node do its full answer work repeatedly (audit C-4).
 	ErrSyncReplayed = errors.New("consensus: BLOCK_SYNC request was already served (replay)")
+	// ErrSyncUnitTooLarge reports a response budget under ONE block plus its
+	// certificate: the node can serve nothing at all, and saying so is better
+	// than an empty response the puller would read as "caught up" (audit S-2).
+	// It is unreachable at the default budget, where a max-size legal block
+	// plus a full certificate is one frame by construction.
+	ErrSyncUnitTooLarge = errors.New("consensus: BLOCK_SYNC response budget cannot hold one block and its certificate")
 )
 
 // Syncer answers BLOCK_SYNC requests from a local chain and pulls missed blocks
@@ -205,7 +215,29 @@ type Syncer struct {
 	// it asks for. (The Len decoder's own bound - a count larger than the
 	// remaining frame bytes is refused - is what keeps the amplification
 	// linear in the frame cap.)
+	//
+	// It is a COUNT bound and it is NOT sufficient on its own (audit S-2): a
+	// block may be nearly a mebibyte, so 64 units of legal blocks encode to
+	// far more than one frame. MaxResponseBytes is the byte bound that keeps
+	// the answer inside a frame; this one keeps the count (and the decoder's
+	// allocation) bounded independently of it.
 	MaxBlocksPerResponse uint64
+
+	// MaxResponseBytes is the largest encoded BLOCK_SYNC response Answer will
+	// build, in bytes; zero takes wire.MaxFrameBytes, the bound every shipped
+	// transport reads frames with.
+	//
+	// THE ANSWER SIDE OF THE TRIANGLE (audit S-2). Serving a window is subject
+	// to two bounds, not one: MaxBlocksPerResponse units, AND one frame. A
+	// response past the frame bound is not truncated by the frame layer - the
+	// reader drains and DISCARDS it (transport.skipOversized) while keeping
+	// the connection, and the puller reads the silence as "caught up", so the
+	// node is ejected from consensus while it keeps re-pulling. Answer
+	// therefore serves the shorter range that fits and lets `served <
+	// MaxBlocksPerResponse` end the pull, which is how a windowed pull has
+	// always learned that a peer has run out: the caller's next wave resumes
+	// from the new head.
+	MaxResponseBytes int
 
 	// Peer is the validator this syncer pulls from, set by the
 	// transport-facing layer when it knows which peer it is behind (a HELLO
@@ -386,6 +418,7 @@ func NewSyncer(ch *chain.Chain, tp transport.Transport, priv ed25519.PrivateKey)
 		tp:                   tp,
 		priv:                 priv,
 		MaxBlocksPerResponse: DefaultMaxBlocksPerResponse,
+		MaxResponseBytes:     wire.MaxFrameBytes,
 		pub:                  pub,
 	}
 	s.nonce.Store(nonceSeed())
@@ -869,6 +902,12 @@ func (s *Syncer) certificateAt(height uint64) (commitRecord, bool) {
 // [from, from+window) of a shorter peer is the normal end of a windowed pull,
 // and the served count below the window is how the requester learns the peer
 // has run out.
+//
+// A range that FITS the count bound but not the BYTE bound is also served
+// short (audit S-2), and that is not a refusal: the alternative is a frame the
+// reader drains and discards, which the puller can only read as silence. The
+// served count below the window ends the pull and the next wave resumes from
+// the head it reached.
 func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 	// BLOCK_SYNC membership is PER HEIGHT, and it MUST NOT BE STRICTER THAN
 	// THE ROTATION ITSELF. The asker's head is the height just before the
@@ -947,6 +986,31 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 		end = height
 	}
 	units := make([]wire.BlockSyncUnit, 0, end-req.From+1)
+	// THE BYTE BUDGET (audit S-2). MaxBlocksPerResponse bounds the COUNT; the
+	// frame bound is in BYTES, and a response that encodes past it is not
+	// truncated by the frame layer - it is drained and DISCARDED while the
+	// connection lives on, and the puller reads that silence as "caught up".
+	// A 64-height window of ordinary blocks already encodes past one frame at
+	// roughly 14 KB per block (a 21-seat certificate is ~2.2 KB per unit), so
+	// an unconditional window is a permanent ejection from consensus for any
+	// node behind on a chain with real transaction weight.
+	//
+	// The fix is to serve the SHORTER range that fits. That needs no new stop
+	// rule on the pull side: `served < win` already ends a pull cleanly (see
+	// PullAndAdopt), which is how a windowed pull has always learned that a
+	// peer has run out, and the next wave resumes from the head this one
+	// reached.
+	//
+	// The measurement goes through the wire encoder rather than re-deriving
+	// its varint framing here: a second length computation is free to drift
+	// from the bytes it is meant to measure, and this one has to be exact or
+	// the frame layer discards the answer.
+	budget := s.MaxResponseBytes
+	if budget <= 0 {
+		budget = wire.MaxFrameBytes
+	}
+	envelope := syncRespLen(&wire.BlockSyncResp{Nonce: req.Nonce}, len(s.pub))
+	used := envelope
 	for h := req.From; h <= end; h++ {
 		blk, err := s.chain.BlockAt(h)
 		if err != nil {
@@ -958,15 +1022,55 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 		if !ok {
 			return nil, fmt.Errorf("%w: this node holds no commit certificate for height %d", ErrBadSyncCommit, h)
 		}
-		units = append(units, wire.BlockSyncUnit{Block: blk.Encode(), Round: rec.round, Votes: rec.encoded})
+		unit := wire.BlockSyncUnit{Block: blk.Encode(), Round: rec.round, Votes: rec.encoded}
+		size := syncRespLen(&wire.BlockSyncResp{Nonce: req.Nonce, Units: []wire.BlockSyncUnit{unit}}, len(s.pub)) - envelope
+		if used+size > budget {
+			// Stop BEFORE appending: what is served is the prefix that fits.
+			break
+		}
+		units = append(units, unit)
+		used += size
+	}
+	if len(units) == 0 {
+		// One unit did not fit the budget, so this node can serve nothing at
+		// all: refusing is explicit, where an empty response would be read by
+		// the puller as silence (and therefore as "caught up"). With the
+		// default budget this is unreachable for any block the chain can
+		// legally hold - a max-size block plus its certificate is one frame
+		// by construction (wire.MaxFrameBytes) - so it means someone lowered
+		// MaxResponseBytes below a legal unit.
+		return nil, fmt.Errorf("%w: one block plus its certificate does not fit the %d-byte response budget", ErrSyncUnitTooLarge, budget)
 	}
 	resp := &wire.BlockSyncResp{Nonce: req.Nonce, Units: units}
+	// Exactness net: the accumulated unit sizes assume the unit-count prefix
+	// keeps the same varint width as the empty envelope's. It does for any
+	// count below 128, which covers DefaultMaxBlocksPerResponse; a larger
+	// configured window could differ by a byte, so the encoded length is
+	// checked once and the tail dropped rather than sending a frame every
+	// reader would discard.
+	for len(resp.Units) > 0 && syncRespLen(resp, len(s.pub)) > budget {
+		resp.Units = resp.Units[:len(resp.Units)-1]
+	}
+	if len(resp.Units) == 0 {
+		return nil, fmt.Errorf("%w: one block plus its certificate does not fit the %d-byte response budget", ErrSyncUnitTooLarge, budget)
+	}
 	// The response envelope is signed as the answering committee member
 	// (round 7, F1): on a relay every member shares the one transport name,
 	// so this signature is what lets the puller attribute the answer to the
 	// member it selected and refuse a stranger's.
 	signSyncResp(s.priv, req, resp)
 	return resp, nil
+}
+
+// syncRespLen is the exact encoded length of a BLOCK_SYNC response frame whose
+// responder key is responderLen bytes and whose signature is a full one: the
+// signature's CONTENT never changes its length, so a placeholder measures the
+// same bytes EncodeBlockSyncResp will write once the response is signed.
+func syncRespLen(resp *wire.BlockSyncResp, responderLen int) int {
+	probe := *resp
+	probe.Responder = make([]byte, responderLen)
+	probe.Sig = make([]byte, ed25519.SignatureSize)
+	return len(wire.EncodeBlockSyncResp(&probe))
 }
 
 // requesterLabel renders a requester key for an error message without pulling
@@ -1274,7 +1378,17 @@ func (s *Syncer) PullAndAdopt(from uint64) error {
 		}
 		served := uint64(len(got.Units))
 		if served < win {
-			return nil // the peer ran out inside this window: caught up
+			// A short window ends THIS pull. It means one of two things, and
+			// the pull cannot tell them apart from the bytes: the peer ran out
+			// of heights (caught up), or the peer's ANSWER-side byte budget cut
+			// the window short because the blocks were too large to fit a
+			// frame together (audit S-2). Neither is an error and neither is
+			// final: adopted blocks moved the head, so the caller's next wave
+			// re-enters at the new head and asks again. The pull deliberately
+			// does NOT keep requesting past a short window - doing so against a
+			// peer that really has run out would pay one full ReplyWait per
+			// pull on the ordinary "already current" path.
+			return nil
 		}
 		from = start + served // a full window: keep pulling past it
 		if from < start {

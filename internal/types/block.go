@@ -9,11 +9,72 @@ import (
 
 const (
 	// MaxTxsPerBlock bounds block size so a Raspberry Pi can always
-	// process a block within one block interval.
+	// process a block within one block interval. It is a COUNT ceiling and it
+	// is deliberately LOOSER than the byte budget can fill at a transaction's
+	// minimum size (see MaxTxsByBytes): a block must satisfy BOTH bounds, and
+	// the producer's byte budget is what actually sizes a full block (audit
+	// S-3).
 	MaxTxsPerBlock = 10_000
 	// MaxBlockBytes bounds the canonical encoding of a block.
 	MaxBlockBytes = 1 << 20
+
+	// headerBytes is the canonical encoding of the header of a block a
+	// validator will accept: five fixed fields (8+32+32+32+8) plus the
+	// varint-prefixed 32-byte proposer key.
+	headerBytes = 112 + 1 + ed25519PublicKeySize
+
+	// BlockOverheadBytes is what a signed block costs before its first
+	// transaction: the header, the transaction-count varint (two bytes for any
+	// block holding at least 128 transactions, the only size this bound is
+	// used at), the one-byte signature-length prefix and the 64-byte
+	// signature. It is what chain.SelectApplicable charges before it starts
+	// accumulating transaction sizes, so a block it assembles can never exceed
+	// MaxBlockBytes.
+	//
+	// THE SIGNATURE IS COUNTED HERE AND NOT BY ValidateStructure: that runs
+	// before a block is signed, so it measures a block whose Sig is empty and
+	// undercounts the bytes that go on the wire by 65. A block measured there
+	// at more than MaxBlockBytes-65 would be accepted locally and then refused
+	// by DecodeBlock at every peer (which enforces MaxBlockBytes on the
+	// SIGNED bytes). The producer's budget closes that gap; the validity rule
+	// is left alone, because tightening it is a consensus change.
+	BlockOverheadBytes = headerBytes + 2 + 1 + 64
+
+	// MinTxBytes is the smallest canonical encoding a valid transaction can
+	// take once the block frames it: a withdraw's 135 bytes plus its two-byte
+	// length prefix. Every other type is larger (a faucet claim is 151 bytes, a
+	// bond or unbond 143, a transfer 163), so this is the floor the byte budget
+	// can ever be asked to hold.
+	MinTxBytes = 135 + 2
+
+	// MaxTxsByBytes is how many minimum-size transactions one block can carry
+	// once BlockOverheadBytes is paid. It is the count the BYTE bound implies,
+	// derived here so the two ceilings cannot be compared by hand.
+	MaxTxsByBytes = (MaxBlockBytes - BlockOverheadBytes) / MinTxBytes
 )
+
+// init asserts that the two block ceilings COMPOSE - the check audit S-3 asked
+// for, in the one form that is true of these constants.
+//
+// The literal inequality the audit prescribed - MaxTxsPerBlock <=
+// (MaxBlockBytes-BlockOverheadBytes)/MinTxBytes - is FALSE here and must be:
+// 10,000 x 165 + 212 = 1,650,212, which is the very arithmetic the finding is
+// made of, so an init assertion of that shape would panic every node at
+// startup. Making it true means lowering MaxTxsPerBlock to the byte-implied
+// count, and that is a CONSENSUS change (ValidateStructure's count check is
+// what a validator enforces), so it belongs with the next versioned fork - not
+// in a producer fix. What the code depends on instead is that the byte budget
+// can hold at least one transaction at the minimum size, or the producer would
+// be unable to put anything in a block at all.
+func init() {
+	if MaxBlockBytes <= BlockOverheadBytes+MinTxBytes {
+		panic(fmt.Sprintf("types: MaxBlockBytes %d cannot hold the %d-byte block overhead plus one %d-byte transaction: every block would be empty",
+			MaxBlockBytes, BlockOverheadBytes, MinTxBytes))
+	}
+	if MaxTxsByBytes < 1 {
+		panic(fmt.Sprintf("types: the byte budget admits %d transactions, want at least 1", MaxTxsByBytes))
+	}
+}
 
 var (
 	ErrBadProposer    = errors.New("types: proposer must be a valid Ed25519 public key")
