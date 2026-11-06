@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -212,4 +213,106 @@ func TestARealChainBondsThenUnbondsOnTheGenesisCooldown(t *testing.T) {
 	if got := next.Bonded(addr); got != 0 {
 		t.Fatalf("Bonded = %d after unbonding the whole bond, want 0", got)
 	}
+}
+
+// TestTheLastCandidateCannotUnbondAcrossABoundary is audit S-1 at the chain
+// boundary: the transition is refused AT THE HEIGHT THAT DECIDES the next
+// epoch, before any write, and the chain then keeps committing across the
+// boundary that the exit would have stranded. It is a constructed state, not a
+// race: the head is walked to exactly E-1, which is the deciding height, and
+// the unbond is offered at head+1 through the same Probe/Build transition
+// Append runs.
+//
+// Before the fix this state is the permanent halt: the deciding block commits a
+// state with no candidate, memoCommitteeLocked swallows ErrNoCandidates, epoch 1
+// is never memoised, CommitteeAt(4) answers ErrNoCommittee and validateLocked
+// refuses ErrNotValidator for every height in the epoch - so the block that
+// could carry a Bond is refused too, and a restart replays it.
+func TestTheLastCandidateCannotUnbondAcrossABoundary(t *testing.T) {
+	const epochBlocks = uint64(4)
+	pub, priv := devKey()
+
+	// One seat, one-block-epoch-free genesis: the one-seat chain the finding
+	// describes, at an epoch length a test can walk to.
+	g := genesis.Devnet()
+	g.ChainID = "b10coin-s1-last-candidate"
+	g.Params.ChainID = g.ChainID
+	g.Params.EpochBlocks = epochBlocks
+	g.Params.CommitteeSize = 1
+	g.Validators = []genesis.Validator{{PubKey: pub, Power: g.Params.MinStakeSparks}}
+	g.DevAccounts = nil
+	if err := g.Validate(); err != nil {
+		t.Fatalf("the constructed one-seat genesis is invalid: %v", err)
+	}
+
+	c, err := Open(g, t.TempDir())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	// Walk to E-1: the block at this height commits the state epoch 1 is
+	// derived from.
+	for c.Height() < epochBlocks-1 {
+		b, err := c.Build(priv, nil, c.Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatalf("building the filler block at height %d: %v", c.Height()+1, err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatalf("appending the filler block at height %d: %v", b.Header.Height, err)
+		}
+	}
+	if got := c.Height(); got != epochBlocks-1 {
+		t.Fatalf("head = %d, want the deciding height %d", got, epochBlocks-1)
+	}
+
+	addr := types.AddressFromPub(pub)
+	unbond := &types.Tx{
+		Type: types.TxUnbond, From: addr, PubKey: pub, Nonce: 0,
+		Fee: 0, Amount: g.Params.MinStakeSparks,
+	}
+	h := unbond.SigningHash(g.Hash())
+	unbond.Sig = crypto.Sign(priv, h[:])
+
+	// THE TRANSITION IS REFUSED. Both seams that judge a block at head+1 -
+	// Probe (the consensus prevote seam) and Build (the producer) - refuse it,
+	// with the state-layer sentinel and not an incidental error.
+	if _, err := c.Probe([]types.Tx{*unbond}); !errors.Is(err, state.ErrLastCandidateUnbond) {
+		t.Fatalf("Probe of the last-candidate unbond at the deciding height: err = %v, want ErrLastCandidateUnbond", err)
+	}
+	if _, err := c.Build(priv, []types.Tx{*unbond}, c.Head().Header.Timestamp+1); !errors.Is(err, state.ErrLastCandidateUnbond) {
+		t.Fatalf("Build of the last-candidate unbond at the deciding height: err = %v, want ErrLastCandidateUnbond", err)
+	}
+	// Refused before any write: the deciding state is untouched, so the
+	// boundary can still be derived from it.
+	if got := c.State().Bonded(addr); got != g.Params.MinStakeSparks {
+		t.Fatalf("the refused unbond changed the deciding state's bond to %d, want %d", got, g.Params.MinStakeSparks)
+	}
+
+	// THE CHAIN KEEPS COMMITTING ACROSS THE BOUNDARY. Epoch 1's committee is
+	// memoised from the intact deciding state, and both the boundary and the
+	// height after it are built and appended by the same seat.
+	for _, want := range []uint64{epochBlocks, epochBlocks + 1} {
+		vals, err := c.CommitteeAt(want)
+		if err != nil {
+			t.Fatalf("CommitteeAt(%d) after the refusal: %v", want, err)
+		}
+		if len(vals) != 1 || !bytes.Equal(vals[0].PubKey, pub) {
+			t.Fatalf("CommitteeAt(%d) = %v, want the one surviving seat", want, vals)
+		}
+		if !c.IsSeatedAt(want, pub) {
+			t.Fatalf("IsSeatedAt(%d) says the surviving seat is not seated", want)
+		}
+		b, err := c.Build(priv, nil, c.Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatalf("building height %d after the boundary: %v", want, err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatalf("appending height %d after the boundary: %v", want, err)
+		}
+		if got := c.Height(); got != want {
+			t.Fatalf("head = %d after appending height %d", got, want)
+		}
+	}
+	t.Logf("the last-candidate unbond was refused at height %d and the chain committed through the boundary to height %d", epochBlocks, c.Height())
 }

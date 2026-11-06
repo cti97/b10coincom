@@ -448,6 +448,57 @@ func (s *State) applyUnbond(tx *types.Tx) error {
 			ErrStakeBelowMinimum, tx.Amount, bond.Amount, remainder, s.params.MinStake)
 	}
 
+	// NEVER LEAVE THE STATE WITHOUT A CANDIDATE (audit S-1). A chain with a
+	// nonzero CommitteeSize and no bond left to seat used to be a PERMANENT
+	// halt, not a transient one: state.Committee returns ErrNoCandidates,
+	// chain.memoCommitteeLocked only writes its epoch memo when the derivation
+	// succeeds, so the boundary epoch is never memoised; CommitteeAt then
+	// answers ErrNoCommittee and validateLocked finds no seat, refusing
+	// ErrNotValidator for EVERY height in that epoch. Restart replays the same
+	// committed state and reproduces it, and the Bond that would seat a
+	// candidate cannot arrive because no block can be accepted at all.
+	//
+	// THE FIX IS HERE, at the transition, and not in the memo or in
+	// CommitteeAt: writing an empty committee into the memo would make
+	// CommitteeAt claim a set that does not exist, and accepting the empty
+	// derivation anywhere else would only move the refusal to a height where
+	// nothing can be done about it. Gating on CommitteeSize > 0 keeps the
+	// promise exact: a state that cannot derive a committee at all (size 0)
+	// has no seats to protect, and refusing its unbonds would change nothing.
+	//
+	// THE RULE IS "NEVER ZERO CANDIDATES", NOT "NEVER THE LAST SEAT". It is a
+	// count of bonds with a POSITIVE amount - the same definition Committee
+	// reads - so a one-seat chain, a six-seat chain that exits down to one, and
+	// any other shape obey one rule. A genesis seat exiting in full while
+	// another candidate remains is untouched (audit C-1's carve-out: the
+	// rotation fixture's sub-floor seat is exactly that exit), and so is a
+	// bond's partial exit, which always leaves its own record positive.
+	//
+	// THIS IS A CONSENSUS-RULE CHANGE. It makes a transition invalid that was
+	// valid before, so two builds disagree about a block carrying it: it must
+	// ship with the next versioned fork, not as a silent rule change on an
+	// already-running chain. It is placed with every other validation, BEFORE
+	// the first write (bond.Unfunded, the bond map, the unbonding records and
+	// the account nonce), so a refusal leaves the receiver untouched exactly as
+	// ApplyTx's contract requires.
+	if s.params.CommitteeSize > 0 {
+		candidatesAfter := 0
+		for addr, b := range s.bonds {
+			amount := b.Amount
+			if addr == tx.From {
+				amount = remainder
+			}
+			if amount > 0 {
+				candidatesAfter++
+				break
+			}
+		}
+		if candidatesAfter == 0 {
+			return fmt.Errorf("%w: unbond %d of %d would leave no bonded candidate, and committee size %d cannot be derived from an empty candidate set",
+				ErrLastCandidateUnbond, tx.Amount, bond.Amount, s.params.CommitteeSize)
+		}
+	}
+
 	release, err := releaseHeightFor(s.height, s.params.UnbondingEpochs, s.params.EpochBlocks)
 	if err != nil {
 		return err
@@ -670,6 +721,14 @@ var (
 	// consensus.NewEngine fails there with ErrEmptyCommittee, a message about
 	// the engine when the fact is about the state.
 	ErrNoCandidates = errors.New("state: no bonded candidate can be seated")
+	// ErrLastCandidateUnbond reports an Unbond that would leave the state with
+	// no candidate bond at all, which is the transition that used to brick a
+	// chain permanently (audit S-1). It is refused at the ONLY place such a
+	// state could be entered - the unbond itself - because no later block can
+	// repair it: an epoch whose deciding state seats no candidate is never
+	// memoised, and a height with no committee refuses every block, so the
+	// Bond that would seat one can never apply.
+	ErrLastCandidateUnbond = errors.New("state: the unbond would leave no bonded candidate to seat a committee")
 	// ErrZeroCommittee reports a state whose Params carry no CommitteeSize. A
 	// zero seat count would derive an empty committee for every height, which
 	// is the same failure one layer later and harder to read.

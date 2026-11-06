@@ -1534,3 +1534,95 @@ func TestMergeUnbondingRefusesAnOverflow(t *testing.T) {
 		}
 	})
 }
+
+// TestTheLastCandidateCannotUnbond is audit S-1's consensus rule at the
+// transition. A chain whose deciding state holds no candidate bond is a
+// PERMANENT halt: Committee() returns ErrNoCandidates, chain.memoCommitteeLocked
+// memoises only on success, so that epoch is never written; CommitteeAt answers
+// ErrNoCommittee and validateLocked refuses ErrNotValidator for every height in
+// it. No block can be accepted, so the Bond that would seat a candidate can
+// never arrive, and a restart replays the same state. The transition is refused
+// HERE instead, before the first write.
+//
+// The rule is "never zero candidates", not "never the last seat": the second
+// subtest exits one of TWO candidates and is refused only when the second
+// leaves, so a one-seat chain and an N-seat chain share one rule.
+func TestTheLastCandidateCannotUnbond(t *testing.T) {
+	params := stakingParams()
+	params.CommitteeSize = 2 // nonzero: the rule applies (a size-0 state derives nothing to protect)
+
+	s := NewWithParams(params)
+	addr, pub, priv := keypair(t)
+	// The genesis initial condition: the seat's bond IS its power, unfunded.
+	s.SetBond(addr, Bond{Validator: pub, Amount: minStakeSparks, Unfunded: minStakeSparks, Height: 0})
+	s.SetHeight(5)
+
+	beforeRoot, beforeBonded := s.Root(), s.Bonded(addr)
+	err := s.ApplyTx(unbondTx(t, pub, priv, addr, 0, minStakeSparks))
+	if !errors.Is(err, ErrLastCandidateUnbond) {
+		t.Fatalf("unbonding the only candidate: err = %v, want ErrLastCandidateUnbond", err)
+	}
+	t.Logf("refused at the transition: %v", err)
+
+	// BEFORE THE FIRST WRITE. ApplyTx's contract is that a rejected
+	// transaction leaves the receiver untouched, and chain.SelectApplicable
+	// runs candidates against one shared state on exactly that promise.
+	if got := s.Root(); got != beforeRoot {
+		t.Fatalf("the refused unbond moved the state root: %x, want %x", got[:8], beforeRoot[:8])
+	}
+	if got := s.Bonded(addr); got != beforeBonded {
+		t.Fatalf("the refused unbond changed the bond to %d, want %d", got, beforeBonded)
+	}
+	if _, ok := s.bonds[addr]; !ok {
+		t.Fatal("the refused unbond deleted the bond record")
+	}
+	if recs := s.UnbondingOf(addr); len(recs) != 0 {
+		t.Fatalf("the refused unbond created unbonding records: %+v", recs)
+	}
+	if got := s.TotalUnbonding(); got != 0 {
+		t.Fatalf("the refused unbond moved %d sparks into unbonding, want 0", got)
+	}
+	if got := s.Get(addr).Nonce; got != 0 {
+		t.Fatalf("the refused unbond consumed a nonce: %d", got)
+	}
+
+	// The derivation the boundary needs still works: the refusal protected a
+	// committee, it did not empty one.
+	vals, err := s.Committee()
+	if err != nil || len(vals) != 1 {
+		t.Fatalf("Committee() after the refusal = %d seats, %v; want the surviving seat and no error", len(vals), err)
+	}
+
+	t.Run("the same full exit is accepted while another candidate remains, and refused when it is the last", func(t *testing.T) {
+		s := NewWithParams(params)
+		first, firstPub, firstPriv := keypair(t)
+		second, secondPub, secondPriv := keypair(t)
+		s.SetBond(first, Bond{Validator: firstPub, Amount: minStakeSparks, Unfunded: minStakeSparks, Height: 0})
+		s.SetBond(second, Bond{Validator: secondPub, Amount: minStakeSparks, Unfunded: minStakeSparks, Height: 0})
+		s.SetHeight(5)
+
+		// The genesis seat exits in full while the other candidate remains: this
+		// is C-1's rotation carve-out and it must stay legal.
+		if err := s.ApplyTx(unbondTx(t, firstPub, firstPriv, first, 0, minStakeSparks)); err != nil {
+			t.Fatalf("a full exit while another candidate remains must be accepted: %v", err)
+		}
+		if _, ok := s.bonds[first]; ok {
+			t.Fatal("the accepted full exit left the first bond behind")
+		}
+		if got := s.Bonded(second); got != minStakeSparks {
+			t.Fatalf("the surviving candidate's bond = %d, want %d", got, minStakeSparks)
+		}
+
+		// Now the remaining seat is the LAST one, whatever the seat count.
+		beforeRoot := s.Root()
+		if err := s.ApplyTx(unbondTx(t, secondPub, secondPriv, second, 0, minStakeSparks)); !errors.Is(err, ErrLastCandidateUnbond) {
+			t.Fatalf("unbonding the last remaining candidate: err = %v, want ErrLastCandidateUnbond", err)
+		}
+		if got := s.Root(); got != beforeRoot {
+			t.Fatal("the refused last-candidate unbond moved the state root")
+		}
+		if _, err := s.Committee(); err != nil {
+			t.Fatalf("Committee() after the refusal: %v", err)
+		}
+	})
+}

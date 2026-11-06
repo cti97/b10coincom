@@ -46,10 +46,11 @@
 // dials and can end, each side evicting the other's winner, with none.
 //
 // The handshake ID frame is bounded at maxHandshakeIDBytes - a few hundred
-// bytes, not the transport's 1 MiB frame bound. A first frame that large is
-// a refusal (audit N-1: the identity read is where a stranger first meets a
-// validator's listener; a 1 MiB "identity" is nothing a legitimate peer
-// ever opens with), and the connection ends instead of being read.
+// bytes, not the transport's frame bound (wire.MaxFrameBytes). A first frame
+// that large is a refusal (audit N-1: the identity read is where a stranger
+// first meets a validator's listener; a block-sized "identity" is nothing a
+// legitimate peer ever opens with), and the connection ends instead of being
+// read.
 //
 // Two further rules exist because a deterministic name is otherwise a free
 // handle (audit N-1, whose first fix introduced exactly that):
@@ -93,24 +94,28 @@ import (
 )
 
 const (
-	// DefaultMaxFrameBytes bounds a frame at 1 MiB. Consensus messages are
-	// hundreds of bytes; only a BLOCK_SYNC response (Task 4) approaches
-	// block payloads, and a devnet block is well under this. Every node in
-	// an honest run uses the same default, but the knob exists because a
-	// peer with a smaller bound must be able to say "too big, try less"
-	// without being disconnected for it (the oversized frame is skipped, and
-	// the connection lives on - see the reader).
-	DefaultMaxFrameBytes = 1 << 20
+	// DefaultMaxFrameBytes bounds a frame at one max-size block plus what a
+	// message may wrap around it (wire.MaxFrameBytes). Consensus messages are
+	// hundreds of bytes; the one frame that approaches block payloads is a
+	// proposal carrying a full block and a BLOCK_SYNC response carrying blocks
+	// with their certificates, and both must fit or the block they carry is
+	// silently skipped (audit S-2). Every node in an honest run uses the same
+	// default, but the knob exists because a peer with a smaller bound must be
+	// able to say "too big, try less" without being disconnected for it (the
+	// oversized frame is skipped, and the connection lives on - see the
+	// reader).
+	DefaultMaxFrameBytes = wire.MaxFrameBytes
 	// DefaultWriteQueueSize is the bound that keeps Broadcast from ever
 	// waiting on a slow peer: 128 frames is far beyond everything one round
 	// of consensus produces, so an honest peer never drops, and a wedged
 	// peer costs the sender buffered memory only.
 	//
 	// The worst case, spelled out with the arithmetic because the bound is
-	// in FRAMES, not bytes: 128 frames x (DefaultMaxFrameBytes 1 MiB
-	// payload + a frame header) = just over 128 MiB of bufferable memory PER
-	// WEDGED PEER CONNECTION, if every queued frame were at today's size
-	// limit. With current consensus traffic (hundreds of bytes per frame)
+	// in FRAMES, not bytes: 128 frames x (DefaultMaxFrameBytes - one
+	// max-size block plus its envelope - plus a frame header) = ~136 MiB of
+	// bufferable memory PER WEDGED PEER CONNECTION, if every queued frame
+	// were at the size limit. With current consensus traffic (hundreds of
+	// bytes per frame)
 	// the same 128-frame bound caps a wedged peer at tens of KiB. When Task
 	// 4 puts block-sized frames on the wire, this number - or a byte-level
 	// companion bound - must be revisited along with it; until then the
@@ -199,7 +204,7 @@ const (
 	// before the connection is ended. Pre-fix the writer had no deadline, so
 	// a sink that never read parked the writer forever, pinning the frame in
 	// its hand and the rest of the bounded queue behind it. A frame at the
-	// 1 MiB bound writes inside it at ~280 kbit/s; honest frames are
+	// frame bound writes inside it at ~300 kbit/s; honest frames are
 	// hundreds of bytes.
 	DefaultWriteTimeout = 30 * time.Second
 	// DefaultRateLimitPerSec and DefaultRateLimitBurst are the per-connection
@@ -566,7 +571,8 @@ func newByteBucket(perSec, burst int) *byteBucket {
 // reserve charges n bytes and reports how long the caller must wait before
 // they are paid for (zero when the bucket had room). A frame larger than the
 // burst is allowed through with a wait of one frame's overage: refusing it
-// would be a drop, and the frame-size bound already caps it at 1 MiB.
+// would be a drop, and the frame-size bound (wire.MaxFrameBytes) already
+// caps it at one max-size block plus its envelope.
 func (b *byteBucket) reserve(n int) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -848,7 +854,15 @@ type TcpTransport struct {
 	// inboundSlots counts ACCEPTED connections currently holding a slot -
 	// including ones still mid-handshake, which is the point: the cap must
 	// bound sockets, not merely installed registrations. Guarded by mu.
+	// Every booking is matched by EXACTLY ONE release (audit S-4): either the
+	// accept goroutine's, when adopt never installed, or finish's, when it did.
 	inboundSlots int
+	// inboundAttempts counts accepted sockets whose adopt has finished being
+	// ACCOUNTED FOR - returned, with the slot release (if any) already done.
+	// It exists so a test can wait for a final slot count instead of polling
+	// for a number that the release sequence passes through transiently. Not
+	// guarded: an atomic, like the other counters.
+	inboundAttempts atomic.Uint64
 	// refusedConns counts inbound dials closed at accept because the cap was
 	// full. The observable an operator checks when honest peers cannot get in.
 	refusedConns atomic.Uint64
@@ -985,19 +999,34 @@ func (t *TcpTransport) acceptLoop(l net.Listener) {
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
-			// An inbound failure is the dialer's problem by definition:
-			// there is no registered maintainer to redial a stranger. The
-			// slot is released here because no conn owns it; a successful
-			// adopt hands it to install, and finish releases it there.
-			// An ACCEPTED socket is a peer only after Options.Admit accepts a frame
-			// from it: pass gated=true so it is held pending (audit N-3/PX-2).
-			if _, err := t.adopt(nc, addr, false, true); err != nil {
+			// The slot booked above must be released EXACTLY ONCE (audit
+			// S-4). adopt reports whether it INSTALLED the connection, and
+			// that flag is the whole rule:
+			//
+			//   - not installed (writeHello, readHello or install failed):
+			//     no conn owns the slot, so this goroutine releases it;
+			//   - installed: install registered the conn with inbound = true,
+			//     so finish() releases the slot - whether adopt then fails in
+			//     exchangeNonce (finish is called there) or the connection
+			//     lives until it dies. Releasing here as well would debit the
+			//     counter twice for one socket, which is the double-release
+			//     that let a failed handshake decay MaxConns.
+			//
+			// An ACCEPTED socket is a peer only after Options.Admit accepts a
+			// frame from it: pass gated=true so it is held pending (audit
+			// N-3/PX-2).
+			_, installed, err := t.adopt(nc, addr, false, true)
+			if err != nil && !installed {
 				t.mu.Lock()
 				if t.inboundSlots > 0 {
 					t.inboundSlots--
 				}
 				t.mu.Unlock()
 			}
+			// Accounted last, so a test that waits for this counter to move
+			// is reading a FINAL slot count: both the release above and
+			// finish's have already happened.
+			t.inboundAttempts.Add(1)
 		}()
 		t.mu.Unlock()
 	}
@@ -1292,7 +1321,9 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 			if ob.relay {
 				c, err = t.adoptRelay(nc, addr)
 			} else {
-				c, err = t.adopt(nc, addr, true, ob.gated)
+				// A dialled conn is outbound (inbound = false), so it books no
+				// accept-time slot; the installed flag is irrelevant here.
+				c, _, err = t.adopt(nc, addr, true, ob.gated)
 			}
 			report(err)
 			if err == nil {
@@ -1393,13 +1424,20 @@ func (t *TcpTransport) forgetOutbound(ob *outbound) {
 // and must pass Options.Admit first (audit PX-2).
 // It does NOT select relay mode: a DIRECT connection is never relay mode,
 // whatever name the peer announces (see install).
-func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*conn, error) {
+// The bool result reports whether the connection was REGISTERED (install
+// succeeded). It is what lets the caller that booked an accept-time slot
+// release it exactly once (audit S-4): install marks an accepted conn
+// inbound = true, so finish() owns the release from that moment on - including
+// on the exchangeNonce-failure path below, which calls finish and returns
+// installed = true. A caller that also released on err would debit the slot
+// twice for one socket.
+func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*conn, bool, error) {
 	if err := t.writeHello(nc, addr); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	id, err := t.readHello(nc, addr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// The registry acceptance runs BEFORE the nonce exchange so a refused name
 	// (self, the reserved relay:<addr> form, a duplicate) is refused for that
@@ -1408,14 +1446,14 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*co
 	// payload byte can be mistaken for a challenge (audit PX-2).
 	c, err := t.install(nc, addr, dialled, false, gated, id)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := t.exchangeNonce(nc, c); err != nil {
-		t.finish(c)
-		return nil, err
+		t.finish(c) // installed connection: finish releases its inbound slot
+		return nil, true, err
 	}
 	t.start(c)
-	return c, nil
+	return c, true, nil
 }
 
 // exchangeNonce performs the per-connection challenge exchange that binds a
@@ -2405,6 +2443,25 @@ func (t *TcpTransport) Peers() []transport.PeerID {
 // the listener already held MaxConns accepted connections (audit N-3). It is
 // the observable an operator checks when an honest peer cannot get in.
 func (t *TcpTransport) RefusedConns() uint64 { return t.refusedConns.Load() }
+
+// InboundSlots reports how many accept-time connection slots the listener
+// currently holds: admitted and mid-handshake sockets alike. It is the
+// counter MaxConns is compared against (audit N-3), made observable so a test
+// - or an operator watching a listener that refuses honest peers - can read it
+// directly instead of inferring it (audit S-4: nothing read it, which is how
+// the double-release stayed invisible).
+func (t *TcpTransport) InboundSlots() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.inboundSlots
+}
+
+// InboundAttempts reports how many accepted sockets have finished being
+// accounted for. An attempt is counted once, AFTER its slot release (if any)
+// has run, so waiting for this number to advance and then reading InboundSlots
+// yields a final count rather than one the release sequence is passing
+// through. Test-only in practice; cheap and monotone.
+func (t *TcpTransport) InboundAttempts() uint64 { return t.inboundAttempts.Load() }
 
 // BindingVintages reports how many connections produced the N-3 binding-width
 // notice: a HELLO whose socket binding has the old one-challenge width, which

@@ -66,17 +66,27 @@ func selectFixture(tb testing.TB, accounts, candidates int) (*Chain, []types.Tx)
 // through state.ApplyBlock, which clones the whole account map; after it the
 // base is mutated in place by state.ApplyTx, so the map is copied once for the
 // whole batch. Run with -benchmem to read the bytes/op.
+//
+// A 10,000-transfer batch cannot fit one block (10,000 x 165 + 212 = 1,650,212
+// against a 1 MiB bound), so since audit S-3 the run stops at the byte budget
+// and the applications measured are the ones the budget admits. What still
+// matters here is that the clone-once path stays flat across the whole
+// candidate list, and that nothing is dropped: every candidate comes back as
+// selected or over budget.
 func BenchmarkSelectApplicable10000(b *testing.B) {
 	c, txs := selectFixture(b, 2000, 10000)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		valid, err := c.SelectApplicable(txs)
+		valid, overBudget, err := c.SelectApplicable(txs)
 		if err != nil {
 			b.Fatal(err)
 		}
-		if len(valid) != len(txs) {
-			b.Fatalf("SelectApplicable kept %d of %d candidates", len(valid), len(txs))
+		if len(valid)+len(overBudget) != len(txs) {
+			b.Fatalf("SelectApplicable accounted for %d of %d candidates", len(valid)+len(overBudget), len(txs))
+		}
+		if len(overBudget) == 0 {
+			b.Fatalf("a 10,000-transfer batch fit a %d-byte block: the byte budget did not bind", types.MaxBlockBytes)
 		}
 	}
 }
@@ -97,7 +107,7 @@ func TestSelectApplicableCostDoesNotScaleWithTheAccountCount(t *testing.T) {
 		var before, after runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&before)
-		if _, err := c.SelectApplicable(txs); err != nil {
+		if _, _, err := c.SelectApplicable(txs); err != nil {
 			t.Fatal(err)
 		}
 		runtime.ReadMemStats(&after)

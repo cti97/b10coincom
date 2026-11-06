@@ -176,7 +176,7 @@ func TestAHintedListenerCannotEvictAnHonestLinkMidHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	// dialled=true, gated=true: exactly the shape AddLearnedPeer produces.
-	if _, err := a.adopt(nc, "squatter", true, true); !errors.Is(err, ErrDuplicatePeer) {
+	if _, _, err := a.adopt(nc, "squatter", true, true); !errors.Is(err, ErrDuplicatePeer) {
 		t.Fatalf("a hint-dialled squatter announcing v1 was installed while the honest peer's socket was unadmitted (err = %v); it took the name", err)
 	}
 	select {

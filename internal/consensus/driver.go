@@ -423,12 +423,21 @@ func (d *Driver) build(height uint64, round uint32, parent [32]byte) (types.Bloc
 		// the state the chain already moved to.
 		d.reclaimPending()
 		candidates := d.pool.Take(types.MaxTxsPerBlock)
-		valid, err := d.ch.SelectApplicable(candidates)
+		valid, overBudget, err := d.ch.SelectApplicable(candidates)
 		if err != nil {
 			// The head+1 transition itself failed, so nothing applies:
 			// park the candidates back rather than lose them, and refuse
 			// to propose.
 			return types.Block{}, d.reAdd(candidates, err)
+		}
+		if len(overBudget) > 0 {
+			// The block's byte budget excluded these (audit S-3). They are
+			// valid and eligible - only too heavy for THIS block - so they go
+			// back into the pool before the head can move, exactly as
+			// node.RunOnce re-adds them. They are NOT part of d.pending: the
+			// proposal does not carry them, so a later reclaim must not treat
+			// them as a batch that was proposed and abandoned.
+			_ = d.pool.Add(overBudget)
 		}
 		txs = valid
 	}

@@ -113,16 +113,21 @@ const accessTokenTimeout = 5 * time.Second
 const DefaultAccessTimeout = accessTokenTimeout
 
 const (
-	// DefaultMaxFrameBytes bounds a frame at 1 MiB, the same bound the TCP
-	// transport defaults to: one number for every wire participant, so no
-	// honest validator ever sends a frame the relay must refuse. The relay's
-	// copy is checked by wire.ReadFrame BEFORE allocation, so a hostile
-	// length prefix costs four bytes of header, never four gibibytes of
-	// buffer. An operator MAY set it higher, never lower than the validators'
-	// bound: a relay stricter than its validators severs every frame that
-	// fits at the ends but not in the middle, and the reconnect churn that
-	// follows would look like flapping peers, not like a misconfigured knob.
-	DefaultMaxFrameBytes = 1 << 20
+	// DefaultMaxFrameBytes is wire.MaxFrameBytes - one max-size block plus
+	// the envelope a message may wrap around it - which is also the TCP
+	// transport's default: one number for every wire participant, so no
+	// honest validator ever sends a frame the relay must refuse. It is
+	// ALIASED to the wire constant rather than written down again (audit
+	// S-2): a relay at 1 MiB while a proposal may encode to 1,048,580 bytes
+	// severs exactly the max-size blocks a validator is entitled to propose,
+	// and the reconnect churn that follows looks like flapping peers, not
+	// like a bound that was one number too small. The relay's copy is checked
+	// by wire.ReadFrame BEFORE allocation, so a hostile length prefix costs
+	// four bytes of header, never four gibibytes of buffer. An operator MAY
+	// set it higher, never lower than the validators' bound: a relay stricter
+	// than its validators severs every frame that fits at the ends but not in
+	// the middle.
+	DefaultMaxFrameBytes = wire.MaxFrameBytes
 	// DefaultMaxConns bounds the registry. Audit N-2 lowered this from 256:
 	// the honest population of one relay is its validator set - a handful of
 	// members plus their reconnect blips - so every slot beyond a few dozen
@@ -174,7 +179,8 @@ const (
 	// PAYLOAD BYTES - a byte budget, not a frame count. This is the bound the
 	// audit's N-2 rebuilt: the pre-fix bound was in FRAMES (64 of them), and
 	// the documented memory claim omitted that whole factor. The old bound's
-	// worst case: 64 frames x MaxFrameBytes 1 MiB = 64 MiB pinned PER wedged
+	// worst case: 64 frames x MaxFrameBytes (one max-size block plus its
+	// envelope, a little over 1 MiB) = ~68 MiB pinned PER wedged
 	// connection, and MaxConns of them - 256 x 64 MiB = 16 GiB - held
 	// indefinitely by a sink that never read, against a documented claim of
 	// 256 MiB. A byte budget makes the per-connection pin independent of how
@@ -395,9 +401,9 @@ func (o Options) withDefaults() Options {
 // upper bound, not an account of copies: the distinct bytes are never more
 // than one reader-plus-queue's worth per connection. At the DEFAULTS:
 //
-//	32 conns x (2 MiB payload + 4096 x 32 B entries + 2 x 1 MiB hands)
-//	  = 32 x (2 MiB + 128 KiB + 2 MiB)
-//	  = 32 x 4.125 MiB = 132 MiB.
+//	32 conns x (2 MiB payload + 4096 x 32 B entries + 2 x 1.0625 MiB hands)
+//	  = 32 x (2 MiB + 128 KiB + 2.125 MiB)
+//	  = 32 x 4.25 MiB = 136 MiB.
 //
 // which is the figure the documents quote, derived from these very fields -
 // change a default and the documents' number moves with it. The per-queue
