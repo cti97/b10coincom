@@ -222,7 +222,43 @@ These are the findings behind the findings. Each produced at least two of the it
 
 12. Every finding above becomes either an issue or an explicit *"won't fix, because X"*. **A carried-over list is not a tracker.** The nine process gaps that have survived six consecutive reports are the evidence.
 13. Add mutation testing to CI over the three packages where a wrong test is invisible.
-</DOC>
-echo "  lines: $(wc -l < docs/audit-2026-11-06-main.md)"
-echo "  findings: $(grep -cE '^\| \*?\*?(High|Medium|Low)' docs/audit-2026-11-06-main.md)"
-echo "  sections: $(grep -cE '^## ' docs/audit-2026-11-06-main.md)"
+
+---
+
+## 9. Corrections after the fixes
+
+Recorded because a report that does not correct itself is the defect this whole
+document is about. Both items below were found by the rounds that fixed S-1..S-4,
+**not** by the review that wrote this document.
+
+**The S-3 init assertion was arithmetically false.** This report prescribed
+`MaxTxsPerBlock <= (MaxBlockBytes − overhead) / minTxSize`. For the shipped
+constants `(1 MiB − 212) / 165 = 6,353`, so `10,000 <= 6,353` is false and the
+assertion **panics every node at startup**. Making it true means lowering
+`MaxTxsPerBlock`, which is a consensus-validity change belonging to the next
+versioned fork. What shipped instead is the satisfiable guard (the byte budget
+admits at least one minimum-size transaction) plus the structural fix that makes
+the count bound irrelevant: the producer budgets by **bytes**, and the frame
+bound is **derived** from the block bound rather than duplicated. This is the
+**second** unsound remedy in this document; the first was S-4's.
+
+**The triangle has a fourth member: the signature.** `chain.Build` runs
+`ValidateStructure` **before** signing, so it measures a block 65 bytes smaller
+than the wire form, while `types.DecodeBlock` enforces `MaxBlockBytes` on the
+**signed** bytes. A block measured at 1,048,555 therefore validates and, once
+signed, is undecodable by every peer. It is unreachable from an honest producer
+— the byte budget charges the signed overhead — but the validity rule still
+admits it, so it is a residual for the next fork rather than something to fix by
+narrowing validity now.
+
+**Two things this report understated.** Consequence A of S-2 is worse than
+written: a **single** sync unit carrying a max-size block already exceeded the
+old 1 MiB frame, so such a block could not be synced **at all**, not merely
+inside a 64-height window. And the legal-band boundary is 1,048,455, not
+1,048,452.
+
+**One thing worse than the findings.** The generator's heredoc terminator was
+consumed by its own content, so three trailing shell lines were written into
+this file and the line count first reported (228) included them. Removed. It is
+the same failure this project keeps finding in its own artifacts: an assertion
+that was never checked against the thing it claims to describe.
