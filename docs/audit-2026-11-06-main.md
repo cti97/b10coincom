@@ -303,3 +303,43 @@ test evaluates the finding's own extreme tunings to prove no panic. `Iterations`
 still has no upper bound — a separate, unhidden residual: it prices work rather
 than deciding representability, and a ceiling is a policy number this round did
 not invent.
+
+**The S-10, S-11 and S-18 round (this section is theirs too).** Recorded on
+2026-11-06 by the branch that fixed them. All three were `VERIFIED`, the
+controller having read the code, and all three are real as written — the
+mechanisms hold. What the findings did **not** say, and what the fixes had to
+discover:
+
+- **S-10's remedy needed one more file than the finding named.** Dropping
+  `-buildvcs=false` makes the toolchain derive `vcs.modified` from
+  `git status`, and `scripts/build-release.sh` builds inside an untracked
+  `.release-stage/` directory of its own. Not in `.gitignore`, that directory
+  made **every release of a pristine tree report `(modified)`** — a false
+  alarm that would have taught operators to ignore exactly the field S-10
+  exists to make them read. Fixed by ignoring it, with the reason recorded
+  there. The reproducibility claim narrowed in two stated ways: a checkout and
+  a source tarball of the same commit can no longer agree byte for byte (only
+  the checkout can be stamped), and a dirty tree's artifacts differ from the
+  clean ones. Two builds of the same VCS state remain byte-identical, and
+  `-trimpath` is untouched. `-buildvcs=auto` rather than `true`, because `true`
+  errors where `auto` omits; the strictness lives in the release script's
+  assertion, which can explain itself.
+- **S-11's deploy fix was one line away from reproducing the defect it
+  fixed.** Replacing `sha256sum -c --ignore-missing` with
+  `grep … | sha256sum -c -` looks like "name the file", and is **not**: GNU
+  `sha256sum -c` exits **0 on empty input** (verified against coreutils on
+  this host; BSD `shasum -a 256 -c` exits 1), so a missing entry still passes
+  silently. The recipe now tests the extracted line explicitly and refuses
+  before verifying. The finding also omitted that `ubuntu-latest` ships **no
+  minisign**, so the documented signing boundary could not execute even with a
+  secret wired: the missing piece was a pinned install, not just the step.
+- **S-18's number, for the record.** `ubuntu-24.04` ships `shellcheck
+  0.9.0-1`, so the gate's verdict was the image's. Pinned to 0.11.0 with a
+  digest, and the whole tree was verified clean under 0.11.0 before the pin
+  landed — the bump is not deferred to the first red cron run.
+
+The one thing this round could not verify: the workflow itself. It was parsed
+as YAML, its shell was read line by line, and every command in it was executed
+locally where the host allows (the identity outputs, the signing sequence with
+a real key, the checksum refusals), but the runner, `actions/upload-artifact`
+and the tag gate are exercised only by the next tagged push.

@@ -183,18 +183,36 @@ report its own architecture — its format and architecture tokens (`Mach-O`,
 wherever they sit in `file`'s output, so the check holds for Apple's `file`
 word order ("Mach-O 64-bit executable arm64") and upstream libmagic's ("Mach-O
 64-bit arm64 executable", which the Linux CI runners emit) alike, and `Mach-O`
-/ `PE32+` names never appear except where they belong. Every artifact is built
-with `-trimpath -buildvcs=false` (no checkout path, no VCS revision or dirty
-flag), and `dist/BUILD-INFO` records the toolchain the go command actually ran
-and those exact flags. **What is actually evidenced about reproducibility** is
-narrower than "deterministic": the 2026-10-30 Docker re-run reports that a warm
-build and a cold-`GOCACHE` build in separate containers (sharing the module
-cache) produced byte-identical `SHA256SUMS` for all 12 artifacts. The first
-2026-10-30 report says a cold-cache cross-check matched only 2 of 12, so the two
-runs disagree. CI builds ONCE and compares nothing. Reproducibility is therefore
-supported by one reported run, not continuously verified, and this repository
-has never executed a signed release: every `SHA256SUMS` it has produced is
-**UNSIGNED**.
+/ `PE32+` names never appear except where they belong. **Every artifact carries
+a build identity** (audit S-10): it is built with `-trimpath -buildvcs=auto`,
+so the toolchain stamps the commit and the modification state into the binary,
+and that stamp is what `b10coin version` and the node startup banner print —
+`0.1.0 rev ded04c891698 (clean)`. A release therefore requires a git checkout
+and the script refuses an artifact that cannot name its commit; there is no
+second constant to bump. `dist/BUILD-INFO` records the toolchain the go command
+actually ran, the exact flags, and the `vcs.revision`/`vcs.modified` **read
+back out of the artifacts** with `go version -m`, so the record describes the
+bytes rather than the tree.
+
+**What is actually evidenced about reproducibility** is narrower than
+"deterministic": the 2026-10-30 Docker re-run reports that a warm build and a
+cold-`GOCACHE` build in separate containers (sharing the module cache)
+produced byte-identical `SHA256SUMS` for all 12 artifacts. The first 2026-10-30
+report says a cold-cache cross-check matched only 2 of 12, so the two runs
+disagree. CI builds ONCE and compares nothing. Reproducibility is therefore
+supported by one reported run, not continuously verified. **Dropping
+`-buildvcs=false` narrowed that claim in two concrete ways**, and they should
+be read as the price of the identity above: a git checkout and a source tarball
+of the same commit no longer produce identical bytes (only the checkout can be
+stamped), and a dirty tree's artifacts differ from the clean ones at the same
+commit (which is the signal working, not a regression). Two builds of the SAME
+VCS state on the same toolchain remain byte-identical, `-trimpath` is unchanged
+and no checkout path is recorded.
+
+This repository has never executed a signed release: every `SHA256SUMS` it has
+produced is **UNSIGNED**. CI can sign now (see the signing boundary below), but
+a signature only becomes real when the maintainer sets the secret and publishes
+the public key, and no run has done that yet.
 On the target machine, verify what you copied:
 
 ```sh
@@ -219,8 +237,16 @@ push: each one is cross-compiled with `go build ./...` **and** `go vet
 ./...` — vet, not the build, is what caught this milestone's one
 cross-platform defect (a Unix-only syscall in the relay's test code, which
 made `GOOS=windows go vet` fail while every build stayed green) — plus a
-release job that builds, asserts and **uploads** all twelve artifacts, so no
-platform can rot silently and none is verified-then-discarded.
+release job that builds and asserts all twelve artifacts on every push, so no
+platform can rot silently. **That job publishes only on a tag** (audit S-11):
+the upload step is gated on `refs/tags/`, and the uploaded name carries the tag
+and the signing state (`b10coin-release-<tag>-signed` or `-UNSIGNED`), so an
+unsigned `dist/` from a branch or a Dependabot bump is never published as if it
+were a release, and a downloaded artifact says which it is. The signing path is
+wired to the `B10COIN_RELEASE_SIGN_KEY` repository secret (written to a 0600
+file outside the workspace, removed by a trap on every path, never logged) with
+minisign pinned by version and digest; when the secret is set and no
+`.minisig` appears, the job fails.
 
 ## The CLI
 
@@ -747,8 +773,14 @@ graceful drain.
 
 ### `b10coin version` and `b10coin help`
 
-`version` prints the software version (`0.1.0`). `help`, `-h` and `--help`
-print the usage text.
+`version` prints the build identity — the software version, the VCS revision
+the binary was built from and whether the tree was modified, e.g.
+`0.1.0 rev ded04c891698 (clean)` (audit S-10). That is the SAME token the node
+prints on its first line at startup, so two Pis can be compared by diffing one
+line; a build that carries no VCS information says `rev unknown (built without
+VCS information)` rather than printing an empty field. `version --short` prints
+only `0.1.0`, which is what `scripts/build-release.sh` names the artifacts
+with. `help`, `-h` and `--help` print the usage text.
 
 ## The faucet
 
@@ -1277,7 +1309,7 @@ by `cmd` alone.
 | `internal/simnet` | N validators over one simulated network, with recording taps, offline and equivocation helpers, catch-up and prefix-agreement assertions — the harness the eight seeded scenarios drive, and the multi-validator devnet with it; M5 adds the rotation fixture's `Unbond` submission through a committee's mempool and per-height committee access |
 | `internal/devnet` | The in-process devnet driver used by both the CLI acceptance commands and the tests: the single-node transfer, claim and double-claim-refusal scenario with replay verification, the multi-validator committee run reporting per-validator heights and agreement, the M5 rotation fixture and the committed-state Nakamoto series (`nakamoto.go`), and the real-TCP node (`tcpnode.go`) the `node` command's committee mode runs |
 | `internal/keystore` | The versioned JSON validator key file `keygen` writes and `--key` loads: owner-only permissions, public key re-derived and checked against the file, refusing a group- or world-readable key |
-| `internal/version` | The semantic version constant (`0.1.0`) |
+| `internal/version` | The semantic version constant (`0.1.0`) and `Build()`/`Identity`: the running binary's own VCS revision and modification state, read from `debug.ReadBuildInfo` (no second constant to bump). Rendered identically by `b10coin version` and the node startup banner |
 | `cmd/b10coin` | CLI entrypoint: `devnet`, `node`, `keygen`, `claim`, `balance`, `history`, `send`, `stake`, `unstake`, `withdraw`, `version`, `help` |
 
 ## Key design decisions
@@ -1481,7 +1513,7 @@ language version 1.26.0.
 | Test suite | `go test ./...` |
 | Build | `go build ./...` |
 | Cross-platform, per target | `GOOS=<os> GOARCH=<arch> go build ./...` and `go vet ./...` for each of the six targets (the matrix job) |
-| Release, all six targets | `make release` (12 reproducible artifacts + `SHA256SUMS` + `BUILD-INFO`, all asserted; `SHA256SUMS.minisig` when `B10COIN_RELEASE_SIGN_KEY` names a minisign key) |
+| Release, all six targets | `make release` (12 identifiable, reproducible artifacts + `SHA256SUMS` + `BUILD-INFO` with the flags and the VCS revision read back out of the artifacts, all asserted; `SHA256SUMS.minisig` when `B10COIN_RELEASE_SIGN_KEY` names a minisign key) |
 | Acceptance check, default run | `go run ./cmd/b10coin devnet --blocks 100` |
 | Acceptance check, claim variant | `go run ./cmd/b10coin devnet --blocks 100 --claims 1` |
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
