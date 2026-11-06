@@ -711,6 +711,32 @@ residual is stated rather than glossed: a flooder that fills the queue
 *before* another sender has queued anything can still occupy all of it, and
 that late sender's frames drop until the backlog drains; a receiver too slow
 to drain it is ended by the write timeout below, which is what bounds the pin.
+
+**A size reservation keeps consensus frames out of the bulk.** The fair share
+is per *sender*, and in a catch-up it does not help: the peers that answer
+BLOCK_SYNC are the same peers that vote, so one sender legitimately sends both
+a 160 KiB response and a 150-byte vote, and two such responses fill a 2 MiB
+queue between them. Frame **size** is the one property that separates the two
+flows, and it is the one the relay already reads (the length prefix), so a
+queue now keeps its last **64 KiB** free of frames larger than **4 KiB**: bulk
+(catch-up responses, transaction-bearing proposals) may hold
+`write-queue-bytes - 64 KiB`, while a consensus-sized frame (a vote, a HELLO,
+a peer exchange, a sync request, a transaction-free proposal) may use the whole
+budget exactly as before. The writer also takes consensus-sized frames first,
+so the reservation does not merely turn a dropped vote into a late one. It is
+a **sub-limit on bulk, never new capacity**: the byte budget, the frame count,
+the entry ring and therefore `MaxPinnedBytes` are unchanged to the byte, and
+nothing is decoded to enforce it. It cannot be gamed without parsing either: a
+frame reaches the reserved room only by *being* at most 4 KiB, and no header
+can make a 160 KiB response small. 64 KiB is sized from the receiving node's
+own relay byte budget (`tcp.Options.RelayBytesPerSec`, default 512 KiB/s,
+audit PX-4): its drain is 125 ms, inside the 200 ms base round timeout, and it
+holds ~330 vote-sized frames. The irreducible residual is one bulk frame
+already in the writer's hand — the socket cannot carry another frame in the
+middle of one — so a vote that arrives mid-response waits for the rest of that
+frame (typically ~0.3 s, at worst one `--max-frame-bytes` frame) rather than for
+the whole queue.
+
 And two socket-level timers
 bound how long a connection may *hold* what it has taken — nothing is parsed to
 enforce them. The per-frame read timeout (`--read-timeout`, default 120
@@ -765,7 +791,7 @@ backoff. Bandwidth is kilobytes per second.
 | `--max-frame-bytes N` | `1114112` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic). The default is `wire.MaxFrameBytes`: one max-size block (`types.MaxBlockBytes`, 1 MiB) plus 64 KiB for the envelope a message may wrap around it — a certificate at the 255-seat committee ceiling is 36,975 bytes — because a bound equal to the block bound would sever exactly the max-size blocks validators are entitled to propose |
 | `--max-conns N` | `32` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
 | `--max-conns-per-ip N` | `8` | how many of those slots one source **prefix** may hold — the IPv6 `/64` or IPv4 `/24`, IPv4-mapped IPv6 unmapped, masked — so a routed prefix cannot bypass the cap by rotating addresses; a dial from a prefix at its cap is closed at accept |
-| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than its contention-relative allowance — its equal share of the queue budget (`limit/senders`) once another account holds bytes there, and the whole budget while none does, so a lone sender uses the whole budget, a sharing sender is held to its share, and two connections from one host share one account. Residual: a flooder that fills the queue before another sender queues anything can occupy all of it until the write timeout reaps a slow receiver |
+| `--write-queue-bytes N` | `2097152` | per-connection write-queue budget in **payload bytes** (floored at `--max-frame-bytes`); a full queue drops new frames for that peer instead of blocking the relay, and no single **sender source group** may occupy more than its contention-relative allowance — its equal share of the queue budget (`limit/senders`) once another account holds bytes there, and the whole budget while none does, so a lone sender uses the whole budget, a sharing sender is held to its share, and two connections from one host share one account. The last **64 KiB** of it is reserved for frames of at most **4 KiB** (votes, HELLOs, peer exchange, sync requests, transaction-free proposals) and bulk is capped at `N - 64 KiB`; the writer drains consensus-sized frames first. Residual: a flooder that fills the queue before another sender queues anything can occupy all of it until the write timeout reaps a slow receiver, and a frame queued while a bulk write is already in progress waits for the rest of that write |
 | `--write-queue-frames N` | `4096` | per-connection write-queue bound in **frames**: the entry ring, so the queue's per-frame memory is structural (a byte budget alone admits ~2 million one-byte entries). Counted into `relay.Options.MaxPinnedBytes` at 32 bytes each |
 | `--write-timeout SECONDS` | `30` | per-connection write deadline, anchored to when the queue became non-empty: the backlog must drain to empty within it, so a never-reading sink **and** a slow-reading one are ended and their queued bytes and entry ring released |
 | `--read-timeout SECONDS` | `120` | per-frame read deadline: armed before each frame's header, refreshed at every completed frame (an actively sending peer is never cut off); expiry ends the connection and releases its registry slot |

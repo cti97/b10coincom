@@ -84,7 +84,19 @@ THE TRUST TRADE — read before running one
   receiver's queue (the budget divided among the sender groups contending for
   it: one uncontended sender may use the whole queue, while two connections
   from one host share one account and cannot split a receiver's budget),
-  and two socket deadlines (--read-timeout, --write-timeout). A frame over
+  and, inside that same budget, a SIZE reservation: the last 64 KiB of every
+  queue is reserved for frames of at most 4 KiB, and the writer sends those
+  first. The fair share is per sender and cannot separate a peer's 160 KiB
+  BLOCK_SYNC response from the same peer's 150-byte vote; frame size can, and
+  it is a length the relay already reads. Bulk is therefore capped at
+  --write-queue-bytes minus 64 KiB while a consensus-sized frame still uses the
+  whole budget - a sub-limit on bulk, never extra capacity, so the memory
+  bound below is unchanged, and a frame cannot reach the reserved room without
+  carrying fewer bytes. 64 KiB at a node's 512 KiB/s relay read budget is
+  125 ms, inside the 200 ms base round timeout. The residual is one bulk frame
+  already in the writer's hand when a vote arrives.
+  The other two bounds are socket deadlines (--read-timeout, --write-timeout).
+  A frame over
   the bound ends its connection; a dial past either connection bound is
   closed at accept. (Zero or negative for any knob selects its default.)
 
