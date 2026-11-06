@@ -236,6 +236,21 @@ jobs:
             exit 1
           fi
           git ls-files -z '*.sh' | xargs -0 "$dir/shellcheck" --severity=warning
+      # THE PLAN GUARD'S PARITY HALF, over every plan (audit S-19). A fence edit
+      # can leave one task section unbalanced, which inverts parity for every
+      # section after it: the brief extractor then finds empty or bleeding
+      # briefs while the plan still looks fine. The guard existed but ran on
+      # nobody's machine but its author's, so a broken fence could reach a
+      # dispatch. --parity-only is the EXPLICIT opt-out from the guard's other
+      # half (task-brief extraction), whose scripts live in the operator's
+      # skill directory and are not in this repository; without the flag their
+      # absence is a failure, so no machine silently gets the weaker verdict.
+      - name: plan fence parity (docs/plans)
+        run: |
+          set -euo pipefail
+          for p in docs/plans/*.md; do
+            ./scripts/check-plan.sh --parity-only "$p"
+          done
       # `go mod tidy` must be a no-op on a committed tree: a graph tidy wants
       # to change means go.mod/go.sum lie about the build. The diff pins both.
       - name: go mod tidy leaves no diff
