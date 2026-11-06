@@ -139,8 +139,8 @@ enforce any of it)
                    + write-queue-frames x 32
                    + 2 x max-frame-bytes)
 
-  At the defaults: 32 x (2 MiB + 4096 x 32 B + 2 x 1 MiB) = 32 x 4.125 MiB
-  = 132 MiB. (Two earlier claims in this space were wrong: the first omitted
+  At the defaults: 32 x (2 MiB + 4096 x 32 B + 2 x 1.0625 MiB) = 32 x 4.25
+  MiB = 136 MiB. (Two earlier claims in this space were wrong: the first omitted
   the write-queue factor - 256 conns could each queue 64 FRAMES x 1 MiB =
   16 GiB aggregate, not the 256 MiB documented; the second omitted the
   per-frame ENTRY cost, so a 2 MiB byte budget admitted ~2 million one-byte

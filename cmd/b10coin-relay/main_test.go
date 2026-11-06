@@ -46,8 +46,8 @@ func TestRunHelpPrintsTheTrustTrade(t *testing.T) {
 		"--write-queue-frames",
 		"max-conns x (write-queue-bytes",
 		"write-queue-frames x 32",
-		"32 x (2 MiB + 4096 x 32 B + 2 x 1 MiB) = 32 x 4.125 MiB",
-		"= 132 MiB",
+		"32 x (2 MiB + 4096 x 32 B + 2 x 1.0625 MiB) = 32 x 4.25",
+		"= 136 MiB",
 		"--access-token-file",
 		"--external-allowlist",
 	} {

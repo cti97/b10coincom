@@ -985,12 +985,39 @@ and the jump that would pull it forward needs 2 of the 4 seats ahead — if the
 next node is already stopping, only one is. So restart the members within one
 block time of each other, or one at a time **waiting for the chain to advance
 before stopping the next**, or expect the wait; [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
-has the operator's version. A node that has spent eight rounds at one height
-while the seats it can reach hold a quorum now says so, once per height:
-`b10coin: no block for 8 rounds at height H (round R, step S): quorum reachable
-with P of T power (quorum Q), yet nothing commits; peers=…; tallies …` — with
-the per-round vote tallies and the peers it sees, so the stall is no longer
-silent.
+has the operator's version. A node now says so, once per height, when a height
+has been undecided for **eight rounds *and* 30 seconds** of its own clock — two
+shapes, because they mean different things and have different fixes:
+
+- **while the seats it can reach hold a quorum:** `b10coin: no block for N
+  rounds at height H (round R, step S): quorum reachable with P of T power
+  (quorum Q), yet nothing commits; peers=…; tallies …` — the per-round vote
+  tallies and the peers it sees;
+- **when they do not:** `… and the quorum is UNREACHABLE: this node can reach P
+  of T power and the quorum is Q … the committee for height H+1 DOES derive (S
+  seats), so the cause is not a missing derivation: it is seats with no node
+  behind them … the K seat(s) it hears nothing from are K[seatN power=X, …]` —
+  the seats an operator has to go and start, named with the power they hold.
+
+The second line is what makes a **permanent** halt diagnosable: two bonded keys
+with no nodes behind them (above) leave a state that no round, restart or wait
+can clear, because the `Unbond` that would free a seat can only travel in a
+block this height refuses. It is also distinct from the third shape, a height
+whose next committee cannot be derived at all: that one prints the derivation
+failure and **no** quorum, because a power figure measured against any other set
+would be wrong.
+
+Thirty seconds is the point of the time threshold: eight rounds alone pass in
+about 4 s at the shipped ladder (200 ms base + 100 ms step), so the line used to
+fire on seconds-long hiccups — 40 lines in four bursts during normal ten-seat
+running and 20 during the documented one-at-a-time restart, whose longest gap was
+8.4 s — while a stall that matters holds for minutes. It also does not fire on a
+node that is **merely catching up**: a fresh peer announcing a height above ours
+means there are certified blocks still to fetch, which is not a stall. Peers are
+named by their **genesis seat** (`seat0`, `seat1`, … — the `--index` name and the
+transport's `vN`), not by their position in the committee at that height: the
+stake-then-key derivation reorders that committee at every boundary, so an
+index-based list renames the same node at every epoch.
 
 **That stall and the 3-seat stall are two different faults, and the difference
 is worth keeping straight.** The 3-seat one (fixed by `5af2174`, pinned in
@@ -1275,22 +1302,38 @@ quorum threshold decide it.
   three bonds are `MIN_STAKE` (`quorumFor(3·MIN_STAKE) = 2·MIN_STAKE + 1`), and
   far less when the dead seat is a whale bond against one-spark fixture seats.
   Nothing can commit; the chain halts at the epoch boundary.
-- **Four or more seats: the chain keeps committing without it.** At four seats
-  the one-quarter cap applies, so no seat holds more than 1/4 of the total power:
-  dropping the seat that has no signer leaves **at least 3/4 of the power**,
-  which is above the 2/3 threshold. At four seats that is exactly 3 of 4 power
-  (`quorumFor(4) = 3`, and three seats hold 3/4 > 2/3). With equal seats the
-  threshold needs at most `floor(2N/3)+1` of the N, and the `N-1` survivors
-  always supply that many for `N >= 4` — exactly at 4, 5 and 6 seats, with slack
-  above that. (Two silent seats are still fatal up to six seats: `(N-2)/N > 2/3`
-  needs `N >= 7`.) Only the node that lost its seat stops voting: it keeps its
+- **Four or more seats, ONE silent seat: the chain keeps committing.** At four
+  seats the one-quarter cap applies, so no seat holds more than 1/4 of the total
+  power: dropping the one seat that has no signer leaves **at least 3/4 of the
+  power**, which is above the 2/3 threshold whatever the seat sizes are. At four
+  equal seats that is exactly 3 of 4 power (`quorumFor(4) = 3`, and three seats
+  hold 3/4 > 2/3). Only the node that lost its seat stops voting: it keeps its
   links and can still adopt certified blocks, but it can no longer propose or
   vote, and nothing waits for it.
+- **TWO silent seats are NOT safe, and the old rule here was wrong.** It said
+  two silent seats are tolerated from `N >= 7`, which counts *seats* as if they
+  carried equal power: `(N-2)/N > 2/3` needs `N >= 7` only when every seat holds
+  the same share. **The cap makes seats unequal by construction** — it clamps a
+  large bond down to a quarter of the seated total — so the power test, not the
+  seat count, is the one that decides: the live share must exceed two thirds of
+  the total, and two seats pinned at the cap hold half of it between them. That
+  half is below two thirds at **every** N. The 2026-11-06 Docker run measured it:
+  on a ten-seat fixture chain, two keys bonded 10^11 each with no node behind
+  either. The cap's fixed point is 4 + 4 of a 16 total against the eight power-1
+  fixture seats (`quorumFor(16) = 11`), so eight of sixteen power stayed live
+  and the chain halted at the boundary — for over nine minutes, with no
+  transaction able to free the seats. With ONE such bond the same chain runs at
+  **exactly** quorum: the fixed point is 3 + 9 of 12, `quorumFor(12) = 9`, and
+  nine live seats supply 9 — one further failure anywhere below is fatal. A
+  chain in that state now says so in its own log line (see
+  [Consensus](#consensus)); it does not fix it.
 
 Either way the seat is wasted, and the deployment is one further failure from a
 stall — so stake only with the key whose node will run as that validator, and
-keep every genesis key's node running. The three-seat recipe halts; the
-four-seat recipes lose one seat's worth of safety margin and keep finalising.
+keep every genesis key's node running. The three-seat recipe halts; a
+four-or-more-seat recipe loses one seat's worth of safety margin and keeps
+finalising, and loses finality outright if a second seat goes silent while both
+of them sit at the cap.
 
 **The end-to-end run behind these claims** (one process, a devnet-parameter
 chain, the fixture key file described above): `stake --amount 1000` submitted a
@@ -1486,9 +1529,10 @@ restart`, or reboot them together), because a one-at-a-time restart leaves
 their rounds apart and can keep the chain at one head for minutes — the
 2026-10-30 Docker re-run measured 4 to 6.5 minutes. If you must restart one
 at a time, wait for the chain to advance after each restart before stopping
-the next. A node now logs the stall once per height (`b10coin: no block for 8
-rounds at height …`) and, at startup, the round it resumes at (`consensus
-resuming height H at round R …`), and
+the next. A node now logs the stall once per height (`b10coin: no block for N
+rounds at height …`, after eight rounds **and** 30 s at that height) and, at
+startup, the round it resumes at (`consensus resuming height H at round R …`),
+and
 [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
 has the operator's procedure.
 
