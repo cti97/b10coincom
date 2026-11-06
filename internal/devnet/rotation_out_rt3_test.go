@@ -175,13 +175,13 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	if err := connectMesh(vs); err != nil {
 		t.Fatalf("connecting the genesis mesh: %v", err)
 	}
-	waitAllReach(t, vs, 2, 60*time.Second)
+	waitReachByWork(t, vs, 2, rt3Tick)
 
 	// STEP 1: J bonds and epoch 1 seats it.
 	minStake := g.Params.MinStakeSparks
 	jtx := rt3BondTx(g, joiner, minStake, 0)
 	submitToAll(t, vs, jtx)
-	waitFor(t, "the joiner's Bond to commit", 90*time.Second, func() bool {
+	waitFor(t, "the joiner's Bond to commit", workWait(rt3Committee+2, rt3Tick), func() bool {
 		for _, v := range vs {
 			if v.Height() < 2 || v.Chain().State().Bonded(joinerAddr) != minStake {
 				return false
@@ -190,7 +190,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 		return true
 	})
 	b1 := (blockContaining(t, vs[0], jtx.ID())/rt3Epoch + 1) * rt3Epoch
-	waitAllReach(t, vs, b1, 120*time.Second)
+	waitReachByWork(t, vs, b1, rt3Tick)
 	for _, v := range vs {
 		vals, err := v.Chain().CommitteeAt(b1)
 		if err != nil {
@@ -218,10 +218,10 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 		}
 	}
 	all := append(append([]*Validator(nil), vs...), jn)
-	waitFor(t, "the joining node to reach the epoch that seats it", 120*time.Second, func() bool {
+	waitFor(t, "the joining node to reach the epoch that seats it", workWait(2, rt3Tick), func() bool {
 		return jn.Height() >= b1+2
 	})
-	waitFor(t, "the joining node to vote after the boundary it was seated at", 90*time.Second, func() bool {
+	waitFor(t, "the joining node to vote after the boundary it was seated at", workWait(2, rt3Tick), func() bool {
 		for _, h := range jn.VotedHeights() {
 			if h > b1 {
 				return true
@@ -229,7 +229,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 		}
 		return false
 	})
-	waitFor(t, "the joining node's precommit to be counted in a quorum certificate", 120*time.Second, func() bool {
+	waitFor(t, "the joining node's precommit to be counted in a quorum certificate", workWait(2, rt3Tick), func() bool {
 		for h := b1; h <= jn.Height(); h++ {
 			ok := true
 			for _, v := range all {
@@ -250,7 +250,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	// genesis keys plus K: J is rotated OUT.
 	ktx := rt3BondTx(g, evictor, 3*minStake, 0)
 	submitToAll(t, vs, ktx)
-	waitFor(t, "the evictor's Bond to commit", 90*time.Second, func() bool {
+	waitFor(t, "the evictor's Bond to commit", workWait(rt3Committee+2, rt3Tick), func() bool {
 		for _, v := range vs {
 			if v.Height() < 2 || v.Chain().State().Bonded(types.AddressFromPub(evictorPub)) != 3*minStake {
 				return false
@@ -262,7 +262,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	if b2 <= b1 {
 		t.Fatalf("fixture: the evictor's bond decides epoch boundary %d, not after the joiner's %d", b2, b1)
 	}
-	waitAllReach(t, vs, b2, 120*time.Second)
+	waitReachByWork(t, vs, b2, rt3Tick)
 	vals2, err := vs[0].Chain().CommitteeAt(b2)
 	if err != nil {
 		t.Fatalf("CommitteeAt(%d): %v", b2, err)
@@ -286,7 +286,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	// committee had already moved on": J must reach a height ABOVE the
 	// committee's own at a settled snapshot. Without the sync half of RT-3 it
 	// stops dead at the crossing height, because its next request is refused.
-	waitFor(t, "the rotated-out validator to cross the boundary by adoption", 120*time.Second, func() bool {
+	waitFor(t, "the rotated-out validator to cross the boundary by adoption", workWait(2, rt3Tick), func() bool {
 		return jn.Height() >= b2+1
 	})
 	// Let any pull in flight land before taking the snapshot: a chain append
@@ -296,7 +296,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	if got := jn.Height(); got > peersNow {
 		peersNow = got // J is a follower; this keeps the assertion honest anyway
 	}
-	waitFor(t, "the rotated-out validator to follow past the committee's settled height", 120*time.Second, func() bool {
+	waitFor(t, "the rotated-out validator to follow past the committee's settled height", workWait(2, rt3Tick), func() bool {
 		_, committeeAdvanced := minMax(heightsOf(vs))
 		return jn.Height() > peersNow && committeeAdvanced > peersNow
 	})
@@ -304,7 +304,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	if jn.Chain().IsSeatedAt(unseatedHeight, joinerPub) {
 		t.Fatalf("fixture: the joining key is seated at height %d; the recovery was not exercised while rotated out", unseatedHeight)
 	}
-	waitFor(t, "the genesis peers to accept HELLOs announcing a height past the boundary", 90*time.Second, func() bool {
+	waitFor(t, "the genesis peers to accept HELLOs announcing a height past the boundary", workWait(2, rt3Tick), func() bool {
 		for _, v := range vs {
 			h, ok := peerSees(v, joinerPub)
 			if !ok || h < b2+1 {
@@ -319,7 +319,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	// only the five genesis seats plus J: J is re-seated.
 	utx := rt3UnbondTx(g, evictor, 3*minStake, 1)
 	submitToAll(t, vs, utx)
-	waitFor(t, "the evictor's Unbond to commit", 90*time.Second, func() bool {
+	waitFor(t, "the evictor's Unbond to commit", workWait(rt3Committee+2, rt3Tick), func() bool {
 		for _, v := range vs {
 			if v.Height() < 2 || v.Chain().State().Bonded(types.AddressFromPub(evictorPub)) != 0 {
 				return false
@@ -331,7 +331,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	if b3 <= b2 {
 		t.Fatalf("fixture: the evictor's unbond decides epoch boundary %d, not after the rotation out at %d", b3, b2)
 	}
-	waitAllReach(t, vs, b3, 120*time.Second)
+	waitReachByWork(t, vs, b3, rt3Tick)
 	vals3, err := vs[0].Chain().CommitteeAt(b3)
 	if err != nil {
 		t.Fatalf("CommitteeAt(%d): %v", b3, err)
@@ -346,10 +346,10 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	// Counted again: the returning node follows a chain that now seats it,
 	// rebuilds its driver, votes, and its precommit is in a certificate that
 	// reaches that height's quorum.
-	waitFor(t, "the returning validator to reach the epoch that re-seats it", 120*time.Second, func() bool {
+	waitFor(t, "the returning validator to reach the epoch that re-seats it", workWait(2, rt3Tick), func() bool {
 		return jn.Height() >= b3+2
 	})
-	waitFor(t, "the returning validator to vote in the epoch that re-seats it", 90*time.Second, func() bool {
+	waitFor(t, "the returning validator to vote in the epoch that re-seats it", workWait(2, rt3Tick), func() bool {
 		for _, h := range jn.VotedHeights() {
 			if h > b3 {
 				return true
@@ -358,7 +358,7 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 		return false
 	})
 	var proven uint64
-	waitFor(t, "the returning validator's precommit to be counted in a quorum certificate again", 120*time.Second, func() bool {
+	waitFor(t, "the returning validator's precommit to be counted in a quorum certificate again", workWait(2, rt3Tick), func() bool {
 		for h := b3 + 1; h <= jn.Height(); h++ {
 			ok := true
 			for _, v := range all {
@@ -397,6 +397,6 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	}
 
 	through := jn.Height()
-	waitAllReach(t, all, through, 120*time.Second)
+	waitReachByWork(t, all, through, rt3Tick)
 	assertIdenticalHistory(t, all, through)
 }

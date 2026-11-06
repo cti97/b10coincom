@@ -222,6 +222,84 @@ func waitAllReach(t *testing.T, vs []*Validator, target uint64, timeout time.Dur
 	}
 }
 
+// reachAllowance is how long a wait tolerates NO height advance: the product's
+// own stall window (stallFor) plus one block interval for every block still
+// missing at the cadence this run has measured. It is a function so the SHAPE
+// is what a test pins, not a number: the allowance grows with the work still
+// to do and with the rate actually observed, and is never below the stall
+// window.
+func reachAllowance(remaining uint64, perBlock, stallFor time.Duration) time.Duration {
+	return stallFor + time.Duration(remaining)*perBlock
+}
+
+// reachByWork waits until every validator stands at or above target, with a
+// deadline DERIVED from the work still missing rather than fixed in seconds
+// (testrun 2026-11-06, T-1).
+//
+// The rotation fixtures commit about one block per driver tick (`cadence`), so
+// a wait that still needs `target-min` blocks is given `stallFor` - the window
+// after which the NODE ITSELF calls the height stalled (stallReportAfter) -
+// plus one measured block interval per block still missing. The interval is
+// MEASURED from this run: wall time per block since the wait began, re-read on
+// every advance. A host running 100x slower than an idle one therefore gets
+// ~100x the allowance for the blocks it still needs, instead of the same 60 s
+// that used to time out at height 0 while the chain was merely starved.
+//
+// It cannot mask a hang: the allowance is re-armed ONLY by a height advance,
+// and a chain that stops advancing is reported after `stallFor` naming the
+// heights it saw. Nothing extends the window while nothing is produced.
+func reachByWork(vs []*Validator, target uint64, cadence, stallFor time.Duration) error {
+	start := time.Now()
+	min0, _ := minMax(heightsOf(vs))
+	if min0 >= target {
+		return nil
+	}
+	if cadence <= 0 {
+		cadence = time.Millisecond
+	}
+	last, lastAt := min0, start
+	perBlock := cadence
+	for {
+		min, _ := minMax(heightsOf(vs))
+		if min >= target {
+			return nil
+		}
+		now := time.Now()
+		if min > last {
+			last, lastAt = min, now
+			if produced := last - min0; produced > 0 {
+				if measured := now.Sub(start) / time.Duration(produced); measured > perBlock {
+					perBlock = measured
+				}
+			}
+		}
+		if waited := now.Sub(lastAt); waited > reachAllowance(target-last, perBlock, stallFor) {
+			return fmt.Errorf("no height advanced for %s (heights %v, target %d, measured %s per block): the fixture is not making progress, so this is a stall and not a slow run",
+				waited, heightsOf(vs), target, perBlock)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// waitReachByWork is reachByWork with the product's own stall window, for the
+// liveness waits in the rotation fixtures.
+func waitReachByWork(t *testing.T, vs []*Validator, target uint64, cadence time.Duration) {
+	t.Helper()
+	if err := reachByWork(vs, target, cadence, stallReportAfter); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// workWait is the deadline for a derived observable that needs at most
+// `blocks` more committed blocks: the product's stall window plus one block
+// interval per block, using the driver's own round floor
+// (stallReportRounds, "eight rounds at one height") as the per-block
+// multiplier. Same shape as reachAllowance - derived from what the observable
+// needs, not chosen.
+func workWait(blocks uint64, cadence time.Duration) time.Duration {
+	return reachAllowance(blocks*stallReportRounds, cadence, stallReportAfter)
+}
+
 // waitConvergedEqual polls until every validator stands at ONE height H with
 // H >= target, and returns H. EQUALITY — not merely "all at or past target" —
 // is the convergence claim: a validator that fell behind must have adopted

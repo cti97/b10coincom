@@ -259,7 +259,7 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 	// Get off height 0, then bond. The transaction's height is read back from
 	// the chain that carries it: how many rounds it waits for a proposal is a
 	// liveness property, not something this test may assume.
-	waitAllReach(t, vs, 2, 60*time.Second)
+	waitReachByWork(t, vs, 2, rotationInTick)
 	tx := bondTx(g, joiner)
 	for _, v := range vs {
 		if errs := v.Pool().Add([]types.Tx{tx}); len(errs) != 0 && errs[0] != nil {
@@ -267,7 +267,7 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 		}
 	}
 	wantBond := rotationInStakeFactor * g.Params.MinStakeSparks
-	waitFor(t, "the Bond to commit and fund the joining seat", 90*time.Second, func() bool {
+	waitFor(t, "the Bond to commit and fund the joining seat", workWait(rotationInCommittee+2, rotationInTick), func() bool {
 		for _, v := range vs {
 			if v.Height() < 2 || v.Chain().State().Bonded(joinerAddr) != wantBond {
 				return false
@@ -282,7 +282,7 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 	// Constructed boundary: the epoch end whose deciding state (boundary-1)
 	// holds the Bond.
 	boundary := (bondHeight/rotationInEpoch + 1) * rotationInEpoch
-	waitAllReach(t, vs, boundary, 120*time.Second)
+	waitReachByWork(t, vs, boundary, rotationInTick)
 
 	// The rotation-IN itself: the committee that judges the new epoch fills
 	// its spare seat with the joining key (the fixture has five genesis seats
@@ -336,10 +336,10 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 
 	// Positive, monotone observables only: the joining node reaches a height
 	// PAST the boundary, and it has put a vote at or past it on the wire.
-	waitFor(t, "the joining node to reach the new epoch", 120*time.Second, func() bool {
+	waitFor(t, "the joining node to reach the new epoch", workWait(2, rotationInTick), func() bool {
 		return joinerNode.Height() >= boundary+2
 	})
-	waitFor(t, "the joining node to vote in the epoch it is seated in", 60*time.Second, func() bool {
+	waitFor(t, "the joining node to vote in the epoch it is seated in", workWait(2, rotationInTick), func() bool {
 		for _, h := range joinerNode.VotedHeights() {
 			if h > boundary {
 				return true
@@ -353,7 +353,7 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 	// possible to claim the vote was ignored.
 	all := append(append([]*Validator(nil), vs...), joinerNode)
 	var provenHeight uint64
-	waitFor(t, "the joining validator's precommit to appear in a quorum-reaching certificate", 120*time.Second, func() bool {
+	waitFor(t, "the joining validator's precommit to appear in a quorum-reaching certificate", workWait(2, rotationInTick), func() bool {
 		for h := boundary; h <= joinerNode.Height(); h++ {
 			ok := true
 			for _, v := range all {
@@ -381,7 +381,7 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 	// was burned - which is exactly how this test missed the regression. The
 	// scan is a bounded wait on a positive observable (a committed block whose
 	// header names the joining key), the same kind of wait as the ones above.
-	waitFor(t, "a block proposed by the joining validator to be committed", 120*time.Second, func() bool {
+	waitFor(t, "a block proposed by the joining validator to be committed", workWait(rotationInCommittee+2, rotationInTick), func() bool {
 		head := joinerNode.Height()
 		for h := boundary + 1; h <= head; h++ {
 			blk, err := joinerNode.Chain().BlockAt(h)
@@ -405,9 +405,10 @@ func TestARotatedInValidatorStartsAndIsCounted(t *testing.T) {
 	// not a safety violation. The 6->5 rotation test already waits this way
 	// (waitAllReach before assertIdenticalHistory); this test was missing it and
 	// flaked once on the race suite. The assertion itself is unchanged - only
-	// the data it reads is now guaranteed to be there.
+	// the data it reads is now guaranteed to be there - and the wait is
+	// waitReachByWork, the work-derived form (testrun 2026-11-06, T-1).
 	through := joinerNode.Height()
-	waitAllReach(t, all, through, 120*time.Second)
+	waitReachByWork(t, all, through, rotationInTick)
 	assertIdenticalHistory(t, all, through)
 }
 
@@ -426,7 +427,7 @@ func TestAStrangerIsStillRefusedAfterABoundary(t *testing.T) {
 	if err := connectMesh(vs); err != nil {
 		t.Fatalf("connecting the mesh: %v", err)
 	}
-	waitAllReach(t, vs, 2, 60*time.Second)
+	waitReachByWork(t, vs, 2, rotationInTick)
 	tx := bondTx(g, joiner)
 	for _, v := range vs {
 		if errs := v.Pool().Add([]types.Tx{tx}); len(errs) != 0 && errs[0] != nil {
@@ -434,7 +435,7 @@ func TestAStrangerIsStillRefusedAfterABoundary(t *testing.T) {
 		}
 	}
 	joinerAddr := types.AddressFromPub(joiner.Public().(ed25519.PublicKey))
-	waitFor(t, "the Bond to commit", 90*time.Second, func() bool {
+	waitFor(t, "the Bond to commit", workWait(rotationInCommittee+2, rotationInTick), func() bool {
 		for _, v := range vs {
 			if v.Height() < 2 || v.Chain().State().Bonded(joinerAddr) == 0 {
 				return false
@@ -447,7 +448,7 @@ func TestAStrangerIsStillRefusedAfterABoundary(t *testing.T) {
 		t.Fatal("the Bond is in state but no block carries it")
 	}
 	boundary := (bondHeight/rotationInEpoch + 1) * rotationInEpoch
-	waitAllReach(t, vs, boundary, 120*time.Second)
+	waitReachByWork(t, vs, boundary, rotationInTick)
 
 	// A key generated by this test and bonded by nobody.
 	strangerPub, strangerPriv, err := ed25519.GenerateKey(nil)
