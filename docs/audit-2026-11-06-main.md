@@ -225,191 +225,48 @@ These are the findings behind the findings. Each produced at least two of the it
 
 ---
 
-## 9. Corrections after the fixes
+## 9. Corrections, and a scoreboard
 
 Recorded because a report that does not correct itself is the defect this whole
-document is about. Both items below were found by the rounds that fixed S-1..S-4,
-**not** by the review that wrote this document.
+document is about. Every item below was found by the round that *fixed* the
+finding, not by the review that wrote it. **Fifteen corrections to a report of
+twenty findings** is the honest measure of what a source-only review is worth:
+the defects were real; the repairs were mine to get wrong and I did.
 
-**The S-3 init assertion was arithmetically false.** This report prescribed
-`MaxTxsPerBlock <= (MaxBlockBytes − overhead) / minTxSize`. For the shipped
-constants `(1 MiB − 212) / 165 = 6,353`, so `10,000 <= 6,353` is false and the
-assertion **panics every node at startup**. Making it true means lowering
-`MaxTxsPerBlock`, which is a consensus-validity change belonging to the next
-versioned fork. What shipped instead is the satisfiable guard (the byte budget
-admits at least one minimum-size transaction) plus the structural fix that makes
-the count bound irrelevant: the producer budgets by **bytes**, and the frame
-bound is **derived** from the block bound rather than duplicated. This is the
-**second** unsound remedy in this document; the first was S-4's.
+### Findings whose mechanism was wrong
 
-**The triangle has a fourth member: the signature.** `chain.Build` runs
-`ValidateStructure` **before** signing, so it measures a block 65 bytes smaller
-than the wire form, while `types.DecodeBlock` enforces `MaxBlockBytes` on the
-**signed** bytes. A block measured at 1,048,555 therefore validates and, once
-signed, is undecodable by every peer. It is unreachable from an honest producer
-— the byte budget charges the signed overhead — but the validity rule still
-admits it, so it is a residual for the next fork rather than something to fix by
-narrowing validity now.
+| ID | What this report said | What the code does |
+|---|---|---|
+| **S-7** | `argon2.IDKey` **panics** when memory < 8×lanes, so a validated genesis crashes every claim | `deriveKey` **coerces**: memory/(4·lanes)·(4·lanes), then raised to 8·lanes. Only `time<1` and `lanes<1` panic, and `Validate` already refuses those. **A validated genesis never crashes the node.** The real defect is narrower: the declared cost is not the cost that runs. |
+| **S-20** | the set is "rate-limited by whoever can afford `MIN_STAKE` bonds" | A bond is **necessary and not sufficient** — a key that bonds and loses the seat draw is never admitted. So `|everSeated| ≤ len(genesis.Validators) + CommitteeSize × epochs`, ≈ 91 keys/day on testnet, ≈ 3 MB/year. **The set is bounded**; the finding is real but its severity was overstated. |
+| **S-5** | "any connected peer, member **or stranger**" | A stranger cannot reach `Route` on a direct socket — the HELLO gate stops it. The stranger case is real **only over the relay link**. |
+| **S-17** | the transaction is destroyed "if both land in one `Take` batch" | It is destroyed **even when its predecessor is in a later batch**, and ordering alone does not save it; the selection must also return nonce-ahead candidates for retry. |
+| **S-12** | incomplete: names only `Open` | `CertAt` had a comparable unbounded allocation — **67 MB requested from a 54-byte log** — and a swapped-record bug: two equal-width records exchanged in place keep every checksum valid, so `CertAt(1)` served height 2's certificate. |
 
-**Two things this report understated.** Consequence A of S-2 is worse than
-written: a **single** sync unit carrying a max-size block already exceeded the
-old 1 MiB frame, so such a block could not be synced **at all**, not merely
-inside a 64-height window. And the legal-band boundary is 1,048,455, not
-1,048,452.
+### Remedies that would have failed, or made things worse
 
-**One thing worse than the findings.** The generator's heredoc terminator was
-consumed by its own content, so three trailing shell lines were written into
-this file and the line count first reported (228) included them. Removed. It is
-the same failure this project keeps finding in its own artifacts: an assertion
-that was never checked against the thing it claims to describe.
+| ID | The prescription | Why it was wrong |
+|---|---|---|
+| **S-4** | "move the release into `adopt`'s pre-install error paths" | `adopt` is **also outbound**, which books no slot; releasing there decrements a slot never taken and makes `MaxConns` *more* permissive. |
+| **S-3** | `MaxTxsPerBlock <= (MaxBlockBytes − overhead)/minTxSize` as an init assertion | Arithmetically **false**: `(1 MiB − 212)/165 = 6,353`, so `10,000 <= 6,353` **panics every node at startup**. |
+| **S-10** | "drop `-buildvcs=false`" | `-buildvcs=auto` derives `vcs.modified` from `git status`, and `build-release.sh` builds inside its own untracked `.release-stage/` — **every clean release would have stamped "(modified)"**. |
+| **S-11** | `grep … \| sha256sum -c -` | GNU `sha256sum -c` **exits 0 on empty input**, so the check silently passes when the entry is missing — the exact failure it was written to catch. |
+| **S-14** | "parse at 64 bits then clamp" | `?offset` had **no clamp at all**; a 64-bit parse alone turns `2⁶⁴−1` into `−1` and indexes out of range. |
+| **S-18** | "wire the signing secret" | `ubuntu-latest` ships **no `minisign`**, so wiring alone could not have signed anything. |
 
-**The S-5..S-7 round (this section is theirs too).** Recorded on 2026-11-06 by
-the branch that fixed them, because these three were `REPORTED`, not reproduced,
-and one of them is wrong in the way this document's own blindspot 4 describes.
+### Understatements
 
-**S-5 is real, with one half of its blast radius corrected.** The proposal
-branch did decode the whole block before any gate, and `transport.dispatch`
-holds one mutex across every `OnMessage`, so the stall is real. The offset
-claim survives inspection: `EncodeProposal` writes a 1-byte tag, then the
-8-byte big-endian `Height`, before any variable-width field, and the transport
-strips the frame's length prefix, so the read is a constant offset and exact
-for every decodable proposal. What does not survive is *"member or stranger"*:
-on a **direct** socket the HELLO admission gate (`admitHello`) refuses every
-non-HELLO frame before dispatch, so a stranger cannot reach `Route` there. The
-stranger case is real only over the **relay** link, whose documented residual
-already says a relay connection cannot bind a frame to an identity. Any
-**member** can do it directly. The fix is as prescribed, applied at the head of
-`Route` (the vote window is the right filter: the driver's engine height is
-chain head + 1, so the window contains it and nothing above it is acted on).
+- **S-2's consequence A**: a **single** sync unit carrying a max-size block already exceeded the old frame bound — such a block could not be synced **at all**, not merely inside a 64-height window. The legal-band boundary is 1,048,455, not 1,048,452.
+- **S-2 has a fourth triangle member**: `chain.Build` validates **before signing**, so it measures a block 65 bytes smaller than the wire form, while `DecodeBlock` bounds the **signed** bytes. A block at 1,048,555 validates and is then undecodable by every peer — unreachable from an honest producer, but admitted by the validity rule.
+- **S-16** was under-specified: "refuse a wildcard bind with neither token nor allowlist" does not say how the binary can *know* about an allowlist. It now takes `--external-allowlist`, which the systemd unit passes.
 
-**S-6 is real as described.** Reproduced at the shipped producer path: a
-genesis with `MaxClaimsPerBlock = 1` and three pending claims makes `Take` hand
-out three, `Build` refuse with `state.ErrTooManyClaims`, and `RunOnce` returns
-without proposing. One consequence the finding missed: the pool's
-`MaxClaimAgeBlocks` (32) assumed the constant hand-out rate, so bounding the
-hand-out by a lower state value without also following the rate would silently
-**age out** claims that were merely waiting their turn.
+### Two errors in this document's own production
 
-**S-7 is wrong where it matters.** `golang.org/x/crypto` v0.58.0's
-`deriveKey` does not panic when memory is below `8 × lanes`; it **coerces**
-memory (`memory = memory/(4·lanes)*(4·lanes)`, then raised to `8·lanes`). Its
-only panics are `time < 1` and `lanes < 1`, both already refused by
-`Validate` and guarded again in `applyFaucetClaim`. So a validated genesis
-never crashes a node on a claim. The residual is the one blindspot 4 names: a
-genesis could declare a memory cost the library silently changes, so the
-parameter priced the work wrongly. `Validate` now accepts only a fixed point of
-the derivation (memory ≥ `8 × lanes`, and a multiple of `4 × lanes`), and a
-test evaluates the finding's own extreme tunings to prove no panic. `Iterations`
-still has no upper bound — a separate, unhidden residual: it prices work rather
-than deciding representability, and a ceiling is a policy number this round did
-not invent.
+- The heredoc terminator was consumed by its content, so **three lines of generator shell** were written into the file and the line count first reported (228) included them.
+- The fixing brief labelled **S-20 as `REPORTED`**; the table here says `VERIFIED`, which is correct. The label was mine to get right.
 
-**The S-10, S-11 and S-18 round (this section is theirs too).** Recorded on
-2026-11-06 by the branch that fixed them. All three were `VERIFIED`, the
-controller having read the code, and all three are real as written — the
-mechanisms hold. What the findings did **not** say, and what the fixes had to
-discover:
+### The rule worth keeping
 
-- **S-10's remedy needed one more file than the finding named.** Dropping
-  `-buildvcs=false` makes the toolchain derive `vcs.modified` from
-  `git status`, and `scripts/build-release.sh` builds inside an untracked
-  `.release-stage/` directory of its own. Not in `.gitignore`, that directory
-  made **every release of a pristine tree report `(modified)`** — a false
-  alarm that would have taught operators to ignore exactly the field S-10
-  exists to make them read. Fixed by ignoring it, with the reason recorded
-  there. The reproducibility claim narrowed in two stated ways: a checkout and
-  a source tarball of the same commit can no longer agree byte for byte (only
-  the checkout can be stamped), and a dirty tree's artifacts differ from the
-  clean ones. Two builds of the same VCS state remain byte-identical, and
-  `-trimpath` is untouched. `-buildvcs=auto` rather than `true`, because `true`
-  errors where `auto` omits; the strictness lives in the release script's
-  assertion, which can explain itself.
-- **S-11's deploy fix was one line away from reproducing the defect it
-  fixed.** Replacing `sha256sum -c --ignore-missing` with
-  `grep … | sha256sum -c -` looks like "name the file", and is **not**: GNU
-  `sha256sum -c` exits **0 on empty input** (verified against coreutils on
-  this host; BSD `shasum -a 256 -c` exits 1), so a missing entry still passes
-  silently. The recipe now tests the extracted line explicitly and refuses
-  before verifying. The finding also omitted that `ubuntu-latest` ships **no
-  minisign**, so the documented signing boundary could not execute even with a
-  secret wired: the missing piece was a pinned install, not just the step.
-- **S-18's number, for the record.** `ubuntu-24.04` ships `shellcheck
-  0.9.0-1`, so the gate's verdict was the image's. Pinned to 0.11.0 with a
-  digest, and the whole tree was verified clean under 0.11.0 before the pin
-  landed — the bump is not deferred to the first red cron run.
+Across twenty findings: **four Highs held exactly as described; of the sixteen Medium and Low items, seven had a component that was wrong** — a false mechanism, an overstated scope, or an incomplete statement. Every one of those seven was marked `REPORTED` except S-20 and S-12.
 
-The one thing this round could not verify: the workflow itself. It was parsed
-as YAML, its shell was read line by line, and every command in it was executed
-locally where the host allows (the identity outputs, the signing sequence with
-a real key, the checksum refusals), but the runner, `actions/upload-artifact`
-and the tag gate are exercised only by the next tagged push.
-
-**The S-12 and S-20 round (this section is theirs too).** Recorded on 2026-11-06
-by the branch that closed the last two findings.
-
-**S-12 is real as described, and one degree worse than written.** `scanCerts`
-did call `os.ReadFile`, so `Open` allocated the whole certificate log in one
-`make` before indexing anything, while the `Store` doc promised records were
-"read back on demand" and the file has no prune of any kind (`PruneLocks` and
-`PruneRounds` exist; there is no `PruneCerts`, and there should not be - serving
-an old height's certificate is what the file is for). Measured on the shipped
-fixture, `Open` over a 10,000-record log of 512-byte payloads allocated
-**5,965,416 bytes** (596.5 B per record, i.e. the payload); over 200 records of
-4 KiB it allocated **844,768 bytes** against 35,968 for the same count of
-64-byte records. After streaming: **758,720 bytes** over the 10,000-record log
-(75.9 B per record, the index entry alone) and **19,760** over the 4 KiB log
-against 19,920 for the narrow one - the payload width no longer enters the
-number at all. `internal/store/cert_alloc_test.go` holds that comparison plus
-`BenchmarkOpenCertLog`, and each was confirmed to fail against the old code.
-
-**What S-12 did not say: `CertAt` had the same hole from the other side.** The
-report named only `Open`. `CertAt` read the length prefix, checked its own
-checksum, and then `make([]byte, n)` **before** consulting the file's length, so
-a single edited or stale header made a 54-byte log request 64 MiB (measured:
-**67,108,880 bytes**). It now frames the record against the file's current size
-first, reusing `readRecordAt`, the same framing policy the scans apply, and
-additionally refuses a record whose height key is not the height it was indexed
-at - two equal-width records swapped in place keep every checksum valid, so the
-key is the only thing that can tell (measured before: `CertAt(1)` served height
-2's certificate). Both are tested and both tests were confirmed to fail against
-the old code.
-
-The cost of the streaming fix is stated where it belongs, on `scanCerts`: `Open`
-no longer verifies the trailer checksum over a certificate payload, because it
-no longer reads one. Framing is unaffected (the length prefix carries its own
-checksum, checked before the length is trusted), and `CertAt` re-verifies the
-whole record before serving, so corruption is now an absent certificate at read
-time instead of a failed start. That is the archive's own error policy - evidence
-for one height, never a safety promise - applied one step further.
-
-**S-20 is real, and it is bounded - so it is accepted, not capped.** Nothing
-deletes from `everSeated`, and it is monotone on purpose (RT-3/RT-7). What the
-report did not work out is that only two paths insert: the genesis seats at
-`Open`, and the derived committee in `memoCommitteeLocked`, which runs once per
-epoch boundary. The set is therefore exactly the union of the genesis seats and
-the committees this chain has recorded, which bounds it **structurally**:
-
-```
-|everSeated| <= len(genesis.Validators) + CommitteeSize x epochs elapsed
-```
-
-On the shipped testnet parameters an epoch is 10,000 blocks of 2,000 ms -
-20,000 s - so the ceiling is 21 seats per epoch, about 91 keys a day and about
-33,100 a year; at the measured 67-88 bytes per entry that is about 3 MB a year,
-and a gibibyte would need ~11.9 million entries, or ~360 years of a fully funded
-committee rotating at its ceiling. Each of those keys must additionally hold
-MIN_STAKE = 10^11 sparks (1,000 b10) to be seatable at all. The finding's
-closing clause - "rate-limited by whoever can afford MIN_STAKE bonds" - is the
-one part that is wrong: a bond is necessary and **not sufficient**. A key that
-bonds and loses the seat draw is never admitted, which is now pinned by
-`internal/chain/s20_everseated_test.go` with a constructed five-candidate,
-four-seat fixture (verified: the 3x key is seated and admitted, the 1x key is
-bonded, excluded, and not admitted).
-
-A cap was rejected rather than measured against: enforcing one means refusing
-HELLO/BLOCK_SYNC to a key that is legitimately seated once the set is full, or
-evicting an entry - and an evicted entry is a rotated-out honest validator that
-this set exists to keep admitting. Both are the RT-3 freeze the project has
-already paid for once. The structural bound above is enforced by the shape of
-the code instead of by a number someone can tune wrong, and the arithmetic is
-recorded on the field so the next reader can re-derive it rather than trust it.
+**A source-only review finds defects reliably and repairs them unreliably.** Write the finding; let the person reading the code choose the fix; and mark what you did not reproduce.
