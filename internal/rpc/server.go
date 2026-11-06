@@ -102,18 +102,32 @@ const (
 	// outside the /tx limiter, so its reply size must not be a function of the
 	// state: a request may never ask for more than this, whatever it sends.
 	maxUnbondingLimit = 256
+	// maxUnbondingOffset bounds the parsed offset so the int conversion below
+	// is safe on every platform Go builds for, including 32-bit ones. The
+	// state bounds this list to UnbondingEpochs+2 records, so any offset this
+	// large is already past the end and means "empty window"; clamping it
+	// there loses no request a client could have meant, and it cannot wrap to
+	// a negative index (audit S-14).
+	maxUnbondingOffset = 1<<31 - 1
 )
 
 // unbondingWindow parses limit/offset. Absent values take the defaults; a
 // non-numeric, zero limit or an offset that is not a number is a client error
 // rather than a silently different window. A limit above maxUnbondingLimit is
 // clamped, not refused: the client asked for "as much as allowed".
+//
+// BOTH FIELDS PARSE AT 64 BITS and are clamped afterwards (audit S-14). A
+// 31-bit parse rejected 2^31 and above as "not a positive integer" - false
+// about the value and contrary to the clamp promise above. With a uint64 parse
+// the only refusals are values no count can be: zero limit, non-numeric,
+// negative, or above 2^64-1. The offset is additionally clamped to
+// maxUnbondingOffset so int(v) cannot overflow.
 func unbondingWindow(q url.Values) (offset, limit int, err error) {
 	limit = defaultUnbondingLimit
 	if raw := q.Get("limit"); raw != "" {
-		v, perr := strconv.ParseUint(raw, 10, 31)
+		v, perr := strconv.ParseUint(raw, 10, 64)
 		if perr != nil || v == 0 {
-			return 0, 0, errors.New("limit must be a positive integer")
+			return 0, 0, errors.New("limit must be a positive integer that fits in 64 bits")
 		}
 		if v > maxUnbondingLimit {
 			v = maxUnbondingLimit
@@ -121,9 +135,12 @@ func unbondingWindow(q url.Values) (offset, limit int, err error) {
 		limit = int(v)
 	}
 	if raw := q.Get("offset"); raw != "" {
-		v, perr := strconv.ParseUint(raw, 10, 31)
+		v, perr := strconv.ParseUint(raw, 10, 64)
 		if perr != nil {
-			return 0, 0, errors.New("offset must be a non-negative integer")
+			return 0, 0, errors.New("offset must be a non-negative integer that fits in 64 bits")
+		}
+		if v > maxUnbondingOffset {
+			v = maxUnbondingOffset
 		}
 		offset = int(v)
 	}

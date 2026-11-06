@@ -873,6 +873,92 @@ func TestHistoryReportsATransferToBothParties(t *testing.T) {
 	}
 }
 
+// TestABlocksCountAbove31BitsIsClampedNotRefused is audit S-14's regression
+// guard at the HTTP edge: 2^31 and 2^64-1 are POSITIVE integers, and the help
+// text promises a larger count is clamped. A 31-bit parse answered them with
+// 400 "must be a positive integer", which is false about the value and
+// contradicts the promise. The reply must be 200 with the clamped window, and
+// the only refusals left must be values a count cannot be.
+func TestABlocksCountAbove31BitsIsClampedNotRefused(t *testing.T) {
+	for _, ask := range []string{"2147483648", "4294967296", "18446744073709551615"} {
+		got, err := historyBlocks(url.Values{"blocks": {ask}})
+		if err != nil {
+			t.Fatalf("blocks=%s = %v, want a clamp to %d, not a refusal", ask, err, MaxHistoryBlocks)
+		}
+		if got != MaxHistoryBlocks {
+			t.Fatalf("blocks=%s parsed to %d, want the clamp %d", ask, got, MaxHistoryBlocks)
+		}
+	}
+	// Above 2^64-1 does not fit in a uint64, so it is not a count this
+	// endpoint can accept - and the sentence must say so rather than claim the
+	// value is not positive.
+	_, err := historyBlocks(url.Values{"blocks": {"18446744073709551616"}})
+	if err == nil {
+		t.Fatal("blocks=2^64 was accepted; it does not fit in 64 bits")
+	}
+	t.Logf("refusal for 2^64: %v", err)
+	if strings.Contains(err.Error(), "positive integer") && !strings.Contains(err.Error(), "fits in 64 bits") {
+		t.Errorf("the refusal still claims a positive integer is not positive: %v", err)
+	}
+
+	// The same rule at the HTTP edge, where the old behaviour was a 400.
+	s, ts := testServer(t)
+	c := s.chain
+	g := c.Genesis()
+	for i := 1; i <= 3; i++ {
+		appendBlock(t, c, nil, g.Time+int64(i))
+	}
+	resp, err := http.Get(ts.URL + "/history?blocks=2147483648")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	t.Logf("GET /history?blocks=2147483648 -> %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /history?blocks=2147483648 = %d, want 200 (clamped)", resp.StatusCode)
+	}
+	var h historyResponse
+	if err := json.Unmarshal(body, &h); err != nil {
+		t.Fatal(err)
+	}
+	if h.Blocks != 3 {
+		t.Fatalf("the reply reports %d scanned blocks, want all 3 (the chain's height)", h.Blocks)
+	}
+}
+
+// TestAnUnbondingWindowAbove31BitsIsClampedNotRefused is S-14 for the second
+// parser: limit and offset above 2^31 must clamp, and a huge offset must not
+// wrap the int conversion into a negative index.
+func TestAnUnbondingWindowAbove31BitsIsClampedNotRefused(t *testing.T) {
+	_, limit, err := unbondingWindow(url.Values{"limit": {"2147483648"}})
+	if err != nil {
+		t.Fatalf("limit=2^31: %v, want a clamp", err)
+	}
+	if limit != maxUnbondingLimit {
+		t.Fatalf("limit=2^31 parsed to %d, want the clamp %d", limit, maxUnbondingLimit)
+	}
+	for _, ask := range []string{"2147483648", "18446744073709551615"} {
+		offset, limit, err := unbondingWindow(url.Values{"offset": {ask}, "limit": {"16"}})
+		if err != nil {
+			t.Fatalf("offset=%s: %v, want a clamp", ask, err)
+		}
+		if offset < 0 {
+			t.Fatalf("offset=%s parsed to %d: the int conversion wrapped negative", ask, offset)
+		}
+		if offset != maxUnbondingOffset {
+			t.Fatalf("offset=%s parsed to %d, want %d", ask, offset, maxUnbondingOffset)
+		}
+		lo, hi := unbondingBounds(4, offset, limit)
+		if lo != 4 || hi != 4 {
+			t.Fatalf("a past-the-end offset window = [%d,%d), want [4,4)", lo, hi)
+		}
+	}
+	if _, _, err := unbondingWindow(url.Values{"offset": {"-1"}}); err == nil {
+		t.Fatal("offset=-1 was accepted; a negative offset has no records before the first")
+	}
+}
+
 // TestHistoryWindowIsBoundedAndSaysWhatItScanned pins the three bounds: the
 // requested window is honoured and reported, an over-large request is clamped
 // to the maximum, and the entry cap sets truncated instead of growing the
