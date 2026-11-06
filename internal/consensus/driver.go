@@ -524,6 +524,16 @@ func (d *Driver) Round() uint32 { return d.eng.Round() }
 // Append, and it clears when a fresh engine replaces the refused one.
 func (d *Driver) AppendRefused() bool { return d.appendRefused }
 
+// NowMillis reports the clock reading Tick last advanced the driver to: the
+// same virtual-millisecond clock the round ladder's deadlines are measured
+// against, and nothing else. It exists for DIAGNOSTICS that must answer "how
+// long has this height been stuck" in the engine's own time rather than in a
+// wall clock the engine never reads (the stall watcher, audit N-3): a second
+// clock in the reporter could disagree with the ladder about the same stall,
+// and a test could then no longer construct one without sleeping. A fresh
+// driver reads zero until its first Tick, exactly like the round it is in.
+func (d *Driver) NowMillis() int64 { return d.now }
+
 // Tick advances the driver's clock to nowMillis and drives three things in a
 // fixed order: proposing (a proposer must not sit silently in its own round),
 // the round timeout of the round the engine is IN, and the flush that delivers

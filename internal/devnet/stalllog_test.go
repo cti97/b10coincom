@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cti97/b10coincom/internal/consensus"
 	"github.com/cti97/b10coincom/internal/genesis"
@@ -93,16 +94,52 @@ func TestANodeInAStallSaysSoOnceWithRoundTalliesAndPeers(t *testing.T) {
 	}
 }
 
-// TestALoneSeatDoesNotCryStallWithoutAReachableQuorum is the other half of "at
-// a height where it believes a quorum should exist": one live seat of three
-// cannot make the quorum of 3 by arithmetic, so its stall is EXPECTED, not a
-// warning. The node must stay silent even past the round threshold.
-func TestALoneSeatDoesNotCryStallWithoutAReachableQuorum(t *testing.T) {
+// TestALoneSeatNamesTheUnreachableQuorumOnce is the S-1 shape at its smallest:
+// one live seat of three cannot make the quorum of 3 by arithmetic, so no round
+// here can commit. That used to be SILENT - the reachable-quorum line
+// suppresses itself by design and this branch simply returned - which is how a
+// real ten-seat halt logged nothing for nine minutes. It now gets its own line,
+// naming the power it can reach, the quorum, the seats it hears nothing from
+// and the cause; and it is still once per height.
+func TestALoneSeatNamesTheUnreachableQuorumOnce(t *testing.T) {
 	vs := quietValidators(t, 3)
 	live := vs[:1] // seats 1 and 2 never run: no peers, no HELLOs
+	v := vs[0]
+	// The tick loop's first observation, at round 0: without it the watcher
+	// would see the height for the first time AT the threshold and (correctly)
+	// count from there, which is a different test.
+	v.stallReportOnce()
 	reachRound(t, live, stallReportRounds)
-	if line, ok := vs[0].stallReportOnce(); ok {
-		t.Fatalf("a lone seat whose 1 of 3 power cannot reach the quorum of 3 reported a stall:%s", line)
+	line, ok := v.stallReportOnce()
+	if !ok {
+		t.Fatal("a lone seat whose 1 of 3 power cannot reach the quorum of 3 said nothing: the permanent-halt shape is silent again")
+	}
+	t.Logf("unreachable-quorum line: %s", line)
+	for _, want := range []string{
+		"no block for 8 rounds",
+		"the quorum is UNREACHABLE",
+		"this node can reach 1 of 3 power and the quorum is 3",
+		"2 more power is needed",
+		"the committee for height 1 DOES derive (3 seats)",
+		"not a missing derivation",
+		"seats with no node behind them",
+		"2[seat1 power=1, seat2 power=1]",
+		"peers=0[]",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("the unreachable-quorum line does not say %q:%s", want, line)
+		}
+	}
+	// It is NOT the reachable-quorum line: that one asserts a quorum exists and
+	// is failing, which is false here (audit B-4's rule, applied to the other
+	// half of the diagnosis).
+	for _, bad := range []string{"quorum reachable", "cannot be derived"} {
+		if strings.Contains(line, bad) {
+			t.Fatalf("the unreachable-quorum line says %q, which is false at this height:%s", bad, line)
+		}
+	}
+	if again, ok := v.stallReportOnce(); ok {
+		t.Fatalf("the same unreachable height was reported twice:%s", again)
 	}
 }
 
@@ -224,19 +261,39 @@ func TestTheStallLineReArmsAtTheNextHeight(t *testing.T) {
 
 // TestAStallLineCountsOnlyRoundsWithAReachableQuorum is the false positive of
 // the M5 network re-run (2026-10-30): a node that climbed rounds while its
-// peers were down - an expected stall, its quorum unreachable - reported a
-// stall the instant a peer came back, because the round NUMBER was already
-// past the threshold. It then recovered in seconds. The rounds that count are
-// the ones entered with a reachable quorum.
+// peers were down reported a REACHABLE-QUORUM stall the instant a peer came
+// back, because the round NUMBER was already past the threshold. It then
+// recovered in seconds. The rounds that count for that line are the ones
+// entered with a reachable quorum.
+//
+// The outage itself is no longer silent (testrun 2026-11-06, S-1): a node that
+// cannot see a quorum says so ONCE, in its own line, after the threshold. That
+// line and the reachable one are separate latches, which is what lets this test
+// keep asserting the original property - when the peers come back, the
+// reachable line does not fire until eight rounds have been spent WITH the
+// quorum in reach - without the earlier outage suppressing it.
 func TestAStallLineCountsOnlyRoundsWithAReachableQuorum(t *testing.T) {
 	vs := quietValidators(t, 4)
 	live := vs[:3]
 	v := live[0]
 	// The outage: nobody heard from, sixteen rounds climbed, every one observed.
+	// Below the threshold: silence. At it: the unreachable-quorum line, ONCE.
+	firedAt := uint32(0)
 	for r := uint32(0); r <= 2*stallReportRounds; r += 4 {
 		reachRound(t, live, r)
-		if line, ok := v.stallReportOnce(); ok {
-			t.Fatalf("a node that could not reach a quorum reported a stall at round %d:%s", r, line)
+		line, ok := v.stallReportOnce()
+		switch {
+		case r < stallReportRounds && ok:
+			t.Fatalf("a node %d rounds into an outage reported anything:%s", r, line)
+		case r == stallReportRounds && !ok:
+			t.Fatalf("a node that could not reach a quorum said nothing at round %d: the permanent-halt shape is silent (S-1)", r)
+		case r == stallReportRounds:
+			if !strings.Contains(line, "the quorum is UNREACHABLE") {
+				t.Fatalf("the outage reported the wrong shape at round %d:%s", r, line)
+			}
+			firedAt = r
+		case ok:
+			t.Fatalf("the same outage was reported again at round %d (first at %d):%s", r, firedAt, line)
 		}
 	}
 	// The peers come back. Round 16 is past the threshold by number, but no
@@ -291,5 +348,258 @@ func TestAPeerThatDropsOutRestartsTheStallCount(t *testing.T) {
 	reachRound(t, live, stallReportRounds)
 	if line, ok := v.stallReportOnce(); ok {
 		t.Fatalf("the rounds before the peers dropped out were still counted (round %d):%s", v.Round(), line)
+	}
+}
+
+// driveClock ticks the validators one tick at a time with the virtual clock
+// advancing by step per tick, from now to until, and returns the clock it
+// reached. Unlike reachRound it does NOT jump the clock: it builds the state a
+// live node actually passes through - "eight rounds in, but only five seconds
+// old" - which is the N-3 hiccup and cannot be built by a helper that advances
+// a thousand seconds per round.
+func driveClock(t *testing.T, vs []*Validator, from, until, step int64) int64 {
+	t.Helper()
+	now := from
+	for now < until {
+		now += step
+		for _, v := range vs {
+			v.mu.Lock()
+			v.drv.Tick(now)
+			v.drv.Observe()
+			v.mu.Unlock()
+		}
+	}
+	return now
+}
+
+// TestASecondsLongHiccupIsNotAStall is N-3, both halves at once.
+//
+// BEFORE: eight rounds at one height was the whole threshold, and the shipped
+// ladder (200 ms base + 100 ms step) spends those eight rounds in about 4.4 s -
+// so normal ten-seat running fired the line in bursts and the documented
+// one-at-a-time restart (longest gap 8.4 s) produced 20 of them, while the
+// README promised a line for a stall that "can hold for minutes".
+//
+// AFTER: the state is constructed with a clock that moves the way the tick loop
+// moves it. At 5 s the node has ALREADY passed the old round threshold - the
+// test asserts that, so it cannot pass vacuously - and says nothing. Past
+// stallReportAfter the same stall is old enough and is reported.
+func TestASecondsLongHiccupIsNotAStall(t *testing.T) {
+	vs := quietValidators(t, 4)
+	live := vs[:3]
+	v := live[0]
+	for seat := 1; seat < 3; seat++ {
+		attestPeer(t, v, string(live[seat].pub), fmt.Sprintf("v%d", seat), 0)
+	}
+	v.stallReportOnce() // the tick loop's round-0 observation
+
+	now := driveClock(t, live, 0, 5_000, 50)
+	rounds := v.Round()
+	if rounds < stallReportRounds {
+		t.Fatalf("fixture: five seconds bought only %d rounds, so this test does not reach the OLD threshold and would prove nothing", rounds)
+	}
+	if line, ok := v.stallReportOnce(); ok {
+		t.Fatalf("a 5 s hiccup (%d rounds at one height) fired the stall line: the threshold is still rounds alone:%s", rounds, line)
+	}
+
+	driveClock(t, live, now, int64(stallReportAfter/time.Millisecond)+5_000, 50)
+	line, ok := v.stallReportOnce()
+	if !ok {
+		t.Fatalf("a stall older than %v said nothing: the time gate suppressed a real one", stallReportAfter)
+	}
+	t.Logf("stall line after the time threshold: %s", line)
+	if !strings.Contains(line, "quorum reachable with 3 of 4 power (quorum 3)") {
+		t.Fatalf("the time-gated line is not the reachable-quorum one:%s", line)
+	}
+	if strings.Contains(line, "no block for 8 rounds") {
+		t.Fatalf("the line still claims the constant 8 rounds after crossing a time threshold:%s", line)
+	}
+}
+
+// TestASyncingNodeDoesNotCryStall is N-3's other half: a node with a certified
+// head still to fetch is catching up, not stalled. The suppression uses the
+// same selection maybeCatchUp pulls on, so the two cannot disagree.
+func TestASyncingNodeDoesNotCryStall(t *testing.T) {
+	vs := quietValidators(t, 4)
+	live := vs[:3]
+	v := live[0]
+	for seat := 1; seat < 3; seat++ {
+		attestPeer(t, v, string(live[seat].pub), fmt.Sprintf("v%d", seat), 0)
+	}
+	// One peer announces a head well above ours: a certified block this node
+	// has not fetched yet. We are behind, and pulling is what we are doing.
+	attestPeer(t, v, string(live[1].pub), "v1", 100)
+	v.stallReportOnce()
+	now := driveClock(t, live, 0, int64(stallReportAfter/time.Millisecond)+5_000, 50)
+	if line, ok := v.stallReportOnce(); ok {
+		t.Fatalf("a node with a certified head to fetch reported a stall while syncing:%s", line)
+	}
+
+	// The same peer, now level with us: there is nothing left to fetch, so a
+	// height that does not move is a real stall again.
+	v.peerHMu.Lock()
+	st := v.peerH[string(live[1].pub)]
+	if st == nil {
+		v.peerHMu.Unlock()
+		t.Fatal("fixture: the peer is not in the catch-up table")
+	}
+	st.height = 0
+	v.peerHMu.Unlock()
+
+	// Enter another round: while the quorum is in reach the watcher samples
+	// reachability once per round, so a second poll at the same round is
+	// deliberately free.
+	driveClock(t, live, now, now+2_000, 50)
+	line, ok := v.stallReportOnce()
+	if !ok {
+		t.Fatal("the sync suppression outlived the catch-up: a level node that cannot commit said nothing")
+	}
+	if !strings.Contains(line, "quorum reachable with 3 of 4 power (quorum 3)") {
+		t.Fatalf("the line after the catch-up is not the reachable-quorum one:%s", line)
+	}
+}
+
+// nodelessBondValidators builds S-1's shape as a CONSTRUCTED STATE: a ten-seat
+// genesis whose eight fixture seats hold power 1 and whose last two hold 4 each
+// with no node behind them. 4 + 4 of 16 is the 1/4 cap's fixed point for two
+// 10^11 bonds against eight power-1 seats, and quorumFor(16) is 11 - so eight
+// live power is below quorum for as long as those two seats have no node. Only
+// the eight seated keys are started: the two silent seats never run.
+func nodelessBondValidators(t *testing.T) []*Validator {
+	t.Helper()
+	g := simnet.Committee(10)
+	g.Validators[8].Power = 4
+	g.Validators[9].Power = 4
+	vs := make([]*Validator, 8)
+	for i := range vs {
+		v, err := StartValidator(ValidatorConfig{
+			Dir:       t.TempDir(),
+			Genesis:   g,
+			Key:       simnet.ValidatorKey(i),
+			TickEvery: time.Hour,
+			WaveEvery: time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("starting validator %d over the capped genesis: %v", i, err)
+		}
+		vs[i] = v
+	}
+	t.Cleanup(func() { closeAll(vs) })
+	return vs
+}
+
+// TestAnUnreachableQuorumWithNodelessSeatsSaysSoOnce is S-1's exact case: two
+// bonded seats with no node behind them leave 8 of 16 power live against a
+// quorum of 11, so no block can commit and no Unbond can be included. The run
+// that found it froze for over nine minutes and the nodes logged NOTHING.
+//
+// The line must (a) exist, (b) name the reachable power, the total and the
+// quorum, (c) name the silent seats WITH their power so an operator knows which
+// node to start, (d) say the cause is seats with no node behind them and not a
+// derivation failure, and (e) be emitted once per height.
+func TestAnUnreachableQuorumWithNodelessSeatsSaysSoOnce(t *testing.T) {
+	vs := nodelessBondValidators(t)
+	v := vs[0]
+	for seat := 1; seat < len(vs); seat++ {
+		attestPeer(t, v, string(vs[seat].pub), fmt.Sprintf("v%d", seat), 0)
+	}
+	v.stallReportOnce() // the tick loop's round-0 observation
+	reachRound(t, vs, stallReportRounds)
+
+	line, ok := v.stallReportOnce()
+	if !ok {
+		t.Fatal("two nodeless seats left 8 of 16 power live against a quorum of 11 and the node said nothing: S-1's silent halt is back")
+	}
+	t.Logf("nodeless-seat halt line: %s", line)
+	for _, want := range []string{
+		"the quorum is UNREACHABLE",
+		"this node can reach 8 of 16 power and the quorum is 11",
+		"3 more power is needed",
+		"the committee for height 1 DOES derive (10 seats)",
+		"not a missing derivation",
+		"seats with no node behind them",
+		"2[seat8 power=4, seat9 power=4]",
+		"peers=7[",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("the nodeless-seat line does not say %q:%s", want, line)
+		}
+	}
+	// The reachable-quorum line would assert a quorum exists and is failing to
+	// commit. Neither is true here, and printing it would be the lie B-4 is
+	// about, one set over.
+	for _, bad := range []string{"quorum reachable", "nothing commits", "cannot be derived"} {
+		if strings.Contains(line, bad) {
+			t.Fatalf("the nodeless-seat line says %q, which is false at this height:%s", bad, line)
+		}
+	}
+	if again, ok := v.stallReportOnce(); ok {
+		t.Fatalf("the same permanent halt was reported twice:%s", again)
+	}
+}
+
+// TestThePeerListNamesSeatsByTheirGenesisSeat is N-4. The committee derived at
+// a boundary is ordered by bonded stake and then by key bytes, so a genesis
+// seat's INDEX in it is a permutation of the genesis order: on this fixture key
+// 0 sits at index 4 and key 4 at index 8. Labelling peers with that index made
+// seat 0 print `peers=9[seat0, seat1, seat2, seat3, seat5, …]` - it looked like
+// the node listing itself and omitting seat4 - while the mapping was exact and
+// the NUMBER was the wrong name. The list now uses the genesis seat, which is
+// the name `--index` and the transport's "vN" already use, so it can be read
+// against the rest of the run.
+func TestThePeerListNamesSeatsByTheirGenesisSeat(t *testing.T) {
+	vs := quietValidators(t, 10)
+	for _, v := range vs {
+		for seat := range vs {
+			if vs[seat] == v {
+				continue
+			}
+			attestPeer(t, v, string(vs[seat].pub), fmt.Sprintf("v%d", seat), 0)
+		}
+	}
+	// Fixture: prove the reordering this test is about is actually present, so
+	// a later derivation change cannot make the test pass vacuously.
+	vals, err := vs[0].cfgC.CommitteeAt(1)
+	if err != nil {
+		t.Fatalf("the committee for height 1: %v", err)
+	}
+	if got := genesis.SeatOfPubKey(vals, vs[0].pub); got != 4 {
+		t.Fatalf("fixture: genesis seat 0 holds committee index %d, not 4, so this test no longer exercises the reordering", got)
+	}
+	if got := genesis.SeatOfPubKey(vals, vs[4].pub); got != 8 {
+		t.Fatalf("fixture: genesis seat 4 holds committee index %d, not 8, so this test no longer exercises the reordering", got)
+	}
+	for _, v := range vs {
+		v.stallReportOnce() // the tick loop's round-0 observation
+	}
+	reachRound(t, vs, stallReportRounds)
+
+	line0, ok := vs[0].stallReportOnce()
+	if !ok {
+		t.Fatal("seat 0 said nothing, so its peer list cannot be read")
+	}
+	t.Logf("seat 0's stall line: %s", line0)
+	want0 := "peers=9[seat1/v1 h=0, seat2/v2 h=0, seat3/v3 h=0, seat4/v4 h=0, seat5/v5 h=0, seat6/v6 h=0, seat7/v7 h=0, seat8/v8 h=0, seat9/v9 h=0]"
+	if !strings.Contains(line0, want0) {
+		t.Fatalf("seat 0's peer list is not the other nine genesis seats (%q missing):%s", want0, line0)
+	}
+	if strings.Contains(line0, "seat0/") {
+		t.Fatalf("seat 0 lists itself:%s", line0)
+	}
+
+	line4, ok := vs[4].stallReportOnce()
+	if !ok {
+		t.Fatal("seat 4 said nothing, so its peer list cannot be read")
+	}
+	t.Logf("seat 4's stall line: %s", line4)
+	want4 := "peers=9[seat0/v0 h=0, seat1/v1 h=0, seat2/v2 h=0, seat3/v3 h=0, seat5/v5 h=0, seat6/v6 h=0, seat7/v7 h=0, seat8/v8 h=0, seat9/v9 h=0]"
+	if !strings.Contains(line4, want4) {
+		t.Fatalf("seat 4's peer list is not the other nine genesis seats (%q missing):%s", want4, line4)
+	}
+	if strings.Contains(line4, "seat4/") {
+		t.Fatalf("seat 4 lists itself:%s", line4)
+	}
+	if !strings.Contains(line4, "seat8/v8") {
+		t.Fatalf("seat 4 does not name seat 8 - the seat the index-based list omitted:%s", line4)
 	}
 }
