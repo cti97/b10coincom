@@ -432,6 +432,23 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{"method not allowed"})
 		return
 	}
+	// /block performs the same store read as /history - one block, off the
+	// same mutex, allocating up to MaxBlockBytes - so it charges the same
+	// bucket and takes the same slot (audit R-1, S-8). The 429 and the 503
+	// below are /history's own sentences, so the two endpoints present ONE
+	// contract. The bucket is charged before the path is parsed or a block is
+	// read, exactly as in /history: a refused request costs a map lookup.
+	//
+	// The allowance inherited is the scan bucket's: a burst of 16 and 4/s per
+	// source, shared with /history and /explorer. That is far above an honest
+	// client polling its own node (one lookup per commit is a fraction of
+	// 4/s), and the endpoint is a per-height read, not the sync protocol -
+	// catch-up is the P2P BLOCK_SYNC path. A client that wants a long run of
+	// heights is exactly the amplification R-1 bounds, and it can pace itself.
+	if !s.scanLimiter.allow(sourceHost(r.RemoteAddr)) {
+		writeJSON(w, http.StatusTooManyRequests, errorResponse{"too many scans from this source"})
+		return
+	}
 	raw := strings.TrimPrefix(r.URL.Path, "/block/")
 	height, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil {
@@ -442,6 +459,17 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{"height not found"})
 		return
 	}
+	// The in-flight bound, taken exactly as /history takes it: never queued,
+	// so a busy node says 503 rather than piling another store read behind
+	// three abandoned ones. The head is memory-only, but the slot is taken for
+	// both paths so the bound covers the disk read a height behind head
+	// performs without a special case to get wrong.
+	release, ok := s.acquireScanSlot()
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{"the node is busy scanning for other clients; retry shortly"})
+		return
+	}
+	defer release()
 	// Only the head is held in memory; earlier blocks are read from disk.
 	b := s.chain.Head()
 	if height != b.Header.Height {
