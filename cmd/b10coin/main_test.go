@@ -26,6 +26,7 @@ import (
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/keystore"
 	"github.com/cti97/b10coincom/internal/types"
+	"github.com/cti97/b10coincom/internal/version"
 )
 
 // captureStdout runs fn with os.Stdout swapped for a pipe and returns what
@@ -683,6 +684,65 @@ func TestNodeGenesisModeFlagContract(t *testing.T) {
 	}
 }
 
+// `b10coin version` must print the build identity — the semantic version plus
+// the toolchain's VCS stamp — and `--short` must print exactly the semantic
+// version, because scripts/build-release.sh names every artifact with it.
+// Audit S-10: "0.1.0" alone cannot tell an upgraded Pi from one left behind,
+// and three nodes printing it are the documented picture of agreement.
+func TestCmdVersionPrintsTheBuildIdentity(t *testing.T) {
+	var firstErr error
+	out := captureStdout(t, func() {
+		firstErr = cmdVersion(nil)
+	})
+	if firstErr != nil {
+		t.Fatalf("cmdVersion: %v", firstErr)
+	}
+	want := version.Build().String() + "\n"
+	if out != want {
+		t.Fatalf("b10coin version printed %q, want %q (the same token the startup banner carries)", out, want)
+	}
+	if !strings.Contains(out, " rev ") {
+		t.Fatalf("b10coin version printed %q with no revision field: an operator cannot tell two builds apart", out)
+	}
+
+	var shortErr error
+	short := captureStdout(t, func() {
+		shortErr = cmdVersion([]string{"--short"})
+	})
+	if shortErr != nil {
+		t.Fatalf("cmdVersion --short: %v", shortErr)
+	}
+	if short != version.Version+"\n" {
+		t.Fatalf("b10coin version --short printed %q, want %q: release artifact names depend on it", short, version.Version+"\n")
+	}
+
+	if err := cmdVersion([]string{"--long"}); err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("an unknown version flag returned %v; it must name the usage, not print something else", err)
+	}
+}
+
+// Audit S-10's degrade half, end to end rather than simulated: a real binary
+// built with -buildvcs=false carries no VCS information, and it must SAY so.
+// The failure this pins is the quiet one — an empty revision field reads as
+// agreement in an operator's diff, which is the state that lets a mixed-build
+// committee fork before anyone notices.
+func TestBinaryWithoutVCSInfoSaysUnknownRatherThanNothing(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "b10coin-no-vcs")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", out, "./cmd/b10coin")
+	build.Dir = moduleRoot(t)
+	if b, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building a binary with no VCS information: %v: %s", err, b)
+	}
+	got, err := exec.Command(out, "version").Output()
+	if err != nil {
+		t.Fatalf("running the no-VCS binary's version: %v", err)
+	}
+	want := version.Version + " rev unknown (built without VCS information)\n"
+	if string(got) != want {
+		t.Fatalf("a binary built with -buildvcs=false printed %q, want %q", got, want)
+	}
+}
+
 // The happy path through the REAL binary: a one-member committee from a
 // committee file, the seat key from a keygen file. This is the deployment
 // shape of the fixed deploy recipe in miniature — and it pins that:
@@ -718,6 +778,22 @@ func TestCliNodeRunsAGenesisFileCommitteeWithItsHeldKey(t *testing.T) {
 	}
 	if st.ChainID != "cli-genesis-1" {
 		t.Fatalf("chain %q, want the committee file's cli-genesis-1: the chain ID must come from the shared file %s", st.ChainID, p.tails())
+	}
+	// Audit S-10: the startup banner is the first place an operator sees which
+	// build is running, so it must carry exactly the identity `b10coin version`
+	// reports for the SAME binary. Comparing against that binary's own output
+	// (not this test process's stamp) makes the assertion exact and immune to
+	// how the test binary itself was built.
+	identOut, err := exec.Command(nodeBin, "version").Output()
+	if err != nil {
+		t.Fatalf("b10coin version: %v", err)
+	}
+	identity := strings.TrimSpace(string(identOut))
+	if !strings.Contains(identity, " rev ") {
+		t.Fatalf("b10coin version printed %q with no revision field", identity)
+	}
+	if want := "b10coin " + identity + " listening on"; !strings.Contains(p.stdout.String(), want) {
+		t.Fatalf("the startup banner must carry %q (the identity the same binary reports), got:\n%s", want, p.stdout.String())
 	}
 	if want := "committee of 1, seat 0, key file "; !strings.Contains(p.stdout.String(), want) {
 		t.Fatalf("the banner must name the committee, seat and key file (%q missing):\n%s", want, p.stdout.String())

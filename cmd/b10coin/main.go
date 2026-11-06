@@ -62,7 +62,7 @@ func main() {
 	case "withdraw":
 		err = cmdWithdraw(os.Args[2:])
 	case "version":
-		fmt.Println(version.Version)
+		err = cmdVersion(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -74,6 +74,31 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// cmdVersion prints the build identity: the semantic version plus, whenever
+// the build carries one, the VCS revision and the modification state. That
+// full line is the SAME token the node startup banner prints, so an operator
+// comparing three Pis can diff the two outputs character for character instead
+// of deciding whether two renderings name the same build (audit S-10).
+//
+// --short prints only the semantic version, and it exists for exactly one
+// caller: scripts/build-release.sh names every artifact with it. The version
+// must keep coming from the binary — a second constant in a shell script would
+// be the drift this repository keeps finding — but a change to the human
+// display must not be able to rename the release files or break the semver
+// assertion that guards them. A flag is the explicit interface; scraping the
+// display string would be the fragile one.
+func cmdVersion(args []string) error {
+	switch {
+	case len(args) == 0:
+		fmt.Println(version.Build().String())
+		return nil
+	case len(args) == 1 && args[0] == "--short":
+		fmt.Println(version.Version)
+		return nil
+	}
+	return fmt.Errorf("usage: b10coin version [--short]")
 }
 
 func usage() {
@@ -103,7 +128,8 @@ Usage:
                                                         Unbond all or part of the bond; a partial exit must leave MIN_STAKE or nothing
   b10coin withdraw --node URL --key PATH [--yes | --dry-run]
                                                         Release matured unbonding records to the spendable balance
-  b10coin version
+  b10coin version [--short]                             Print the build identity (version + VCS revision);
+                                                        --short prints only the semantic version, for scripts
 
 A node with --peers/--relay/--listen runs the M4 consensus committee over real
 TCP: --peers dials the other validators (or the relay), --relay dials the dumb
@@ -1122,6 +1148,18 @@ func shutdownHTTP(s *http.Server) {
 	_ = s.Shutdown(ctx)
 }
 
+// startupLine is the first line a node prints: the build identity, the listen
+// address, the chain and the height. Both node paths — the single-node
+// producer and the consensus validator — print exactly this line, through this
+// function, so the identity an operator sees at startup cannot differ between
+// the two (audit S-10). The identity comes from version.Build, which reads the
+// toolchain's stamp; nothing here is a constant that could disagree with what
+// `b10coin version` says about the same binary.
+func startupLine(addr, chainID string, height uint64) string {
+	return fmt.Sprintf("b10coin %s listening on http://%s (chain %s, height %d)",
+		version.Build().String(), addr, chainID, height)
+}
+
 func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	// M1 nodes run the devnet genesis. The testnet genesis has no validator
 	// keys yet, so there is nothing to sign blocks with until M4.
@@ -1164,8 +1202,7 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 		close(shutdownDone)
 	}()
 
-	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
-		version.Version, ln.Addr(), c.Genesis().ChainID, c.Height())
+	fmt.Println(startupLine(ln.Addr().String(), c.Genesis().ChainID, c.Height()))
 
 	// A failed Serve must reach the shell as a failure, not as exit 0: the
 	// goroutine delivers its error into the buffered channel BEFORE calling
@@ -1389,8 +1426,7 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers,
 		close(shutdownDone)
 	}()
 
-	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
-		version.Version, ln.Addr(), v.Chain().Genesis().ChainID, v.Height())
+	fmt.Println(startupLine(ln.Addr().String(), v.Chain().Genesis().ChainID, v.Height()))
 	dialDesc := "listening for inbound connections"
 	if len(dial) > 0 {
 		dialDesc = "dialled " + strings.Join(dial, " ")
