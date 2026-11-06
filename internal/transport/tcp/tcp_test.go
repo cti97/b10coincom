@@ -2189,6 +2189,128 @@ func TestTheAcceptCapRefusesDialsPastMaxConns(t *testing.T) {
 	_ = live
 }
 
+// inboundHandshake completes a raw peer's handshake far enough to be ADMITTED:
+// it sends its ID, reads the transport's, and answers the nonce commitment. The
+// socket is left open and handed back so the caller holds a real slot.
+func inboundHandshake(t *testing.T, a *TcpTransport, name string) net.Conn {
+	t.Helper()
+	nc := rawDial(t, a.Addr().String())
+	if err := wire.WriteFrame(nc, []byte(name)); err != nil {
+		t.Fatalf("writing the ID frame for %s: %v", name, err)
+	}
+	br := bufio.NewReader(nc)
+	if _, err := wire.ReadFrame(br, maxHandshakeIDBytes); err != nil {
+		t.Fatalf("reading the transport's ID frame for %s: %v", name, err)
+	}
+	rawAnswerNonce(t, nc, br)
+	return nc
+}
+
+// abandonAfterID leaves the handshake in the INSTALL-SUCCEEDED-THEN-FAILED
+// shape: the ID exchange is complete, so the transport has installed the
+// connection (inbound = true), and the socket then closes before the nonce
+// commitment, so exchangeNonce fails and adopt calls finish. This is audit
+// S-4's exact sequence - two releases for one socket, pre-fix.
+func abandonAfterID(t *testing.T, addr, name string) {
+	t.Helper()
+	nc, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("raw dial for %s: %v", name, err)
+	}
+	defer nc.Close()
+	if err := wire.WriteFrame(nc, []byte(name)); err != nil {
+		t.Fatalf("writing the ID frame for %s: %v", name, err)
+	}
+	br := bufio.NewReader(nc)
+	if _, err := wire.ReadFrame(br, maxHandshakeIDBytes); err != nil {
+		t.Fatalf("reading the transport's ID frame for %s: %v", name, err)
+	}
+	// Close without answering the commitment: exchangeNonce's read fails.
+}
+
+// TestAFailedHandshakeReleasesOneSlotNotTwo is audit S-4's regression test, and
+// it measures the counter DIRECTLY. It holds two live admitted peers - two real
+// sockets holding two real slots - because with an empty listener the second,
+// faulty release would clamp at zero and hide the decay. Each abandoned
+// handshake must leave the counter exactly where it was: one socket, one
+// released slot.
+//
+// Pre-fix, the counter loses TWO per abandoned handshake (finish releases the
+// installed conn's slot, and acceptLoop releases it again), so it decays below
+// the live socket count and MaxConns admits more sockets than it bounds. The
+// InboundAttempts wait is what makes the reading FINAL: the attempt is counted
+// after both releases, so the test never samples the intermediate value that
+// the release sequence passes through.
+func TestAFailedHandshakeReleasesOneSlotNotTwo(t *testing.T) {
+	a := listen(t, Options{LocalID: "validator", MaxConns: 8})
+
+	live := make([]net.Conn, 0, 2)
+	for i := 0; i < 2; i++ {
+		live = append(live, inboundHandshake(t, a, fmt.Sprintf("peer%d", i)))
+	}
+	waitPeersIs(t, a, "[peer0 peer1]")
+	baseline := a.InboundSlots()
+	if baseline != 2 {
+		t.Fatalf("inboundSlots with two live admitted peers = %d, want 2", baseline)
+	}
+
+	const attempts = 20
+	for i := 0; i < attempts; i++ {
+		before := a.InboundAttempts()
+		abandonAfterID(t, a.Addr().String(), fmt.Sprintf("ghost%d", i))
+		waitFor(t, fmt.Sprintf("abandoned handshake %d to be accounted for", i+1), 5*time.Second, func() bool {
+			return a.InboundAttempts() > before
+		})
+		if got := a.InboundSlots(); got != baseline {
+			t.Fatalf("after abandoned handshake %d of %d: inboundSlots = %d, want %d (the counter moved by %d for one socket - one release is missing or doubled)",
+				i+1, attempts, got, baseline, got-baseline)
+		}
+	}
+
+	// The live peers paid nothing for the strangers' failures.
+	waitPeersIs(t, a, "[peer0 peer1]")
+	if got := a.InboundSlots(); got != baseline {
+		t.Fatalf("inboundSlots after %d abandoned handshakes = %d, want %d", attempts, got, baseline)
+	}
+	t.Logf("inboundSlots: %d before, %d after %d install-then-failed handshakes with 2 live peers - one slot released per socket", baseline, a.InboundSlots(), attempts)
+	_ = live
+}
+
+// TestAFailedHandshakeBeforeInstallReleasesOneSlot pins the OTHER half of S-4's
+// rule: when adopt never installed the connection (the ID exchange itself
+// failed), no conn owns the slot, so the accept goroutine must release it -
+// exactly once. The listener starts empty, so a missing release shows as a
+// counter that climbs by one per abandoned dial and never comes back down,
+// which is the mirror image of the double release this fix removes.
+func TestAFailedHandshakeBeforeInstallReleasesOneSlot(t *testing.T) {
+	a := listen(t, Options{LocalID: "validator", MaxConns: 8})
+	baseline := a.InboundSlots()
+	if baseline != 0 {
+		t.Fatalf("a fresh listener holds %d inbound slots, want 0", baseline)
+	}
+
+	const attempts = 20
+	for i := 0; i < attempts; i++ {
+		before := a.InboundAttempts()
+		nc, err := net.DialTimeout("tcp", a.Addr().String(), 5*time.Second)
+		if err != nil {
+			t.Fatalf("raw dial %d: %v", i+1, err)
+		}
+		// No frame at all: the transport's hello write may land in the kernel
+		// buffer, but its hello READ sees the close (or its write fails first).
+		// Either way install is never reached.
+		_ = nc.Close()
+		waitFor(t, fmt.Sprintf("abandoned dial %d to be accounted for", i+1), 5*time.Second, func() bool {
+			return a.InboundAttempts() > before
+		})
+		if got := a.InboundSlots(); got != baseline {
+			t.Fatalf("after abandoned dial %d of %d: inboundSlots = %d, want %d (a slot with no installed conn was leaked)",
+				i+1, attempts, got, baseline)
+		}
+	}
+	t.Logf("inboundSlots: %d before, %d after %d pre-install handshake failures - one slot released per socket", baseline, a.InboundSlots(), attempts)
+}
+
 // TestAnIdleConnectionIsClosedByTheReadDeadline is audit N-3's idle deadline:
 // after the handshake the reader re-arms a read deadline before every frame,
 // so a connection that delivers nothing for the whole timeout is closed and

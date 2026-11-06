@@ -280,8 +280,21 @@ func (v *Validator) stallQuorum(height uint64) (power, quorum, total uint64, pee
 // The engine has halted for the same reason (Driver.HaltError), and the last
 // clause says so, because "no block" and "this node cannot judge a block" are
 // different diagnoses.
+//
+// IT MUST NOT PROMISE A RECOVERY THAT DOES NOT EXIST (audit S-1). This line
+// used to end "until the derivation succeeds", which for the cause S-1 found -
+// a deciding state with no bonded candidate - could never happen: the state was
+// already committed, so no retry, restart or waiting period could change the
+// derivation, and the Bond that would seat a candidate could only arrive in a
+// block this height refuses. The wording now states the terminal shape instead:
+// the deciding state is committed, so nothing this node retries changes it, and
+// no block at this height can be judged. That is true for every cause that
+// reaches here - CommitteeAt only runs out of candidates on an already-committed
+// state, and the remaining causes (no CommitteeSize, EpochBlocks 0, a genesis
+// seating none) are equally fixed - so the line does not have to guess which one
+// it is looking at.
 func (v *Validator) stallUndeducibleLine(head uint64, round uint32, err error) string {
-	return fmt.Sprintf("b10coin: no block for %d rounds at height %d (round %d, step %s): the committee for height %d cannot be derived (%v), so no quorum is reported - a power figure measured against any other set would be wrong, and this node cannot judge a block at this height until the derivation succeeds; the driver reports the same cause as its halt error (see Driver.HaltError). The stall line is silent about tallies for the same reason: nothing was judged here",
+	return fmt.Sprintf("b10coin: no block for %d rounds at height %d (round %d, step %s): the committee for height %d cannot be derived (%v), so no quorum is reported - a power figure measured against any other set would be wrong, and this node cannot judge a block at this height. This does not clear on its own: the state that decides it is already committed, so no retry, restart or wait can change the derivation, and no block at this height can be judged - not even one carrying the Bond that would seat a candidate. The driver reports the same cause as its halt error (see Driver.HaltError). The stall line is silent about tallies for the same reason: nothing was judged here",
 		stallReportRounds, head, round, v.drv.DiagStep(), head+1, err)
 }
 

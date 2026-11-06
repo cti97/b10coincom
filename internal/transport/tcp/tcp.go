@@ -848,7 +848,15 @@ type TcpTransport struct {
 	// inboundSlots counts ACCEPTED connections currently holding a slot -
 	// including ones still mid-handshake, which is the point: the cap must
 	// bound sockets, not merely installed registrations. Guarded by mu.
+	// Every booking is matched by EXACTLY ONE release (audit S-4): either the
+	// accept goroutine's, when adopt never installed, or finish's, when it did.
 	inboundSlots int
+	// inboundAttempts counts accepted sockets whose adopt has finished being
+	// ACCOUNTED FOR - returned, with the slot release (if any) already done.
+	// It exists so a test can wait for a final slot count instead of polling
+	// for a number that the release sequence passes through transiently. Not
+	// guarded: an atomic, like the other counters.
+	inboundAttempts atomic.Uint64
 	// refusedConns counts inbound dials closed at accept because the cap was
 	// full. The observable an operator checks when honest peers cannot get in.
 	refusedConns atomic.Uint64
@@ -985,19 +993,34 @@ func (t *TcpTransport) acceptLoop(l net.Listener) {
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
-			// An inbound failure is the dialer's problem by definition:
-			// there is no registered maintainer to redial a stranger. The
-			// slot is released here because no conn owns it; a successful
-			// adopt hands it to install, and finish releases it there.
-			// An ACCEPTED socket is a peer only after Options.Admit accepts a frame
-			// from it: pass gated=true so it is held pending (audit N-3/PX-2).
-			if _, err := t.adopt(nc, addr, false, true); err != nil {
+			// The slot booked above must be released EXACTLY ONCE (audit
+			// S-4). adopt reports whether it INSTALLED the connection, and
+			// that flag is the whole rule:
+			//
+			//   - not installed (writeHello, readHello or install failed):
+			//     no conn owns the slot, so this goroutine releases it;
+			//   - installed: install registered the conn with inbound = true,
+			//     so finish() releases the slot - whether adopt then fails in
+			//     exchangeNonce (finish is called there) or the connection
+			//     lives until it dies. Releasing here as well would debit the
+			//     counter twice for one socket, which is the double-release
+			//     that let a failed handshake decay MaxConns.
+			//
+			// An ACCEPTED socket is a peer only after Options.Admit accepts a
+			// frame from it: pass gated=true so it is held pending (audit
+			// N-3/PX-2).
+			_, installed, err := t.adopt(nc, addr, false, true)
+			if err != nil && !installed {
 				t.mu.Lock()
 				if t.inboundSlots > 0 {
 					t.inboundSlots--
 				}
 				t.mu.Unlock()
 			}
+			// Accounted last, so a test that waits for this counter to move
+			// is reading a FINAL slot count: both the release above and
+			// finish's have already happened.
+			t.inboundAttempts.Add(1)
 		}()
 		t.mu.Unlock()
 	}
@@ -1292,7 +1315,9 @@ func (t *TcpTransport) maintain(ob *outbound, first chan<- error) {
 			if ob.relay {
 				c, err = t.adoptRelay(nc, addr)
 			} else {
-				c, err = t.adopt(nc, addr, true, ob.gated)
+				// A dialled conn is outbound (inbound = false), so it books no
+				// accept-time slot; the installed flag is irrelevant here.
+				c, _, err = t.adopt(nc, addr, true, ob.gated)
 			}
 			report(err)
 			if err == nil {
@@ -1393,13 +1418,20 @@ func (t *TcpTransport) forgetOutbound(ob *outbound) {
 // and must pass Options.Admit first (audit PX-2).
 // It does NOT select relay mode: a DIRECT connection is never relay mode,
 // whatever name the peer announces (see install).
-func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*conn, error) {
+// The bool result reports whether the connection was REGISTERED (install
+// succeeded). It is what lets the caller that booked an accept-time slot
+// release it exactly once (audit S-4): install marks an accepted conn
+// inbound = true, so finish() owns the release from that moment on - including
+// on the exchangeNonce-failure path below, which calls finish and returns
+// installed = true. A caller that also released on err would debit the slot
+// twice for one socket.
+func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*conn, bool, error) {
 	if err := t.writeHello(nc, addr); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	id, err := t.readHello(nc, addr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// The registry acceptance runs BEFORE the nonce exchange so a refused name
 	// (self, the reserved relay:<addr> form, a duplicate) is refused for that
@@ -1408,14 +1440,14 @@ func (t *TcpTransport) adopt(nc net.Conn, addr string, dialled, gated bool) (*co
 	// payload byte can be mistaken for a challenge (audit PX-2).
 	c, err := t.install(nc, addr, dialled, false, gated, id)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := t.exchangeNonce(nc, c); err != nil {
-		t.finish(c)
-		return nil, err
+		t.finish(c) // installed connection: finish releases its inbound slot
+		return nil, true, err
 	}
 	t.start(c)
-	return c, nil
+	return c, true, nil
 }
 
 // exchangeNonce performs the per-connection challenge exchange that binds a
@@ -2405,6 +2437,25 @@ func (t *TcpTransport) Peers() []transport.PeerID {
 // the listener already held MaxConns accepted connections (audit N-3). It is
 // the observable an operator checks when an honest peer cannot get in.
 func (t *TcpTransport) RefusedConns() uint64 { return t.refusedConns.Load() }
+
+// InboundSlots reports how many accept-time connection slots the listener
+// currently holds: admitted and mid-handshake sockets alike. It is the
+// counter MaxConns is compared against (audit N-3), made observable so a test
+// - or an operator watching a listener that refuses honest peers - can read it
+// directly instead of inferring it (audit S-4: nothing read it, which is how
+// the double-release stayed invisible).
+func (t *TcpTransport) InboundSlots() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.inboundSlots
+}
+
+// InboundAttempts reports how many accepted sockets have finished being
+// accounted for. An attempt is counted once, AFTER its slot release (if any)
+// has run, so waiting for this number to advance and then reading InboundSlots
+// yields a final count rather than one the release sequence is passing
+// through. Test-only in practice; cheap and monotone.
+func (t *TcpTransport) InboundAttempts() uint64 { return t.inboundAttempts.Load() }
 
 // BindingVintages reports how many connections produced the N-3 binding-width
 // notice: a HELLO whose socket binding has the old one-challenge width, which
