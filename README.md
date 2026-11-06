@@ -1487,13 +1487,14 @@ language version 1.26.0.
 | Acceptance check, consensus committee | `go run ./cmd/b10coin devnet --validators 4 --blocks 100` |
 | Acceptance check, M5 rotation + Nakamoto | `go run ./cmd/b10coin devnet --validators 6 --epoch-blocks 40 --blocks 105 --rotate-demo --plot-nakamoto` |
 | Acceptance check, M6 walkthrough | `./scripts/acceptance-walkthrough.sh` (extracts and runs the one shell fence in `docs/2026-11-01-m6-walkthrough.md`; CI runs it on every push) |
+| Fuzz discovery (the `fuzz` job) | each `Fuzz*` target in `internal/consensus`, `internal/types` and `internal/wire` runs `-fuzztime 60s` with `-run '^$'`; scheduled twice a week and on `workflow_dispatch`, never on a push. A crasher is written to `testdata/fuzz/<Target>/<hash>`: commit it and fix the decoder — the corpus entry is the regression, and the `fuzz` job is reported like any other failed scheduled job |
 
 Actions in CI are pinned to commit SHAs, not mutable tags. The workflow defaults
 the token to `contents: read`; two jobs narrow that further and grant exactly
 one extra permission each: `lint` has `issues: write` (the scheduled
 toolchain-chore step) and the scheduled `report` job has `issues: write` (it
-files the issue for any failed job). `test`, `release` and `cross` remain
-read-only (`.github/workflows/ci.yml`); Dependabot watches Go modules and GitHub
+files the issue for any failed job). `test`, `release`, `cross` and `fuzz`
+remain read-only (`.github/workflows/ci.yml`); Dependabot watches Go modules and GitHub
 Actions weekly (`.github/dependabot.yml`).
 
 Makefile targets: `make test`, `make race`, `make build` (produces

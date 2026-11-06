@@ -85,8 +85,10 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -883,6 +885,9 @@ type Relay struct {
 	dropped      atomic.Uint64
 	refused      atomic.Uint64
 	unauthorized atomic.Uint64
+	// readerPanics counts per-connection readers that recovered from a panic
+	// (audit S-9). One panic costs one connection, never the process.
+	readerPanics atomic.Uint64
 }
 
 // New returns a relay with all bounds defaulted. Nothing runs and nothing is
@@ -957,6 +962,10 @@ func (r *Relay) Stats() Stats {
 		Unauthorized: r.unauthorized.Load(),
 	}
 }
+
+// ReaderPanics reports how many per-connection readers recovered from a panic
+// (audit S-9). One is one connection closed, not one relay lost.
+func (r *Relay) ReaderPanics() uint64 { return r.readerPanics.Load() }
 
 func (r *Relay) acceptLoop(l net.Listener) {
 	defer r.wg.Done()
@@ -1242,6 +1251,24 @@ func (r *Relay) admit(nc net.Conn, group string) error {
 func (r *Relay) reader(c *conn) {
 	defer r.wg.Done()
 	defer r.finish(c)
+	// A panic in ONE connection's read path closes that connection and keeps
+	// the relay serving everyone else (audit S-9): the relay is the shared
+	// link every validator behind it depends on, so losing the process to one
+	// stranger's bytes is the worst outcome available. The reader owns only
+	// its own socket and framing buffer; the registry is reached under r.mu
+	// (finish and forward each hold it for the whole operation they need), and
+	// a panic mid-fan-out costs the remaining targets one frame - a DROPPED
+	// frame, which is an outcome this relay already permits - not an
+	// inconsistent registry. A relay that parsed would have a decoder to blame
+	// here; this one has none, so the line names the connection and the panic
+	// and the count makes it testable.
+	defer func() {
+		if p := recover(); p != nil {
+			r.readerPanics.Add(1)
+			log.Printf("b10coin: relay: recovered a panic in the read loop of %s (connection closed, relay kept running - audit S-9): %v\n%s",
+				c.nc.RemoteAddr(), p, debug.Stack())
+		}
+	}()
 	for {
 		// The per-frame read deadline is armed BEFORE the header and refreshed
 		// for every frame, so it measures one frame's whole silence - from

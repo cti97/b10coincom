@@ -278,6 +278,61 @@ jobs:
       - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
       - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go vet ./...
 
+  # S-9's discovery half: every fuzz target runs for a bounded time, so a
+  # crasher is found here before a stranger finds it on the wire. Scheduled
+  # (the twice-weekly cron above) and on-demand (workflow_dispatch) rather
+  # than on every push: 9 targets x 60 s is ~10 minutes, worth paying twice a
+  # week and when an operator asks, not on every commit.
+  #
+  # THE BOUND IS `-fuzztime 60s` PER TARGET, not a timeout on the job: each
+  # target gets a full minute of mutation from its seeds, and a target that
+  # cannot start fails immediately. The job does not run on pushes, so it can
+  # never be the reason a PR looks red for a reason unrelated to its diff.
+  #
+  # A crasher is saved by the Go tool to
+  # `testdata/fuzz/<Target>/<hash>` in the target's package and the step goes
+  # red. COMMIT THAT FILE: it replays as an ordinary seed on every later run,
+  # so the corpus (not the job) is what stops the same input being re-found
+  # forever. The file is also the reproduction for the decoder fix - leaving
+  # the crasher only in CI's cache would lose it on the next cache eviction,
+  # and leaving the recover in without the fix would hide it (audit S-9).
+  #
+  # The recover in internal/transport/tcp and internal/relay is containment,
+  # not a reason to accept a finding: a crasher this job turns up is a bug to
+  # fix, and the fuzz run fails on it whether or not a reader would have
+  # caught it in production.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: fuzz every target for 60s
+        run: |
+          set -euo pipefail
+          bound=60s
+          # One target per line, `<Name> <package>`: -fuzz accepts exactly ONE
+          # matching target, so this cannot be one `go test ./...`.
+          targets=(
+            "FuzzDecodeVote ./internal/consensus"
+            "FuzzDecodeProposal ./internal/consensus"
+            "FuzzDecodeBlock ./internal/types"
+            "FuzzDecodeTx ./internal/types"
+            "FuzzReadFrame ./internal/wire"
+            "FuzzDecodeHello ./internal/wire"
+            "FuzzDecodeBlockSyncReq ./internal/wire"
+            "FuzzDecodeBlockSyncResp ./internal/wire"
+            "FuzzDecodePeerExchange ./internal/wire"
+          )
+          for entry in "${targets[@]}"; do
+            set -- $entry   # deliberate split: name then package
+            echo "::group::go test -run '^$' -fuzz '^$1$' -fuzztime $bound $2"
+            go test -run '^$' -fuzz "^$1\$" -fuzztime "$bound" "$2"
+            echo "::endgroup::"
+          done
+
   # The release: both binaries for all six targets in dist/ with SHA256SUMS.
   # scripts/build-release.sh owns the build flags AND the artifact assertions
   # (count == target count, every artifact file(1)-checked to report its own
@@ -342,7 +397,7 @@ jobs:
     # ci.yml -f simulate_failure=true` is the whole procedure; delete the test
     # issue it files.
     if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.simulate_failure))
-    needs: [test, lint, release, cross]
+    needs: [test, lint, release, cross, fuzz]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -355,18 +410,22 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           RELEASE_RESULT: ${{ needs.release.result }}
           CROSS_RESULT: ${{ needs.cross.result }}
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
         run: |
           set -u
           # `lint` reports itself in-job (its govulncheck output is there); the
           # other jobs have no vuln output to classify, so each gets a generic
           # "scheduled <job> job failed" issue. Matrix legs of `cross` share one
           # title on purpose: one broken platform should not open six issues,
-          # and later legs comment on the first one.
-          for job in test release cross; do
+          # and later legs comment on the first one. `fuzz` is the S-9 crasher
+          # job: a scheduled fuzz failure is a decoder bug that must not go
+          # unseen, so it is in this loop for exactly the CI-1 reason.
+          for job in test release cross fuzz; do
             case "$job" in
               test)    result=$TEST_RESULT ;;
               release) result=$RELEASE_RESULT ;;
               cross)   result=$CROSS_RESULT ;;
+              fuzz)    result=$FUZZ_RESULT ;;
             esac
             if [ "$result" = failure ]; then
               REPORT_JOB=$job ./scripts/ci/file-toolchain-issue.sh \

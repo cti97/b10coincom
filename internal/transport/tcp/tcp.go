@@ -82,6 +82,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -875,6 +876,12 @@ type TcpTransport struct {
 	// (noteBindingVintage) and the node layer (NoteBindingVintage, for an
 	// admitted connection) feed it.
 	bindingVintages atomic.Uint64
+	// readerPanics counts per-connection reader goroutines that recovered
+	// from a panic (audit S-9). One panic costs one connection, never the
+	// process; this counter is how a test and an operator see that the
+	// containment ran. It is per CONNECTION, not per frame: a recovered
+	// reader ends with its connection.
+	readerPanics atomic.Uint64
 	// maintainers counts the running maintainer goroutines. A registration
 	// and a goroutine are different things: RemovePeer deletes the former
 	// immediately, but the goroutine ends only when it observes the stop, and
@@ -2081,6 +2088,34 @@ func newcomerWins(local transport.PeerID, existing, newcomer *conn) bool {
 //     A-2) - so the policy can require a HELLO that names THIS socket's two
 //     ends.
 func (t *TcpTransport) reader(c *conn) {
+	// A panic in ONE connection's read path - framing, pacing, the admission
+	// policy, or a node callback running on this goroutine - closes that
+	// connection and keeps the process alive (audit S-9). This is the only
+	// recover in this package, and the boundary is deliberate: the reader
+	// owns nothing shared. Its socket, frame buffer, buckets and counters are
+	// per-connection; the registry and inbound slots it touches are touched
+	// under t.mu through finish, and dispatchMu (and the node's own lock) are
+	// released by their holders' defers, so the unwind locks nothing out.
+	//
+	// The class this contains is the attacker-byte one the fuzzers hunt: every
+	// decoder in the node path runs BEFORE the state mutation it guards - in
+	// router.Route (Dedup.Seen records only after Verify succeeded) and in
+	// Engine.OnMessage (decode, then onVote/onProposal) - so a decoder panic
+	// unwinds with consensus state as the frame found it. The residual is
+	// stated, not hidden: a panic in the MUTATING half of onVote/onProposal is
+	// a logic bug rather than a decode, and this boundary would contain it
+	// too, potentially over a half-applied tally. That is the price of
+	// containing the decode class at all, and it is why the line is loud, has
+	// a stack, and is counted: the counter is the instruction to fix the bug,
+	// never a licence to leave it.
+	defer t.finish(c)
+	defer func() {
+		if r := recover(); r != nil {
+			t.readerPanics.Add(1)
+			log.Printf("b10coin: transport: recovered a panic in the read loop of %s (connection closed, process kept running - audit S-9): %v\n%s",
+				c.remote, r, debug.Stack())
+		}
+	}()
 	for {
 		if err := c.nc.SetReadDeadline(time.Now().Add(t.opts.IdleReadTimeout)); err != nil {
 			break // the socket itself is gone; finish below cleans up
@@ -2122,7 +2157,6 @@ func (t *TcpTransport) reader(c *conn) {
 		}
 		t.dispatch(transport.Message{From: c.remote, Data: payload})
 	}
-	t.finish(c)
 }
 
 // noteBindingVintage makes the A-2 binding change LOUD once per connection
@@ -2471,6 +2505,10 @@ func (t *TcpTransport) InboundAttempts() uint64 { return t.inboundAttempts.Load(
 // the log stays readable. A steady nonzero value with a healthy committee is a
 // mixed-version deployment, and the log line names the two widths.
 func (t *TcpTransport) BindingVintages() uint64 { return t.bindingVintages.Load() }
+
+// ReaderPanics reports how many per-connection readers recovered from a panic
+// (audit S-9). One is one connection closed, not one node lost.
+func (t *TcpTransport) ReaderPanics() uint64 { return t.readerPanics.Load() }
 
 // GatedFrames reports how many frames were dropped because their connection
 // had not passed Options.Admit (audit N-3/PX-2); RateLimitedFrames reports the
