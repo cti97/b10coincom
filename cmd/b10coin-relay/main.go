@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -41,7 +42,7 @@ Usage:
                 [--write-queue-frames N]
                 [--write-timeout SECONDS] [--read-timeout SECONDS]
                 [--keepalive SECONDS] [--access-token-file PATH]
-                [--access-timeout SECONDS]
+                [--access-timeout SECONDS] [--external-allowlist]
   b10coin-relay --help
 
 Every validator connects OUTBOUND to this relay (inbound to a home machine
@@ -172,6 +173,17 @@ enforce any of it)
   a scanner. It is also the bound the deploy recipe quotes for a dial that
   answers nothing, so the two cannot disagree.
 
+  --external-allowlist acknowledges that this relay listens on a WILDCARD
+  address with NO access token because something outside this process already
+  restricts who can reach the port: a cloud security group, a ufw allowlist,
+  or the shipped systemd unit's IPAddressDeny=any / IPAddressAllow= lines
+  (audit S-16). Without it, a wildcard --addr with no token is REFUSED before
+  a listener exists: an unauthenticated relay on a public port is a flood
+  target, and the shipped default must not be able to open by accident. A
+  SPECIFIC --addr (e.g. 127.0.0.1:7001) needs no acknowledgement, and a token
+  makes it unnecessary; the acknowledgement is a statement about the network,
+  not a second credential.
+
 Operation: run one instance per validator star, behind the VPS firewall
 allowlisting the validator IPs where that is practical - and with
 --access-token-file as the in-process layer for the cases where it is not.
@@ -263,6 +275,39 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// wildcardAddr reports whether addr listens on every interface: the empty
+// host (":7001", the default), 0.0.0.0, or ::. It deliberately answers false
+// for anything it cannot classify - a hostname, or an address net.Listen will
+// reject anyway - so the refusal never turns a normal invocation into a
+// guessing game; the empty string is the one form net.Listen accepts as
+// "all interfaces" without a port, and it is treated as wildcard.
+func wildcardAddr(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
+// checkOpenBind is the policy behind --external-allowlist: a wildcard bind
+// with no access token is refused unless the operator acknowledges an
+// external allowlist. The message names the remedy the audit asked for
+// (--access-token-file) first, because that is the in-process fix and the one
+// that survives a provider firewall change.
+func checkOpenBind(addr string, token []byte, externalAllowlist bool) error {
+	if len(token) > 0 || externalAllowlist || !wildcardAddr(addr) {
+		return nil
+	}
+	return fmt.Errorf("refusing to listen on %q with no access token: anyone who can reach that port can flood the relay and pin its connection slots (audit S-16). Set --access-token-file PATH, or, when an external allowlist already restricts the port to your validators (a cloud security group, a ufw rule, or the shipped unit's IPAddressDeny/IPAddressAllow), pass --external-allowlist to acknowledge it", addr)
+}
+
 // accessTokenMode describes the access-control state for the startup line
 // without ever printing the token itself.
 func accessTokenMode(token []byte) string {
@@ -311,6 +356,7 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 	keepAlive := fs.Int("keepalive", int(relay.DefaultKeepAlive/time.Second), "TCP keepalive probe period in seconds; half-open connections are reaped by the kernel after unanswered probes")
 	accessTokenFile := fs.String("access-token-file", "", "path to a file whose bytes are the pre-shared access token (audit N-8; at least 16 bytes). The relay announces the gate with a fixed first frame and a fresh random challenge; each connection must then answer HMAC-SHA-256(token, challenge) or be closed and counted unauthorized, and the relay confirms with HMAC-SHA-256(token, challenge || answer). The token is never sent, is bound to a fresh challenge (not replayable on another connection), and the relay decodes nothing; it still travels in plaintext, so run it over a trusted path")
 	accessTimeout := fs.Int("access-timeout", int(relay.DefaultAccessTimeout/time.Second), "seconds an accepted connection may take to answer the access-token challenge before it is closed and its slot released (audit N-7); an honest client answers immediately")
+	externalAllowlist := fs.Bool("external-allowlist", false, "acknowledge that a WILDCARD --addr with no --access-token-file is safe because something outside this process restricts who can reach the port (a cloud security group, a ufw allowlist, or the shipped unit's IPAddressDeny/IPAddressAllow). Without this, that combination is refused before a listener exists (audit S-16)")
 
 	err := fs.Parse(args)
 	switch {
@@ -350,6 +396,17 @@ func parseArgs(args []string, stderr io.Writer) (string, relay.Options, error) {
 			fmt.Fprintf(stderr, "the access token is %d bytes; at least %d are required, or it is brute-forced by dialling\n", len(token), wire.MinRelayAccessTokenBytes)
 			return "", relay.Options{}, fmt.Errorf("access-token file %q is %d bytes; at least %d are required", *accessTokenFile, len(token), wire.MinRelayAccessTokenBytes)
 		}
+	}
+	// THE OPEN-RELAY REFUSAL (audit S-16). The shipped default was ":7001"
+	// with no token, protected only by a firewall rule the deploy README itself
+	// softened to "if your provider's UI can". A wildcard bind with neither a
+	// token nor an explicit acknowledgement of an external allowlist is now a
+	// bad invocation: the shipped default cannot open by accident, and an
+	// operator who wants the allowlist-only deployment still can have it by
+	// saying so once.
+	if err := checkOpenBind(*addr, token, *externalAllowlist); err != nil {
+		fmt.Fprintln(stderr, err)
+		return "", relay.Options{}, err
 	}
 	return *addr, relay.Options{
 		MaxFrameBytes:    *maxFrame,

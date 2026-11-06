@@ -370,10 +370,31 @@ stop and fix that before anything else, using the checklist in §8, failure 1.
 
 ## 4. The relay: address and how to run it
 
-On the VPS, in the foreground first:
+The relay ships CLOSED, in two independent layers (audit S-16). The systemd
+unit (§6) sets `IPAddressDeny=any` with only `localhost` allowed; add one
+`IPAddressAllow=<validator IP>` line per Pi. The binary itself refuses a
+wildcard `--addr` with no access token unless `--external-allowlist`
+acknowledges that an outside allowlist exists — the shipped unit passes it
+because it ships those `IPAddress*` lines. Neither layer can open by accident:
+with no `IPAddressAllow=` line a validator's frames are dropped before the
+relay sees them, and a bare `b10coin-relay` (no token, no acknowledgement)
+exits with the refusal below instead of listening.
+
+On the VPS, in the foreground first — the acknowledgement is required because
+a foreground run is outside the unit's address filter, so pass it only on a
+host whose security group or ufw rules already restrict 7001 to the
+validators (add the same addresses to the unit's `IPAddressAllow=` lines before
+the systemd start):
 
 ```sh
-sudo -u b10coin /opt/b10coin/b10coin-relay --addr :7001
+sudo -u b10coin /opt/b10coin/b10coin-relay --addr :7001 --external-allowlist
+```
+
+A bare start with no token and no acknowledgement refuses before it listens
+(exit 2, nothing on stdout):
+
+```
+refusing to listen on ":7001" with no access token: anyone who can reach that port can flood the relay and pin its connection slots (audit S-16). Set --access-token-file PATH, or, when an external allowlist already restricts the port to your validators (a cloud security group, a ufw rule, or the shipped unit's IPAddressDeny/IPAddressAllow), pass --external-allowlist to acknowledge it
 ```
 
 `--addr` is the relay's listen address (`:7001`, all interfaces, is the
@@ -405,12 +426,15 @@ slots from any one source prefix — an IPv6 `/64` or IPv4 `/24`) keeps a
 single host, or a whole routed prefix, from holding the registry.
 
 The address the Pis dial is `<VPS public IP or DNS name>:7001`. The VPS must
-allow inbound TCP 7001 **from the validators only** — both the cloud security
-group (restrict the source, or scope it to the validators' IPs if your
-provider's UI can) and, if enabled, the host firewall. The host-firewall step
-is an ALLOWLIST, one line per validator — its outbound source IP — and never
-a bare `ufw allow 7001/tcp` (the audit's A-1 found exactly that open rule in
-the previous revision of this recipe):
+allow inbound TCP 7001 **from the validators only**, in three layers: the
+unit's `IPAddressDeny=any` plus one `IPAddressAllow=` line per validator
+(below and in §6), the cloud security group, and — if enabled — the host
+firewall. Do not treat the security group as a replacement for the unit's
+filter: the unit is the layer that ships in this repository and cannot be
+forgotten by a provider's UI. The host-firewall step is an ALLOWLIST, one line
+per validator — its outbound source IP — and never a bare
+`ufw allow 7001/tcp` (the audit's A-1 found exactly that open rule in the
+previous revision of this recipe):
 
 ```sh
 # one ALLOWLIST line per validator — the Pi's outbound source IP
@@ -725,6 +749,11 @@ the relay unit assumes inbound TCP 7001 and writes nothing to disk. From the
 # VPS
 scp scripts/deploy/b10coin-relay.service vps@example.com:/tmp/
 sudo install -m 0644 /tmp/b10coin-relay.service /etc/systemd/system/
+# EDIT the unit before the first start: one IPAddressAllow= line per validator
+# (a Pi's outbound source IP, the same addresses as §4's ufw allowlist), next
+# to the shipped IPAddressDeny=any. Without them the relay starts CLOSED -
+# reachable from localhost only - which is the intended default (audit S-16).
+sudoedit /etc/systemd/system/b10coin-relay.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now b10coin-relay
 ```

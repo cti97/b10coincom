@@ -749,13 +749,19 @@ frame cap is what bounds the entries structurally, and
 keepalive (`--keepalive`, default 15 seconds) reaps a half-open connection —
 a peer that vanished without closing, e.g. a power cut — after the kernel's
 unanswered probes, again without the relay looking at any byte. In production
-the access policy does not live in the relay at all — run it behind the VPS
-firewall allowlisting the validator IPs. Validators reconnect to a restarted
-relay with exponential backoff. Bandwidth is kilobytes per second.
+the access policy does not live in the relay's forwarding path at all — run it
+behind the shipped unit's `IPAddressDeny=any` / `IPAddressAllow=` filter (the
+deploy recipe's §6) and the VPS firewall allowlisting the validator IPs. The
+binary itself refuses a wildcard `--addr` with no access token unless
+`--external-allowlist` acknowledges an outside allowlist (audit S-16), so an
+unauthenticated relay on every interface is a decision the operator states,
+never a default. Validators reconnect to a restarted relay with exponential
+backoff. Bandwidth is kilobytes per second.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--addr ADDR` | `:7001` | listen address (all interfaces — validators must reach this one) |
+| `--addr ADDR` | `:7001` | listen address (all interfaces — validators must reach this one). A wildcard address with no `--access-token-file` is refused (exit 2) unless `--external-allowlist` is given (audit S-16) |
+| `--external-allowlist` | *off* | acknowledge that a wildcard `--addr` with no token is safe because something outside this process restricts who can reach the port — a cloud security group, a ufw allowlist, or the shipped systemd unit's `IPAddressDeny`/`IPAddressAllow`. Without it that combination exits 2 before a listener exists (audit S-16) |
 | `--max-frame-bytes N` | `1114112` | largest frame any connection may send; a larger declared length ends that connection (keep at or above the validators' own frame bound, or the relay severs mid-sized honest traffic). The default is `wire.MaxFrameBytes`: one max-size block (`types.MaxBlockBytes`, 1 MiB) plus 64 KiB for the envelope a message may wrap around it — a certificate at the 255-seat committee ceiling is 36,975 bytes — because a bound equal to the block bound would sever exactly the max-size blocks validators are entitled to propose |
 | `--max-conns N` | `32` | maximum simultaneous connections; excess dials are closed at accept and the validator's backoff redials |
 | `--max-conns-per-ip N` | `8` | how many of those slots one source **prefix** may hold — the IPv6 `/64` or IPv4 `/24`, IPv4-mapped IPv6 unmapped, masked — so a routed prefix cannot bypass the cap by rotating addresses; a dial from a prefix at its cap is closed at accept |
