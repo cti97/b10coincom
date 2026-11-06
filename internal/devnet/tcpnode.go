@@ -857,6 +857,16 @@ func (v *Validator) Chain() *chain.Chain { return v.ch }
 // Pool exposes the validator's mempool for the CLI's RPC server.
 func (v *Validator) Pool() *mempool.Mempool { return v.pool }
 
+// SigningKey returns a COPY of the validator public key this node signs blocks
+// with. The RPC server takes it so POST /tx can tell a client when that key
+// holds no committee seat at the height a transaction would need (testrun S-2):
+// proposals are built from the local pool, so on an unseated node admission is
+// the last thing that happens to a transaction. A copy, not the field: the
+// key is this node's identity and no caller gets to edit it in place.
+func (v *Validator) SigningKey() ed25519.PublicKey {
+	return append(ed25519.PublicKey(nil), v.pub...)
+}
+
 // BlocksAdopted counts blocks the catch-up pull brought in. A convergence
 // test reads it to distinguish "adopted the committee's blocks" from "voted
 // its way up", which an empty chain can never do.

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -172,8 +173,24 @@ type blockResponse struct {
 	Txs       int    `json:"tx_count"`
 }
 
+// txResponse is one POST /tx reply: the admitted transaction's ID, and - when
+// this server knows the key the node signs blocks with - whether that key holds
+// a committee seat at the height the transaction would need (testrun S-2).
+//
+// BOTH FIELDS ARE APPENDED, never a rename: a client written against the M5
+// shape keeps parsing this body. They are emitted together and only when the
+// server can answer, because "seated" is a claim about a specific signing key;
+// a server built without one (a test, an embedded reader) has nothing to say
+// and says nothing rather than answering a question it was not asked.
+//
+// A `seated: false` reply is still a 200. The transaction WAS admitted, and a
+// status code that said otherwise would be a lie about what happened; what an
+// operator needs to know is that admission is the end of it on this node. See
+// handleTx.
 type txResponse struct {
-	TxID string `json:"txid"`
+	TxID    string `json:"txid"`
+	Seated  *bool  `json:"seated,omitempty"`
+	Warning string `json:"warning,omitempty"`
 }
 
 type errorResponse struct {
@@ -302,10 +319,34 @@ type Server struct {
 	// on every request. Genesis cannot change under a running chain, so the
 	// hash cannot either.
 	genesisHash [32]byte
+	// seatKey is the validator public key this node signs blocks with, when it
+	// has one (testrun S-2). It is a COPY: the caller's slice is not retained,
+	// so a caller reusing its buffer cannot change what this server answers.
+	// Empty means "this server does not sign for a chain", and then POST /tx
+	// reports nothing about seats.
+	seatKey []byte
 }
 
+// NewServer binds the chain and mempool to HTTP handlers for a server that does
+// not sign blocks (a test, an embedded reader). POST /tx can admit a
+// transaction but cannot say whether any block will ever carry it, so its reply
+// carries no seat fields.
 func NewServer(c *chain.Chain, mp *mempool.Mempool) *Server {
-	return &Server{
+	return newServer(c, mp, nil)
+}
+
+// NewServerWithSigningKey is NewServer for a node that proposes blocks with
+// seatKey. POST /tx then tells the client when that key holds no committee seat
+// at the height the transaction would need (testrun S-2): a transaction reaches
+// a block only when the node it was posted to proposes one, so on an unseated
+// node "accepted" is the end of the story, and saying so is the difference
+// between an operator who reposts to a seated validator and one who waits.
+func NewServerWithSigningKey(c *chain.Chain, mp *mempool.Mempool, seatKey []byte) *Server {
+	return newServer(c, mp, seatKey)
+}
+
+func newServer(c *chain.Chain, mp *mempool.Mempool, seatKey []byte) *Server {
+	s := &Server{
 		chain:       c,
 		mempool:     mp,
 		txLimiter:   newSourceLimiter(txRateBurst, txRatePerSecond, txRateMaxSources),
@@ -313,6 +354,10 @@ func NewServer(c *chain.Chain, mp *mempool.Mempool) *Server {
 		scanSlots:   make(chan struct{}, maxConcurrentScans),
 		genesisHash: c.Genesis().Hash(),
 	}
+	if len(seatKey) > 0 {
+		s.seatKey = append([]byte(nil), seatKey...)
+	}
+	return s
 }
 
 // acquireScanSlot takes a scan slot without waiting. ok is false when every
@@ -519,6 +564,21 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 // they never do the pool drops it when a block's filter finds it inapplicable.
 // There is deliberately no /tx/{id} on this milestone, so a client cannot poll
 // that outcome; it learns it by observing the chain's nonce.
+//
+// THE STRONGER REASON "admitted" is not "included" (testrun S-2): proposals are
+// built from the LOCAL pool (consensus.Driver.build), and no transaction is
+// gossiped, so a transaction reaches a block only through the node it was
+// posted to and only in a round where that node is the proposer. On a node
+// whose key holds no committee seat the pool never feeds a block at all - the
+// live finding is an Unbond that waited 400 blocks in a displaced seat's pool
+// and applied in 12 s when the same bytes were posted to a seated node. That is
+// a property of the design, not a defect, so the fix is to say it: when this
+// server knows the node's signing key it reports whether that key holds a seat
+// at the height a transaction would need, and an unseated reply explains what
+// the pool now means. The status stays 200 because the admission really did
+// happen, and a refusal would read as "your bytes are wrong" to a client whose
+// bytes are fine; the warning is in the body, and the CLI prints it beside the
+// txid.
 func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{"method not allowed"})
@@ -571,5 +631,42 @@ func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := tx.ID()
-	writeJSON(w, http.StatusOK, txResponse{TxID: hex.EncodeToString(id[:])})
+	resp := txResponse{TxID: hex.EncodeToString(id[:])}
+	if len(s.seatKey) > 0 {
+		// The height a transaction posted now would have to be carried at. The
+		// chain decides head+1 next, so that is the height whose committee
+		// matters - at an epoch boundary it is the NEXT epoch's set, which is
+		// exactly the seat an operator needs to know about.
+		height := s.chain.Height() + 1
+		seated, warning := s.seatStatus(height)
+		resp.Seated = &seated
+		resp.Warning = warning
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// seatStatus reports whether this node can propose at height h, and why not
+// when it cannot. It is called only when the server knows the signing key.
+//
+// The question is asked of the chain, not kept in a field: IsSeatedAt is the
+// chain's own read-locked membership test over the memoised epoch set - the one
+// the router calls for every vote and proposal (audit RT-6) - so it allocates
+// nothing on the seated path and adds no lock. The answer cannot be a stale
+// read: an epoch's set is a pure function of the state at epoch*E-1, which is
+// committed before any height in that epoch can be asked about and never
+// changes afterwards, so a commit racing this reply can only make the answer
+// NEWER than the height it names, never wrong for that height.
+//
+// IsSeatedAt answers false for "not seated" and for "this chain cannot derive a
+// committee at h", and the two need different sentences, so the false case asks
+// CommitteeAt - the diagnostic seam its own doc comment names - to tell them
+// apart. That costs one copy of the seat set on the refusal path only.
+func (s *Server) seatStatus(h uint64) (seated bool, warning string) {
+	if s.chain.IsSeatedAt(h, s.seatKey) {
+		return true, ""
+	}
+	if _, err := s.chain.CommitteeAt(h); err != nil {
+		return false, fmt.Sprintf("this node cannot derive the committee that judges height %d (%v), so no proposal can carry the transaction yet; it is parked in this node's mempool. Post the same bytes to a node that is running and seated", h, err)
+	}
+	return false, fmt.Sprintf("this node's key holds no committee seat at height %d, so this node will not propose a block there and the transaction cannot be included until it holds one; it is parked in this node's mempool. A transaction reaches a block only through the node it was posted to: post the same bytes to a node that holds a seat (any validator that the committee lists at that height)", h)
 }
