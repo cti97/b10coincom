@@ -317,6 +317,47 @@ func (g *Genesis) Validate() error {
 	if p.FaucetPowArgon2.Parallelism == 0 {
 		return fmt.Errorf("%w: the faucet puzzle's Parallelism must be at least 1 (zero lanes cannot be evaluated and would brick the faucet)", ErrBadGenesis)
 	}
+	// MEMORY AND LANES ARE NOT INDEPENDENT (audit S-7 of 2026-11-06, corrected
+	// against the library source). golang.org/x/crypto/argon2 v0.58.0's
+	// deriveKey derives the arena it allocates and walks from BOTH values:
+	//
+	//	memory = memory / (4 * lanes) * (4 * lanes)   // floor to a 4-lane step
+	//	if memory < 8 * lanes { memory = 8 * lanes }  // then raise to that floor
+	//
+	// The finding said this relation PANICS. It does not: the package's only
+	// panics are "number of rounds too small" (time < 1) and "parallelism
+	// degree too low" (lanes < 1), both already refused above, and a test in
+	// this package evaluates a matrix of extreme tunings to prove it
+	// (TestArgon2DoesNotPanicOnExtremeTunings, which reads the same source).
+	//
+	// The real defect is quieter and still worth refusing: a genesis can
+	// validate with a tuning the library SILENTLY COERCES, so the parameter
+	// that prices every validator's per-claim work is not the work performed.
+	// MemoryKiB = 1 at one lane runs 8 KiB; MemoryKiB = 100 at three lanes runs
+	// 96. Both sides coerce identically, so this never forks the chain - it
+	// makes a consensus parameter a lie an operator cannot reason about, which
+	// is the class blindspot 4 names ("validates ranges, not the relationships
+	// the node depends on"). Accept only a FIXED POINT of that derivation:
+	// memory at least 8 x lanes, and a multiple of 4 x lanes. Every shipped
+	// tuning (64 KiB and 8 MiB, one lane) satisfies both.
+	//
+	// The division below cannot divide by zero: Parallelism == 0 was refused
+	// immediately above. No OTHER relation panics either - Iterations has no
+	// upper bound in this validation, which is a separate residual (it prices
+	// work, it does not decide representability), and keyLen is a constant 32
+	// in faucet.PowDigest.
+	lanes := uint64(p.FaucetPowArgon2.Parallelism)
+	memKiB := uint64(p.FaucetPowArgon2.MemoryKiB)
+	if memKiB < 8*lanes || memKiB%(4*lanes) != 0 {
+		// The value the library would actually use, for the refusal to be
+		// concrete rather than a restatement of the rule.
+		effective := memKiB / (4 * lanes) * (4 * lanes)
+		if effective < 8*lanes {
+			effective = 8 * lanes
+		}
+		return fmt.Errorf("%w: the faucet puzzle's MemoryKiB is %d at Parallelism %d; Argon2id requires memory to be at least 8 x parallelism (%d KiB) and a multiple of 4 x parallelism (%d KiB steps, so a lane gets a whole segment), and this tuning would silently run as %d KiB instead of the declared %d",
+			ErrBadGenesis, memKiB, lanes, 8*lanes, 4*lanes, effective, memKiB)
+	}
 	// A claim of zero sparks pays the claimant nothing while still spending the
 	// key's one-claim-per-epoch marker: a genesis whose faucet pays zero has no
 	// faucet at all.

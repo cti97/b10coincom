@@ -262,3 +262,44 @@ consumed by its own content, so three trailing shell lines were written into
 this file and the line count first reported (228) included them. Removed. It is
 the same failure this project keeps finding in its own artifacts: an assertion
 that was never checked against the thing it claims to describe.
+
+**The S-5..S-7 round (this section is theirs too).** Recorded on 2026-11-06 by
+the branch that fixed them, because these three were `REPORTED`, not reproduced,
+and one of them is wrong in the way this document's own blindspot 4 describes.
+
+**S-5 is real, with one half of its blast radius corrected.** The proposal
+branch did decode the whole block before any gate, and `transport.dispatch`
+holds one mutex across every `OnMessage`, so the stall is real. The offset
+claim survives inspection: `EncodeProposal` writes a 1-byte tag, then the
+8-byte big-endian `Height`, before any variable-width field, and the transport
+strips the frame's length prefix, so the read is a constant offset and exact
+for every decodable proposal. What does not survive is *"member or stranger"*:
+on a **direct** socket the HELLO admission gate (`admitHello`) refuses every
+non-HELLO frame before dispatch, so a stranger cannot reach `Route` there. The
+stranger case is real only over the **relay** link, whose documented residual
+already says a relay connection cannot bind a frame to an identity. Any
+**member** can do it directly. The fix is as prescribed, applied at the head of
+`Route` (the vote window is the right filter: the driver's engine height is
+chain head + 1, so the window contains it and nothing above it is acted on).
+
+**S-6 is real as described.** Reproduced at the shipped producer path: a
+genesis with `MaxClaimsPerBlock = 1` and three pending claims makes `Take` hand
+out three, `Build` refuse with `state.ErrTooManyClaims`, and `RunOnce` returns
+without proposing. One consequence the finding missed: the pool's
+`MaxClaimAgeBlocks` (32) assumed the constant hand-out rate, so bounding the
+hand-out by a lower state value without also following the rate would silently
+**age out** claims that were merely waiting their turn.
+
+**S-7 is wrong where it matters.** `golang.org/x/crypto` v0.58.0's
+`deriveKey` does not panic when memory is below `8 × lanes`; it **coerces**
+memory (`memory = memory/(4·lanes)*(4·lanes)`, then raised to `8·lanes`). Its
+only panics are `time < 1` and `lanes < 1`, both already refused by
+`Validate` and guarded again in `applyFaucetClaim`. So a validated genesis
+never crashes a node on a claim. The residual is the one blindspot 4 names: a
+genesis could declare a memory cost the library silently changes, so the
+parameter priced the work wrongly. `Validate` now accepts only a fixed point of
+the derivation (memory ≥ `8 × lanes`, and a multiple of `4 × lanes`), and a
+test evaluates the finding's own extreme tunings to prove no panic. `Iterations`
+still has no upper bound — a separate, unhidden residual: it prices work rather
+than deciding representability, and a ceiling is a policy number this round did
+not invent.
