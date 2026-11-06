@@ -26,6 +26,7 @@ import (
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/keystore"
 	"github.com/cti97/b10coincom/internal/types"
+	"github.com/cti97/b10coincom/internal/version"
 )
 
 // captureStdout runs fn with os.Stdout swapped for a pipe and returns what
@@ -683,6 +684,65 @@ func TestNodeGenesisModeFlagContract(t *testing.T) {
 	}
 }
 
+// `b10coin version` must print the build identity — the semantic version plus
+// the toolchain's VCS stamp — and `--short` must print exactly the semantic
+// version, because scripts/build-release.sh names every artifact with it.
+// Audit S-10: "0.1.0" alone cannot tell an upgraded Pi from one left behind,
+// and three nodes printing it are the documented picture of agreement.
+func TestCmdVersionPrintsTheBuildIdentity(t *testing.T) {
+	var firstErr error
+	out := captureStdout(t, func() {
+		firstErr = cmdVersion(nil)
+	})
+	if firstErr != nil {
+		t.Fatalf("cmdVersion: %v", firstErr)
+	}
+	want := version.Build().String() + "\n"
+	if out != want {
+		t.Fatalf("b10coin version printed %q, want %q (the same token the startup banner carries)", out, want)
+	}
+	if !strings.Contains(out, " rev ") {
+		t.Fatalf("b10coin version printed %q with no revision field: an operator cannot tell two builds apart", out)
+	}
+
+	var shortErr error
+	short := captureStdout(t, func() {
+		shortErr = cmdVersion([]string{"--short"})
+	})
+	if shortErr != nil {
+		t.Fatalf("cmdVersion --short: %v", shortErr)
+	}
+	if short != version.Version+"\n" {
+		t.Fatalf("b10coin version --short printed %q, want %q: release artifact names depend on it", short, version.Version+"\n")
+	}
+
+	if err := cmdVersion([]string{"--long"}); err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("an unknown version flag returned %v; it must name the usage, not print something else", err)
+	}
+}
+
+// Audit S-10's degrade half, end to end rather than simulated: a real binary
+// built with -buildvcs=false carries no VCS information, and it must SAY so.
+// The failure this pins is the quiet one — an empty revision field reads as
+// agreement in an operator's diff, which is the state that lets a mixed-build
+// committee fork before anyone notices.
+func TestBinaryWithoutVCSInfoSaysUnknownRatherThanNothing(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "b10coin-no-vcs")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", out, "./cmd/b10coin")
+	build.Dir = moduleRoot(t)
+	if b, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building a binary with no VCS information: %v: %s", err, b)
+	}
+	got, err := exec.Command(out, "version").Output()
+	if err != nil {
+		t.Fatalf("running the no-VCS binary's version: %v", err)
+	}
+	want := version.Version + " rev unknown (built without VCS information)\n"
+	if string(got) != want {
+		t.Fatalf("a binary built with -buildvcs=false printed %q, want %q", got, want)
+	}
+}
+
 // The happy path through the REAL binary: a one-member committee from a
 // committee file, the seat key from a keygen file. This is the deployment
 // shape of the fixed deploy recipe in miniature — and it pins that:
@@ -718,6 +778,22 @@ func TestCliNodeRunsAGenesisFileCommitteeWithItsHeldKey(t *testing.T) {
 	}
 	if st.ChainID != "cli-genesis-1" {
 		t.Fatalf("chain %q, want the committee file's cli-genesis-1: the chain ID must come from the shared file %s", st.ChainID, p.tails())
+	}
+	// Audit S-10: the startup banner is the first place an operator sees which
+	// build is running, so it must carry exactly the identity `b10coin version`
+	// reports for the SAME binary. Comparing against that binary's own output
+	// (not this test process's stamp) makes the assertion exact and immune to
+	// how the test binary itself was built.
+	identOut, err := exec.Command(nodeBin, "version").Output()
+	if err != nil {
+		t.Fatalf("b10coin version: %v", err)
+	}
+	identity := strings.TrimSpace(string(identOut))
+	if !strings.Contains(identity, " rev ") {
+		t.Fatalf("b10coin version printed %q with no revision field", identity)
+	}
+	if want := "b10coin " + identity + " listening on"; !strings.Contains(p.stdout.String(), want) {
+		t.Fatalf("the startup banner must carry %q (the identity the same binary reports), got:\n%s", want, p.stdout.String())
 	}
 	if want := "committee of 1, seat 0, key file "; !strings.Contains(p.stdout.String(), want) {
 		t.Fatalf("the banner must name the committee, seat and key file (%q missing):\n%s", want, p.stdout.String())
@@ -812,6 +888,14 @@ type stakingStub struct {
 	historyBody  *walletHistory
 	historyQuery url.Values
 	historyCalls int
+
+	// txStatus/txBody replace /tx's reply when txBody is non-empty. They exist
+	// for the hostile-node fixtures (audit S-13): every other stub in this file
+	// returns a well-formed 64-hex txid, which is exactly the blindspot that
+	// let a terminal-injection bug pass a green suite. A test sets this to a
+	// status and a RAW body, so the reply is whatever a hostile node chooses.
+	txStatus int
+	txBody   string
 }
 
 func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *stakingStub {
@@ -864,7 +948,16 @@ func newStakingStub(t *testing.T, genesisHash [32]byte, acc stakingAccount) *sta
 		}
 		s.mu.Lock()
 		s.posts = append(s.posts, raw)
+		status, reply := s.txStatus, s.txBody
 		s.mu.Unlock()
+		if reply != "" {
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, reply)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"txid": strings.Repeat("ab", 32)})
 	})
 	s.ts = httptest.NewServer(mux)
@@ -911,6 +1004,17 @@ func (s *stakingStub) setChainID(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.chainID = id
+}
+
+// setTxReply makes the stub answer POST /tx with this status and RAW body,
+// instead of its well-formed {"txid": "abab..."}. It is the hostile-node
+// fixture audit S-13 asked for: garbage in the txid field and garbage in the
+// error field, both chosen by the node rather than by this test's idea of a
+// node.
+func (s *stakingStub) setTxReply(status int, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.txStatus, s.txBody = status, body
 }
 
 // reads returns how many /status and /account reads the stub has served.
@@ -2439,6 +2543,107 @@ func TestSendVerbSubmitsATransferWithTheRightFields(t *testing.T) {
 	devnet := tx.SigningHash(genesis.Devnet().Hash())
 	if crypto.Verify(tx.PubKey, devnet[:], tx.Sig) {
 		t.Error("the signature verifies against the compiled-in devnet hash: the verb assumed a chain instead of reading the node's")
+	}
+}
+
+// TestHostileNodeTxIDIsRefusedAndCannotForgeAReceipt is audit S-13's fixture.
+// Every other stub in this file answers /tx with a well-formed 64-hex txid,
+// which is precisely the blindspot (audit blindspot 6) that let the bug live:
+// a hostile node is not required to answer with a hash at all. This one
+// returns an ANSI eraser and a forged receipt line in the txid field, and the
+// CLI must refuse rather than print it.
+func TestHostileNodeTxIDIsRefusedAndCannotForgeAReceipt(t *testing.T) {
+	keyPath, _, to, stub := sendTestSetup(t, 5*genesis.SparksPerB10, 0)
+	// ESC[2K erases the current line and ESC[1A moves the cursor up, so a node
+	// that gets this printed AFTER the CLI's own output can wipe the lines
+	// saying what was signed and substitute its own receipt.
+	const forged = "\x1b[2K\x1b[1A\x1b[32mtxid        " + "deadbeef" +
+		"  transfer final: 500 b10 to the operator\x1b[0m"
+	body, err := json.Marshal(map[string]string{"txid": forged})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub.setTxReply(http.StatusOK, string(body))
+
+	var postErr error
+	out := captureStdout(t, func() {
+		postErr = cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--yes"})
+	})
+	if postErr == nil {
+		t.Fatalf("the hostile txid was accepted; a node-chosen string was printed as a receipt:\n%s", out)
+	}
+	t.Logf("refusal: %v", postErr)
+	t.Logf("stdout while refusing: %q", out)
+	if !strings.Contains(postErr.Error(), "64 lowercase hex") {
+		t.Errorf("the refusal does not say what was wrong:\n%v", postErr)
+	}
+	if strings.ContainsRune(postErr.Error(), '\x1b') {
+		t.Errorf("the reference to the bad txid carries a RAW ESC byte; safeText must quote it:\n%v", postErr)
+	}
+	if strings.Contains(out, "txid") {
+		t.Errorf("a txid line was printed for a refused reply; the forged receipt reached the terminal:\n%s", out)
+	}
+	if strings.ContainsRune(out, '\x1b') {
+		t.Errorf("a raw ESC byte reached stdout:\n%q", out)
+	}
+}
+
+// TestHostileNodeErrorBodyIsQuotedNotEchoed is the second half of S-13's
+// fixture: the error body is node-chosen text too, and it used to be echoed
+// with %s into the CLI's error. It must arrive quoted, with its control bytes
+// visible as escapes rather than executed.
+func TestHostileNodeErrorBodyIsQuotedNotEchoed(t *testing.T) {
+	keyPath, _, to, stub := sendTestSetup(t, 5*genesis.SparksPerB10, 0)
+	const forged = "\x1b[2K\x1b[1Arejected by the node (this line is the node's, not the CLI's)"
+	body, err := json.Marshal(map[string]string{"error": forged})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub.setTxReply(http.StatusBadRequest, string(body))
+
+	var postErr error
+	out := captureStdout(t, func() {
+		postErr = cmdSend([]string{"--node", stub.url, "--key", keyPath, "--to", to.String(), "--amount", "0.5", "--yes"})
+	})
+	if postErr == nil {
+		t.Fatalf("a 400 reply was not an error:\n%s", out)
+	}
+	t.Logf("safe refusal: %v", postErr)
+	if strings.ContainsRune(postErr.Error(), '\x1b') {
+		t.Errorf("the error body was echoed with a raw ESC byte:\n%v", postErr)
+	}
+	if !strings.Contains(postErr.Error(), strconv.Quote(forged)) {
+		t.Errorf("the error body was not quoted by safeText:\n%v", postErr)
+	}
+	if strings.ContainsRune(out, '\x1b') {
+		t.Errorf("a raw ESC byte reached stdout:\n%q", out)
+	}
+}
+
+// TestValidTxIDAcceptsOnlyCanonicalHashes pins the receipt rule itself: 64
+// lowercase hex characters, nothing else. Uppercase is refused too - the
+// encoder this CLI's own hashes go through emits lowercase, so a mixed-case
+// reply is a string the node invented, not a hash it computed (audit S-13).
+func TestValidTxIDAcceptsOnlyCanonicalHashes(t *testing.T) {
+	good := strings.Repeat("ab", 32)
+	for _, tc := range []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"canonical", good, true},
+		{"empty", "", false},
+		{"too short", good[:len(good)-1], false},
+		{"too long", good + "a", false},
+		{"uppercase", strings.Repeat("AB", 32), false},
+		{"mixed case", strings.Repeat("aB", 32), false},
+		{"non-hex", strings.Repeat("ab", 31) + "zz", false},
+		{"escape", good[:60] + "\x1b[2K", false},
+		{"newline", good[:63] + "\n", false},
+	} {
+		if got := validTxID(tc.in); got != tc.want {
+			t.Errorf("validTxID(%s) = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

@@ -67,12 +67,20 @@ type historyResponse struct {
 // a client error rather than a silently different window, and a value above
 // the maximum is CLAMPED, not refused - the client asked for "as much as
 // allowed", and the reply's `blocks` reports what it actually got.
+//
+// THE PARSE IS AT 64 BITS, then clamped (audit S-14). It used to parse at 31
+// bits, so 2^31 and above failed the PARSE and were answered with "must be a
+// positive integer" about a positive integer - a 400 the help text promised
+// would be clamped. Parsing a uint64 and clamping afterwards makes the promise
+// true for every value a client can send; the only refusals left are the ones
+// the sentence describes (zero, non-numeric, negative, or above 2^64-1, which
+// does not "fit in 64 bits" and so is not a count this endpoint accepts).
 func historyBlocks(q url.Values) (blocks int, err error) {
 	blocks = defaultHistoryBlocks
 	if raw := q.Get("blocks"); raw != "" {
-		v, perr := strconv.ParseUint(raw, 10, 31)
+		v, perr := strconv.ParseUint(raw, 10, 64)
 		if perr != nil || v == 0 {
-			return 0, errors.New("blocks must be a positive integer")
+			return 0, errors.New("blocks must be a positive integer that fits in 64 bits")
 		}
 		if v > MaxHistoryBlocks {
 			v = MaxHistoryBlocks

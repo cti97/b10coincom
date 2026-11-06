@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -126,6 +127,39 @@ type Chain struct {
 	// stays a permitted peer forever, exactly as a genesis key already did
 	// (audit RT-7); see committeeMemberAt's comment for what that admits and
 	// what it does not. Guarded by mu like committees.
+	//
+	// BOUNDED, AND WHY THERE IS NO EVICTION (audit S-20). Only two paths insert
+	// here - the genesis seats at Open and the derived committee in
+	// memoCommitteeLocked, which runs once per epoch boundary - so the set is
+	// always exactly the union of the genesis seats and the committees this
+	// chain has recorded. That gives a structural bound, not an economic one:
+	//
+	//	|everSeated| <= len(genesis.Validators) + CommitteeSize x epochs elapsed
+	//
+	// because each recorded committee contributes at most CommitteeSize keys and
+	// a committee is recorded once per epoch. On the shipped testnet parameters
+	// (CommitteeSize 21, EpochBlocks 10,000, BlockTimeMS 2,000) an epoch is
+	// 20,000 s - 5 h 33 m - so the ceiling is 21 seats per epoch, about 91 keys a
+	// day and about 33,100 a year. Measured on 2026-11-06, an entry of this map
+	// (a 32-byte ed25519 key plus the map's share of key and value slots) is
+	// 67-88 bytes of heap at a million entries, so the ceiling is about 3 MB a
+	// year; a gibibyte needs ~11.9 million entries, which is ~360 years of a
+	// fully funded committee rotating at that ceiling. Each of those keys must
+	// separately hold MIN_STAKE = 10^11 sparks (1,000 b10) to be seatable at all,
+	// so the flow is also gated by capital: 21,000 b10 working capital rotating
+	// through bond, seat, unbond.
+	//
+	// A cap was considered and REJECTED. Enforcing one means either refusing
+	// HELLO/BLOCK_SYNC to a key that is legitimately seated once the set is
+	// full, or evicting an entry - and an entry that is evicted is a rotated-out
+	// honest validator that this set exists precisely to keep admitting (audit
+	// RT-3). That is the freeze this project has already paid for once, and it
+	// buys nothing here: the structural bound above is enforced by the shape of
+	// the code rather than by a number someone can tune wrong. Pruning "keys
+	// whose bond is gone and whose epoch is past" was also rejected: the bond log
+	// is not retained, so that condition is not knowable at admission time
+	// without a second unbounded index, and getting it wrong un-admits an honest
+	// key on exactly the same path.
 	everSeated map[string]struct{}
 }
 
@@ -651,19 +685,49 @@ func (c *Chain) Probe(txs []types.Tx) (*state.State, error) {
 // a second claim rule that could drift from the state machine's; the two
 // layers this side of ApplyBlock stay exactly where they are.
 //
+// ORDERING, AND THE FUTURE NONCE THAT USED TO BE DESTROYED (audit S-17). The
+// pool admits a transaction whose nonce is ahead of the account's, because it
+// may become applicable when its predecessors land. Take hands candidates back
+// in insertion order, so a sender whose nonce-2 transaction arrived before its
+// nonce-1 predecessor presented [2, 1]: 2 was evicted as inapplicable, 1 was
+// selected, and 2 was gone - Take had already removed it and nothing put it
+// back. Candidates are therefore permuted so that each sender's transactions
+// are in nonce order BEFORE selection, moving only that sender's own entries
+// among their own positions. No transaction changes its position relative to
+// any other sender, so a transfer that funded another sender keeps its arrival
+// order. Within one sender, nonce order is the only order a chain can apply in,
+// so this can only turn "inapplicable now" into "applicable now", never the
+// reverse; the selected set is exactly what sequential nonce-order arrival
+// would have produced.
+//
+// A candidate that still cannot apply because its nonce is AHEAD of the
+// running state - a real gap, where the predecessor is not in this batch at
+// all - is not silently destroyed either. It is returned in retry and the
+// caller re-adds it to the pool before the head moves, so it is eligible again
+// once the gap fills; a gap that never fills ages out through the pool's
+// ordinary capacity and per-sender bounds, exactly as any other unapplied
+// transaction. Only a nonce-ahead candidate is deferred: one the state refused
+// for any other reason (a spent nonce, a bad signature, insufficient funds) is
+// genuinely inapplicable, and is evicted as before.
+//
 // An error return means the empty head+1 transition itself failed, so nothing
 // applies and every candidate was lost by the caller's bookkeeping; the caller
 // is expected to return its candidates to wherever they came from.
 //
-// overBudget is a sub-slice of candidates, in the caller's order, and must not
-// be mutated. It is empty whenever the candidates fit a block.
-func (c *Chain) SelectApplicable(candidates []types.Tx) (selected, overBudget []types.Tx, err error) {
+// retry is the set of candidates this block cannot carry but that remain
+// eligible: the tail the byte budget excluded (which is not judged at all -
+// the budget's point is that the work stops there) plus the nonce-ahead
+// candidates deferred above. When both kinds are present it is not a view of
+// candidates, so the caller must only re-add it. It is empty whenever every
+// candidate fits and applies.
+func (c *Chain) SelectApplicable(candidates []types.Tx) (selected, retry []types.Tx, err error) {
 	// Probe returns a fresh state (advanceLocked clones before applying), so it
 	// is the caller's to mutate; no further clone is needed.
 	base, err := c.Probe(nil)
 	if err != nil {
 		return nil, nil, err
 	}
+	orderBySenderNonce(candidates)
 	// used is the encoded size the block would have: the signed overhead plus
 	// every selected transaction's framed weight. It is compared before a
 	// candidate is applied, because a candidate that does not fit must not
@@ -676,15 +740,78 @@ func (c *Chain) SelectApplicable(candidates []types.Tx) (selected, overBudget []
 	for i := range candidates {
 		size := candidates[i].FramedSize()
 		if used+size > types.MaxBlockBytes {
-			return selected, candidates[i:], nil
+			if len(retry) == 0 {
+				return selected, candidates[i:], nil
+			}
+			return selected, append(retry, candidates[i:]...), nil
 		}
 		if err := base.ApplyTx(&candidates[i]); err != nil {
+			if notYetApplicable(base, &candidates[i], err) {
+				retry = append(retry, candidates[i])
+			}
 			continue // evict: it cannot apply at this state, leaving base unchanged
 		}
 		selected = append(selected, candidates[i])
 		used += size
 	}
-	return selected, nil, nil
+	return selected, retry, nil
+}
+
+// orderBySenderNonce puts each sender's candidates in nonce order WITHOUT
+// moving any entry out of that sender's own positions, so sender order and
+// every cross-sender relationship are untouched. It is in place and
+// allocation-free unless some sender's entries are actually out of order (the
+// common case: the pool's insertion order is the submission order, which a
+// correct wallet sends in nonce order).
+func orderBySenderNonce(txs []types.Tx) {
+	if len(txs) < 2 {
+		return
+	}
+	groups := make(map[types.Address][]int, 8)
+	senders := make([]types.Address, 0, 8)
+	for i := range txs {
+		a := txs[i].From
+		if _, ok := groups[a]; !ok {
+			senders = append(senders, a)
+		}
+		groups[a] = append(groups[a], i)
+	}
+	for _, a := range senders {
+		pos := groups[a]
+		if len(pos) < 2 {
+			continue
+		}
+		ordered := true
+		for k := 1; k < len(pos); k++ {
+			if txs[pos[k]].Nonce < txs[pos[k-1]].Nonce {
+				ordered = false
+				break
+			}
+		}
+		if ordered {
+			continue
+		}
+		group := make([]types.Tx, len(pos))
+		for k, i := range pos {
+			group[k] = txs[i]
+		}
+		sort.SliceStable(group, func(i, j int) bool { return group[i].Nonce < group[j].Nonce })
+		for k, i := range pos {
+			txs[i] = group[k]
+		}
+	}
+}
+
+// notYetApplicable reports whether the running state refused a candidate ONLY
+// because its nonce is ahead of its sender's account nonce: the transaction is
+// legal and will apply once the missing predecessors land, so it belongs back
+// in the pool rather than in the void. A nonce BELOW the account's is spent and
+// stays evicted; so does any other refusal.
+func notYetApplicable(base *state.State, tx *types.Tx, err error) bool {
+	if !errors.Is(err, state.ErrBadNonce) {
+		return false
+	}
+	return base.Get(tx.From).Nonce < tx.Nonce
 }
 
 // Build constructs and signs a candidate block. It does not mutate the

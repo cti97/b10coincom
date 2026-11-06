@@ -225,40 +225,48 @@ These are the findings behind the findings. Each produced at least two of the it
 
 ---
 
-## 9. Corrections after the fixes
+## 9. Corrections, and a scoreboard
 
 Recorded because a report that does not correct itself is the defect this whole
-document is about. Both items below were found by the rounds that fixed S-1..S-4,
-**not** by the review that wrote this document.
+document is about. Every item below was found by the round that *fixed* the
+finding, not by the review that wrote it. **Fifteen corrections to a report of
+twenty findings** is the honest measure of what a source-only review is worth:
+the defects were real; the repairs were mine to get wrong and I did.
 
-**The S-3 init assertion was arithmetically false.** This report prescribed
-`MaxTxsPerBlock <= (MaxBlockBytes − overhead) / minTxSize`. For the shipped
-constants `(1 MiB − 212) / 165 = 6,353`, so `10,000 <= 6,353` is false and the
-assertion **panics every node at startup**. Making it true means lowering
-`MaxTxsPerBlock`, which is a consensus-validity change belonging to the next
-versioned fork. What shipped instead is the satisfiable guard (the byte budget
-admits at least one minimum-size transaction) plus the structural fix that makes
-the count bound irrelevant: the producer budgets by **bytes**, and the frame
-bound is **derived** from the block bound rather than duplicated. This is the
-**second** unsound remedy in this document; the first was S-4's.
+### Findings whose mechanism was wrong
 
-**The triangle has a fourth member: the signature.** `chain.Build` runs
-`ValidateStructure` **before** signing, so it measures a block 65 bytes smaller
-than the wire form, while `types.DecodeBlock` enforces `MaxBlockBytes` on the
-**signed** bytes. A block measured at 1,048,555 therefore validates and, once
-signed, is undecodable by every peer. It is unreachable from an honest producer
-— the byte budget charges the signed overhead — but the validity rule still
-admits it, so it is a residual for the next fork rather than something to fix by
-narrowing validity now.
+| ID | What this report said | What the code does |
+|---|---|---|
+| **S-7** | `argon2.IDKey` **panics** when memory < 8×lanes, so a validated genesis crashes every claim | `deriveKey` **coerces**: memory/(4·lanes)·(4·lanes), then raised to 8·lanes. Only `time<1` and `lanes<1` panic, and `Validate` already refuses those. **A validated genesis never crashes the node.** The real defect is narrower: the declared cost is not the cost that runs. |
+| **S-20** | the set is "rate-limited by whoever can afford `MIN_STAKE` bonds" | A bond is **necessary and not sufficient** — a key that bonds and loses the seat draw is never admitted. So `|everSeated| ≤ len(genesis.Validators) + CommitteeSize × epochs`, ≈ 91 keys/day on testnet, ≈ 3 MB/year. **The set is bounded**; the finding is real but its severity was overstated. |
+| **S-5** | "any connected peer, member **or stranger**" | A stranger cannot reach `Route` on a direct socket — the HELLO gate stops it. The stranger case is real **only over the relay link**. |
+| **S-17** | the transaction is destroyed "if both land in one `Take` batch" | It is destroyed **even when its predecessor is in a later batch**, and ordering alone does not save it; the selection must also return nonce-ahead candidates for retry. |
+| **S-12** | incomplete: names only `Open` | `CertAt` had a comparable unbounded allocation — **67 MB requested from a 54-byte log** — and a swapped-record bug: two equal-width records exchanged in place keep every checksum valid, so `CertAt(1)` served height 2's certificate. |
 
-**Two things this report understated.** Consequence A of S-2 is worse than
-written: a **single** sync unit carrying a max-size block already exceeded the
-old 1 MiB frame, so such a block could not be synced **at all**, not merely
-inside a 64-height window. And the legal-band boundary is 1,048,455, not
-1,048,452.
+### Remedies that would have failed, or made things worse
 
-**One thing worse than the findings.** The generator's heredoc terminator was
-consumed by its own content, so three trailing shell lines were written into
-this file and the line count first reported (228) included them. Removed. It is
-the same failure this project keeps finding in its own artifacts: an assertion
-that was never checked against the thing it claims to describe.
+| ID | The prescription | Why it was wrong |
+|---|---|---|
+| **S-4** | "move the release into `adopt`'s pre-install error paths" | `adopt` is **also outbound**, which books no slot; releasing there decrements a slot never taken and makes `MaxConns` *more* permissive. |
+| **S-3** | `MaxTxsPerBlock <= (MaxBlockBytes − overhead)/minTxSize` as an init assertion | Arithmetically **false**: `(1 MiB − 212)/165 = 6,353`, so `10,000 <= 6,353` **panics every node at startup**. |
+| **S-10** | "drop `-buildvcs=false`" | `-buildvcs=auto` derives `vcs.modified` from `git status`, and `build-release.sh` builds inside its own untracked `.release-stage/` — **every clean release would have stamped "(modified)"**. |
+| **S-11** | `grep … \| sha256sum -c -` | GNU `sha256sum -c` **exits 0 on empty input**, so the check silently passes when the entry is missing — the exact failure it was written to catch. |
+| **S-14** | "parse at 64 bits then clamp" | `?offset` had **no clamp at all**; a 64-bit parse alone turns `2⁶⁴−1` into `−1` and indexes out of range. |
+| **S-18** | "wire the signing secret" | `ubuntu-latest` ships **no `minisign`**, so wiring alone could not have signed anything. |
+
+### Understatements
+
+- **S-2's consequence A**: a **single** sync unit carrying a max-size block already exceeded the old frame bound — such a block could not be synced **at all**, not merely inside a 64-height window. The legal-band boundary is 1,048,455, not 1,048,452.
+- **S-2 has a fourth triangle member**: `chain.Build` validates **before signing**, so it measures a block 65 bytes smaller than the wire form, while `DecodeBlock` bounds the **signed** bytes. A block at 1,048,555 validates and is then undecodable by every peer — unreachable from an honest producer, but admitted by the validity rule.
+- **S-16** was under-specified: "refuse a wildcard bind with neither token nor allowlist" does not say how the binary can *know* about an allowlist. It now takes `--external-allowlist`, which the systemd unit passes.
+
+### Two errors in this document's own production
+
+- The heredoc terminator was consumed by its content, so **three lines of generator shell** were written into the file and the line count first reported (228) included them.
+- The fixing brief labelled **S-20 as `REPORTED`**; the table here says `VERIFIED`, which is correct. The label was mine to get right.
+
+### The rule worth keeping
+
+Across twenty findings: **four Highs held exactly as described; of the sixteen Medium and Low items, seven had a component that was wrong** — a false mechanism, an overstated scope, or an incomplete statement. Every one of those seven was marked `REPORTED` except S-20 and S-12.
+
+**A source-only review finds defects reliably and repairs them unreliably.** Write the finding; let the person reading the code choose the fix; and mark what you did not reproduce.

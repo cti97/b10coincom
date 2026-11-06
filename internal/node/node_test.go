@@ -2,6 +2,7 @@ package node
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
@@ -86,6 +87,14 @@ func TestRunOnceIncludesMempoolTransactions(t *testing.T) {
 
 func mkTransfer(t *testing.T, nonce uint64) types.Tx {
 	t.Helper()
+	return mkTransferOf(t, nonce, 1)
+}
+
+// mkTransferOf is mkTransfer with an explicit amount, so a test can build a
+// transaction the state must refuse (spend more than the balance) without
+// changing any other field.
+func mkTransferOf(t *testing.T, nonce, amount uint64) types.Tx {
+	t.Helper()
 	fromPub, fromPriv := genesis.DevAccountKey(0)
 	toPub, _ := genesis.DevAccountKey(1)
 	tx := &types.Tx{
@@ -95,7 +104,7 @@ func mkTransfer(t *testing.T, nonce uint64) types.Tx {
 		Nonce:  nonce,
 		Fee:    1, // mkTransfer's callers open devnet chains, whose minimum is 1
 		To:     types.AddressFromPub(toPub),
-		Amount: 1,
+		Amount: amount,
 	}
 	sigHash := tx.SigningHash(genesis.Devnet().Hash())
 	tx.Sig = crypto.Sign(fromPriv, sigHash[:])
@@ -115,7 +124,12 @@ func TestRunOnceEvictsOnlyInvalidTransactions(t *testing.T) {
 	mp := mempool.New(100, c.Genesis().Hash(), c.AdmissionHead)
 
 	good := mkTransfer(t, 0)
-	bad := mkTransfer(t, 99) // valid signature, impossible nonce
+	// Valid signature, and a nonce the batch reaches (after `good` applies) -
+	// but it spends more than the account holds, so no execution order can
+	// ever apply it. That is the "invalid" this test evicts; a transaction
+	// whose nonce is merely AHEAD is kept now (audit S-17), covered by
+	// TestAFutureNonceGapSurvivesToALaterBlock.
+	bad := mkTransferOf(t, 1, math.MaxUint64)
 	for i, e := range mp.Add([]types.Tx{good, bad}) {
 		if e != nil {
 			t.Fatalf("mempool.Add[%d]: %v", i, e)

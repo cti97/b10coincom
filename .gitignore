@@ -15,6 +15,13 @@ validator-keys/
 /build/
 *.exe
 
+# scripts/build-release.sh's staging directory. Ignored for a reason beyond
+# tidiness (audit S-10): the release stamps `vcs.modified` from `git status`,
+# so an untracked staging directory inside the tree would make every artifact
+# claim the tree was dirty — a false alarm that would teach operators to
+# ignore the one field meant to stop a mixed-build committee from forking.
+/.release-stage/
+
 # Local devnet / testnet data (regenerable, never authoritative)
 /devnet-data/
 /testnet-data/

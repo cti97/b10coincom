@@ -4,10 +4,14 @@
 # Assumes the machine already has (see scripts/deploy/README.md §§2, 6):
 #   - the binary at /opt/b10coin/b10coin-relay    (from scripts/deploy/build.sh, scp'd)
 #   - a system user and group "b10coin"
-#   - TCP port 7001 reachable ONLY from the validators: a cloud/security-group
-#     rule restricting the port plus, if a host firewall is in use, one ufw
-#     ALLOWLIST line per validator IP (§4) — NEVER `ufw allow 7001/tcp`, which
-#     opens the relay to the whole internet
+#   - TCP port 7001 reachable ONLY from the validators, in THREE independent
+#     layers, all shipped closed: this unit's IPAddressDeny=any plus one
+#     IPAddressAllow= line per validator (add them below — as shipped, only
+#     localhost reaches the relay), a cloud/security-group rule
+#     restricting the port, and, if a host firewall is in use, one ufw
+#     ALLOWLIST line per validator IP (§4). NEVER `ufw allow 7001/tcp`, and
+#     never delete the IPAddress* lines to "make it work": both open the relay
+#     to the whole internet (audit S-16)
 #
 # The relay persists nothing and reads no config; everything in /opt is read
 # as a static binary, so ProtectSystem=strict is exact, not aspirational.
@@ -45,19 +49,51 @@ WorkingDirectory=/opt/b10coin
 # out here so the port the Pis dial and the port the relay binds are visibly
 # the same decision, in the same file. (NOTE: the relay's flag is --addr, not
 # --listen — --listen is the node command's optional direct-peer listener.)
+#
+# The binary REFUSES this wildcard address with no access token unless it is
+# told an external allowlist exists (audit S-16). The allowlist in this
+# deployment is the IPAddressDeny/IPAddressAllow pair below, which is why
+# --external-allowlist is passed in ExecStart. Add a token and the
+# acknowledgement becomes unnecessary (but remains harmless); remove the
+# IPAddress* lines and you must add a token instead.
 Environment=B10COIN_RELAY_ADDR=:7001
 # B10COIN_RELAY_TOKEN is the pre-shared access-token file (audit N-8). Leave it
-# EMPTY for the allowlist-only behaviour; set it (e.g. to
-# /var/lib/b10coin/relay.token, owned by b10coin, mode 0600) to require every
-# connection to present the token as its first frame. ProtectSystem=strict
-# leaves the file readable; the relay only compares its bytes.
+# EMPTY for the allowlist-only behaviour (the IPAddress* lines below); set it
+# (e.g. to /var/lib/b10coin/relay.token, owned by b10coin, mode 0600) to
+# require every connection to present the token as its first frame.
+# ProtectSystem=strict leaves the file readable; the relay only compares its
+# bytes. An empty value passes an empty --access-token-file, which the binary
+# reads as "no token".
 Environment=B10COIN_RELAY_TOKEN=
 
 ExecStart=/opt/b10coin/b10coin-relay --addr ${B10COIN_RELAY_ADDR} \
-    --access-token-file ${B10COIN_RELAY_TOKEN}
+    --access-token-file ${B10COIN_RELAY_TOKEN} \
+    --external-allowlist
 
 Restart=always
 RestartSec=5
+
+# --- The shipped relay is CLOSED (audit S-16) -------------------------------
+# Without this section the unit starts an UNAUTHENTICATED relay on every
+# interface: B10COIN_RELAY_ADDR is a wildcard and B10COIN_RELAY_TOKEN is empty,
+# so the only thing between a stranger and port 7001 was an optional ufw rule
+# the deploy README softened to "if your provider's UI can". The kernel-level
+# address filter is part of the same unit, so the default cannot be opened by
+# accident: with no IPAddressAllow= line for a validator, that validator's
+# frames are dropped by systemd before the relay sees them.
+#
+# ADD ONE LINE PER VALIDATOR, using the same IPs as the ufw allowlist in
+# scripts/deploy/README.md §4 (a Pi's OUTBOUND source address):
+#     IPAddressAllow=192.0.2.11
+#     IPAddressAllow=192.0.2.12
+#     IPAddressAllow=192.0.2.13
+# Debian 12 / Pi OS bookworm systemd supports both directives.
+#
+# localhost is allowed so the foreground smoke test in README §4 works from the
+# VPS itself; delete that line if you do not want it. The cloud security group
+# is still a second layer, not a replacement for this one.
+IPAddressDeny=any
+IPAddressAllow=localhost
 
 # The relay stores nothing anywhere: strict read-only filesystem, no home,
 # no temp files of its own beyond PrivateTmp's private scratch.

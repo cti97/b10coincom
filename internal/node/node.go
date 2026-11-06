@@ -47,15 +47,19 @@ func New(c *chain.Chain, proposer ed25519.PrivateKey, mp *mempool.Mempool) *Node
 // A transaction that cannot apply is evicted ALONE: it must not discard its
 // valid siblings, and it must not leave them to fail with it in a later
 // batch (Take removes everything it returned, so a transaction dropped here
-// is gone for good. Claims past MaxFaucetClaimsPerBlock are never returned -
-// they stay in the pool untouched, outside this eviction path entirely).
+// is gone for good - unless its nonce is merely AHEAD of the running state,
+// which is returned and re-added; see below and audit S-17. Claims past
+// MaxFaucetClaimsPerBlock are never returned - they stay in the pool
+// untouched, outside this eviction path entirely).
 //
-// Transactions the block's BYTE BUDGET could not hold are a different case and
-// are put straight back (audit S-3): they are valid and eligible, they simply
-// did not fit this block, and SelectApplicable reports them rather than
-// dropping them. The re-add happens BEFORE Build, while the pool's nonce floor
-// is still the pre-block one - a re-add after Append would be refused, because
-// the block that did not carry them moved the nonce floor past them.
+// Transactions the block could not take but that remain eligible are put
+// straight back: those the BYTE BUDGET could not hold (audit S-3) and those
+// whose nonce is still ahead of the running state (audit S-17). Both are valid
+// and eligible and belong in a later block, and SelectApplicable reports them
+// rather than dropping them. The re-add happens BEFORE Build, while the pool's
+// nonce floor is still the pre-block one - a re-add after Append would be
+// refused, because the block that did not carry them moved the nonce floor
+// past them (and a future-nonce transaction would be refused as spent).
 func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 	if timestamp == 0 {
 		timestamp = n.now().Unix()
@@ -66,20 +70,21 @@ func (n *Node) RunOnce(timestamp int64) (*types.Block, error) {
 	// a policy written twice here and there could drift into a fork. Only the
 	// bookkeeping around it is node's own.
 	candidates := n.mempool.Take(types.MaxTxsPerBlock)
-	valid, overBudget, err := n.chain.SelectApplicable(candidates)
+	valid, retry, err := n.chain.SelectApplicable(candidates)
 	if err != nil {
 		// Nothing applies at a state whose head+1 transition fails; park
 		// the candidates back in the mempool rather than lose them.
 		return nil, reAdd(n.mempool, candidates, err)
 	}
-	if len(overBudget) > 0 {
-		// Return the transactions the byte budget excluded. A failure here is
-		// reported rather than swallowed: it means the pool refused a
-		// transaction it had already admitted, so the block attempt is
-		// abandoned and everything still in hand goes back with it. Returning
-		// the error costs one tick; ignoring it would lose the transaction
-		// silently.
-		if rerr := reAdd(n.mempool, overBudget, nil); rerr != nil {
+	if len(retry) > 0 {
+		// Return everything this block could not carry but that is still
+		// eligible: the byte budget's tail and the nonce-ahead candidates
+		// (audit S-3, S-17). A failure here is reported rather than
+		// swallowed: it means the pool refused a transaction it had already
+		// admitted, so the block attempt is abandoned and everything still in
+		// hand goes back with it. Returning the error costs one tick; ignoring
+		// it would lose the transaction silently.
+		if rerr := reAdd(n.mempool, retry, nil); rerr != nil {
 			return nil, reAdd(n.mempool, valid, rerr)
 		}
 	}

@@ -102,18 +102,32 @@ const (
 	// outside the /tx limiter, so its reply size must not be a function of the
 	// state: a request may never ask for more than this, whatever it sends.
 	maxUnbondingLimit = 256
+	// maxUnbondingOffset bounds the parsed offset so the int conversion below
+	// is safe on every platform Go builds for, including 32-bit ones. The
+	// state bounds this list to UnbondingEpochs+2 records, so any offset this
+	// large is already past the end and means "empty window"; clamping it
+	// there loses no request a client could have meant, and it cannot wrap to
+	// a negative index (audit S-14).
+	maxUnbondingOffset = 1<<31 - 1
 )
 
 // unbondingWindow parses limit/offset. Absent values take the defaults; a
 // non-numeric, zero limit or an offset that is not a number is a client error
 // rather than a silently different window. A limit above maxUnbondingLimit is
 // clamped, not refused: the client asked for "as much as allowed".
+//
+// BOTH FIELDS PARSE AT 64 BITS and are clamped afterwards (audit S-14). A
+// 31-bit parse rejected 2^31 and above as "not a positive integer" - false
+// about the value and contrary to the clamp promise above. With a uint64 parse
+// the only refusals are values no count can be: zero limit, non-numeric,
+// negative, or above 2^64-1. The offset is additionally clamped to
+// maxUnbondingOffset so int(v) cannot overflow.
 func unbondingWindow(q url.Values) (offset, limit int, err error) {
 	limit = defaultUnbondingLimit
 	if raw := q.Get("limit"); raw != "" {
-		v, perr := strconv.ParseUint(raw, 10, 31)
+		v, perr := strconv.ParseUint(raw, 10, 64)
 		if perr != nil || v == 0 {
-			return 0, 0, errors.New("limit must be a positive integer")
+			return 0, 0, errors.New("limit must be a positive integer that fits in 64 bits")
 		}
 		if v > maxUnbondingLimit {
 			v = maxUnbondingLimit
@@ -121,9 +135,12 @@ func unbondingWindow(q url.Values) (offset, limit int, err error) {
 		limit = int(v)
 	}
 	if raw := q.Get("offset"); raw != "" {
-		v, perr := strconv.ParseUint(raw, 10, 31)
+		v, perr := strconv.ParseUint(raw, 10, 64)
 		if perr != nil {
-			return 0, 0, errors.New("offset must be a non-negative integer")
+			return 0, 0, errors.New("offset must be a non-negative integer that fits in 64 bits")
+		}
+		if v > maxUnbondingOffset {
+			v = maxUnbondingOffset
 		}
 		offset = int(v)
 	}
@@ -432,6 +449,23 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{"method not allowed"})
 		return
 	}
+	// /block performs the same store read as /history - one block, off the
+	// same mutex, allocating up to MaxBlockBytes - so it charges the same
+	// bucket and takes the same slot (audit R-1, S-8). The 429 and the 503
+	// below are /history's own sentences, so the two endpoints present ONE
+	// contract. The bucket is charged before the path is parsed or a block is
+	// read, exactly as in /history: a refused request costs a map lookup.
+	//
+	// The allowance inherited is the scan bucket's: a burst of 16 and 4/s per
+	// source, shared with /history and /explorer. That is far above an honest
+	// client polling its own node (one lookup per commit is a fraction of
+	// 4/s), and the endpoint is a per-height read, not the sync protocol -
+	// catch-up is the P2P BLOCK_SYNC path. A client that wants a long run of
+	// heights is exactly the amplification R-1 bounds, and it can pace itself.
+	if !s.scanLimiter.allow(sourceHost(r.RemoteAddr)) {
+		writeJSON(w, http.StatusTooManyRequests, errorResponse{"too many scans from this source"})
+		return
+	}
 	raw := strings.TrimPrefix(r.URL.Path, "/block/")
 	height, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil {
@@ -442,6 +476,17 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{"height not found"})
 		return
 	}
+	// The in-flight bound, taken exactly as /history takes it: never queued,
+	// so a busy node says 503 rather than piling another store read behind
+	// three abandoned ones. The head is memory-only, but the slot is taken for
+	// both paths so the bound covers the disk read a height behind head
+	// performs without a special case to get wrong.
+	release, ok := s.acquireScanSlot()
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{"the node is busy scanning for other clients; retry shortly"})
+		return
+	}
+	defer release()
 	// Only the head is held in memory; earlier blocks are read from disk.
 	b := s.chain.Head()
 	if height != b.Header.Height {

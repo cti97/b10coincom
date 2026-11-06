@@ -62,7 +62,7 @@ func main() {
 	case "withdraw":
 		err = cmdWithdraw(os.Args[2:])
 	case "version":
-		fmt.Println(version.Version)
+		err = cmdVersion(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -74,6 +74,31 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// cmdVersion prints the build identity: the semantic version plus, whenever
+// the build carries one, the VCS revision and the modification state. That
+// full line is the SAME token the node startup banner prints, so an operator
+// comparing three Pis can diff the two outputs character for character instead
+// of deciding whether two renderings name the same build (audit S-10).
+//
+// --short prints only the semantic version, and it exists for exactly one
+// caller: scripts/build-release.sh names every artifact with it. The version
+// must keep coming from the binary — a second constant in a shell script would
+// be the drift this repository keeps finding — but a change to the human
+// display must not be able to rename the release files or break the semver
+// assertion that guards them. A flag is the explicit interface; scraping the
+// display string would be the fragile one.
+func cmdVersion(args []string) error {
+	switch {
+	case len(args) == 0:
+		fmt.Println(version.Build().String())
+		return nil
+	case len(args) == 1 && args[0] == "--short":
+		fmt.Println(version.Version)
+		return nil
+	}
+	return fmt.Errorf("usage: b10coin version [--short]")
 }
 
 func usage() {
@@ -103,7 +128,8 @@ Usage:
                                                         Unbond all or part of the bond; a partial exit must leave MIN_STAKE or nothing
   b10coin withdraw --node URL --key PATH [--yes | --dry-run]
                                                         Release matured unbonding records to the spendable balance
-  b10coin version
+  b10coin version [--short]                             Print the build identity (version + VCS revision);
+                                                        --short prints only the semantic version, for scripts
 
 A node with --peers/--relay/--listen runs the M4 consensus committee over real
 TCP: --peers dials the other validators (or the relay), --relay dials the dumb
@@ -516,13 +542,48 @@ func getJSON(url string, into any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+		// The status line and the body are both the node's text: quote them so
+		// a reply cannot clear the screen or forge a line of this CLI's output
+		// on the read paths (/status, /account, /history) as well (audit S-13).
+		return fmt.Errorf("%s: %s", safeText(resp.Status), safeText(strings.TrimSpace(string(body))))
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(into)
 }
 
+// txidHexLen is the length of a hex-encoded 32-byte transaction ID.
+const txidHexLen = 64
+
+// validTxID reports whether s is exactly the canonical hex form of a 32-byte
+// transaction ID: 64 characters, all lowercase. This is not cosmetic. The txid
+// is the only string a signing verb prints as a RECEIPT, and it is printed
+// after the signature; the node chooses every byte of it. A node that returns
+// ANSI escapes or a newline in that field can erase the lines the CLI just
+// printed (including the ones saying what was signed) and write a forged
+// receipt in their place (audit S-13, the class W-2 closed for /history rows).
+// A value that is not a well-formed hash has no business being printed, and a
+// receipt this CLI cannot check must not be presented as one.
+func validTxID(s string) bool {
+	if len(s) != txidHexLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // postTxHex submits the canonical hex encoding of one transaction and
 // returns the node's txid.
+//
+// EVERY node-chosen string on this path is either validated or quoted. The
+// txid must be a canonical 32-byte hash (validTxID) or the submission is
+// refused; the error body and the HTTP status line (whose reason phrase the
+// server also chooses) go through safeText, so a hostile node cannot move the
+// cursor, clear the screen or start a new line inside an error message. There
+// is no raw echo of node bytes left on this path (audit S-13).
 func postTxHex(url string, raw []byte) (string, error) {
 	resp, err := claimHTTP.Post(url, "application/octet-stream", strings.NewReader(hex.EncodeToString(raw)))
 	if err != nil {
@@ -534,16 +595,20 @@ func postTxHex(url string, raw []byte) (string, error) {
 		Error string `json:"error"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
-		return "", fmt.Errorf("%s: unreadable reply: %w", resp.Status, err)
+		return "", fmt.Errorf("%s: unreadable reply: %w", safeText(resp.Status), err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		if out.Error != "" {
-			return "", fmt.Errorf("%s: %s", resp.Status, out.Error)
+			return "", fmt.Errorf("%s: %s", safeText(resp.Status), safeText(out.Error))
 		}
-		return "", fmt.Errorf("%s", resp.Status)
+		return "", fmt.Errorf("%s", safeText(resp.Status))
 	}
-	if out.TxID == "" {
-		return "", fmt.Errorf("%s: reply carried no txid", resp.Status)
+	if !validTxID(out.TxID) {
+		// The bad value is quoted, never echoed: it is exactly the string that
+		// must not reach the terminal raw, and quoting keeps its ESC/CR bytes
+		// visible as escapes instead of executing them.
+		return "", fmt.Errorf("%s: the node's reply carried a txid that is not 64 lowercase hex characters (%s); refusing to print it as a receipt",
+			safeText(resp.Status), safeText(out.TxID))
 	}
 	return out.TxID, nil
 }
@@ -1122,6 +1187,18 @@ func shutdownHTTP(s *http.Server) {
 	_ = s.Shutdown(ctx)
 }
 
+// startupLine is the first line a node prints: the build identity, the listen
+// address, the chain and the height. Both node paths — the single-node
+// producer and the consensus validator — print exactly this line, through this
+// function, so the identity an operator sees at startup cannot differ between
+// the two (audit S-10). The identity comes from version.Build, which reads the
+// toolchain's stamp; nothing here is a constant that could disagree with what
+// `b10coin version` says about the same binary.
+func startupLine(addr, chainID string, height uint64) string {
+	return fmt.Sprintf("b10coin %s listening on http://%s (chain %s, height %d)",
+		version.Build().String(), addr, chainID, height)
+}
+
 func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	// M1 nodes run the devnet genesis. The testnet genesis has no validator
 	// keys yet, so there is nothing to sign blocks with until M4.
@@ -1164,8 +1241,7 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 		close(shutdownDone)
 	}()
 
-	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
-		version.Version, ln.Addr(), c.Genesis().ChainID, c.Height())
+	fmt.Println(startupLine(ln.Addr().String(), c.Genesis().ChainID, c.Height()))
 
 	// A failed Serve must reach the shell as a failure, not as exit 0: the
 	// goroutine delivers its error into the buffered channel BEFORE calling
@@ -1389,8 +1465,7 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers,
 		close(shutdownDone)
 	}()
 
-	fmt.Printf("b10coin %s listening on http://%s (chain %s, height %d)\n",
-		version.Version, ln.Addr(), v.Chain().Genesis().ChainID, v.Height())
+	fmt.Println(startupLine(ln.Addr().String(), v.Chain().Genesis().ChainID, v.Height()))
 	dialDesc := "listening for inbound connections"
 	if len(dial) > 0 {
 		dialDesc = "dialled " + strings.Join(dial, " ")

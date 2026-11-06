@@ -186,17 +186,71 @@ jobs:
       # code that no Go test runs. The gate is `--severity=warning` so it fails
       # on real defects (warnings and errors) without turning pre-existing
       # info/style notes into a red CI; acceptance.sh and check-plan.sh are
-      # clean at the default severity too. shellcheck ships on GitHub's
-      # ubuntu-latest runner, but a MISSING shellcheck must never look like a
-      # clean lint: this step fails loudly rather than passing silently.
-      - name: shellcheck the scripts
+      # clean at the default severity too.
+      #
+      # PINNED (audit S-18). This was the one unpinned tool in an otherwise
+      # exactly-pinned gate: it came from the runner image (0.9.0-1 on
+      # ubuntu-24.04 when this was written), so a runner-image bump could change
+      # the verdict with NO tree change — and the twice-weekly cron's reporter
+      # would file that as "ci: scheduled lint job failed", i.e. as a code
+      # problem. The version and the digest are pinned here, the tarball is
+      # verified before it is unpacked, and the version the binary reports is
+      # asserted, so the verdict is a function of this file alone.
+      #
+      # TO BUMP (the same deliberate act as bumping staticcheck's @vX.Y.Z):
+      #   1. pick a release at https://github.com/koalaman/shellcheck/releases;
+      #   2. read its SHA-256 from GitHub itself, so the digest does not rest on
+      #      this comment being right:
+      #        curl -s https://api.github.com/repos/koalaman/shellcheck/releases/tags/vX.Y.Z \
+      #          | grep -A3 '"name": "shellcheck-vX.Y.Z.linux.x86_64.tar.gz"' | grep digest
+      #      (or compute it: `shasum -a 256 shellcheck-vX.Y.Z.linux.x86_64.tar.gz`)
+      #   3. update BOTH variables below, run this step on a branch, and fix or
+      #      record any new finding — a bump that reddens the gate is a finding
+      #      about this tree, not a reason to unpin.
+      # Every pin is checked, none is trusted: `curl -f` fails on a 404, the
+      # digest line fails on any other bytes, and the version assertion catches
+      # a tarball whose contents do not match its name.
+      - name: shellcheck the scripts (pinned)
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
         run: |
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            echo "::error::shellcheck is not installed; install it (apt-get install shellcheck). This gate must not pass silently."
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/$SHELLCHECK_VERSION/shellcheck-$SHELLCHECK_VERSION.linux.x86_64.tar.gz"
+          tarball="$RUNNER_TEMP/shellcheck-$SHELLCHECK_VERSION.tar.gz"
+          dir="$RUNNER_TEMP/shellcheck-$SHELLCHECK_VERSION"
+          if ! curl -fsSL --proto '=https' --tlsv1.2 -o "$tarball" "$url"; then
+            echo "::error::cannot download shellcheck $SHELLCHECK_VERSION from $url. This gate must not pass silently and must not fall back to the runner image's copy: fix the URL or bump the pin."
             exit 1
           fi
-          shellcheck --version
-          git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
+          if ! printf '%s  %s\n' "$SHELLCHECK_SHA256" "$tarball" | sha256sum -c -; then
+            echo "::error::$tarball does not match the pinned SHA-256. The download is not the artifact this gate was written against: do NOT update the digest to make this pass unless you are deliberately bumping the version."
+            exit 1
+          fi
+          mkdir -p "$dir"
+          tar -xzf "$tarball" -C "$dir" --strip-components=1
+          "$dir/shellcheck" --version
+          got=$("$dir/shellcheck" --version | awk '$1 == "version:" { print $2 }')
+          if [ "$got" != "${SHELLCHECK_VERSION#v}" ]; then
+            echo "::error::the pinned tarball runs shellcheck $got, not ${SHELLCHECK_VERSION#v}: the pin and the bytes disagree"
+            exit 1
+          fi
+          git ls-files -z '*.sh' | xargs -0 "$dir/shellcheck" --severity=warning
+      # THE PLAN GUARD'S PARITY HALF, over every plan (audit S-19). A fence edit
+      # can leave one task section unbalanced, which inverts parity for every
+      # section after it: the brief extractor then finds empty or bleeding
+      # briefs while the plan still looks fine. The guard existed but ran on
+      # nobody's machine but its author's, so a broken fence could reach a
+      # dispatch. --parity-only is the EXPLICIT opt-out from the guard's other
+      # half (task-brief extraction), whose scripts live in the operator's
+      # skill directory and are not in this repository; without the flag their
+      # absence is a failure, so no machine silently gets the weaker verdict.
+      - name: plan fence parity (docs/plans)
+        run: |
+          set -euo pipefail
+          for p in docs/plans/*.md; do
+            ./scripts/check-plan.sh --parity-only "$p"
+          done
       # `go mod tidy` must be a no-op on a committed tree: a graph tidy wants
       # to change means go.mod/go.sum lie about the build. The diff pins both.
       - name: go mod tidy leaves no diff
@@ -278,6 +332,61 @@ jobs:
       - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
       - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go vet ./...
 
+  # S-9's discovery half: every fuzz target runs for a bounded time, so a
+  # crasher is found here before a stranger finds it on the wire. Scheduled
+  # (the twice-weekly cron above) and on-demand (workflow_dispatch) rather
+  # than on every push: 9 targets x 60 s is ~10 minutes, worth paying twice a
+  # week and when an operator asks, not on every commit.
+  #
+  # THE BOUND IS `-fuzztime 60s` PER TARGET, not a timeout on the job: each
+  # target gets a full minute of mutation from its seeds, and a target that
+  # cannot start fails immediately. The job does not run on pushes, so it can
+  # never be the reason a PR looks red for a reason unrelated to its diff.
+  #
+  # A crasher is saved by the Go tool to
+  # `testdata/fuzz/<Target>/<hash>` in the target's package and the step goes
+  # red. COMMIT THAT FILE: it replays as an ordinary seed on every later run,
+  # so the corpus (not the job) is what stops the same input being re-found
+  # forever. The file is also the reproduction for the decoder fix - leaving
+  # the crasher only in CI's cache would lose it on the next cache eviction,
+  # and leaving the recover in without the fix would hide it (audit S-9).
+  #
+  # The recover in internal/transport/tcp and internal/relay is containment,
+  # not a reason to accept a finding: a crasher this job turns up is a bug to
+  # fix, and the fuzz run fails on it whether or not a reader would have
+  # caught it in production.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: fuzz every target for 60s
+        run: |
+          set -euo pipefail
+          bound=60s
+          # One target per line, `<Name> <package>`: -fuzz accepts exactly ONE
+          # matching target, so this cannot be one `go test ./...`.
+          targets=(
+            "FuzzDecodeVote ./internal/consensus"
+            "FuzzDecodeProposal ./internal/consensus"
+            "FuzzDecodeBlock ./internal/types"
+            "FuzzDecodeTx ./internal/types"
+            "FuzzReadFrame ./internal/wire"
+            "FuzzDecodeHello ./internal/wire"
+            "FuzzDecodeBlockSyncReq ./internal/wire"
+            "FuzzDecodeBlockSyncResp ./internal/wire"
+            "FuzzDecodePeerExchange ./internal/wire"
+          )
+          for entry in "${targets[@]}"; do
+            set -- $entry   # deliberate split: name then package
+            echo "::group::go test -run '^$' -fuzz '^$1$' -fuzztime $bound $2"
+            go test -run '^$' -fuzz "^$1\$" -fuzztime "$bound" "$2"
+            echo "::endgroup::"
+          done
+
   # The release: both binaries for all six targets in dist/ with SHA256SUMS.
   # scripts/build-release.sh owns the build flags AND the artifact assertions
   # (count == target count, every artifact file(1)-checked to report its own
@@ -285,15 +394,46 @@ jobs:
   # simply runs the one build story — replacing the single linux/arm64 job
   # this workflow carried since the Pi task. A regression that silently
   # produced only the host platform's binaries, or dropped one of the pair,
-  # fails HERE and not on a Pi flashed hours later. The job then UPLOADS the
-  # whole dist/ (audit B-2: it verified and threw the bytes away): a run's
-  # artifacts are retrievable instead of rebuilt, and BUILD-INFO names the
-  # toolchain and the reproducible flags that produced them.
+  # fails HERE and not on a Pi flashed hours later.
   #
-  # SIGNING BOUNDARY: SHA256SUMS is signed only if B10COIN_RELEASE_SIGN_KEY
-  # points at a minisign secret key. Add a repository secret holding the key
-  # file's bytes, write it to a runner temp file in a step here, and export the
-  # path; nothing signs without it and no key belongs in this repository.
+  # IDENTITY (audit S-10). The artifacts are built with `-buildvcs=auto`, so
+  # each one carries `vcs.revision`/`vcs.modified` and prints them in the
+  # banner and in `b10coin version`. The steps below assert that the stamp is
+  # really there: an anonymous artifact is the failure mode, and it must fail
+  # here rather than on three Pis that all call themselves 0.1.0. The stamp
+  # comes from the checkout, which is a full git working copy — the `test` job
+  # already builds with the same default in the same environment, so this is
+  # not a new dependency on the clone's shape.
+  #
+  # SIGNING (audit S-11). The old comment here told the reader to "add a
+  # repository secret ... write it to a runner temp file in a step here" and
+  # there was no such step and no `secrets.` reference anywhere in this file:
+  # the signing boundary was documented, never wired. It is wired now, and the
+  # key material is treated as the attack surface it is:
+  #   - the secret reaches the shell ONLY as an environment variable, never as
+  #     an interpolated `${{ secrets... }}` inside the script text (where a
+  #     secret containing a quote or a backtick would be parsed as code);
+  #   - it is written with `umask 077` into a 0700 mktemp directory under
+  #     $RUNNER_TEMP — OUTSIDE the workspace, so it cannot be picked up by a
+  #     build, a checksum, BUILD-INFO or the artifact upload — and the file's
+  #     0600 mode is asserted, not assumed;
+  #   - there is no `set -x` in this step and the secret is never an operand of
+  #     echo, so the log sees a PATH, never the material;
+  #   - an EXIT/INT/TERM trap removes the directory on every path, including
+  #     the failure path, so a red run does not leave a key on the runner;
+  #   - a signature that does not appear is a FAILURE. build-release.sh refuses
+  #     to finish an unsigned release when a key is set; the explicit check
+  #     here says so in the workflow's own words, and the signature is then
+  #     VERIFIED against the public key derived from the same secret, because a
+  #     .minisig that does not verify is worse than none at all.
+  #
+  # PUBLISH GATE (audit S-11). The artifact upload is TAG-ONLY. Before this, an
+  # unsigned dist/ from any branch or Dependabot bump was published under the
+  # name "b10coin-release", indistinguishable from the maintainer's. The build
+  # and its assertions still run on every push — that is the regression gate —
+  # but only a tag publishes, and the artifact name carries the tag AND the
+  # signing state, so an operator sees `...-signed` or `...-UNSIGNED` and never
+  # has to guess which build they are holding.
   release:
     runs-on: ubuntu-latest
     steps:
@@ -301,7 +441,77 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - run: make release
+      - name: build, sign and verify the release
+        id: release
+        env:
+          # An absent repository secret is an empty string, which is the
+          # unsigned path. Nothing about the key is interpolated into the
+          # script below; it travels as an environment variable.
+          SIGN_KEY_SECRET: ${{ secrets.B10COIN_RELEASE_SIGN_KEY }}
+        run: |
+          set -euo pipefail
+          # Outside $GITHUB_WORKSPACE on purpose: nothing here can be read by
+          # the build, swept into dist/, or uploaded.
+          keydir=$(mktemp -d "$RUNNER_TEMP/b10coin-signing.XXXXXX")
+          chmod 700 "$keydir"
+          trap 'rm -rf "$keydir"' EXIT INT TERM
+          signing=UNSIGNED
+          if [ -n "${SIGN_KEY_SECRET:-}" ]; then
+            keyfile="$keydir/b10coin.key"
+            # umask BEFORE the redirection, so the file is 0600 from creation.
+            ( umask 077; printf '%s' "$SIGN_KEY_SECRET" > "$keyfile" )
+            perm=$(stat -c '%a' "$keyfile")
+            if [ "$perm" != "600" ]; then
+              echo "::error::$keyfile is mode $perm, not 600. Refusing to use a signing key other local users can read."
+              exit 1
+            fi
+            # minisign is NOT on the ubuntu-latest image, so a wired secret
+            # alone would reproduce the S-11 defect one layer down: a signing
+            # path that cannot run. It is pinned by version AND digest, the
+            # same discipline as shellcheck (audit S-18); GitHub records no
+            # digest for this project's assets, so the value below was computed
+            # from the release asset itself and a wrong value fails CLOSED at
+            # the checksum line. Re-derive it before bumping:
+            #   curl -fsSL -O https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-linux.tar.gz
+            #   sha256sum minisign-0.12-linux.tar.gz
+            minisign_version=0.12
+            minisign_sha256=9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+            minisign_tar="$keydir/minisign.tar.gz"
+            minisign_url="https://github.com/jedisct1/minisign/releases/download/$minisign_version/minisign-$minisign_version-linux.tar.gz"
+            if ! curl -fsSL --proto '=https' --tlsv1.2 -o "$minisign_tar" "$minisign_url"; then
+              echo "::error::cannot download minisign $minisign_version from $minisign_url, so the supplied signing key cannot be used"
+              exit 1
+            fi
+            if ! printf '%s  %s\n' "$minisign_sha256" "$minisign_tar" | sha256sum -c -; then
+              echo "::error::$minisign_tar does not match the pinned SHA-256; refusing to run it"
+              exit 1
+            fi
+            tar -xzf "$minisign_tar" -C "$keydir"
+            export PATH="$keydir/minisign-linux/x86_64:$PATH"
+            # A passphrase-protected key would block on a prompt with no TTY
+            # here; `timeout` turns that from a hung job into a named failure.
+            # Deriving the public key first also proves the secret is a usable
+            # minisign key before anything is built or signed.
+            if ! timeout 30 minisign -R -s "$keyfile" -p "$keydir/verify.pub" >/dev/null; then
+              echo "::error::minisign cannot use the supplied key. A passphrase-protected key cannot work in CI (there is no TTY to prompt on): store an UNENCRYPTED minisign key in B10COIN_RELEASE_SIGN_KEY, or sign a release locally."
+              exit 1
+            fi
+            export B10COIN_RELEASE_SIGN_KEY="$keyfile"
+            signing=signed
+            echo "release signing: a key was supplied from the repository secret; SHA256SUMS will be signed"
+          else
+            echo "::warning::no B10COIN_RELEASE_SIGN_KEY secret is configured: this release's SHA256SUMS will be UNSIGNED and will say so"
+          fi
+          make release
+          if [ -n "${SIGN_KEY_SECRET:-}" ]; then
+            if [ ! -s dist/SHA256SUMS.minisig ]; then
+              echo "::error::a signing key was supplied but dist/SHA256SUMS.minisig is missing or empty. An unsigned release must never be published as if it were signed."
+              exit 1
+            fi
+            minisign -Vm dist/SHA256SUMS -p "$keydir/verify.pub"
+            echo "release signing: SHA256SUMS.minisig verified against the public key derived from the same secret"
+          fi
+          echo "signing=$signing" >> "$GITHUB_OUTPUT"
       - run: file dist/*
       # Belt over the script's internal assertion: exactly 12 b10coin-*
       # artifacts for 6 targets (BUILD-INFO is metadata, not a binary), and
@@ -310,12 +520,26 @@ jobs:
       - run: test "$(wc -l < dist/SHA256SUMS)" -eq 12
       # The toolchain record must exist and be non-empty (audit B-2).
       - run: grep -q '^toolchain go' dist/BUILD-INFO
-      - run: grep -q '^flags -trimpath -buildvcs=false$' dist/BUILD-INFO
+      # The flags line must be the flags the build was given — BUILD-INFO
+      # records the same variable the build line used, and this is where the
+      # two are compared (audit S-10 dropped -buildvcs=false; if that changes
+      # again, this is the line that should go red).
+      - run: grep -q '^flags -trimpath -buildvcs=auto$' dist/BUILD-INFO
+      # The build identity must be RECORDED, and recorded from the artifacts
+      # themselves (build-release.sh reads it back with `go version -m`). A
+      # release whose BUILD-INFO cannot name its commit is the S-10 failure.
+      - run: grep -Eq '^vcs\.revision [0-9a-f]{40,64}$' dist/BUILD-INFO
+      - run: grep -Eq '^vcs\.modified (true|false)$' dist/BUILD-INFO
       # Publish the artifacts (audit B-2). Pinned by commit SHA, like every
       # other action here; the comment names the tag it matches.
+      #
+      # TAG-ONLY (audit S-11): see the job comment above. `if-no-files-found`
+      # stays an error, and the name carries the tag and the signing state so
+      # a downloaded artifact is self-describing.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          name: b10coin-release
+          name: b10coin-release-${{ github.ref_name }}-${{ steps.release.outputs.signing }}
           path: dist/
           if-no-files-found: error
 
@@ -342,7 +566,7 @@ jobs:
     # ci.yml -f simulate_failure=true` is the whole procedure; delete the test
     # issue it files.
     if: always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.simulate_failure))
-    needs: [test, lint, release, cross]
+    needs: [test, lint, release, cross, fuzz]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -355,18 +579,22 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           RELEASE_RESULT: ${{ needs.release.result }}
           CROSS_RESULT: ${{ needs.cross.result }}
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
         run: |
           set -u
           # `lint` reports itself in-job (its govulncheck output is there); the
           # other jobs have no vuln output to classify, so each gets a generic
           # "scheduled <job> job failed" issue. Matrix legs of `cross` share one
           # title on purpose: one broken platform should not open six issues,
-          # and later legs comment on the first one.
-          for job in test release cross; do
+          # and later legs comment on the first one. `fuzz` is the S-9 crasher
+          # job: a scheduled fuzz failure is a decoder bug that must not go
+          # unseen, so it is in this loop for exactly the CI-1 reason.
+          for job in test release cross fuzz; do
             case "$job" in
               test)    result=$TEST_RESULT ;;
               release) result=$RELEASE_RESULT ;;
               cross)   result=$CROSS_RESULT ;;
+              fuzz)    result=$FUZZ_RESULT ;;
             esac
             if [ "$result" = failure ]; then
               REPORT_JOB=$job ./scripts/ci/file-toolchain-issue.sh \

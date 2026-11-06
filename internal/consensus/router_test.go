@@ -268,12 +268,15 @@ func (r *routerRig) signedProposal(height uint64, round uint32) *Proposal {
 
 // TestTheRouterDrivesEveryVerifiedConsensusMessage requires committee-signed
 // prevote, precommit and proposal frames to come back TRUE (the engine's to
-// consume) even though the router carries a live syncer: the consensus
-// branches run FIRST, so a verified consensus frame can never be re-parsed as
-// the same-tagged wire frame - prevote and BLOCK_SYNC_REQ share tag 2,
-// precommit and BLOCK_SYNC_RESP share tag 3, proposal and HELLO share tag 1.
-// Routing by tag alone would deliver every vote into the sync layer; this is
-// the hazard's direct pin.
+// consume) even though the router carries a live syncer.
+//
+// Audit N-5 renumbered the wire tags into a disjoint range (0x80 upward), so a
+// wire frame now fails the consensus branches on its FIRST byte: prevote 2 vs
+// BLOCK_SYNC_REQ 0x81, precommit 3 vs BLOCK_SYNC_RESP 0x82, proposal 1 vs HELLO
+// 0x80. Those collisions were real before the renumbering and are recorded
+// here because the VERIFIED-DECODE discipline they forced is still the rule:
+// a tag is a claim about bytes, and classification stays a full decode (plus a
+// verifying signature) rather than a tag comparison. This is the hazard's pin.
 func TestTheRouterDrivesEveryVerifiedConsensusMessage(t *testing.T) {
 	rig := newRouterRig(t)
 
@@ -303,14 +306,15 @@ func TestTheRouterDrivesEveryVerifiedConsensusMessage(t *testing.T) {
 }
 
 // TestTheRouterNeverMisroutesWireFrames pins the other direction: wire frames
-// whose first byte sits inside the consensus tag range must land in the WIRE
-// branches. The signed request here decodes as a prevote-shaped byte stream
-// (the same tag 2) far enough that only the SIGNATURE check keeps the
-// classification honest; a bare-tag router would have fed it to the engine.
+// must land in the WIRE branches. Since audit N-5 their tags are disjoint from
+// the consensus union (0x80+), which is what makes a wire frame fail the
+// consensus branches immediately; the signed-request case below is the harder
+// shape (a prevote-sized byte stream) and stays decided by the decode plus the
+// SIGNATURE check, never by a tag.
 func TestTheRouterNeverMisroutesWireFrames(t *testing.T) {
 	rig := newRouterRig(t)
 
-	// HELLO (tag 1 - the proposal's tag).
+	// HELLO (tag 0x80, disjoint from the proposal tag 1 since audit N-5).
 	h := &wire.Hello{ChainID: "b10coin-router-test", Validator: testCommitteeKey(0).Public().(ed25519PublicKey), Height: 12}
 	hh := routerTestHelloHash(h)
 	h.Sig = crypto.Sign(rig.priv, hh[:])
@@ -318,7 +322,7 @@ func TestTheRouterNeverMisroutesWireFrames(t *testing.T) {
 		t.Fatal("a HELLO was routed to the engine: the proposal branch accepted wire bytes")
 	}
 
-	// BLOCK_SYNC_REQ (tag 2 - the prevote's tag), from a signed member; the
+	// BLOCK_SYNC_REQ (tag 0x81, disjoint from the prevote tag 2), from a signed member; the
 	// reply goes back to the asker.
 	req := &wire.BlockSyncReq{From: 1, To: 1, Requester: testCommitteeKey(0).Public().(ed25519PublicKey)}
 	q := syncReqHash(req)
@@ -349,7 +353,7 @@ func TestTheRouterNeverMisroutesWireFrames(t *testing.T) {
 		t.Fatalf("a stranger's request produced %d replies, want 0: Handle's refusal must be silence", got)
 	}
 
-	// BLOCK_SYNC_RESP (tag 3 - the precommit's tag): filed for the pull.
+	// BLOCK_SYNC_RESP (tag 0x82, disjoint from the precommit tag 3): filed for the pull.
 	if got := rig.rt.Route(transport.Message{From: "v1", Data: wire.EncodeBlockSyncResp(&wire.BlockSyncResp{})}); got {
 		t.Fatal("a BLOCK_SYNC response was routed to the engine")
 	}

@@ -59,12 +59,47 @@ package consensus
 // for garbage is the protocol-error posture everywhere else in this package.
 
 import (
+	"encoding/binary"
 	"sync/atomic"
 
 	"github.com/cti97/b10coincom/internal/genesis"
 	"github.com/cti97/b10coincom/internal/transport"
 	"github.com/cti97/b10coincom/internal/wire"
 )
+
+// The proposal envelope's fixed prefix (audit S-5), and why reading it before
+// decoding the block is safe rather than a guessed offset.
+//
+// EncodeProposal writes, in order: the one-byte message tag, Height as a
+// fixed-width 8-byte big-endian uint64, Round as 4 fixed bytes, and only THEN
+// the length-prefixed block. Nothing before Height is variable-width, and the
+// transport hands Route the frame's PAYLOAD with its wire length prefix already
+// stripped (wire.ReadFrame), so Height sits at a constant offset from the front
+// of Message.Data for every proposal that can decode at all.
+//
+// The peek is therefore exact, not heuristic: for any frame DecodeProposal
+// accepts, big-endian data[1:9] IS p.Height, because DecodeProposal reads those
+// same nine bytes in the same order.
+// TestProposalHeightPeekAgreesWithTheDecodedEnvelope pins the agreement across
+// heights, rounds and block sizes, so a future change to the envelope's field
+// order fails loudly there instead of silently rejecting honest proposals.
+const (
+	proposalHeightOffset = 1
+	proposalHeightBytes  = 8
+	proposalPrefixBytes  = proposalHeightOffset + proposalHeightBytes
+)
+
+// peekProposalHeight reads a proposal envelope's Height WITHOUT decoding the
+// block, and reports whether data has the shape that makes the read valid: the
+// proposal tag and at least the fixed prefix. ok=false means "not a proposal,
+// or too short to hold one", and the caller must fall through to the decoders,
+// which name the malformed field themselves.
+func peekProposalHeight(data []byte) (height uint64, ok bool) {
+	if len(data) < proposalPrefixBytes || MsgType(data[0]) != MsgProposal {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(data[proposalHeightOffset:proposalPrefixBytes]), true
+}
 
 // MessageRouter dispatches one transport message by what it verifies as.
 //
@@ -135,8 +170,9 @@ type MessageRouter struct {
 	// how the mesh is forming, never whether the chain is advancing.
 	peerExchanges atomic.Uint64
 	// refused counts consensus-tagged frames this router refused before any
-	// signature verification: a non-member's key, or a vote whose height the
-	// live engine cannot judge. A steady nonzero count on a healthy committee
+	// signature verification: a non-member's key, a vote whose height the live
+	// engine cannot judge, or (audit S-5) a proposal whose PEEKED height is
+	// outside that same window. A steady nonzero count on a healthy committee
 	// means a peer is sending frames for a chain this node is not on (or a
 	// stranger reached the port); zero is the healthy value.
 	refused atomic.Uint64
@@ -204,6 +240,39 @@ func (r *MessageRouter) voteHeightInWindow(height uint64) (ok, known bool) {
 	return height == head || height == head+1, true
 }
 
+// proposalHeightInWindow reports whether a proposal at height could still be
+// acted on by the live engine, and whether a local head height is known.
+//
+// It is DELIBERATELY the vote window, not a separate one. The driver builds its
+// engine for chain head + 1 (Driver.newEngine judges that height), so the height
+// an honest proposer proposes at is exactly head+1; head is the height this node
+// has just committed, and a proposal for it is stale - the engine returns nil
+// without touching state - but it is not a frame to silently refuse, since votes
+// at head are still tallied into the commit that finishes it. Nothing ABOVE
+// head+1 can be acted on: the engine drops any p.Height != its own, and unlike a
+// future ROUND at the same height (bufferProposal) there is no future-height
+// buffering anywhere.
+//
+// So this filter cannot reject a proposal the engine would otherwise ACCEPT: it
+// contains the engine's own height by construction (engine height == head+1), and
+// every height it drops is one the engine answers with a nil return and no state
+// change. TestAnHonestProposalAtTheLiveHeightIsStillPrevoted pins the acceptance
+// half end to end; TestTheProposalHeightWindowContainsTheEngineHeight pins the
+// containment.
+//
+// THE ONE TRANSIENT, stated rather than hidden: after a catch-up pull adopts
+// blocks, the chain head moves before rebuildDriver replaces the engine
+// (devnet.tcpnode's documented handoff), so for that instant the engine judges a
+// height the window no longer contains. A proposal there is dropped by this gate
+// where it used to reach the stale engine - and the stale engine could only
+// prevote a height the chain has ALREADY decided, whose Append fails and whose
+// round state the rebuild discards. A pull that adopts exactly one block leaves
+// the stale engine's height equal to the new head, which IS inside the window, so
+// the ordinary one-behind case is unchanged.
+func (r *MessageRouter) proposalHeightInWindow(height uint64) (ok, known bool) {
+	return r.voteHeightInWindow(height)
+}
+
 // voteDedupKey is the dedup key a decoded vote records.
 func voteDedupKey(v *Vote) transport.VoteKey {
 	return transport.VoteKey{
@@ -233,6 +302,39 @@ func proposalDedupKey(p *Proposal) transport.VoteKey {
 // false for HELLO and BLOCK_SYNC traffic consumed here and for frames that
 // decode as nothing (counted, dropped).
 func (r *MessageRouter) Route(m transport.Message) bool {
+	// READ A PROPOSAL'S HEIGHT BEFORE DECODING ITS BLOCK (audit S-5). The
+	// proposal branch below used to decode a whole block - up to the frame bound
+	// - before ANY height or membership check, because the proposer key is the
+	// envelope's LAST field and only a decoded envelope names it. One dispatch
+	// mutex serialises every reader (TcpTransport.dispatch holds dispatchMu
+	// across every OnMessage), so each decode stalled every consensus frame
+	// behind it, and a peer could force one per frame at distinct (height, round)
+	// pairs: dedup cannot help, because its key needs the validator identity the
+	// decode yields.
+	//
+	// The height needs none of that: it sits in the fixed prefix
+	// (proposalHeightOffset), so the two-height window the vote branch already
+	// uses can be applied first and a foreign-height proposal dropped without
+	// touching its block. That is what makes this cheap and this is why it runs
+	// FIRST: a refused frame costs one compare and zero allocations.
+	//
+	// This is a REJECTION filter, never a classification - the discipline
+	// DecodeVote exists to keep. The byte it keys on is the proposal tag (1),
+	// which DecodeProposal itself demands and which NO other branch accepts:
+	// votes are 2/3, wire frames are >= 0x80. So it can only ever drop frames
+	// the proposal branch would have handled, and proposalHeightInWindow drops
+	// only heights the live engine answers with a nil return and no state change.
+	//
+	// One observable changes: a frame that both fails to decode AND names a
+	// foreign height now lands in RefusedBeforeVerify instead of UnknownDropped.
+	// The bytes are dropped either way; both counters are diagnostics, never
+	// decisions.
+	if h, ok := peekProposalHeight(m.Data); ok {
+		if inWindow, known := r.proposalHeightInWindow(h); known && !inWindow {
+			r.refused.Add(1)
+			return false
+		}
+	}
 	// Consensus first. The two unions are tag-disjoint (audit N-5), so a wire
 	// frame fails these branches on its first byte. Within them the ORDER is
 	// the audit C-8 fix: the two free checks - is the carried key a committee
@@ -291,11 +393,13 @@ func (r *MessageRouter) Route(m transport.Message) bool {
 		}
 	}
 	if p, err := DecodeProposal(m.Data); err == nil {
-		// The proposer key is inside the proposal, after the block, so the
-		// decode is unavoidable; the membership check still runs before the
-		// signature, which is the expensive part of judging the decoded frame
-		// (audit C-8). A non-member's proposal costs one decode, never a
-		// verification, and never reaches the engine.
+		// The proposer key is inside the proposal, after the block, so a decode
+		// is still unavoidable to check MEMBERSHIP; the membership check still
+		// runs before the signature, which is the expensive part of judging the
+		// decoded frame (audit C-8). A non-member's proposal costs one decode,
+		// never a verification, and never reaches the engine. The height gate
+		// at the top of Route is what stops a foreign-height block from costing
+		// that decode at all (audit S-5).
 		if member, known := r.isMemberAt(p.Validator, p.Height); known && !member {
 			r.refused.Add(1)
 			return false

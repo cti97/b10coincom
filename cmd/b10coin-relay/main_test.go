@@ -49,6 +49,7 @@ func TestRunHelpPrintsTheTrustTrade(t *testing.T) {
 		"32 x (2 MiB + 4096 x 32 B + 2 x 1 MiB) = 32 x 4.125 MiB",
 		"= 132 MiB",
 		"--access-token-file",
+		"--external-allowlist",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("--help is missing %q - an operator would not see it", want)
@@ -82,7 +83,10 @@ func TestRunBadInvocationsExitTwo(t *testing.T) {
 // every flag override must land on the right Options field.
 func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 	var stderr bytes.Buffer
-	addr, opts, err := parseArgs(nil, &stderr)
+	// --external-allowlist because the point of this test is the flag wiring,
+	// not the default bind posture; the refusal itself is pinned by
+	// TestAWildcardBindWithNoCredentialsIsRefused.
+	addr, opts, err := parseArgs([]string{"--external-allowlist"}, &stderr)
 	if err != nil {
 		t.Fatalf("parseArgs() with no args: %v", err)
 	}
@@ -145,7 +149,7 @@ func TestParseArgsWiresFlagsOntoRelayOptions(t *testing.T) {
 
 	// A zero is a deliberate convention ("use the default", relay.Options'
 	// contract) and must pass through untouched, not become some other value.
-	_, opts, err = parseArgs([]string{"--read-timeout", "0", "--keepalive", "0", "--write-timeout", "0", "--max-conns-per-ip", "0", "--write-queue-bytes", "0", "--write-queue-frames", "0", "--access-timeout", "0"}, &stderr2)
+	_, opts, err = parseArgs([]string{"--read-timeout", "0", "--keepalive", "0", "--write-timeout", "0", "--max-conns-per-ip", "0", "--write-queue-bytes", "0", "--write-queue-frames", "0", "--access-timeout", "0", "--external-allowlist"}, &stderr2)
 	if err != nil {
 		t.Fatalf("parseArgs(zeros): %v", err)
 	}
@@ -211,6 +215,78 @@ func TestParseArgsReadsTheAccessTokenFile(t *testing.T) {
 	}
 	if _, _, err := parseArgs([]string{"--access-token-file", emptyPath}, &stderr); err == nil {
 		t.Fatal("an empty access-token file was accepted")
+	}
+}
+
+// TestAWildcardBindWithNoCredentialsIsRefused pins audit S-16's binary half:
+// the shipped default was ":7001" with no token, protected only by a firewall
+// rule the deploy README softened to "if your provider's UI can". A wildcard
+// bind with no token now needs the operator to acknowledge an external
+// allowlist; the refusal arrives before any listener exists and names the
+// in-process remedy.
+func TestAWildcardBindWithNoCredentialsIsRefused(t *testing.T) {
+	var stderr bytes.Buffer
+	for _, addr := range []string{":7001", "0.0.0.0:7001", "[::]:7001", ""} {
+		_, _, err := parseArgs([]string{"--addr", addr}, &stderr)
+		if err == nil {
+			t.Fatalf("--addr %q with no token started an unauthenticated relay on every interface", addr)
+		}
+		if !strings.Contains(err.Error(), "--access-token-file") {
+			t.Errorf("--addr %q refusal does not name --access-token-file: %v", addr, err)
+		}
+		if !strings.Contains(err.Error(), "--external-allowlist") {
+			t.Errorf("--addr %q refusal does not name the allowlist acknowledgement: %v", addr, err)
+		}
+	}
+
+	// A specific address is not world-reachable by default, so it is allowed.
+	if _, _, err := parseArgs([]string{"--addr", "127.0.0.1:7001"}, &stderr); err != nil {
+		t.Fatalf("a loopback bind with no token was refused: %v", err)
+	}
+
+	// The allowlist-only deployment is still available, one acknowledgement.
+	if _, _, err := parseArgs([]string{"--addr", ":7001", "--external-allowlist"}, &stderr); err != nil {
+		t.Fatalf("--external-allowlist did not permit the documented allowlist-only relay: %v", err)
+	}
+
+	// THE SHIPPED UNIT'S EXACT ARGV, including the empty token path the unit's
+	// empty Environment variable expands to: it must parse.
+	unitArgv := []string{"--addr", ":7001", "--access-token-file", "", "--external-allowlist"}
+	if _, _, err := parseArgs(unitArgv, &stderr); err != nil {
+		t.Fatalf("the shipped unit's argv is refused: %v", err)
+	}
+
+	// And a token makes the acknowledgement unnecessary.
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("shared-secret-enough"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := parseArgs([]string{"--addr", ":7001", "--access-token-file", tokenPath}, &stderr); err != nil {
+		t.Fatalf("a token-configured wildcard relay was refused: %v", err)
+	}
+}
+
+// TestRunRefusesAnOpenWildcardRelay is the same policy through run(): the bad
+// invocation code, the remedy on stderr, and no startup line on stdout - so a
+// script that started the relay and watched stdout cannot mistake the refusal
+// for a running relay.
+//
+// The port is deliberately INVALID. The address is still a wildcard, so the
+// refusal is the only reason a correct binary stops here; if the guard ever
+// regresses this call reaches net.Listen and fails on the port at once, instead
+// of binding a real one and blocking the suite in run's serve loop.
+func TestRunRefusesAnOpenWildcardRelay(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--addr", ":999999"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("an open wildcard relay exited %d, want 2 (the bad-invocation code)", code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("the refused relay printed a startup line: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--access-token-file") {
+		t.Fatalf("the refusal did not name the remedy: %q", stderr.String())
 	}
 }
 

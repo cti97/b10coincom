@@ -114,26 +114,57 @@ Two answers are likely:
 Copy the binaries to the machine that runs each, then install (the static
 binaries need no runtime packages; current 64-bit Raspberry Pi OS and any
 current Debian/Ubuntu VPS run them as-is — the relay "as-is" only once it is
-the architecture-matched file from the branch above). **Copy `bin/SHA256SUMS`
+the architecture-matched file from the branch above). **Copy the checksum file
 too, and verify on the target before installing** — `scripts/deploy/build.sh`
-writes it over the stable names it produced, and the target check is what
-turns "I copied the right bytes" from a hope into a check (audit B-2;
-`--ignore-missing` lets the one checksum file serve a machine that received
-only some of the artifacts):
+writes one per target, over exactly the two stable-name files that run built,
+and the target check is what turns "I copied the right bytes" from a hope into
+a check (audit B-2, S-11).
+
+The file is `bin/SHA256SUMS-linux-arm64` for the Pi pair and
+`bin/SHA256SUMS-linux-amd64` for the amd64 VPS pair — one per build, not one
+shared file with `--ignore-missing`. That flag is why the old recipe verified
+nothing: on a Pi that received only the node binary it **silently skipped the
+relay line**, so "checksums OK" was printed by a check that had not checked the
+file you were about to install. A missing entry must be a refusal, not a pass.
+
+If `scripts/deploy/build.sh` was run with `B10COIN_RELEASE_SIGN_KEY` set (see
+`make release` in the top-level README), a `bin/SHA256SUMS-linux-arm64.minisig`
+sits beside the file. **Copy it and `b10coin.pub` too, and verify the signature
+FIRST** — a checksum file proves only that the bytes did not rot on the way; it
+cannot prove who built them, because whoever could replace the binary could
+replace the checksum as well. The signature is the only one of the two that
+answers that:
 
 ```sh
 # from the build machine — replace pi@ and vps@ with your real SSH targets
-scp bin/SHA256SUMS bin/b10coin-relay-linux-amd64 vps@example.com:/tmp/    # x86_64 VPS (uname -m above)
-# scp bin/SHA256SUMS bin/b10coin-relay-linux-arm64 vps@example.com:/tmp/  # aarch64 VPS: that line instead
+scp bin/SHA256SUMS-linux-amd64 bin/b10coin-relay-linux-amd64 vps@example.com:/tmp/    # x86_64 VPS (uname -m above)
+# scp bin/SHA256SUMS-linux-arm64 bin/b10coin-relay-linux-arm64 vps@example.com:/tmp/  # aarch64 VPS: that line instead
 for p in 192.0.2.11 192.0.2.12 192.0.2.13; do
-    scp bin/SHA256SUMS bin/b10coin-linux-arm64 pi@$p:/tmp/
+    scp bin/SHA256SUMS-linux-arm64 bin/b10coin-linux-arm64 pi@$p:/tmp/
 done
+# only when the build was signed — the .minisig and the published key:
+# scp bin/SHA256SUMS-linux-arm64.minisig b10coin.pub pi@$p:/tmp/
 ```
 
-On the VPS (verify FIRST; a mismatch stops the install):
+On the VPS (verify FIRST; a mismatch stops the install). Step 1 verifies the
+signature **when one was copied**; step 2 checks the one artifact you are about
+to install, naming it:
 
 ```sh
-cd /tmp && sha256sum -c --ignore-missing SHA256SUMS
+cd /tmp
+# 1. signature over the checksum file itself; a no-op only when the build was unsigned
+if [ -f SHA256SUMS-linux-amd64.minisig ]; then minisign -Vm SHA256SUMS-linux-amd64 -p b10coin.pub; fi
+# 2. the named artifact. This form FAILS CLOSED: GNU sha256sum -c exits 0 on
+#    EMPTY input, so a bare `grep ... | sha256sum -c -` would pass when the
+#    entry is missing — the same silent skip as --ignore-missing, one layer down.
+sums=SHA256SUMS-linux-amd64 name=b10coin-relay-linux-amd64
+line=$(grep -E "^[0-9a-f]{64}  $name\$" "$sums") || line=
+if [ -z "$line" ]; then
+    echo "REFUSED: $sums has no checksum for $name" >&2
+    false
+else
+    printf '%s\n' "$line" | sha256sum -c -
+fi
 sudo useradd --system --home-dir /var/lib/b10coin --shell /usr/sbin/nologin b10coin || true
 sudo mkdir -p /opt/b10coin
 sudo install -m 0755 /tmp/b10coin-relay-linux-amd64 /opt/b10coin/b10coin-relay   # -arm64 on an aarch64 VPS
@@ -147,7 +178,16 @@ systemd's `StateDirectory` only guarantees the directory once the unit first
 starts:
 
 ```sh
-cd /tmp && sha256sum -c --ignore-missing SHA256SUMS
+cd /tmp
+if [ -f SHA256SUMS-linux-arm64.minisig ]; then minisign -Vm SHA256SUMS-linux-arm64 -p b10coin.pub; fi  # no-op when unsigned
+sums=SHA256SUMS-linux-arm64 name=b10coin-linux-arm64
+line=$(grep -E "^[0-9a-f]{64}  $name\$" "$sums") || line=
+if [ -z "$line" ]; then
+    echo "REFUSED: $sums has no checksum for $name" >&2
+    false
+else
+    printf '%s\n' "$line" | sha256sum -c -
+fi
 sudo useradd --system --home-dir /var/lib/b10coin --shell /usr/sbin/nologin b10coin || true
 sudo mkdir -p /opt/b10coin
 sudo install -m 0755 /tmp/b10coin-linux-arm64 /opt/b10coin/b10coin
@@ -330,10 +370,31 @@ stop and fix that before anything else, using the checklist in §8, failure 1.
 
 ## 4. The relay: address and how to run it
 
-On the VPS, in the foreground first:
+The relay ships CLOSED, in two independent layers (audit S-16). The systemd
+unit (§6) sets `IPAddressDeny=any` with only `localhost` allowed; add one
+`IPAddressAllow=<validator IP>` line per Pi. The binary itself refuses a
+wildcard `--addr` with no access token unless `--external-allowlist`
+acknowledges that an outside allowlist exists — the shipped unit passes it
+because it ships those `IPAddress*` lines. Neither layer can open by accident:
+with no `IPAddressAllow=` line a validator's frames are dropped before the
+relay sees them, and a bare `b10coin-relay` (no token, no acknowledgement)
+exits with the refusal below instead of listening.
+
+On the VPS, in the foreground first — the acknowledgement is required because
+a foreground run is outside the unit's address filter, so pass it only on a
+host whose security group or ufw rules already restrict 7001 to the
+validators (add the same addresses to the unit's `IPAddressAllow=` lines before
+the systemd start):
 
 ```sh
-sudo -u b10coin /opt/b10coin/b10coin-relay --addr :7001
+sudo -u b10coin /opt/b10coin/b10coin-relay --addr :7001 --external-allowlist
+```
+
+A bare start with no token and no acknowledgement refuses before it listens
+(exit 2, nothing on stdout):
+
+```
+refusing to listen on ":7001" with no access token: anyone who can reach that port can flood the relay and pin its connection slots (audit S-16). Set --access-token-file PATH, or, when an external allowlist already restricts the port to your validators (a cloud security group, a ufw rule, or the shipped unit's IPAddressDeny/IPAddressAllow), pass --external-allowlist to acknowledge it
 ```
 
 `--addr` is the relay's listen address (`:7001`, all interfaces, is the
@@ -365,12 +426,15 @@ slots from any one source prefix — an IPv6 `/64` or IPv4 `/24`) keeps a
 single host, or a whole routed prefix, from holding the registry.
 
 The address the Pis dial is `<VPS public IP or DNS name>:7001`. The VPS must
-allow inbound TCP 7001 **from the validators only** — both the cloud security
-group (restrict the source, or scope it to the validators' IPs if your
-provider's UI can) and, if enabled, the host firewall. The host-firewall step
-is an ALLOWLIST, one line per validator — its outbound source IP — and never
-a bare `ufw allow 7001/tcp` (the audit's A-1 found exactly that open rule in
-the previous revision of this recipe):
+allow inbound TCP 7001 **from the validators only**, in three layers: the
+unit's `IPAddressDeny=any` plus one `IPAddressAllow=` line per validator
+(below and in §6), the cloud security group, and — if enabled — the host
+firewall. Do not treat the security group as a replacement for the unit's
+filter: the unit is the layer that ships in this repository and cannot be
+forgotten by a provider's UI. The host-firewall step is an ALLOWLIST, one line
+per validator — its outbound source IP — and never a bare
+`ufw allow 7001/tcp` (the audit's A-1 found exactly that open rule in the
+previous revision of this recipe):
 
 ```sh
 # one ALLOWLIST line per validator — the Pi's outbound source IP
@@ -685,6 +749,11 @@ the relay unit assumes inbound TCP 7001 and writes nothing to disk. From the
 # VPS
 scp scripts/deploy/b10coin-relay.service vps@example.com:/tmp/
 sudo install -m 0644 /tmp/b10coin-relay.service /etc/systemd/system/
+# EDIT the unit before the first start: one IPAddressAllow= line per validator
+# (a Pi's outbound source IP, the same addresses as §4's ufw allowlist), next
+# to the shipped IPAddressDeny=any. Without them the relay starts CLOSED -
+# reachable from localhost only - which is the intended default (audit S-16).
+sudoedit /etc/systemd/system/b10coin-relay.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now b10coin-relay
 ```

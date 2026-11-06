@@ -23,12 +23,24 @@
 #     implementations word the same binary differently: Apple's file prints
 #     "Mach-O 64-bit executable x86_64" while upstream libmagic (every Linux,
 #     i.e. the CI release job) prints "Mach-O 64-bit x86_64 executable".
-#   - REPRODUCIBLE: every artifact is built with `-trimpath` (no checkout path
-#     baked into the binary) and `-buildvcs=false` (no VCS revision or dirty
-#     flag embedded), so two builds from the same clean tree on the same
-#     toolchain produce byte-identical files. dist/BUILD-INFO records the
-#     toolchain that actually ran and the exact flags, because go.mod's `go`
-#     and `toolchain` lines are a MINIMUM the go command may upgrade past.
+#   - IDENTIFIABLE: every artifact carries the toolchain's own VCS stamp --
+#     `vcs.revision` and `vcs.modified` in debug.ReadBuildInfo -- which is
+#     exactly what `b10coin version` and the node startup banner print at run
+#     time (audit S-10). A release therefore REQUIRES a git checkout: an
+#     artifact that cannot name its commit cannot tell an operator which build
+#     is on which machine, so this script refuses to call it a release.
+#   - REPRODUCIBLE: `-trimpath` records no checkout path, and the stamp adds no
+#     host-specific input either -- `vcs.revision` and `vcs.time` are values of
+#     the COMMIT, so two builds of the same tree on the same toolchain still
+#     produce byte-identical files. The cost of dropping `-buildvcs=false`,
+#     stated plainly: the bytes now depend on the tree's VCS state, so a git
+#     checkout and a source tarball of the SAME commit no longer agree byte for
+#     byte (only the checkout can be stamped), and a dirty tree's artifacts
+#     differ from the clean ones. The second is the point -- the difference is
+#     the signal -- and the first is a real narrowing of the old claim.
+#     dist/BUILD-INFO records the toolchain that actually ran, the exact flags
+#     and the stamp READ BACK OUT OF THE ARTIFACTS, because go.mod's `go` and
+#     `toolchain` lines are a MINIMUM the go command may upgrade past.
 #   - SIGNING BOUNDARY: SHA256SUMS is signed only when the operator supplies a
 #     minisign secret key (B10COIN_RELEASE_SIGN_KEY); the repository never
 #     contains one and the script never generates one. With no key the release
@@ -46,12 +58,17 @@ fail() {
 # nothing here is inferred from the host, so the list is the matrix.
 targets_all="darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64 windows/arm64"
 
-# The reproducible-build flags every artifact is built with (audit B-2):
-# -trimpath records no checkout path, and -buildvcs=false records no VCS
-# revision or dirty flag, so the toolchain has no host-specific input left to
-# embed. They are one variable so the build line and dist/BUILD-INFO cannot
-# disagree about what was actually passed.
-goflags="-trimpath -buildvcs=false"
+# The build flags every artifact is built with (audit B-2, S-10):
+# -trimpath records no checkout path, and -buildvcs=auto lets the toolchain
+# stamp the commit it is building from. `auto` rather than `true` on purpose:
+# `true` errors when VCS information is available but cannot be included, while
+# `auto` stamps when the build runs in a checkout and simply omits the stamp
+# elsewhere -- which keeps `go build`/`go run` working from a source tarball.
+# This script then ASSERTS the stamp is present (below), so a release still
+# cannot be anonymous; the strictness lives in the assertion, where it can
+# explain itself, rather than in a flag that just errors. They are one variable
+# so the build line and dist/BUILD-INFO cannot disagree about what was passed.
+goflags="-trimpath -buildvcs=auto"
 
 # Optional subset: `--only <os>/<arch>` for recipes that want exactly one
 # target (the Pi deployment build). The argument must name a DECLARED target,
@@ -75,7 +92,9 @@ expected=$((ntargets * 2))
 # The version comes from internal/version, read the only way that guarantees
 # it: ask the binary that `go build` produces from the same package. No
 # ldflags, no second constant, no parsing the source.
-version=$(go run ./cmd/b10coin version) || fail "cannot read the version from internal/version (go run ./cmd/b10coin version failed)"
+# --short is the machine interface: `b10coin version` also prints the build
+# identity, and artifact NAMES must not change when that display does.
+version=$(go run ./cmd/b10coin version --short) || fail "cannot read the version from internal/version (go run ./cmd/b10coin version --short failed)"
 printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
     fail "internal/version reported '$version', which is not semver x.y.z"
 
@@ -177,6 +196,39 @@ for t in $targets; do
     done
 done
 
+# THE BUILD IDENTITY (audit S-10). The stamp is read back OUT OF THE
+# ARTIFACTS, not out of the tree: `git rev-parse` here would record what the
+# checkout says even if the binaries had been built some other way, and the
+# whole point is that this record describes these bytes. `go version -m` parses
+# a binary (it does not run it), so one host can read every target.
+#
+# One release is one commit. Every artifact must carry the SAME revision: a
+# per-target difference would mean the matrix was built from mixed trees, which
+# is precisely the divergence an operator would otherwise meet as a fork.
+rev=""
+mod=""
+for t in $targets; do
+    os=${t%/*}
+    arch=${t#*/}
+    suffix=""
+    [ "$os" = "windows" ] && suffix=".exe"
+    for name in b10coin b10coin-relay; do
+        f="$stage/$name-$version-$os-$arch$suffix"
+        stamp=$(go version -m "$f" 2>/dev/null) || fail "go version -m cannot read $f, so its build identity cannot be recorded"
+        v=$(printf '%s\n' "$stamp" | sed -n 's/.*vcs\.revision=\([0-9a-f]\{7,64\}\).*/\1/p')
+        m=$(printf '%s\n' "$stamp" | sed -n 's/.*vcs\.modified=\([a-z]*\).*/\1/p')
+        if [ -z "$v" ]; then
+            fail "artifact $name-$os-$arch$suffix carries NO build identity (no vcs.revision in its build info). -buildvcs=auto stamps it only when the build runs inside a git checkout with git installed, so build the release from a checkout: three nodes on different commits print the same banner and fork without warning (audit S-10)."
+        fi
+        if [ -z "$rev" ]; then
+            rev=$v
+            mod=$m
+        elif [ "$v" != "$rev" ]; then
+            fail "artifact $name-$os-$arch$suffix carries revision $v but another artifact in this release carries $rev: this release was built from more than one tree"
+        fi
+    done
+done
+
 # Record HOW the artifacts were built (audit B-2). go.mod's `go` and
 # `toolchain` lines are a MINIMUM the go command may upgrade past, so the only
 # honest record of the toolchain that produced these bytes is what the go
@@ -184,6 +236,10 @@ done
 # record cannot drift from the build. BUILD-INFO is metadata, not an artifact:
 # SHA256SUMS below covers the binaries only, exactly the set `sha256sum -c`
 # verifies in dist/ and in the deployment recipe.
+#
+# It is a FIXED six-line record, and that is a security property, not a
+# formatting choice (audit S-11): nothing else is ever written here, so no
+# environment variable, no key path and no signing material can reach it.
 toolchain=$(go version) || fail "go version failed; cannot record the toolchain that built the release"
 goversion=$(go env GOVERSION) || fail "go env GOVERSION failed; cannot record the toolchain version"
 {
@@ -191,6 +247,8 @@ goversion=$(go env GOVERSION) || fail "go env GOVERSION failed; cannot record th
     printf 'go-env-goversion %s\n' "$goversion"
     printf 'flags %s\n' "$goflags"
     printf 'version %s\n' "$version"
+    printf 'vcs.revision %s\n' "$rev"
+    printf 'vcs.modified %s\n' "${mod:-unknown}"
 } > "$stage/BUILD-INFO" || fail "recording BUILD-INFO failed"
 
 # Checksums over EVERY artifact, relative to dist/ so `shasum -a 256 -c`
@@ -252,7 +310,10 @@ fi
 # Last step: install the staging directory as dist/. Nothing after this can fail.
 mv "$stage" dist
 
-echo "OK: $expected release artifacts for $ntargets target(s) in dist/ (version $version from internal/version), SHA256SUMS covers all; release $signing"
+echo "OK: $expected release artifacts for $ntargets target(s) in dist/ (version $version from internal/version, revision $rev, modified ${mod:-unknown}), SHA256SUMS covers all; release $signing"
+if [ "$mod" = "true" ]; then
+    echo "NOTE: the work tree had UNCOMMITTED CHANGES when this release was built, so every artifact reports 'rev $rev (modified)' and these bytes match no commit. Two builds of the same dirty tree are still identical to each other; a release is built from a clean checkout." >&2
+fi
 if [ "$signing" = "UNSIGNED" ]; then
     echo "NOTE: dist/SHA256SUMS is UNSIGNED. Install minisign and set B10COIN_RELEASE_SIGN_KEY to sign it (see this script's header); never commit the key." >&2
 fi

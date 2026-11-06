@@ -52,31 +52,39 @@ advisory is yours unless you prefer otherwise.
   the README and `b10coin-relay --help` state the bounds it does put on
   strangers. Reports that the documented bounds are *wrong or bypassable* (a
   pinned slot that is never reaped, memory beyond the stated ceiling) are in
-  scope and are exactly the class worth reporting.
+  scope and are exactly the class worth reporting. The relay binary's default
+  listen is all interfaces with no token; it refuses that combination unless
+  the operator sets `--access-token-file` or explicitly acknowledges an external
+  allowlist, and the shipped unit adds `IPAddressDeny=any` with one
+  `IPAddressAllow=` line per validator (audit S-16).
 - **The relay gate authenticates a ROLE, not an owner.** A node with
   `--relay-access-token-file` reads the relay's greeting, answers an HMAC over
-  the relay's per-connection challenge, and expects the accepted frame before
-  it registers the link. That defends against a relay started **without** a
-  token, and it never puts the token on the wire (a replay of the answer is
-  worthless on another connection). It does **not** defend against an attacker
-  who controls the endpoint `--relay` names: the node reads frames, not
-  provenance, so that endpoint can play the greeting, a challenge of its own and
-  the accepted frame, and then keep a link that was never gated. "The relay is
-  gated" describes this node's configuration, not who owns the address. The
-  gate answer is read under a fixed 32-byte bound (`wire.RelayGateMACBytes`),
-  never the frame bound (`wire.MaxFrameBytes`), and the relay still decodes
-  nothing on that path.
+  the relay's per-connection challenge, and expects the confirmation MAC over
+  that challenge and its own answer before it registers the link. That defends
+  against a relay started **without** a token, and it never puts the token on
+  the wire (a replay of the answer is worthless on another connection). It does
+  **not** bind the link to an owner: the node reads frames, not provenance. A
+  relay that does not hold the token cannot manufacture the confirmation, so the
+  reachable residual is an attacker who holds the token too, or who proxies this
+  node's proof to a genuine gated relay and carries that relay's confirmation
+  back — either way the endpoint `--relay` names is trusted by configuration.
+  "The relay is gated" describes this node's configuration, not who owns the
+  address. The gate answer is read
+  under a fixed 32-byte bound (`wire.RelayGateMACBytes`), never the frame bound
+  (`wire.MaxFrameBytes`), and the relay still decodes nothing on that path.
   (Audit PX-9: the *frame bound* item is fixed; the endpoint-trust boundary is
   the documented residual.)
-- **HELLO admission is a union, and a rotated-out genesis seat keeps it.** A
-  transport connection becomes a peer when a signed committee HELLO arrives on
-  it; membership is checked against the **union** of genesis, the committee at
-  the announced height and the committee at this node's head. The union is what
-  lets a rotated-in key reach a node that is still behind the boundary, and a
-  peer one boundary behind reach this node; the price is that a **genesis** seat
-  that rotation removed keeps *admission* for the life of the node — it can open
-  a connection and send bounded traffic forever. It cannot change state: every
-  frame still faces the router's per-height membership, and every block is
+- **HELLO admission is a union, and a rotated-out seat keeps it.** A transport
+  connection becomes a peer when a signed committee HELLO arrives on it;
+  membership is checked against the **union** of genesis, the committee at
+  the announced height, the committee at this node's head, and **every key that
+  has ever held a seat on this node's committed chain** (audit RT-3). The union
+  is what lets a rotated-in key reach a node that is still behind the boundary,
+  a peer one boundary behind reach this node, and a rotated-out key resynchronise
+  instead of freezing; the price is that **any** seat that rotation removed —
+  not only a genesis one — keeps *admission* for the life of the node. It can
+  open a connection and send bounded traffic forever. It cannot change state:
+  every frame still faces the router's per-height membership, and every block is
   adopted only through the certificate gate for its own height. Reports asking
   for a penalty or for "the evicted seat should be disconnected" describe a
   policy this branch documents rather than implements (audit PX-9, RT-3).
@@ -90,8 +98,14 @@ advisory is yours unless you prefer otherwise.
   Reports asking for a penalty, a forfeiture, or "the validator should lose its
   stake" describe a protocol change the plan deliberately leaves out of scope;
   the README's Staking section says so.
-- The claim command printing its ephemeral key to stdout: documented,
-  operator-visible, intentionally.
+- **The claim command's ephemeral key is printed only on request.** `b10coin
+  claim` prints the claimant address, the public key, the epoch, the
+  proof-of-work nonce and the txid. The ephemeral signing key is printed ONLY
+  when `--print-key` is given (the opt-in added in `2122d06`), because stdout
+  is captured by shells, CI logs and journalctl; a claim run WITHOUT that flag
+  that printed the key would be a bug, not documented behaviour. Reports that
+  any other verb, log line or error path leaks it are in scope, as is a
+  regression that prints it by default.
 
 ## Supported versions
 
@@ -106,8 +120,8 @@ Dependabot does not manage the `toolchain` directive, so **every Go patch
 release re-creates the failure until someone edits that line**.
 
 Any other failed job on a `schedule` run now files its own issue naming the job
-(`test`, `release`, `cross`), so a red cron is never silent; this section is the
-govulncheck procedure specifically. Before CI-1, only a govulncheck failure was
+(`test`, `release`, `cross`, `fuzz`), so a red cron is never silent; this
+section is the govulncheck procedure specifically. Before CI-1, only a govulncheck failure was
 reported, and `main` failed its scheduled release for days unnoticed.
 
 If the scheduled `lint` run fails and the findings are all in the **standard
