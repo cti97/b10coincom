@@ -126,6 +126,47 @@ machine id, so a re-run keeps its seat and two machines never share one.
 
 Watch it: `journalctl -u b10coin -f`, and `curl -s 127.0.0.1:8645/status`.
 
+---
+
+## 9. Five-hour soak (added after the fact, same run)
+
+The run in §1 was still going when this report was written. Five hours and fifteen
+minutes later, without a restart of any node or of the relay:
+
+```
+node       height 280,427 -> 280,521 while watched   (10 blocks/s live)
+           sustained 14.8 blocks/s over 5h15m  =  280,169 blocks
+relay      conns=3   forwarded=4,195,263   dropped=0   refused=0
+           unauthorized 140,522 -> 140,526   (+4 in five hours)
+           5.6 MiB RSS   ·   0 restarts   ·   0 OOM
+```
+
+**These are stronger figures than §1 and they supersede them.**
+
+- **280,169 blocks across three hosts on three networks, continuously, with no
+  halt, no fork and no stalled round.** The consensus ran for five hours.
+- **4,195,263 frames carried at ~222 frames/s with `dropped=0 refused=0`.** The
+  relay's queue bounds - the PX-4 byte bucket, the N-1 reserved lane, the
+  32-connection caps - held under sustained load.
+- **5.6 MiB resident after 4.2 million frames.** This is the most useful number
+  here: the relay's memory story is not "bounded by design" but *measured*, so the
+  `MaxPinnedBytes` arithmetic is confirmed rather than asserted. No leak.
+- **`unauthorized` moved by four in five hours.** On the broken build (§4) the same
+  counter climbed ~1,200 every 40 seconds. This is the gate fix, measured over
+  hours rather than minutes.
+
+### What the soak did not exercise
+
+**No node was restarted during the run.** That matters, because the one known
+liveness defect - a restarted node resuming at its persisted round, where the
+uncapped ladder costs ~43 s per round (§6) - is exactly what a soak with a restart
+would hit, and this run never did. A 24-hour soak that restarts one validator and
+confirms it rejoins is the missing evidence.
+
+The live rate also drifted: ~15 blocks/s at the start of the run, 10 in the final
+sample, 14.8 sustained. Nothing in the project measures block cadence over hours,
+so whether that drift is load, peer churn or something structural is unmeasured.
+
 ## 8. Next
 
 - **A third Raspberry Pi**, to make the hardware claim complete.

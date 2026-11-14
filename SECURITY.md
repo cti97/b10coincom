@@ -57,6 +57,18 @@ advisory is yours unless you prefer otherwise.
   the operator sets `--access-token-file` or explicitly acknowledges an external
   allowlist, and the shipped unit adds `IPAddressDeny=any` with one
   `IPAddressAllow=` line per validator (audit S-16).
+- **The relay token is a LIVENESS credential, not merely access control.**
+  Measured (`docs/audit-2026-11-14-relay-token-adversary.md`): a token holder
+  **cannot** forge a vote, commit a block or fork the chain - safety held
+  absolutely under a 2.1-million-frame flood, one history throughout. A token
+  holder **can** halt the committee at will, two ways: by occupying every
+  `--max-conns` slot so validators are refused at accept (total denial for as
+  long as they hold them), and by flooding frames until the 30 s write deadline
+  reaps the connections (continuous if they reconnect). **One leaked token is
+  therefore fleet-wide liveness compromise.** Treat it like a key: per-node
+  tokens where possible, rotate on any exposure, never in a shared command line
+  or a CI log.
+
 - **The relay gate authenticates a ROLE, not an owner.** A node with
   `--relay-access-token-file` reads the relay's greeting, answers an HMAC over
   the relay's per-connection challenge, and expects the confirmation MAC over
