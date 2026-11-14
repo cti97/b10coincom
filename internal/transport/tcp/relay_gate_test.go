@@ -1,6 +1,7 @@
 package tcp
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -445,6 +446,101 @@ func TestTheNodeGateHandshakeCompletesAgainstAGatingRelay(t *testing.T) {
 	waitPeersIs(t, tp, fmt.Sprintf("[%s]", RelayPeerName(addr)))
 	if got := rl.Stats().Unauthorized; got != 0 {
 		t.Fatalf("the relay counted %d unauthorized dials from a token holder", got)
+	}
+}
+
+// TestTheRelayDialPathIsAdmittedOnTheFirstAttempt is the pin the 2026-11-14
+// deployment outage was missing (docs/bug-2026-11-14-relay-gate.md). It drives
+// the REAL --relay dial path - the maintainer's net.Dial, adoptRelay, the gate
+// exchange - against a REAL relay socket, and requires FIRST-ATTEMPT admission:
+// one registered connection, zero unauthorized, zero accept-refusals.
+//
+// The backoff is an hour, so a first dial that failed could not be papered over
+// by a retry: with one attempt in the whole test, the peer either appears or
+// the test says the gate did not admit.
+func TestTheRelayDialPathIsAdmittedOnTheFirstAttempt(t *testing.T) {
+	token := []byte("a-shared-sixteen-byte-token")
+	rl := relay.New(relay.Options{AccessToken: token})
+	if err := rl.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	defer rl.Close()
+	addr := rl.Addr().String()
+
+	tp := listen(t, Options{
+		LocalID: "v0", RelayAccessToken: token,
+		HandshakeTimeout: 5 * time.Second,
+		BackoffBase:      time.Hour, BackoffMax: time.Hour, // exactly one dial
+		Rand: rand.New(rand.NewSource(3)),
+	})
+	if err := tp.AddRelay(addr); err != nil {
+		t.Fatalf("AddRelay: %v", err)
+	}
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", RelayPeerName(addr)))
+
+	// The node installed the link, so ask the relay the same question from its
+	// own side: exactly one connection, and nothing refused on the way in.
+	if got := rl.Stats().Conns; got != 1 {
+		t.Fatalf("the relay holds %d connections after the first dial, want 1: the gate did not admit on the first attempt", got)
+	}
+	if got := rl.Stats().Unauthorized; got != 0 {
+		t.Fatalf("the relay counted %d unauthorized dials from a token holder: the proof was not the first frame", got)
+	}
+	if got := rl.Stats().RefusedConns; got != 0 {
+		t.Fatalf("the relay refused %d connections at accept; the gate cannot admit what the caps drop", got)
+	}
+}
+
+// TestATokenlessRelayDialSendsNoIdentityFrame pins the wire fact the outage
+// turned on: a relay-mode connection announces NOTHING. A relay reads no peer
+// ID on that link - it names the connection relay:<addr> from the address the
+// node dialled - so an opening ID frame can only arrive where it does not
+// belong: a token-gated relay reads it as a short, wrong proof and refuses it
+// (the 2026-11-14 outage), and an ungated relay FORWARDS it to every other peer
+// as a bogus payload.
+//
+// The assertion is the forwarded frame itself. A plain connection is registered
+// at a token-less relay first, then a token-less transport dials it: before the
+// fix the sink received "v0" and the relay counted one forwarded frame, after
+// it neither happens.
+func TestATokenlessRelayDialSendsNoIdentityFrame(t *testing.T) {
+	rl := relay.New(relay.Options{})
+	if err := rl.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("relay listen: %v", err)
+	}
+	defer rl.Close()
+	addr := rl.Addr().String()
+
+	// The sink must be REGISTERED before the node dials: a relay forwards to
+	// the connections it holds at the instant a frame arrives, and a frame sent
+	// into the dial-to-register window is queued for nobody.
+	sink := rawDial(t, addr)
+	if err := sink.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the sink registering at the relay", 5*time.Second, func() bool {
+		return rl.Stats().Conns == 1
+	})
+
+	tp := listen(t, Options{
+		LocalID:     "v0",
+		BackoffBase: time.Hour, BackoffMax: time.Hour, // exactly one dial
+		Rand: rand.New(rand.NewSource(5)),
+	})
+	if err := tp.AddRelay(addr); err != nil {
+		t.Fatalf("AddRelay: %v", err)
+	}
+	waitPeersIs(t, tp, fmt.Sprintf("[%s]", RelayPeerName(addr)))
+
+	// Any frame the relay had been sent would be forwarded within its next
+	// read; the deadline is orders of magnitude longer than that.
+	if frame, err := wire.ReadFrame(bufio.NewReader(sink), 4096); err == nil {
+		t.Fatalf("the relay forwarded %d bytes (%q) from a relay-mode dial: a relay link announces no ID, so this frame is one a gate refuses (2 bytes where a 32-byte proof belongs)", len(frame), frame)
+	} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("the sink's read failed with %v; want a timeout, meaning nothing was forwarded", err)
+	}
+	if got := rl.Stats().Forwarded; got != 0 {
+		t.Fatalf("the relay forwarded %d frames from a relay-mode dial that sent nothing but its identity, want 0", got)
 	}
 }
 

@@ -545,14 +545,29 @@ thing with `sudo -u b10coin` for first contact):
 /opt/b10coin/b10coin node \
     --dir /var/lib/b10coin \
     --relay example.com:7001 \
+    --relay-access-token-file /var/lib/b10coin/relay.token \
     --genesis /var/lib/b10coin/committee.json \
     --key /var/lib/b10coin/b10coin.key
 ```
+
+**`--relay-access-token-file` is not optional when the relay gates.** §4 starts
+the relay with `--access-token-file`, so every node MUST present the same token
+here (§4 copies it to `/var/lib/b10coin/relay.token`, mode 0600). A node started
+without it does not fail at startup: it dials, the relay refuses it at the gate,
+and it redials while the relay's `unauthorized` counter climbs on the VPS — the
+node stays at height 0 with `peers=0[]`. That is the 2026-11-14
+outage (`docs/bug-2026-11-14-relay-gate.md`); since the fix, the node prints a
+startup warning when `--relay` is given with no token, and the relay logs the
+refusal with its reason. The shipped unit passes
+`--relay-access-token-file ${B10COIN_RELAY_TOKEN}`, so **set `B10COIN_RELAY_TOKEN`
+in `/etc/default/b10coin` to that path** (§6) — its empty default means "no
+token".
 
 | Flag | Meaning |
 |---|---|
 | `--dir` | this node's data directory — its chain database lives here. Each Pi keeps its own |
 | `--relay` | the VPS's `<host>:7001` from §4. All consensus traffic flows through it; this is the only address a home Pi needs to reach |
+| `--relay-access-token-file` | the relay's pre-shared token, copied from the VPS (§4). **Required when the relay runs with `--access-token-file`** — the shipped systemd unit takes it from `B10COIN_RELAY_TOKEN` (§6) |
 | `--genesis` | the shared committee file (§3.2) — the committee's public keys, the chain ID. **Byte-identical on all three Pis; final once the chain starts** |
 | `--key` | THIS machine's key file (§3.1) — unique per Pi; a key not listed in the committee file **refuses to start** rather than signing as a foreign seat |
 | `--http` (default `127.0.0.1:8645`) | RPC status endpoint, loopback-only by default. Read it via SSH (§7) rather than opening it to your LAN |

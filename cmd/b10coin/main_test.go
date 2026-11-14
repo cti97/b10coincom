@@ -236,6 +236,48 @@ func findDuplicatePort(ports []int) (int, int) {
 	return -1, -1
 }
 
+// TestRelayNoTokenWarning pins the startup line that names the 2026-11-14
+// outage's actual trigger (docs/bug-2026-11-14-relay-gate.md): the shipped node
+// unit defaults B10COIN_RELAY_TOKEN to empty, and an empty token means a node
+// dialling a relay that gates is refused at the gate forever with no line of its
+// own. The warning must appear exactly when a relay is dialled with no token,
+// and must name both flags an operator can set.
+func TestRelayNoTokenWarning(t *testing.T) {
+	cases := []struct {
+		name   string
+		relays []string
+		token  []byte
+		warn   bool
+	}{
+		{"no relay at all", nil, nil, false},
+		{"relay with a token", []string{"relay.example.com:7001"}, []byte("a-real-token"), false},
+		{"relay with no token", []string{"relay.example.com:7001"}, nil, true},
+		{"relay with an empty token", []string{"relay.example.com:7001"}, []byte{}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := relayNoTokenWarning(tc.relays, tc.token)
+			if !tc.warn {
+				if got != "" {
+					t.Fatalf("relayNoTokenWarning = %q, want no warning", got)
+				}
+				return
+			}
+			for _, want := range []string{
+				"NO access token",
+				"--relay-access-token-file", // the node-side flag
+				"B10COIN_RELAY_TOKEN",       // the unit's variable
+				"--access-token-file",       // the relay-side flag, the other half
+				tc.relays[0],                // which relay is affected
+			} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("the warning does not mention %q:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
+
 // The allocation the mesh test actually makes — 4 P2P + 4 HTTP, 50 rounds —
 // must never come back with a duplicate. The test re-checks the returned set
 // itself only so this contract survives even if someone later removes the

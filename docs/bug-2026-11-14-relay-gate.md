@@ -1,6 +1,7 @@
 # Bug: the relay gate rejects every node — the first frame disagrees
 
-**Status: open. Diagnosed to a first-frame ordering disagreement; not fixed.**
+**Status: FIXED 2026-11-14 (commit `fix:` on `fix-relay-gate`). Root cause was
+neither H1 nor H2 — see §7. Loopback DID reproduce it, with one flag omitted.**
 Found 2026-11-14 during the three-Pi deployment, with two Pis on separate home
 networks and a relay on a public VPS.
 
@@ -67,6 +68,13 @@ challenge is read correctly, the token is 43 bytes, and the proof is 32.
 would log `DIAG adopt …`. It does not appear. `writeHello` — the only code that
 writes an ID frame — is called from exactly one place, `adopt()`.
 
+> **WRONG, and this is the sentence the whole investigation turned on.**
+> `writeHello` has a SECOND caller: the `else` branch of `adoptRelay`, taken when
+> the transport holds no access token. That branch is inside `adoptRelay`, so it
+> does not log `DIAG adopt` — which is exactly why the absence of that line
+> looked like proof that no ID was written. Verified at HEAD by grep and by the
+> reproduction in §7.
+
 **(f) The routing is correct.** `--relay` → `Validator.ConnectRelay` →
 `ttp.AddRelay` → `registerOutbound(addr, relay=true, …)` → `ob.relay` true →
 `adoptRelay`. Verified by reading each step.
@@ -97,6 +105,11 @@ Two possibilities remain, and they need different fixes:
   constant time. Read at `internal/relay/relay.go`.
 - The consensus, transport framing, and the fixture committee: three seats on
   one host commit normally (1,004 blocks, 42,992 frames forwarded).
+
+> **That run proves nothing about the gate.** It was run against a relay with NO
+> access token (the token-less path, §7), so it exercised the *ungated* relay and
+> never touched `handshake`'s gate at all. It is not evidence that the gate
+> admitted anyone.
 
 ## 5. Plan to fix
 
@@ -141,3 +154,70 @@ the first `unauthorized` increment.** It should have been the first step, not
 the eighth. A counter that cannot say *why* it incremented is not a diagnostic;
 the refusal path should have logged its reason from the day the gate landed.
 That logging is the durable fix regardless of which hypothesis is true.
+
+## 7. Resolution (2026-11-14)
+
+**Neither H1 nor H2. The node took `adoptRelay`'s token-less branch**, so it
+wrote its transport ID (`"v0"`/`"v1"`, i.e. `fmt.Sprintf("v%d", index)`) as the
+first frame, exactly as the relay's refusal said. Nothing was one frame behind,
+and there was no second dial: the relay read the only frame the node sent.
+
+The two halves of §3 were individually true because **they came from two
+different invocations**. The `challenge=50 token=43 proof=32` lines (§2 d) came
+from a hand-run node that DID have the token, where the gate works; the failing
+service ran without one, where `adoptRelay` skips that whole branch and logs
+`DIAG adoptRelay` only. That is the contradiction, and §6's own lesson applies:
+the log line was read from one run and the packet capture from another.
+
+**Why the node had no token.** `scripts/deploy/README.md` §4 starts the relay
+with `--access-token-file` and tells the operator to give each node
+`--relay-access-token-file` "§5, §6" — but §5's copy-paste command did not
+contain it, and the shipped unit's `B10COIN_RELAY_TOKEN=` defaults to EMPTY, and
+an empty value is passed as an empty flag, which the node reads as "no token".
+Following the recipe literally produced a token-less node against a gated relay.
+
+**Why it was silent on both machines.** The relay only incremented
+`unauthorized`. The node installs a relay link without reading any frame (a relay
+link reads no ID), so it believed it was connected and never saw an error; the
+maintainer's `report(err)` only hands the FIRST failure to a registration
+channel, so every later redial failed silently. The relay closes each refused
+socket at once, and the maintainer resets its backoff on any non-superseded
+death, so the loop ran at ~25 dials/s (the ~1,200 `unauthorized` per 40 s and the
+TIME_WAIT pile).
+
+**Fix.**
+1. `internal/transport/tcp` — a relay-mode connection announces NO identity in
+   either mode (`adoptRelay` no longer calls `writeHello`). A relay never reads an
+   ID on that link (it names it `relay:<addr>`), so the frame was consumed by
+   nobody, refused by every gated relay, and forwarded to peers by every ungated
+   one. The `writeHello` and `devnet.ConnectRelay` comments that claimed the
+   opposite are corrected — that disagreement is what hid the branch.
+2. `internal/relay` — the gate's refusal now LOGS ITS REASON, rate-limited to one
+   line per second with a suppressed count so it cannot be used to flood a log.
+   It names the short-frame shape (a 2-byte opening frame is a transport ID, so
+   the dialer has no token) and the wrong-MAC shape separately.
+3. `cmd/b10coin` — a node dialling a relay with no token prints a startup warning
+   naming both flags.
+4. `scripts/deploy/README.md` §5 and `b10coin.service` now carry the flag and
+   state that an empty token is fatal against a gated relay.
+
+**Pinned by** `TestTheRelayDialPathIsAdmittedOnTheFirstAttempt` (real dial path,
+real relay, first attempt: `conns==1`, zero `unauthorized`),
+`TestATokenlessRelayDialSendsNoIdentityFrame` (fails on the pre-fix branch with
+the literal `"v0"` frame) and
+`TestTheGateRefusalNamesItsReasonAndCannotFloodTheLog`.
+
+**Reproduced on loopback, one flag.** `--relay` WITH the token file admits on loopback
+(`conns=1 unauthorized=0`); the same binary with the token file omitted
+reproduces `frameLen=2 wantLen=32 frame="v0"`, `conns=0` and a climbing
+`unauthorized` in under a second. The VPS was never needed.
+
+**Still open, and deliberately not fixed here:** the maintainer resets its
+backoff on ANY non-superseded connection death, so a relay that accepts and
+closes instantly still produces a hot redial loop (~10/s at the 100 ms default
+base, which is the TIME_WAIT pile and the ~1,200 `unauthorized` per 40 s). This
+fix does not change that rate: a token-less link now writes a consensus frame
+first instead of a transport ID, and the gate refuses either one immediately.
+Fixing it means changing the reset rule, which is a pinned liveness contract
+(`TestBackoffClimbs…`: "a live connection resets the counter"), so it needs its
+own lifetime threshold and its own test rather than a passenger change here.

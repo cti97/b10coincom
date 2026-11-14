@@ -787,10 +787,12 @@ func (v *Validator) Connect(addrs ...string) error {
 
 // ConnectRelay registers relay addresses: the same permanent maintainer and
 // backoff as Connect, but through the transport's RELAY dial mode - the
-// connection announces the local ID, never reads one back, and is named
-// relay:<addr>, so no frame the relay forwards can be mistaken for the
-// peer's identity (audit N-1). The CLI's --relay lands here. Each address is
-// also RESERVED against peer hints (audit PX-6), and the reservation is taken
+// connection announces NO identity at all (a relay link reads none: the link
+// is named relay:<addr> from the address dialled, so no frame the relay
+// forwards can be mistaken for the peer's identity, audit N-1) and, with a
+// token, opens by answering the relay's challenge. The CLI's --relay lands
+// here. Each address is ALSO RESERVED against peer hints (audit PX-6), and the
+// reservation is taken
 // BEFORE the dial: no hint racing this call can name the relay and open a
 // second, direct-mode connection to it.
 func (v *Validator) ConnectRelay(addrs ...string) error {

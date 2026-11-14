@@ -1603,9 +1603,18 @@ func readNonceFrame(nc net.Conn, addr, what string, want int, deadline time.Time
 	return frame, nil
 }
 
-// writeHello sends the local ID under the handshake write deadline - the
-// half of the identity exchange every mode shares (a relay connection still
-// announces the local ID; it only never reads one back, see adoptRelay).
+// writeHello sends the local ID under the handshake write deadline. It is the
+// opening frame of the DIRECT handshake ONLY (adopt, and the inbound accept
+// path), where the far end reads it as the peer's identity.
+//
+// A RELAY connection never sends it (adoptRelay): the relay reads no ID - it
+// names the link RelayPeerName(addr) from the address this node dialled - so an
+// ID frame there is a frame no one consumes, and a token-gated relay reads it
+// as a short, wrong gate proof and closes the socket. Sending it on the
+// token-less relay branch is what made every token-less node redial forever
+// against a gated relay in silence (docs/bug-2026-11-14-relay-gate.md). Do not
+// reintroduce it on the relay path "for symmetry": the two handshakes are not
+// symmetric, and the comment that claimed they were is how that bug survived.
 func (t *TcpTransport) writeHello(nc net.Conn, addr string) error {
 	return t.writeHandshakeFrame(nc, addr, []byte(t.opts.LocalID))
 }
@@ -1679,9 +1688,22 @@ func (t *TcpTransport) readHello(nc net.Conn, addr string) (transport.PeerID, er
 // challenge, answers wire.RelayGateProof(token, challenge) - HMAC-SHA-256 over
 // bytes the relay just generated - and only then waits for
 // wire.RelayGateConfirmation before installing the connection (audit PX-3,
-// D-1). The ID announcement is omitted on this path. Without a token the ID
-// announcement is unchanged, so every relay deployment that configures no
-// token behaves exactly as before.
+// D-1). A relay link NEVER announces this node's ID, with or without a token:
+// a relay does not read one (it names the link RelayPeerName(addr) from the
+// address this node dialled), so an ID frame here is a frame nobody consumes.
+// Without a token the gate is skipped and the connection is installed at once;
+// with a token the proof is the first and only frame this end sends.
+//
+// THE ID FRAME USED TO BE SENT ON THE TOKEN-LESS BRANCH, and that is the
+// 2026-11-14 deployment outage (docs/bug-2026-11-14-relay-gate.md). A node
+// started without --relay-access-token-file against a relay that HAS a token
+// wrote its 2-byte transport ID first; the gate read 2 bytes where it needs a
+// 32-byte MAC, refused, and closed. The node never noticed - a relay link reads
+// no frame at install - so it redialled forever in silence, and the relay's
+// only evidence was a counter. Omitting the frame removes the disagreement
+// rather than papering over it: a relay-mode connection now sends the proof and
+// nothing else when it holds a token, and nothing at all when it does not, so
+// the gate never has to guess what a short first frame was.
 //
 // The order and the MACs are the fix, not details. The first shape wrote the
 // token unconditionally, and a relay started without --access-token-file
@@ -1733,8 +1755,6 @@ func (t *TcpTransport) adoptRelay(nc net.Conn, addr string) (*conn, error) {
 			"the relay did not prove it holds the access token, so the link was not installed (a wrong or mismatched token, a relay that predates the challenge-confirmation gate, or a stranger behind an ungated relay looping the greeting and a challenge)"); err != nil {
 			return nil, err
 		}
-	} else if err := t.writeHello(nc, addr); err != nil {
-		return nil, err
 	}
 	c, err := t.install(nc, addr, true, true, false, RelayPeerName(addr))
 	if err != nil {

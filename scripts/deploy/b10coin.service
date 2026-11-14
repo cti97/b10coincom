@@ -45,7 +45,11 @@ Environment=B10COIN_KEY=/var/lib/b10coin/b10coin.key
 # Leave it EMPTY for an allowlist-only relay; set it to /var/lib/b10coin/relay.token
 # (the file copied from the VPS, mode 0600) when the relay runs with
 # --access-token-file. An empty value passes an empty flag, which the node
-# treats as "no token". Empty default keeps every existing deployment working.
+# treats as "no token": that is correct for an allowlist-only relay and FATAL
+# against one that gates - the relay refuses every dial at the gate and the node
+# redials at height 0 forever (the 2026-11-14 outage, docs/bug-2026-11-14-relay-gate.md).
+# The node now prints a startup warning when --relay is set with no token; take
+# it seriously. Empty default keeps an ALLOWLIST-ONLY deployment working.
 Environment=B10COIN_RELAY_TOKEN=
 
 # The node's seat is derived from where its key's public half sits in the

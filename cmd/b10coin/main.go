@@ -1411,6 +1411,32 @@ func runProducerNode(dir, httpAddr string, blockTime time.Duration) error {
 	}
 }
 
+// relayNoTokenWarning is the startup line for a node that will dial a relay
+// while holding no access token, or "" when there is nothing to warn about.
+//
+// It exists because the two halves of that configuration live on two machines.
+// The relay says "--access-token-file" and the node says
+// "--relay-access-token-file", and the shipped node unit defaults
+// B10COIN_RELAY_TOKEN to EMPTY so that an allowlist-only relay keeps working.
+// A node that skipped the variable therefore starts cleanly, dials, is refused
+// at the gate, and redials forever without ever printing a line: the relay's
+// unauthorized counter is the only evidence and it lives elsewhere. That is the
+// 2026-11-14 outage exactly, and one line naming the flag is the whole fix for
+// this half of it - the wire fix is in tcp.adoptRelay (a relay link no longer
+// announces a transport ID, so the gate's refusal is now "nothing arrived"
+// rather than a 2-byte frame it had to guess about).
+//
+// It is a warning, not an error: a relay started WITHOUT a token is a supported
+// deployment (the IP allowlist is the gate there), and the node cannot tell the
+// two apart without connecting.
+func relayNoTokenWarning(relays []string, token []byte) string {
+	if len(relays) == 0 || len(token) > 0 {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: dialling relay %s with NO access token (--relay-access-token-file / B10COIN_RELAY_TOKEN is empty). A relay started with --access-token-file refuses every such dial at the gate and this node can never join it; a relay started without a token is unaffected.",
+		strings.Join(relays, ","))
+}
+
 // runNetworkedNode is the M4 consensus path of the `node` command: one
 // validator of a consensus committee over the real transport, running the same
 // consensus stack the in-process TCP integration test drives. The single-node
@@ -1510,6 +1536,15 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers,
 	relayDial := make([]string, 0, 1)
 	if r := strings.TrimSpace(relay); r != "" {
 		relayDial = append(relayDial, r)
+	}
+	// An empty B10COIN_RELAY_TOKEN (the shipped unit's default) means "no
+	// token", which is right for an allowlist-only relay and fatal against a
+	// relay that gates. Say so once, at startup, instead of leaving the
+	// operator with a node that redials in silence while the relay's
+	// unauthorized counter climbs on the other machine: that silence is the
+	// 2026-11-14 outage (docs/bug-2026-11-14-relay-gate.md).
+	if w := relayNoTokenWarning(relayDial, relayToken); w != "" {
+		fmt.Fprintln(os.Stderr, w)
 	}
 	committeeSize := committee
 	seatName := fmt.Sprintf("seat %d", seat)

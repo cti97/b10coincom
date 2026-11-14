@@ -1077,6 +1077,15 @@ type Relay struct {
 	// readerPanics counts per-connection readers that recovered from a panic
 	// (audit S-9). One panic costs one connection, never the process.
 	readerPanics atomic.Uint64
+
+	// refusalMu guards the gate-refusal line's rate limiter, and is separate
+	// from r.mu so a refusal never contends with the registry lock. The
+	// refusal path is reachable by anyone who can open a socket, so it is the
+	// one log line in this process that an attacker can trigger at will: it is
+	// rate-limited, and the suppressed count keeps it honest.
+	refusalMu         sync.Mutex
+	refusalLast       time.Time
+	refusalSuppressed int
 }
 
 // New returns a relay with all bounds defaulted. Nothing runs and nothing is
@@ -1341,6 +1350,7 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 		expected := wire.RelayGateProof(r.opts.AccessToken, challenge)
 		if err != nil || len(frame) != len(expected) ||
 			subtle.ConstantTimeCompare(frame, expected) != 1 {
+			r.logGateRefusal(nc.RemoteAddr(), frame, err)
 			r.unauthorized.Add(1)
 			r.releaseHandshake(nc)
 			_ = nc.Close()
@@ -1381,6 +1391,68 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 		}
 		_ = nc.Close()
 	}
+}
+
+// gateRefusalLogInterval is the floor between two gate-refusal lines. The
+// refusal path is reachable by anyone who can open a socket, so this line is
+// rate-limited instead of per-connection: a flood must not turn the operator's
+// log into the flood. Suppressed refusals are counted and named on the next
+// emitted line, so a quiet log still reports a rising rate.
+const gateRefusalLogInterval = time.Second
+
+// logGateRefusal writes one bounded, rate-limited line saying WHY a socket was
+// refused at the gate. Before it existed the gate only incremented
+// `unauthorized`, and that silence is why the 2026-11-14 outage
+// (docs/bug-2026-11-14-relay-gate.md) took eight wrong diagnoses: every counter
+// reading was compatible with every hypothesis.
+//
+// Nothing here decodes the frame - it is quoted, not interpreted, and the read
+// that produced it was bounded to the MAC's own width, so the longest frame
+// this can print is 32 bytes. The two shapes worth naming are the ones that
+// actually occur:
+//
+//   - a SHORT first frame. On this wire a 2-byte opening frame is a node's
+//     transport ID ("v0", "v1", ...), which means the dialer has no access
+//     token and its relay path announced its identity instead of answering the
+//     challenge. That is the 2026-11-14 outage exactly, and it is an operator
+//     configuration error on the DIALER, not on this relay.
+//   - a right-sized MAC that did not compare. A wrong token, or a proof minted
+//     for another connection's challenge.
+func (r *Relay) logGateRefusal(remote net.Addr, frame []byte, err error) {
+	r.refusalMu.Lock()
+	now := time.Now()
+	if !r.refusalLast.IsZero() && now.Sub(r.refusalLast) < gateRefusalLogInterval {
+		r.refusalSuppressed++
+		r.refusalMu.Unlock()
+		return
+	}
+	suppressed := r.refusalSuppressed
+	r.refusalSuppressed = 0
+	r.refusalLast = now
+	r.refusalMu.Unlock()
+
+	var why string
+	switch {
+	case err != nil:
+		// Two shapes: a dialer that said nothing until the deadline, and one
+		// whose first frame could not even be a proof (a consensus frame from a
+		// link that never ran the gate, or an oversized declaration). Neither
+		// ever sends a proof, and a node without an access token never can.
+		if te, ok := err.(net.Error); ok && te.Timeout() {
+			why = fmt.Sprintf("no %d-byte gate proof arrived within --access-timeout; a dialer with no access token never sends one", wire.RelayGateMACBytes)
+		} else {
+			why = fmt.Sprintf("the first frame is not a %d-byte gate proof (%v); a dialer with no access token cannot send one, so this is whatever its link wrote first", wire.RelayGateMACBytes, err)
+		}
+	case len(frame) < wire.RelayGateMACBytes:
+		why = fmt.Sprintf("frameLen=%d wantLen=%d frame=%q; a frame this short is a transport ID, so the dialer has NO access token configured (--relay-access-token-file) and announced its identity instead of a proof", len(frame), wire.RelayGateMACBytes, frame)
+	default:
+		why = fmt.Sprintf("frameLen=%d wantLen=%d; the proof did not match this connection's challenge (a wrong token, or a proof minted for another connection)", len(frame), wire.RelayGateMACBytes)
+	}
+	if suppressed > 0 {
+		log.Printf("b10coin-relay: gate refused %s: %s (and %d more since the last line)", remote, why, suppressed)
+		return
+	}
+	log.Printf("b10coin-relay: gate refused %s: %s", remote, why)
 }
 
 // writeGateFrame writes one gate frame under a write deadline, so a peer that
