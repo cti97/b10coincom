@@ -485,6 +485,17 @@ file is trimmed) or it is closed and counted `unauthorized`. The answer is
 consumed, never forwarded, and an unauthenticated connection is never
 registered, so it receives nothing. Copy the SAME token file to every Pi
 (`scp`, mode 0600) and give each node `--relay-access-token-file` (§5, §6). A
+
+**Treat this token as a liveness credential, not a password.** Measured
+(`docs/audit-2026-11-14-relay-token-adversary.md`): its holder cannot forge a
+vote, commit a block or fork the chain - safety held under a 2.1-million-frame
+flood - but **can halt the committee at will**, either by occupying every
+`--max-conns` slot so validators are refused at accept, or by flooding frames
+until the 30 s write deadline reaps the connections. **One shared token is
+fleet-wide liveness compromise**: anyone who sees the bootstrap command, a shell
+history or a CI log can stop the chain. Prefer one token per node so a leak is
+one revocation; rotate on any exposure; keep it out of command lines. A
+
 node and a relay of different gate vintages refuse each other and the node logs
 the reason; upgrade both together.
 
