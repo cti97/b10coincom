@@ -2,6 +2,9 @@ package chain
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/cti97/b10coincom/internal/genesis"
@@ -286,5 +289,138 @@ func TestOpenResumeRefusesAMismatchedCheckpoint(t *testing.T) {
 	}
 	if base, err := store.BaseOf(empty); err != nil || base != 1 {
 		t.Fatalf("a refused import recorded base %d (%v); nothing may be written", base, err)
+	}
+}
+
+// certSegsIn returns the certificate segment files a data directory holds,
+// sorted. The names are the store's documented on-disk format
+// ("certs-NNNNNNNN.cseg", fixed width), which is what lets this test create a
+// second, SEALED segment without reaching into the store's internals: the
+// L-1 fault has to land on a segment the certificate prune is allowed to
+// remove, and audit I-2 makes the ACTIVE one unselectable by construction.
+func certSegsIn(t *testing.T, dir string) []string {
+	t.Helper()
+	segs, err := filepath.Glob(filepath.Join(dir, "certs-*.cseg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(segs)
+	return segs
+}
+
+// TestAPruneCertsErrorDoesNotDesynchroniseTheChain is the L-1 fault injection
+// (docs/audit-2026-11-15-main.md): PruneHistory's block pass succeeds and its
+// certificate pass then fails on an I/O error.
+//
+// The assertions are about the RUNNING CHAIN's consistency, not about the
+// error. Before the fix, PruneBlocks advanced the on-disk base while
+// PruneCerts' error returned before the in-memory one moved, so StateAt(h) for
+// h in (oldBase, upTo] passed its `h < base` guard, read a DELETED block and
+// reported store.ErrNotFound for the life of the process. After the fix the
+// same state is reported as PRUNED (a deliberate absence, which a caller can
+// act on), the horizon state is still exportable, and the next pass reclaims
+// the surplus certificates.
+func TestAPruneCertsErrorDoesNotDesynchroniseTheChain(t *testing.T) {
+	c, g, dir := pruneChain(t, 12)
+	// Certificates below the horizon, so a certificate segment is removable.
+	// (The payload is opaque to the chain; only its presence matters here.)
+	for h := uint64(1); h <= 3; h++ {
+		if err := c.PutCert(h, []byte{byte('0' + h)}); err != nil {
+			t.Fatalf("PutCert(%d): %v", h, err)
+		}
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segs := certSegsIn(t, dir)
+	if len(segs) != 1 {
+		t.Fatalf("the fixture wrote %d certificate segments, want the one segment its three certificates share: %v", len(segs), segs)
+	}
+	// Seal segment 0 and give the store a NEW active segment 1 (its header is
+	// the segment format itself: the magic and the version, nothing per-file),
+	// exactly the shape rotation produces. The pruner may remove segment 0;
+	// I-2 forbids it from touching the open segment 1.
+	raw, err := os.ReadFile(segs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= store.SegmentHeaderLen {
+		t.Fatalf("segment %s is %d bytes, want records after the %d-byte header", segs[0], len(raw), store.SegmentHeaderLen)
+	}
+	active := filepath.Join(dir, "certs-00000001.cseg")
+	if err := os.WriteFile(active, raw[:store.SegmentHeaderLen], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Open(g, dir)
+	if err != nil {
+		t.Fatalf("reopening the chain with two certificate segments: %v", err)
+	}
+	defer func() { _ = c2.Close() }()
+	// THE FAULT: segment 0's name now belongs to a NON-EMPTY DIRECTORY, so the
+	// pruner's os.Remove returns ENOTEMPTY - a real I/O failure on the exact
+	// call it makes, with no test seam in the production code.
+	if err := os.Remove(segs[0]); err != nil {
+		t.Fatalf("replacing %s: %v", segs[0], err)
+	}
+	if err := os.Mkdir(segs[0], 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(segs[0], "occupied"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st7, err := c2.StateAt(7)
+	if err != nil {
+		t.Fatalf("StateAt(7) before the prune: %v", err)
+	}
+	if _, err := c2.PruneHistory(7, st7); err == nil {
+		t.Fatal("PruneHistory(7) reported success although removing a certificate segment must fail")
+	}
+
+	// 2. The pruned range reads as PRUNED, not as a missing block - this is
+	// the symptom the audit names: pre-fix, StateAt read a DELETED block and
+	// reported store.ErrNotFound, which a caller cannot tell from a damaged
+	// directory. h=7 is the base itself and is still answerable from baseState.
+	for _, h := range []uint64{1, 5} {
+		if _, err := c2.StateAt(h); !errors.Is(err, ErrHistoryPruned) {
+			t.Fatalf("StateAt(%d) after a certificate-prune error = %v, want ErrHistoryPruned (below the retained history)", h, err)
+		}
+	}
+	// 3. The base advanced anyway: the block base moved on disk, so the
+	// in-memory base must move with it.
+	if got := c2.Base(); got != 7 {
+		t.Fatalf("Base after a certificate-prune error = %d, want 7: the in-memory base must follow the block base, which the successful PruneBlocks already advanced", got)
+	}
+	if base, err := store.BaseOf(dir); err != nil || base != 8 {
+		t.Fatalf("the directory records first block height %d (%v), want 8", base, err)
+	}
+	if st, err := c2.StateAt(7); err != nil || st.Root() != st7.Root() {
+		t.Fatalf("StateAt(7) after the failed pass = %v, %v; want the horizon state (a checkpoint re-export reads exactly this)", st, err)
+	}
+	// 4. The live chain is untouched and its retained history still replays.
+	if got := c2.Height(); got != 12 {
+		t.Fatalf("the head moved to %d after a certificate-prune error", got)
+	}
+	if st, err := c2.StateAt(12); err != nil || st.Root() != c2.State().Root() {
+		t.Fatalf("StateAt(head) after the failed pass = %v, %v", st, err)
+	}
+	// 5. The surplus certificates are reclaimable: repair the injected fault
+	// and the NEXT pass completes, on the normal schedule, with no special
+	// handling of "a previous pass failed".
+	if err := os.RemoveAll(segs[0]); err != nil {
+		t.Fatal(err)
+	}
+	st11, err := c2.StateAt(11)
+	if err != nil {
+		t.Fatalf("StateAt(11): %v", err)
+	}
+	if _, err := c2.PruneHistory(11, st11); err != nil {
+		t.Fatalf("the next prune must reclaim the surplus certificate segments: %v", err)
+	}
+	if got := c2.Base(); got != 11 {
+		t.Fatalf("Base after the recovering prune = %d, want 11", got)
+	}
+	if _, err := c2.StateAt(8); !errors.Is(err, ErrHistoryPruned) {
+		t.Fatalf("StateAt(8) after pruning to 11 = %v, want ErrHistoryPruned", err)
 	}
 }
