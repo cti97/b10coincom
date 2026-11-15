@@ -41,6 +41,12 @@ Environment=B10COIN_HTTP=127.0.0.1:8645
 Environment=B10COIN_RELAY=changeme.example.com:7001
 Environment=B10COIN_GENESIS=/var/lib/b10coin/committee.json
 Environment=B10COIN_KEY=/var/lib/b10coin/b10coin.key
+# 0 keeps every block (the default). Set it to a block count to bound the data
+# directory (M7): the node then keeps that many blocks and writes a checkpoint at
+# its horizon, from which it - or a replacement machine - can resume. It is
+# refused below 4 x epoch_blocks, and only a consensus validator can use it,
+# because a checkpoint is a quorum certificate and a producer records none.
+Environment=B10COIN_RETAIN_BLOCKS=0
 # B10COIN_RELAY_TOKEN is the relay's pre-shared access-token file (audit N-8).
 # Leave it EMPTY for an allowlist-only relay; set it to /var/lib/b10coin/relay.token
 # (the file copied from the VPS, mode 0600) when the relay runs with
@@ -61,7 +67,8 @@ ExecStart=/opt/b10coin/b10coin node \
     --relay ${B10COIN_RELAY} \
     --relay-access-token-file ${B10COIN_RELAY_TOKEN} \
     --genesis ${B10COIN_GENESIS} \
-    --key ${B10COIN_KEY}
+    --key ${B10COIN_KEY} \
+    --retain-blocks ${B10COIN_RETAIN_BLOCKS}
 
 Restart=always
 RestartSec=5

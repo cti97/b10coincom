@@ -359,6 +359,8 @@ whose keys sign, and that is the security boundary:**
 | `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |
+| `--retain-blocks N` | `0` (**keep everything**) | bound the data directory to the last `N` blocks (M7). Off by default, so a node started without it behaves exactly as it did before. Refused below `4 × epoch_blocks` blocks, and only a **consensus** validator may use it: pruning is allowed only when the horizon's quorum certificate can be written into a checkpoint, and a single-node producer records none. Prunes only at epoch boundaries, so the state at the horizon is exactly reproducible; what is never pruned is `rounds.log`, `locks.log`, `genesis.hash`, the head block and its certificate, the horizon committee, the base marker and the checkpoint itself (`internal/retention`) |
+| `--checkpoint PATH` | *unset* | start this node from a checkpoint written by `b10coin checkpoint export`. The file is **verified before it is installed**: its precommit votes must reach a quorum of the **genesis** committee for the block it carries, and its state must hash to that block's committed root. It is only accepted into an **empty** data directory — importing over a chain is refused, never silently merged. Without the flag a pruned directory still starts: it reads its own `checkpoint.json` |
 
 **Peer exchange, and who it actually helps.** M5 adds `PEER_EXCHANGE`: a node
 that has a listener advertises its `IP:port` at most once every four waves
@@ -420,10 +422,87 @@ limitation of the message, not a defect in the dial path, and it is pinned by
 `TestPeerExchangeDoesNotMeshAChain`. Use `--relay`, or give every member every
 other member's address in `--peers`, for a topology that must mesh without one.
 
+**Bounded history and recovery (M7).** A validator's data directory used to grow
+forever: measured at height 824,350, it was 558 MB (~710 B/block, ~1.7 GB/day at
+the observed rate), 68% of it the single append-only `certs.log`. Two flags bound
+it:
+
+```sh
+b10coin node ... --retain-blocks 200000
+```
+
+`--retain-blocks N` keeps the last `N` blocks and drops whole block and
+certificate segments below a horizon. The horizon is always the **last block
+before an epoch boundary** (`k × epoch_blocks − 1`), because that state is what
+decides the first retained epoch's committee — a mid-epoch horizon would leave
+the resumed node unable to judge the block it resumes into. Retention is in
+heights, not hours: a height is exact and the operator can convert.
+
+Pruning is **only** performed when the node can write a verifiable **checkpoint**
+at that horizon, and a checkpoint is *(height H, block H, state at H, the
+precommit votes for block H)*. If the node holds no certificate for H it
+**refuses to prune** and says so on stderr — a node that looks healthy and cannot
+recover is worse than a full disk, because a full disk is visible. The default is
+`0`: nothing is pruned, and nothing about a default node changed.
+
+A pruned node restarts from its own `checkpoint.json` and replays the retained
+blocks. It can also hand that file to another machine:
+
+```sh
+b10coin checkpoint export --dir ./b10coin-data --at 12000 --out cp.json
+b10coin node ... --dir ./fresh --checkpoint cp.json
+```
+
+The import verifies three things before adopting anything: the certificate is a
+quorum of the **genesis** committee (the trust anchor stays genesis — a peer
+cannot forge the signatures that founded the chain), the state snapshot hashes to
+the root that block commits (so a swapped state is refused), and the retained
+blocks then replay on top of it and must reproduce every stored header's root.
+`--checkpoint` is accepted only into an empty `--dir`.
+
+**The static-committee assumption, stated because it is load-bearing.** M7
+verifies a checkpoint against the genesis committee, which is correct while the
+committee is genesis-fixed. M5 rotation means the committee at H *can* differ:
+`checkpoint export` refuses in that case rather than write a file its own
+importer could not verify, and the importer refuses anything the genesis
+committee did not sign. Rotation-aware checkpoints must additionally carry the
+committee at H and a light-client proof of the rotation, and are deliberately
+left to the next milestone (`docs/plan-2026-11-15-m7-bounded-history.md` §4/§7).
+
+**What a prune may never take** is a table in code, not a convention
+(`internal/retention`): `rounds.log` is the validator's restart position and
+`locks.log` the double-vote promise (a validator that forgets either can sign
+twice at one height — a safety bug, not a liveness one); `genesis.hash` is the
+chain identity; the head block and its certificate are what the node last
+committed; the horizon committee, the base marker and the checkpoint are what
+recovery is made of. The pruner's every deletion asks that table, and a test
+asserts the exclusions.
+
 Ctrl-C (or, on Unix, SIGTERM) stops block production and the HTTP server
 cleanly. The graceful stop listens for both through one cancellation
 channel, so on Windows — where SIGTERM is a POSIX signal that is never
 delivered — Ctrl-C still reaches the same clean path.
+
+### `b10coin checkpoint export`
+
+```
+b10coin checkpoint export --dir PATH --at H [--out FILE] [--genesis PATH | --validators N]
+```
+
+Writes the verifiable recovery artefact for height `H`: the block, the committed
+state and the precommit votes that prove a committee agreed on it. `--at H` must
+be a height whose certificate this directory still holds. `--out` is optional
+(the checkpoint goes to stdout without it). It is an **offline** verb: it opens
+the data directory, so the node using it must be stopped — a running node holds
+the directory lock and the export refuses with `data directory is in use` rather
+than taking an inconsistent snapshot. `--genesis`/`--validators` name the chain
+the directory belongs to, exactly as the node that wrote it did; neither means
+the devnet genesis.
+
+The output is JSON, indented so an operator can read it before trusting it.
+Nothing in the file is authenticated by its own bytes: the votes and the state
+root are the evidence, which is why the file may be copied, inspected and
+re-served by anything.
 
 ### `b10coin claim`
 
