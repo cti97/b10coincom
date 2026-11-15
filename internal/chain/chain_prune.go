@@ -19,8 +19,11 @@ import (
 // its epoch, so a checkpoint at H = kE-1 carries exactly the state that decides
 // the first retained epoch - and OpenResume can record that committee from it.
 // A checkpoint at H = kE would carry the state that decides epoch k+1 and would
-// leave epoch k's committee underivable, which is the rotation-aware gap M7
-// explicitly does not solve.
+// leave epoch k's committee underivable. That is also why the checkpoint's
+// carried committee is the one that SIGNED H (epoch k-1), not the one the state
+// at H decides: M8's rotation-aware form reads the signer from the chain
+// (consensus.ExportTrustedCheckpoint), and the snapshot is what makes the
+// first RETAINED epoch judgeable after the resume.
 
 // checkResume validates the internal consistency of a checkpoint hand-off,
 // independent of any consensus check the caller already did: the block must sit

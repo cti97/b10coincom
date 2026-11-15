@@ -585,7 +585,9 @@ token".
 | `--listen`, `--peers` | optional **direct** peer connections (same-LAN or port-forwarded setups). With the relay star they stay off; a dial list is already complete via `--relay` |
 | `--advertise IP:PORT` | with `--listen`, the address peers should dial. Required for a **port-forwarded** node: `--listen` binds `0.0.0.0:7001` (a wildcard names no endpoint), and without `--advertise` the node advertises nothing and logs one line saying so (§5) |
 | `--retain-blocks N` | bound the data directory to the last `N` blocks (§5.2). **Default 0: keep everything.** The shipped unit passes `B10COIN_RETAIN_BLOCKS`, whose default is `0`, so nothing changes until you set it |
-| `--checkpoint PATH` | start this node from a checkpoint written by `b10coin checkpoint export` (§5.2). Only for an **empty** `--dir`; a pruned node reads its own `checkpoint.json` without the flag |
+| `--checkpoint PATH` | start this node from a checkpoint written by `b10coin checkpoint export` (§5.2). Only for an **empty** `--dir`; a pruned node reads its own `checkpoint.json` without the flag. A checkpoint whose committee has **rotated** is refused unless you also pass `--checkpoint-trust` |
+| `--checkpoint-trust` | **TRUST DOWNGRADE:** with `--checkpoint`, accept a file whose committee is not the genesis committee by checking only that the file agrees with itself — its own committee signed its own block, whose header commits its own state. Anyone can fabricate that; it proves internal consistency, **not** that the file is the real chain. Only use it for a file you exported yourself or authenticated out of band (§5.2) |
+| `--checkpoint-max-age EPOCHS` | the hard age bound on a `--checkpoint-trust` import (default 4 epochs; `0` is refused). The file's `issued_at` is compared with the local clock; past the bound it is refused, so a trusted checkpoint cannot pin this node to a long-dead fork forever |
 
 **The seat is derived, not configured.** A node's seat is the position of its
 public key inside the shared committee file, so there is no `--index` here
@@ -829,6 +831,41 @@ hash to the root that block commits. A file from another chain, or one with a
 state swapped in, is refused and nothing is written into the data directory.
 After adopting it the node is at the checkpoint's height and catches up over
 BLOCK_SYNC like any other node that fell behind.
+
+**If the committee has rotated, the default import refuses — and that is the
+safe answer.** A node with no history has no way to authenticate a committee
+other than genesis. A checkpoint that carries its own committee *verifies
+against itself*: a quorum of the committee in the file signed the block in the
+file, whose header commits the state in the file. Anyone can fabricate all of
+that with their own keys, so it proves internal consistency, **not** that the
+file is on the real chain. There is no local fix for a wiped node; full
+verification is a light client, which this build does not have.
+
+The rotation-aware path is explicit, and bounded:
+
+```sh
+# on the OLD Pi (stopped): write the rotation-aware form
+sudo -u b10coin /opt/b10coin/b10coin checkpoint export \
+    --dir /var/lib/b10coin --at <height> --out /tmp/cp.json \
+    --genesis /var/lib/b10coin/committee.json --trust
+
+# on the NEW Pi, into an EMPTY --dir — note both flags:
+b10coin node --checkpoint /tmp/cp.json --checkpoint-trust --checkpoint-max-age 4 ...
+```
+
+* `--checkpoint-trust` is a **trust downgrade**, not a verification. The
+  importer checks the file's internal consistency and nothing else, and prints
+  a warning saying so. Only give it a file you produced or authenticated out of
+  band (a copy you carried from your own Pi is fine; one a peer sent you is not).
+* `--checkpoint-max-age` is **hard and not optional** (default 4 epochs,
+  `0` refused). The file carries `issued_at`, because this chain's block
+  timestamps are logical (parent + 1) and cannot date a height; a file past the
+  bound is refused, so a trusted checkpoint cannot pin this node to an arbitrary
+  past fork forever. If the move takes longer than the bound, re-export — do not
+  raise the bound to "no limit".
+* The file's `note`, the import warning and the exporter warning all state the
+  trade. The default path (no flag) is unchanged and still authenticates against
+  genesis.
 
 `--at <height>` must be a height the directory can still prove: the pruning
 HORIZON (always available - the pruner keeps its certificate and the chain keeps
