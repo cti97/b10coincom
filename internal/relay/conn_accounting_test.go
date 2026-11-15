@@ -309,26 +309,6 @@ func (v *invariantViolation) Error() string {
 		" (conns=" + strconv.Itoa(v.b.conns) + " handshaking=" + strconv.Itoa(v.b.handshaking) + ")"
 }
 
-// drainUntilClosed reads whatever the relay managed to write before it ended
-// the connection and then requires the socket to be closed: unlike
-// waitClosed, data already in flight is expected here, because the receiver
-// was wedged AFTER the relay wrote to it.
-func drainUntilClosed(t *testing.T, c net.Conn, what string) {
-	t.Helper()
-	if err := c.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		t.Fatalf("%s: set read deadline: %v", what, err)
-	}
-	buf := make([]byte, 4096)
-	for {
-		if _, err := c.Read(buf); err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				t.Fatalf("%s: the relay left the connection open (read timed out instead of closing)", what)
-			}
-			return
-		}
-	}
-}
-
 // TestRelayWedgedReceiverReapReleasesItsSlot drives the ONE finish path that is
 // not the reader's deferred teardown: the writer calling finish because a
 // receiver's queue failed to drain (receiverStalled). It is constructed rather
