@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
 	"github.com/cti97/b10coincom/internal/crypto"
@@ -641,4 +643,355 @@ func dirSize(dir string) (int64, error) {
 		total += info.Size()
 	}
 	return total, nil
+}
+
+// ---------------------------------------------------------------------------
+// M8: rotation-aware checkpoints.
+//
+// The security argument in executable form is TestAFabricatedSelfConsistent-
+// CheckpointIsAdmittedOnlyByTrust: a checkpoint whose committee, state, block
+// and votes were all fabricated by an attacker passes the trust flag trivially.
+// That is not a defect to hide - it is the reason the flag exists and the
+// reason it is not the default.
+// ---------------------------------------------------------------------------
+
+// rotatedCertChain builds a chain of n blocks whose committee ROTATES: a
+// funded post-genesis key bonds at height 1, the boundary at epoch-1 seats it,
+// and every height gets a certificate signed by the committee that judged it
+// (all of its seats, so quorum holds whatever the power cap does to the
+// weights).
+func rotatedCertChain(t *testing.T, n int, epoch uint64) (*chain.Chain, *genesis.Genesis) {
+	t.Helper()
+	g := fourValGenesis(t)
+	g.Params.EpochBlocks = epoch
+	// One spare seat so the joiner is ADDED, not an eviction: the point is a
+	// committee DIFFERENT from genesis, not a specific rotation policy.
+	g.Params.CommitteeSize = 5
+	xpub, xpriv := genesis.DevAccountKey(0)
+	keys := make(map[string]ed25519.PrivateKey)
+	for i := 0; i < len(g.Validators); i++ {
+		keys[string(g.Validators[i].PubKey)] = testCommitteeKey(i)
+	}
+	keys[string(xpub)] = xpriv
+
+	c, err := chain.Open(g, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	build := func(txs []types.Tx) {
+		h := c.Height() + 1
+		b, err := c.Build(testCommitteeKey(0), txs, c.Head().Header.Timestamp+1)
+		if err != nil {
+			t.Fatalf("Build(%d): %v", h, err)
+		}
+		if err := c.Append(b); err != nil {
+			t.Fatalf("Append(%d): %v", h, err)
+		}
+		vals, err := c.CommitteeAt(h)
+		if err != nil {
+			t.Fatalf("CommitteeAt(%d): %v", h, err)
+		}
+		votes := make([]*Vote, 0, len(vals))
+		for _, v := range vals {
+			priv, ok := keys[string(v.PubKey)]
+			if !ok {
+				t.Fatalf("fixture: no private key for seat %x at height %d", v.PubKey, h)
+			}
+			vote := &Vote{Type: MsgPrecommit, Height: h, Round: 0, BlockID: b.ID(), Validator: v.PubKey}
+			sigHash := vote.SigningHash()
+			vote.Sig = ed25519.Sign(priv, sigHash[:])
+			votes = append(votes, vote)
+		}
+		if err := c.PutCert(h, EncodeCertificate(0, votes)); err != nil {
+			t.Fatalf("PutCert(%d): %v", h, err)
+		}
+	}
+
+	tx := &types.Tx{
+		Type:   types.TxBond,
+		From:   types.AddressFromPub(xpub),
+		PubKey: xpub,
+		Nonce:  0,
+		Amount: g.Params.MinStakeSparks,
+		Fee:    g.Params.MinFeeSparks,
+	}
+	sigHash := tx.SigningHash(g.Hash())
+	tx.Sig = crypto.Sign(xpriv, sigHash[:])
+	build([]types.Tx{*tx}) // height 1: the joiner bonds
+	for c.Height() < uint64(n) {
+		build(nil)
+	}
+	return c, g
+}
+
+// TestAFabricatedSelfConsistentCheckpointIsAdmittedOnlyByTrust is M8's whole
+// security argument, executed. An attacker who holds three keys nobody's
+// genesis lists fabricates a committee, a state, a block whose header commits
+// that state's root, and votes by those keys. The file is internally perfect
+// and has nothing to do with the real chain:
+//
+//   - without the flag it is REFUSED (the genesis anchor is the only check a
+//     node with no history can make), and the error says why and what the flag
+//     would cost;
+//   - with --checkpoint-trust it is ADMITTED, because self-consistency is all
+//     that flag checks. The test proves the weakness rather than hiding it.
+func TestAFabricatedSelfConsistentCheckpointIsAdmittedOnlyByTrust(t *testing.T) {
+	g := fourValGenesis(t)
+	g.Params.EpochBlocks = 4
+	const at = 7
+
+	// The attacker's committee: three keys, zero genesis seats.
+	vals := make([]genesis.Validator, 3)
+	privs := make([]ed25519.PrivateKey, 3)
+	for i := range vals {
+		h := crypto.HashParts([]byte("m8-fabricated-attacker"), []byte{byte(i)})
+		privs[i] = ed25519.NewKeyFromSeed(h[:])
+		vals[i] = genesis.Validator{PubKey: privs[i].Public().(ed25519.PublicKey), Power: 1}
+	}
+	// A state of the attacker's own, not genesis and not any committed height.
+	st := state.NewWithParams(chain.GenesisParams(g))
+	acc := st.Get(types.AddressFromPub(vals[0].PubKey))
+	acc.Balance = 999 * genesis.SparksPerB10
+	st.Set(types.AddressFromPub(vals[0].PubKey), acc)
+
+	blk := &types.Block{Header: types.Header{
+		Height:    at,
+		StateRoot: st.Root(),
+		TxRoot:    crypto.MerkleRoot(nil),
+		Timestamp: g.Time + at,
+		Proposer:  vals[0].PubKey,
+	}}
+	votes := make([]*Vote, 0, len(vals))
+	for i := range vals {
+		v := &Vote{Type: MsgPrecommit, Height: at, Round: 0, BlockID: blk.ID(), Validator: vals[i].PubKey}
+		vh := v.SigningHash()
+		v.Sig = ed25519.Sign(privs[i], vh[:])
+		votes = append(votes, v)
+	}
+	gh := g.Hash()
+	cp := &Checkpoint{
+		Version:      CheckpointVersion,
+		ChainID:      g.ChainID,
+		GenesisHash:  hexOf(gh[:]),
+		Height:       at,
+		Round:        0,
+		BlockHex:     hexOf(blk.Encode()),
+		StateHex:     hexOf(st.Encode()),
+		CommitteeHex: encodeCommittee(vals),
+		IssuedAt:     time.Now().Unix(),
+		Note:         trustedCheckpointNote,
+	}
+	for _, v := range votes {
+		cp.VotesHex = append(cp.VotesHex, hexOf(EncodeVote(v)))
+	}
+
+	// WITH the flag: admitted, root and all. This is the documented weakness.
+	resume, err := VerifyTrustedCheckpoint(g, cp, TrustPolicy{MaxAgeEpochs: 4})
+	if err != nil {
+		t.Fatalf("the trust flag must ADMIT a fabricated, self-consistent checkpoint - that weakness is exactly what it trades for: %v", err)
+	}
+	if got, want := resume.State.Root(), st.Root(); got != want {
+		t.Fatalf("the fabricated checkpoint resumed at root %x, want its own fabricated root %x", got[:8], want[:8])
+	}
+	if resume.Height != at {
+		t.Fatalf("the fabricated checkpoint resumed at height %d, want %d", resume.Height, at)
+	}
+
+	// WITHOUT the flag: refused, for the right reason, naming the cost.
+	_, err = VerifyCheckpoint(g, cp)
+	if err == nil {
+		t.Fatal("a fabricated checkpoint was admitted WITHOUT --checkpoint-trust: the genesis anchor is not being applied")
+	}
+	if !errors.Is(err, ErrBadCheckpoint) {
+		t.Fatalf("the refusal is %v, want ErrBadCheckpoint", err)
+	}
+	for _, want := range []string{"--checkpoint-trust", "genesis", "fabricate", "internal consistency"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal %q does not name %q; it must say WHY and WHAT the flag would cost", err, want)
+		}
+	}
+
+	// The warning the importer prints must name the TRADE, not congratulate the
+	// operator on an import: it is the second of the four signals.
+	notice := TrustStatement(cp)
+	for _, want := range []string{"did NOT verify", "fabricate", "this is the real chain", "--checkpoint-max-age"} {
+		if !strings.Contains(notice, want) {
+			t.Fatalf("the import warning %q does not name %q", notice, want)
+		}
+	}
+}
+
+// TestATrustedCheckpointOlderThanTheBoundIsRefused is step 3's hard bound: a
+// trusted checkpoint is an anchor at an instant, not forever. Without the bound
+// it would pin a node to an arbitrary past fork, which is why the verifier
+// refuses an unbounded policy as well as an expired file.
+func TestATrustedCheckpointOlderThanTheBoundIsRefused(t *testing.T) {
+	c, g, _ := certChain(t, 20, 4)
+	cp, err := ExportCheckpoint(c, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fresh: a genesis-committee file also verifies on the trusted path, so the
+	// bound is what makes the difference.
+	if _, err := VerifyTrustedCheckpoint(g, cp, TrustPolicy{MaxAgeEpochs: 4}); err != nil {
+		t.Fatalf("a freshly exported checkpoint was refused as expired: %v", err)
+	}
+	old := *cp
+	old.IssuedAt = time.Now().Add(-time.Hour).Unix()
+	_, err = VerifyTrustedCheckpoint(g, &old, TrustPolicy{MaxAgeEpochs: 4})
+	if err == nil {
+		t.Fatal("a trusted checkpoint issued an hour ago was admitted under a 32-second bound")
+	}
+	if !errors.Is(err, ErrBadCheckpoint) || !strings.Contains(err.Error(), "older than") {
+		t.Fatalf("the expiry refusal is %v, want ErrBadCheckpoint naming the age", err)
+	}
+	// An unbounded policy is not a policy: the bound is not optional.
+	if _, err := VerifyTrustedCheckpoint(g, cp, TrustPolicy{}); err == nil || !strings.Contains(err.Error(), "maximum age") {
+		t.Fatalf("an unbounded trust policy gave %v, want a refusal demanding a maximum age", err)
+	}
+	// A file dated in the future would defeat the bound, so it is refused too.
+	future := *cp
+	future.IssuedAt = time.Now().Add(24 * time.Hour).Unix()
+	if _, err := VerifyTrustedCheckpoint(g, &future, TrustPolicy{MaxAgeEpochs: 4}); err == nil || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("a forward-dated trusted checkpoint gave %v, want a refusal naming the future stamp", err)
+	}
+}
+
+// TestARotatedCheckpointNeedsTrustAndThenReachesTheReplayRoot is the rotation
+// round trip, in one place:
+//
+//   - the default exporter REFUSES a rotated horizon (M7's behaviour intact);
+//   - `checkpoint export --trust` writes the rotation-aware form;
+//   - the default importer REFUSES it, and the error says why and what the flag
+//     would cost;
+//   - a trusted import resumes at the SAME state root as replaying that height,
+//     adopts the file into a wiped directory, replays the retained blocks, and
+//     reaches the exporting node's exact head and state root;
+//   - a restart from B's own pruned directory adopts the rotated file through
+//     VerifyAdoptedCheckpoint and reports the same root again.
+func TestARotatedCheckpointNeedsTrustAndThenReachesTheReplayRoot(t *testing.T) {
+	const (
+		epoch = 4
+		total = 12
+		at    = 7 // the last height of epoch 1, i.e. a real prune horizon
+	)
+	a, g := rotatedCertChain(t, total, epoch)
+	// Fixture sanity: the horizon's committee really is not the genesis one.
+	vals, err := a.CommitteeAt(at)
+	if err != nil {
+		t.Fatalf("CommitteeAt(%d): %v", at, err)
+	}
+	if committeeDiff(g.Validators, vals) == "" {
+		t.Fatal("fixture: the committee at the horizon is still the genesis committee")
+	}
+
+	// 1. Default export refuses rotation: M7's refusal, unchanged.
+	if _, err := ExportCheckpoint(a, at); err == nil {
+		t.Fatal("the default export wrote a checkpoint for a rotated horizon")
+	} else if !strings.Contains(err.Error(), "not the genesis committee") {
+		t.Fatalf("the default export's refusal is %v, want it to name the rotated committee", err)
+	}
+
+	// 2. The trusted exporter writes the committee that SIGNED the height.
+	cp, err := ExportTrustedCheckpoint(a, at)
+	if err != nil {
+		t.Fatalf("ExportTrustedCheckpoint(%d): %v", at, err)
+	}
+	signed, err := decodeCommittee(cp.CommitteeHex)
+	if err != nil {
+		t.Fatalf("the exported committee does not decode: %v", err)
+	}
+	if diff := committeeDiff(vals, signed); diff != "" {
+		t.Fatalf("the checkpoint carries the wrong signer committee: %s", diff)
+	}
+	if cp.Note != trustedCheckpointNote {
+		t.Fatalf("a trusted checkpoint's note does not state the trade: %q", cp.Note)
+	}
+	if cp.IssuedAt <= 0 {
+		t.Fatal("a checkpoint carries no issue time, so no age bound can apply")
+	}
+
+	// 3. Without the flag, the rotated file is refused and the error names the
+	//    exact trade.
+	_, err = VerifyCheckpoint(g, cp)
+	if err == nil {
+		t.Fatal("a rotated checkpoint was admitted WITHOUT --checkpoint-trust")
+	}
+	if !errors.Is(err, ErrBadCheckpoint) {
+		t.Fatalf("the refusal is %v, want ErrBadCheckpoint", err)
+	}
+	for _, want := range []string{"--checkpoint-trust", "AGREES WITH ITSELF", "fabricate", "--checkpoint-max-age"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the rotated refusal %q does not name %q", err, want)
+		}
+	}
+
+	// 4. With the flag: the resumed state is the replayed state at the horizon.
+	wantHorizonRoot := mustStateAt(t, a, at).Root()
+	resume, err := VerifyTrustedCheckpoint(g, cp, TrustPolicy{MaxAgeEpochs: 4})
+	if err != nil {
+		t.Fatalf("VerifyTrustedCheckpoint: %v", err)
+	}
+	if got := resume.State.Root(); got != wantHorizonRoot {
+		t.Fatalf("the trusted import's state root is %x, replay gives %x", got[:8], wantHorizonRoot[:8])
+	}
+	if blk, err := a.BlockAt(at); err != nil {
+		t.Fatal(err)
+	} else {
+		got, want := resume.Head.ID(), blk.ID()
+		if got != want {
+			t.Fatalf("the trusted import's block is %x, want the chain's block %x", got[:8], want[:8])
+		}
+	}
+
+	// 5. A wiped directory adopts it and replays the retained blocks to the
+	//    exporting node's head and state root.
+	dirB := t.TempDir()
+	if err := InstallCheckpoint(dirB, cp); err != nil {
+		t.Fatal(err)
+	}
+	b, err := chain.OpenResume(g, dirB, resume)
+	if err != nil {
+		t.Fatalf("a wiped node cannot open from the trusted checkpoint: %v", err)
+	}
+	if got := b.Height(); got != at {
+		t.Fatalf("the wiped node resumed at height %d, want %d", got, at)
+	}
+	for h := uint64(at + 1); h <= total; h++ {
+		blk, err := a.BlockAt(h)
+		if err != nil {
+			t.Fatalf("the exporting node lost retained block %d: %v", h, err)
+		}
+		if err := b.Append(blk); err != nil {
+			t.Fatalf("the wiped node refused retained block %d: %v", h, err)
+		}
+	}
+	wantHeadRoot := a.State().Root()
+	if got := b.State().Root(); got != wantHeadRoot {
+		t.Fatalf("the restored node's head root is %x, the exporting node's is %x", got[:8], wantHeadRoot[:8])
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 6. And it PERSISTS: the directory's own rotated checkpoint is adopted on
+	//    restart (no flag, no age bound - the trust decision was the import).
+	resume2, err := ResumeForDir(g, dirB)
+	if err != nil {
+		t.Fatalf("a pruned directory with a rotated checkpoint cannot restart: %v", err)
+	}
+	if resume2 == nil {
+		t.Fatal("the pruned directory's own rotated checkpoint was not adopted on restart")
+	}
+	b2, err := chain.OpenResume(g, dirB, resume2)
+	if err != nil {
+		t.Fatalf("restart from the rotated checkpoint: %v", err)
+	}
+	defer func() { _ = b2.Close() }()
+	if got := b2.State().Root(); got != wantHeadRoot {
+		t.Fatalf("after a restart the root is %x, want %x", got[:8], wantHeadRoot[:8])
+	}
+	t.Logf("ROTATED ROUND TRIP: horizon %d, replay root %x, restored head %d root %x", at, wantHorizonRoot, b2.Height(), b2.State().Root())
 }

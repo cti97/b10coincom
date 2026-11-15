@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cti97/b10coincom/internal/chain"
+	"github.com/cti97/b10coincom/internal/consensus"
 	"github.com/cti97/b10coincom/internal/crypto"
 	"github.com/cti97/b10coincom/internal/devnet"
 	"github.com/cti97/b10coincom/internal/faucet"
@@ -114,6 +115,8 @@ Usage:
                  [--peers ADDR,...] [--relay ADDR] [--listen ADDR]       Run the single-node devnet producer, or — with --peers/--relay/--listen — a consensus validator
                  [--advertise IP:PORT]                                  (the address peers should dial when --listen binds a wildcard, e.g. a forwarded port)
                  [--allow-local-peer-hints]                              (accept loopback/private peer hints: private-range and single-host networks only)
+                 [--retain-blocks N] [--checkpoint FILE]                  (bound history to the last N blocks; start from a verifiable checkpoint)
+                 [--checkpoint-trust --checkpoint-max-age EPOCHS]        (TRUST DOWNGRADE: admit a checkpoint from a ROTATED committee on internal consistency alone)
                  --genesis PATH --key PATH                               (with both: a REAL member of the committee the genesis file lists)
                  --validators N --index I                                (fixture ONLY: the derived development committee, publicly derivable keys)
   b10coin claim  --node URL [--key PATH] [--print-key] [--yes | --dry-run]
@@ -130,9 +133,11 @@ Usage:
                                                         Unbond all or part of the bond; a partial exit must leave MIN_STAKE or nothing
   b10coin withdraw --node URL --key PATH [--yes | --dry-run]
                                                         Release matured unbonding records to the spendable balance
-  b10coin checkpoint export --dir PATH --at H [--out FILE]
+  b10coin checkpoint export --dir PATH --at H [--out FILE] [--trust]
                                                         Write the verifiable recovery artefact for height H: the
-                                                        block, the state committed there and the quorum certificate
+                                                        block, the state committed there, the quorum certificate and
+                                                        the committee that signed it (--trust: write the form a
+                                                        rotated chain needs, accepted only with --checkpoint-trust)
                                                         that proves a committee agreed on it (M7)
   b10coin version [--short]                             Print the build identity (version + VCS revision);
                                                         --short prints only the semantic version, for scripts
@@ -235,6 +240,19 @@ default ceiling bounds that loss to one spark. There is deliberately no
 made for a different node's chain is useless there and invalid on the chain
 the operator meant - useless, not dangerous. HTTP redirects are refused for
 the same reason.
+
+CHECKPOINTS HAVE TWO TRUST LEVELS, and only one of them is authentication.
+Without flags a checkpoint is verified against the GENESIS committee: the votes
+must be a genesis quorum, and a checkpoint whose committee has rotated is
+REFUSED. --checkpoint-trust (with --checkpoint-max-age, default 4 epochs)
+admits a ROTATED checkpoint by checking only that IT AGREES WITH ITSELF - a
+quorum of the committee the file carries signed the block it carries, whose
+header commits the state it carries. Anyone can fabricate that consistently
+with their own keys, so a trusted checkpoint is an ANCHOR YOU CHOSE, not
+evidence about the real chain; the age bound is what stops it pinning the node
+to a long-dead fork forever. The warning is printed at import, the file says it
+in its own "note" field, and "b10coin checkpoint export --trust" writes that form
+deliberately because a default export refuses a rotated committee.
 
 A TRANSACTION IS NOT GOSSIPED, and that decides where you post it. The wire
 carries proposals, votes, HELLOs, block sync and peer exchange; no message
@@ -1249,6 +1267,8 @@ func cmdNode(args []string) error {
 	epochBlocks := fs.Uint64("epoch-blocks", 0, "FIXTURE mode only: override the fixture genesis's epoch length before it is hashed (development and scenarios; refused with --genesis, where the shared committee file owns it)")
 	retainBlocks := fs.Uint64("retain-blocks", 0, "bound the data directory to the last N blocks (0 = keep everything, the default). Only a checkpoint can make pruned history recoverable, and only a consensus validator records the quorum certificate a checkpoint is built from")
 	checkpointPath := fs.String("checkpoint", "", "start this node from a checkpoint file written by `b10coin checkpoint export` (the data directory must be empty: importing over a chain is refused)")
+	checkpointTrust := fs.Bool("checkpoint-trust", false, "TRUST DOWNGRADE, for a rotated chain only: accept --checkpoint FILE even when its committee is not the genesis committee, by checking only that THE FILE AGREES WITH ITSELF (its own committee signed its own block, whose header commits its own state). Anyone can fabricate such a file with their own keys, so this proves internal consistency, NOT that it is the real chain. Bounded by --checkpoint-max-age. Never pass it for a file whose provenance you have not authenticated out of band")
+	checkpointMaxAge := fs.Uint64("checkpoint-max-age", consensus.DefaultCheckpointMaxAgeEpochs, "EPOCHS: a --checkpoint-trust import is refused once the file is older than this. 0 is refused - an unbounded trusted checkpoint pins this node to a past fork forever")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1289,10 +1309,33 @@ func cmdNode(args []string) error {
 		if *checkpointPath != "" {
 			return fmt.Errorf("--checkpoint adopts a state a committee signed; this single-node producer has no committee and cannot judge one. Give --genesis/--key (or --validators/--index) together with it")
 		}
+		if *checkpointTrust {
+			return fmt.Errorf("--checkpoint-trust names a trust decision about an imported checkpoint, and this single-node producer imports none; give --checkpoint FILE --genesis/--key (or --validators/--index), or drop the flag")
+		}
 		if err := checkProducerBlockTime(*blockTime); err != nil {
 			return err
 		}
 		return runProducerNode(*dir, *addr, *blockTime)
+	}
+	// The trust flag and its age bound are ONE decision, and the CLI refuses
+	// every half of it here rather than letting the verifier discover it:
+	// a trust flag with no file trusts nothing, an age with no trust bounds
+	// nothing, and a zero age is the permanent fork-pin the whole bound exists
+	// to prevent.
+	if *checkpointTrust && *checkpointPath == "" {
+		return fmt.Errorf("--checkpoint-trust is a statement about the file given to --checkpoint, and none was given. Pass --checkpoint FILE, or drop the flag: a pruned directory's own checkpoint is verified without it")
+	}
+	maxAgeSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "checkpoint-max-age" {
+			maxAgeSet = true
+		}
+	})
+	if maxAgeSet && !*checkpointTrust {
+		return fmt.Errorf("--checkpoint-max-age bounds a --checkpoint-trust import, and --checkpoint-trust was not given. The default genesis-anchored import needs no age bound; give both flags, or neither")
+	}
+	if *checkpointTrust && *checkpointMaxAge == 0 {
+		return fmt.Errorf("--checkpoint-max-age 0 would remove the only bound on a trusted checkpoint, and an unbounded one pins this node to an arbitrary past fork forever. Give a positive number of epochs (the default is %d)", consensus.DefaultCheckpointMaxAgeEpochs)
 	}
 	var relayToken []byte
 	if *relayTokenPath != "" {
@@ -1328,7 +1371,7 @@ func cmdNode(args []string) error {
 		// peer. The devnet layer refuses it too (it is the library entry point).
 		return fmt.Errorf("--advertise names the address peers should dial, but this node has no --listen to receive them: give --listen ADDR (e.g. 0.0.0.0:7001) together with it")
 	}
-	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints, checkpointBytes, *retainBlocks, *epochBlocks)
+	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints, checkpointBytes, *checkpointTrust, *checkpointMaxAge, *retainBlocks, *epochBlocks)
 }
 
 // runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
@@ -1476,6 +1519,14 @@ func pruneLog(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
+// checkpointLog is where the M8 trusted-import warning goes. It sits beside
+// pruneLog on stderr, where systemd captures it next to the node's other
+// operational lines - a trust downgrade the operator never sees is the failure
+// mode this milestone guards hardest.
+func checkpointLog(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
 // runNetworkedNode is the M4 consensus path of the `node` command: one
 // validator of a consensus committee over the real transport, running the same
 // consensus stack the in-process TCP integration test drives. The single-node
@@ -1498,7 +1549,7 @@ func pruneLog(format string, args ...any) {
 //
 // --block-time is refused with networking: a committee's cadence is its
 // round-timeout ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool, checkpoint []byte, retainBlocks, epochBlocks uint64) error {
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool, checkpoint []byte, checkpointTrust bool, checkpointMaxAge, retainBlocks, epochBlocks uint64) error {
 	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -1610,9 +1661,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers,
 	var v *devnet.Validator
 	var err error
 	if g != nil {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, CheckpointTrust: checkpointTrust, CheckpointMaxAgeEpochs: checkpointMaxAge, CheckpointLog: checkpointLog, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
 	} else {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, CheckpointTrust: checkpointTrust, CheckpointMaxAgeEpochs: checkpointMaxAge, CheckpointLog: checkpointLog, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
 	}
 	if err != nil {
 		return err

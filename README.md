@@ -361,7 +361,9 @@ whose keys sign, and that is the security boundary:**
 | `--index I` | *unset* | fixture seat number — development only |
 | `--epoch-blocks N` | `0` (the fixture's own) | **fixture mode only**: override the derived committee's epoch length before the genesis is hashed. It exists for the M7 pruning scenario, whose first prune would otherwise need ~5000 blocks (an hour at the fixture pace); refused with `--genesis`, where the shared committee file owns the epoch, and refused below 2. Two nodes that disagreed on it would hash different chains — which is why the fixture mode is development-only in the first place |
 | `--retain-blocks N` | `0` (**keep everything**) | bound the data directory to the last `N` blocks (M7). Off by default, so a node started without it behaves exactly as it did before. Refused below `4 × epoch_blocks` blocks, and only a **consensus** validator may use it: pruning is allowed only when the horizon's quorum certificate can be written into a checkpoint, and a single-node producer records none. Prunes only at epoch boundaries, so the state at the horizon is exactly reproducible; what is never pruned is `rounds.log`, `locks.log`, `genesis.hash`, the head block and its certificate, the horizon committee, the base marker and the checkpoint itself (`internal/retention`) |
-| `--checkpoint PATH` | *unset* | start this node from a checkpoint written by `b10coin checkpoint export`. The file is **verified before it is installed**: its precommit votes must reach a quorum of the **genesis** committee for the block it carries, and its state must hash to that block's committed root. It is only accepted into an **empty** data directory — importing over a chain is refused, never silently merged. Without the flag a pruned directory still starts: it reads its own `checkpoint.json` |
+| `--checkpoint PATH` | *unset* | start this node from a checkpoint written by `b10coin checkpoint export`. The file is **verified before it is installed**: its precommit votes must reach a quorum of the **genesis** committee for the block it carries, and its state must hash to that block's committed root. A checkpoint whose committee has **rotated** is refused here; see `--checkpoint-trust`. It is only accepted into an **empty** data directory — importing over a chain is refused, never silently merged. Without the flag a pruned directory still starts: it reads its own `checkpoint.json` |
+| `--checkpoint-trust` | `false` | **TRUST DOWNGRADE.** With `--checkpoint`, admit a checkpoint whose committee is *not* the genesis committee by checking only that **the file agrees with itself** — its own committee signed its own block, whose header commits its own state. Anyone can fabricate that with their own keys, so it proves internal consistency, **not** that the file is the real chain. Bounded by `--checkpoint-max-age`. A file whose genesis-anchored verification succeeds never needs it |
+| `--checkpoint-max-age EPOCHS` | `4` | the hard age bound a `--checkpoint-trust` import gets, in epochs (converted with the chain's nominal `epoch_blocks × block_time`). The file's `issued_at` is compared with the local clock; `0` is refused, because an unbounded trusted checkpoint pins a node to an arbitrary past fork forever. Meaningful only with `--checkpoint-trust` |
 
 **Peer exchange, and who it actually helps.** M5 adds `PEER_EXCHANGE`: a node
 that has a listener advertises its `IP:port` at most once every four waves
@@ -461,14 +463,52 @@ the root that block commits (so a swapped state is refused), and the retained
 blocks then replay on top of it and must reproduce every stored header's root.
 `--checkpoint` is accepted only into an empty `--dir`.
 
-**The static-committee assumption, stated because it is load-bearing.** M7
-verifies a checkpoint against the genesis committee, which is correct while the
-committee is genesis-fixed. M5 rotation means the committee at H *can* differ:
-`checkpoint export` refuses in that case rather than write a file its own
-importer could not verify, and the importer refuses anything the genesis
-committee did not sign. Rotation-aware checkpoints must additionally carry the
-committee at H and a light-client proof of the rotation, and are deliberately
-left to the next milestone (`docs/plan-2026-11-15-m7-bounded-history.md` §4/§7).
+**Rotated committees: the default refuses, and the opt-in is a trust
+downgrade (M8).** The trust anchor stays genesis: a default import refuses a
+checkpoint whose committee is not the genesis committee, because a node with no
+history has no other committee it can authenticate. Rotation does not create a
+new kind of evidence — a checkpoint that carries its own committee *verifies
+against itself*, and an attacker who fabricates a state, a committee of their
+own keys and matching votes produces a file that passes that check trivially.
+Self-consistency is not authenticity.
+
+So the rotation-aware path is explicit and bounded:
+
+```sh
+# on the exporting node (stopped), write the rotation-aware form:
+b10coin checkpoint export --dir ./b10coin-data --at 12000 --out cp.json --trust
+
+# on the importing node (empty --dir):
+b10coin node ... --dir ./fresh --checkpoint cp.json --checkpoint-trust --checkpoint-max-age 4
+```
+
+* `--checkpoint-trust` verifies **internal consistency only**: the votes form a
+  quorum of the committee the file carries, and the state hashes to the root the
+  certified block commits. That is a real check, and it does not touch the real
+  chain.
+* `--checkpoint-max-age` (default 4 epochs) is **hard** and not optional. The
+  file's `issued_at` is its exporter's wall clock — block timestamps are
+  **logical** on this chain (parent + 1, audit S-8), so a height cannot be
+  dated. A trusted checkpoint past the bound is refused; without the bound a
+  node could be pinned to a long-dead fork forever.
+* The file says this in its own `note`, the importer prints a warning on
+  stderr, and the exporter warns too. A trust downgrade must be impossible to
+  acquire by accident.
+* **What this is not:** a light client. Fully verifying a rotated checkpoint for
+  a node that lost its history needs the header chain and the rotation
+  transactions; that is a milestone of its own. This flag makes a rotated
+  restore *possible* at the cost of trusting the file's provenance, which the
+  operator must authenticate out of band. A node that still has its history can
+  simply replay.
+
+Note that the file now carries `committee_hex` — the committee that **signed**
+block H — and `issued_at`, and the format version is 2. The signer committee is
+read from the chain's per-height source and asserted at export by re-tallying
+H's certificate under it; it is **not** derivable from the carried state, because
+epoch e's committee comes from the state at `e × epoch_blocks − 1`, which is
+earlier than H (the state at H decides the *next* epoch — which is why the prune
+horizon sits one block before a boundary). Files from the M7 format are refused
+rather than guessed at.
 
 **What a prune may never take** is a table in code, not a convention
 (`internal/retention`): `rounds.log` is the validator's restart position and
@@ -487,11 +527,16 @@ delivered — Ctrl-C still reaches the same clean path.
 ### `b10coin checkpoint export`
 
 ```
-b10coin checkpoint export --dir PATH --at H [--out FILE] [--genesis PATH | --validators N]
+b10coin checkpoint export --dir PATH --at H [--out FILE] [--trust] [--genesis PATH | --validators N]
 ```
 
 Writes the verifiable recovery artefact for height `H`: the block, the committed
-state and the precommit votes that prove a committee agreed on it. `--at H` must
+state, the precommit votes that prove a committee agreed on it, and the
+committee that signed it. Without `--trust` it is the **genesis-anchored** form:
+it refuses a height whose committee has rotated. With `--trust` it writes the
+rotation-aware form instead — see the trust section above for exactly what that
+does and does not prove, and note that only a node started with
+`--checkpoint-trust` accepts it. `--at H` must
 be a height whose certificate this directory still holds. `--out` is optional
 (the checkpoint goes to stdout without it). It is an **offline** verb: it opens
 the data directory, so the node using it must be stopped — a running node holds
