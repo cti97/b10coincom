@@ -94,6 +94,23 @@ expected=$((ntargets * 2))
 # ldflags, no second constant, no parsing the source.
 # --short is the machine interface: `b10coin version` also prints the build
 # identity, and artifact NAMES must not change when that display does.
+# The version in internal/version must equal the TAG being built from. Without
+# this, v0.1.0 through v0.1.3 all shipped artifacts named b10coin-0.1.0-* under
+# four different tags: the number was stale and nothing noticed for four
+# releases. A build whose version and tag disagree has no identity, exactly like
+# one that cannot name its commit (audit S-10).
+if tag=$(git describe --tags --exact-match HEAD 2>/dev/null); then
+	case "$tag" in
+	v[0-9]*)
+		tag_version=${tag#v}
+		build_version=$(go run ./cmd/b10coin version --short) || fail "cannot read the version from internal/version"
+		if [ "$tag_version" != "$build_version" ]; then
+			fail "the tag ($tag) and internal/version ($build_version) disagree: an artifact whose version and tag differ cannot be identified. Bump internal/version/version.go to $tag_version, or build from the right commit."
+		fi
+		;;
+	esac
+fi
+
 version=$(go run ./cmd/b10coin version --short) || fail "cannot read the version from internal/version (go run ./cmd/b10coin version --short failed)"
 printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
     fail "internal/version reported '$version', which is not semver x.y.z"

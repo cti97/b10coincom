@@ -23,7 +23,7 @@ import (
 )
 
 // Version is the semantic version of the node software.
-const Version = "0.1.0"
+const Version = "0.1.4"
 
 // shortRev is how many characters of the revision an Identity shows. Twelve
 // hex digits is 48 bits — no two commits of this repository collide — and it
