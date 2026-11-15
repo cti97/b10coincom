@@ -47,6 +47,21 @@ type Driver struct {
 	// the engine performs no I/O and reads no other component.
 	CommitWitness func(height uint64, round uint32, votes []*Vote)
 
+	// HistoryPruner, when set, is called after a commit has been appended AND
+	// witnessed (so the new height's certificate is already in the certificate
+	// log). It is the M7 seam that lets a validator bound its data directory:
+	// the pruner decides whether the head has exposed a new epoch boundary
+	// below the retention window, writes the checkpoint for it, and only then
+	// deletes history. It is injected for the same reason CommitWitness is -
+	// the engine performs no I/O and reads no other component - and nil is the
+	// default, which keeps every earlier run byte-identical.
+	//
+	// The pruner runs on the tick goroutine, after the engine for the next
+	// height is installed, so a slow pass delays the next round rather than
+	// losing one. Its error is the CALLER's to record: a prune that cannot
+	// build a checkpoint must leave the node running with its history intact.
+	HistoryPruner func(*chain.Chain)
+
 	// pending holds the transactions this driver has TAKEN from its mempool
 	// for the proposal at the current undecided height and that no committed
 	// block has carried yet. Take removes what it returns, so without this
@@ -793,4 +808,13 @@ func (d *Driver) flush() {
 	d.eng = eng
 	d.appendRefused = false
 	d.timeoutAt = d.now + d.cfg.TimeoutBase
+
+	// Bounded history (M7), when the operator asked for it. AFTER the engine
+	// swap so a pruning pass cannot delay the commit it follows from being
+	// recorded, and after the witness so the horizon's certificate is already
+	// in the log when the pruner looks for it. The pruner refuses rather than
+	// fails: see Pruner.MaybePrune.
+	if d.HistoryPruner != nil {
+		d.HistoryPruner(d.ch)
+	}
 }

@@ -765,6 +765,21 @@ func (s *Syncer) verifyCertificate(blk *types.Block, round uint32, votes []*Vote
 		// all. A refused certificate, never a fallback to genesis.
 		return fmt.Errorf("%w: no committee for height %d: %w", ErrBadSyncCommit, blk.Header.Height, err)
 	}
+	return verifyCertificateVotes(vals, blk, round, votes)
+}
+
+// verifyCertificateVotes is THE quorum gate's body, extracted (M7) so the
+// checkpoint verifier re-tallies a checkpoint's certificate through EXACTLY the
+// same rules the syncer applies to an adopted block: VoteSet.Add proves each
+// vote's signature, its sender's committee membership, its placement at
+// (height, round), and the one-vote-per-validator rule; HasQuorum demands the
+// same two-thirds-of-total-power a live commit musters.
+//
+// It takes the committee rather than looking it up, because the checkpoint
+// verifier's committee is the GENESIS committee (the trust anchor) while the
+// syncer's is the block's epoch committee. Both paths agree on everything else
+// by construction: there is one tally rule.
+func verifyCertificateVotes(vals []genesis.Validator, blk *types.Block, round uint32, votes []*Vote) error {
 	// certVoteSet builds a bare Config (no timeouts), so Config.Validate is not
 	// run over it and Config.Quorum would silently use a WRAPPED total if this
 	// committee's powers summed past 2^64 (audit C-17). The production node

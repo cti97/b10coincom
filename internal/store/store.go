@@ -266,8 +266,16 @@ type Store struct {
 	dir   string
 	file  *os.File // append handle on the segment receiving writes
 	last  uint64   // highest height present, corrupt ones included
-	have  bool
-	index map[uint64]int64 // height -> record offset within its segment
+	first uint64   // lowest height this directory still holds (1: never pruned)
+	// firstOffset is where height `first`'s RECORD starts within its segment
+	// (base.height, M7). The pruner never rewrites a segment - it moves the
+	// marker and deletes whole segments below it - so this offset is where the
+	// surviving history begins inside a segment that may still carry pruned
+	// records ahead of it. certFirst is the certificate log's horizon.
+	firstOffset int64
+	certFirst   uint64
+	have        bool
+	index       map[uint64]int64 // height -> record offset within its segment
 	// indexMu guards index, last and have (audit R-2). Append writes them
 	// under the chain's write lock; Read used to look the offset up under the
 	// chain's READ lock, which the chain no longer holds across a disk read,
@@ -326,6 +334,7 @@ type Store struct {
 	certFile        *os.File
 	certSeg         uint64
 	certSegRecords  map[uint64]int
+	certSegMax      map[uint64]uint64
 	certIndex       map[uint64]certLoc
 	legacyCertMax   uint64 // highest height the legacy certs.log holds, 0 if none
 	legacyCertRecs  int    // records the legacy certs.log physically holds
@@ -365,11 +374,15 @@ func Open(dir string) (*Store, error) {
 	}
 	s := &Store{
 		dir:            dir,
+		first:          1,
+		firstOffset:    int64(SegmentHeaderLen),
+		certFirst:      1,
 		index:          make(map[uint64]int64),
 		locks:          make(map[uint64]LockRecord),
 		rounds:         make(map[uint64]uint32),
 		certIndex:      make(map[uint64]certLoc),
 		certSegRecords: make(map[uint64]int),
+		certSegMax:     make(map[uint64]uint64),
 		readers:        make(map[string]*os.File),
 		lock:           lock,
 	}
@@ -449,11 +462,16 @@ func Open(dir string) (*Store, error) {
 	return s, nil
 }
 
+// segmentPath is the segment an append lands in: the last one when the store
+// holds blocks, and the segment that would hold the next height when it holds
+// none. The latter is NOT always segmentName(0) any more (M7): a directory
+// pruned down to empty has a first height above 1 (base.height), and appending
+// to segment 0 there would write below the recorded base.
 func (s *Store) segmentPath() string {
 	if s.have {
 		return filepath.Join(s.dir, segmentName(s.last))
 	}
-	return filepath.Join(s.dir, segmentName(0))
+	return filepath.Join(s.dir, segmentName(s.first))
 }
 
 // syncDir best-effort fsyncs a directory so a newly created or renamed entry
@@ -536,13 +554,47 @@ func (s *Store) scan() error {
 	if err != nil {
 		return err
 	}
+	// The pruner's first-height marker (M7) comes FIRST: block segments are
+	// numbered by record count, so a directory whose first segments were
+	// deleted would silently renumber every surviving block unless the scan
+	// knows where numbering starts. It also tells a crash-interrupted prune how
+	// many records at the head of the boundary segment are already pruned and
+	// must be SKIPPED rather than renumbered.
+	marker, err := readBaseMarker(s.dir)
+	if err != nil {
+		return err
+	}
+	first := marker.blockFirst
+	s.first = first
+	s.firstOffset = marker.blockOffset
+	s.certFirst = marker.certFirst
+	s.last = first - 1
 	var segs []string
 	for _, e := range entries {
 		if !e.IsDir() && filepath.Ext(e.Name()) == ".seg" {
+			if _, err := segmentIndexFromName(e.Name()); err != nil {
+				return err
+			}
 			segs = append(segs, e.Name())
 		}
 	}
 	slices.Sort(segs)
+	// Leading segments ENTIRELY below the base are what a crash between writing
+	// the marker and removing them leaves behind. They are not part of the
+	// chain any more, and numbering cannot start inside one that no longer
+	// holds a retained height - so drop them before the sequence check runs.
+	// Only LEADING ones: a segment below the base with a retained segment
+	// before it would be a hole, and the name check below refuses that.
+	for len(segs) > 0 {
+		idx, err := segmentIndexFromName(segs[0])
+		if err != nil {
+			return err
+		}
+		if segmentMaxHeight(idx) >= first {
+			break
+		}
+		segs = segs[1:]
+	}
 
 	for si, name := range segs {
 		if err := s.scanSegment(name, si == len(segs)-1); err != nil {
@@ -794,7 +846,31 @@ func (s *Store) scanSegment(name string, final bool) error {
 	default:
 		return fmt.Errorf("%w%s", err, formatHint(path))
 	}
-	off := int64(SegmentHeaderLen)
+	// Where numbering resumes. A never-pruned directory starts a segment at its
+	// header; the FIRST segment of a pruned one starts at the offset the horizon
+	// marker records, so the pruned records ahead of it - still on disk, never
+	// rewritten - are simply not part of the chain any more.
+	start := int64(SegmentHeaderLen)
+	if !s.have && s.firstOffset > start {
+		start = s.firstOffset
+	}
+	if start > size {
+		return fmt.Errorf("%w: the horizon marker starts block %d at offset %d, past the end of %s (%d bytes); the marker or the segment is damaged", ErrCorruptRecord, s.first, start, name, size)
+	}
+
+	// The segment's NAME is a fact about its absolute position: a hole in the
+	// sequence (a segment removed by hand, or a rename the pruner did not do)
+	// would otherwise renumber everything after it, and a renumbered chain
+	// replays to the roots its rewritten headers claim. Refuse the hole here,
+	// where the file name makes it visible, rather than at replay time where
+	// it presents as a divergence.
+	if idx, err := segmentIndexFromName(name); err != nil {
+		return err
+	} else if want := (s.last + 1) / BlocksPerSegment; idx != want {
+		return fmt.Errorf("%w: block segment %s is number %d, but the chain reaches it at segment %d: a segment is missing from the directory", ErrCorruptRecord, name, idx, want)
+	}
+
+	off := start
 	// buf is reused across records; it grows to the largest record and no more.
 	var buf []byte
 	for off < size {
@@ -847,7 +923,10 @@ func (s *Store) truncateTail(path string, size int64) error {
 
 // Append writes payload as the block at height. Heights must be sequential.
 func (s *Store) Append(height uint64, payload []byte) error {
-	want := uint64(1)
+	// The first height this directory can accept is its recorded horizon, not
+	// necessarily 1: a store adopted from a checkpoint at H (M7) starts at H+1
+	// with no blocks yet, and asking for 1 would refuse the very first append.
+	want := s.first
 	if s.have {
 		want = s.last + 1
 	}
@@ -1375,6 +1454,25 @@ func (s *Store) scanCertFile(name string, loc certLoc, final bool) error {
 			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, name, err)
 		}
 		h := binary.BigEndian.Uint64(key[:])
+		// The physical record count and the segment's height range are tracked
+		// for EVERY record, including the ones below the horizon: rotation
+		// counts the bytes actually in the file, and the pruner must be able to
+		// tell that a segment is entirely below the horizon even when none of
+		// its records is indexed any more.
+		if !legacy {
+			s.certSegRecords[loc.seg]++
+			if h > s.certSegMax[loc.seg] {
+				s.certSegMax[loc.seg] = h
+			}
+		}
+		// A height below the certificate horizon is ABSENT, even though its
+		// record may still be on disk: the pruner never rewrites a segment, so
+		// the boundary segment keeps its pruned prefix and this is where it is
+		// ignored (M7).
+		if h < s.certFirst {
+			off = recEnd
+			continue
+		}
 		// Newest wins: a height is certified once, and the store's PutCert
 		// refuses to append a second record for it, so only a hand-written
 		// file can present two.
@@ -1384,8 +1482,6 @@ func (s *Store) scanCertFile(name string, loc certLoc, final bool) error {
 			if h > s.legacyCertMax {
 				s.legacyCertMax = h
 			}
-		} else {
-			s.certSegRecords[loc.seg]++
 		}
 		off = recEnd
 	}

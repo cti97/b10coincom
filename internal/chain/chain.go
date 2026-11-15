@@ -53,6 +53,18 @@ var (
 	// proposer set any positive value, including one behind its parent, and
 	// made the timestamp a free grinding input for the next proposer draw.
 	ErrBadTimestamp = errors.New("chain: block timestamp is not valid for its parent")
+	// ErrHistoryPruned reports a data directory whose blocks below some height
+	// are deliberately absent (M7 pruning). It is not corruption: the node can
+	// start, but only from a checkpoint that proves the state at the horizon.
+	// Distinct from ErrGenesisReplay because the remedy is a checkpoint or a
+	// resync, never a repair.
+	ErrHistoryPruned = errors.New("chain: the data directory's history has been pruned; it must be opened from a checkpoint")
+	// ErrCheckpointMismatch reports a checkpoint that does not belong to the
+	// directory it was handed to - a different height than the retained
+	// history builds on, or a checkpoint offered to a chain that still holds
+	// genesis. Ignoring it would start a node on a state its operator did not
+	// ask for.
+	ErrCheckpointMismatch = errors.New("chain: checkpoint does not match this data directory")
 	// ErrNoCommittee reports a height whose committee epoch has not been
 	// decided yet: the block at that epoch's deciding height (e*E-1, or the
 	// genesis state for epoch 0) is not committed. It is an error rather than
@@ -78,6 +90,26 @@ type Chain struct {
 	store *store.Store
 	state *state.State
 	head  *types.Block
+
+	// baseHeight is the height the directory's FIRST retained block sits on:
+	// 0 for a chain that starts at genesis, and the checkpoint's height for a
+	// pruned (or checkpoint-imported) chain. baseState is the committed state
+	// AT baseHeight, which is what replaying a pruned chain forward starts
+	// from. Both are written once, under mu, by OpenResume and PruneHistory;
+	// no other path moves them.
+	//
+	// They exist because the store can no longer be replayed from height 1 once
+	// history is pruned: StateAt(h) - which the pruner needs to snapshot the
+	// state at its horizon - must start from the state the retained history
+	// builds on, not from genesis.
+	baseHeight uint64
+	baseState  *state.State
+
+	// pruneMu serialises the two operations that READ baseHeight/baseState
+	// against the one that MOVES them (PruneHistory). StateAt replays blocks
+	// outside mu - a replay of a retained window must not hold up every RPC
+	// reader - so the store's first height has to be pinned for its duration.
+	pruneMu sync.Mutex
 
 	// faucet is the protocol-controlled faucet address this chain mints into,
 	// derived from the genesis hash (so no private key exists for it). Set
@@ -169,8 +201,17 @@ type Chain struct {
 // block uses) and wires the faucet claim's parameters, without which no
 // claim could ever verify. It cannot fail: genesis validation has already
 // checked every key length, so the error return is omitted.
-func genesisState(g *genesis.Genesis) *state.State {
-	st := state.NewWithParams(state.Params{
+// GenesisParams returns the protocol parameters a chain built on g runs with:
+// the faucet the claims pay into, the claim and staking rules, the epoch length
+// and the chain identifier every transaction signature is bound to.
+//
+// It is EXPORTED (M7) because a checkpoint carries a state snapshot and decoding
+// it needs the same parameters the chain built its state with - and there must
+// be ONE construction of them. A second copy in the checkpoint verifier would
+// silently decode a snapshot against different rules after a genesis change,
+// producing a state that hashes to the right root and behaves differently.
+func GenesisParams(g *genesis.Genesis) state.Params {
+	return state.Params{
 		FaucetAddress: g.FaucetAddress(),
 		ClaimAmount:   g.Params.ClaimAmountSparks,
 		EpochBlocks:   g.Params.EpochBlocks,
@@ -198,7 +239,11 @@ func genesisState(g *genesis.Genesis) *state.State {
 		MinStake:        g.Params.MinStakeSparks,
 		UnbondingEpochs: g.Params.UnbondingEpochs,
 		CommitteeSize:   g.Params.CommitteeSize,
-	})
+	}
+}
+
+func genesisState(g *genesis.Genesis) *state.State {
+	st := state.NewWithParams(GenesisParams(g))
 	for _, d := range g.DevAccounts {
 		addr := types.AddressFromPub(d.PubKey)
 		acc := st.Get(addr)
@@ -253,9 +298,44 @@ func genesisBlock(g *genesis.Genesis, st *state.State) *types.Block {
 	}
 }
 
+// ResumeState is the hand-off from a VERIFIED checkpoint to the chain: the
+// block the directory's retained history builds on, and the state committed
+// there. It is constructed by whoever verified the checkpoint's quorum
+// certificate against the genesis committee (package consensus owns that; the
+// chain deliberately does not import it), and OpenResume re-checks the
+// INTERNAL consistency that needs no consensus knowledge: the head is at the
+// named height and the state hashes to the head's committed root. A caller
+// cannot slip a state that disagrees with the block it claims to resume from,
+// and cannot make a pruned directory replay from the wrong starting point.
+type ResumeState struct {
+	Height uint64
+	Head   *types.Block
+	State  *state.State
+}
+
 // Open loads the chain from dir, replaying every stored block. If the
 // directory is empty it initialises the genesis block instead.
+//
+// A directory whose history has been pruned cannot be opened this way - its
+// blocks start above height 1 and replaying them from genesis would silently
+// renumber the chain - and it is refused with ErrHistoryPruned. Use
+// OpenResume with a verified checkpoint.
 func Open(g *genesis.Genesis, dir string) (*Chain, error) {
+	return OpenResume(g, dir, nil)
+}
+
+// OpenResume loads the chain from dir, replaying every block the directory
+// still holds on top of resume (nil for a chain that starts at genesis).
+//
+// THE PRUNED DIRECTORY IS THE POINT (M7). A node that pruned to height H keeps
+// blocks H+1..head and a checkpoint at H; it cannot rebuild its state from
+// genesis because genesis's descendants are gone. resume supplies the state at
+// H, which the checkpoint's certificate authenticates, and replay continues
+// from H+1. The store's base.height marker (store.PruneBlocks) is what tells
+// this function which height that is; a resume whose height disagrees with the
+// marker is refused rather than trusted, because adopting the wrong starting
+// state is how a node "recovers" onto a state no quorum ever committed.
+func OpenResume(g *genesis.Genesis, dir string, resume *ResumeState) (*Chain, error) {
 	if err := g.Validate(); err != nil {
 		return nil, err
 	}
@@ -276,7 +356,11 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 	}()
 	c := &Chain{gen: g, store: s, state: st, head: genesisBlock(g, st), faucet: g.FaucetAddress(),
 		committees: make(map[uint64][]genesis.Validator),
-		everSeated: make(map[string]struct{}, len(g.Validators))}
+		everSeated: make(map[string]struct{}, len(g.Validators)),
+		// Until the directory says otherwise, the retained history starts at
+		// height 1 and therefore builds on the genesis state. OpenResume moves
+		// both when it adopts a checkpoint.
+		baseState: st}
 	// The genesis seats are seats: every one of them has "ever been seated"
 	// from height 0, so the authorisation set is complete even on a chain
 	// whose genesis committee cannot be derived (CommitteeSize zero) and on
@@ -326,11 +410,62 @@ func Open(g *genesis.Genesis, dir string) (*Chain, error) {
 	}
 
 	height, ok := s.Height()
+	base := s.FirstHeight()
+	// The checkpoint hand-off. Three shapes are legal, and each has its own
+	// refusal so a mismatch cannot degrade into a silent genesis start:
+	//
+	//   - base > 1: a pruned directory. It MUST be resumed, and resume must sit
+	//     exactly on base-1 - the block the retained history links to.
+	//   - base == 1 and the directory holds no blocks: a fresh directory (or a
+	//     checkpoint import that has not written its marker yet). A resume is
+	//     adopted by recording base = resume.Height+1.
+	//   - base == 1 and the directory holds blocks: an ordinary chain. A resume
+	//     handed to it is a CHECKPOINT MISMATCH, never something to ignore: an
+	//     operator who imported the wrong file must hear about it.
+	switch {
+	case base > 1:
+		if resume == nil {
+			return nil, fmt.Errorf("%w: the directory starts at height %d, so blocks 1..%d are gone; start it with a checkpoint (--checkpoint FILE, or the checkpoint.json this node pruned with)", ErrHistoryPruned, base, base-1)
+		}
+		if err := checkResume(resume, base-1); err != nil {
+			return nil, err
+		}
+	case resume != nil:
+		if ok {
+			return nil, fmt.Errorf("%w: the checkpoint is at height %d, but this directory already holds blocks from height 1 to %d; import a checkpoint only into an empty --dir", ErrCheckpointMismatch, resume.Height, height)
+		}
+		if err := checkResume(resume, resume.Height); err != nil {
+			return nil, err
+		}
+		if err := s.AdoptBase(resume.Height + 1); err != nil {
+			return nil, err
+		}
+		base = s.FirstHeight()
+		ok = false // a fresh directory has no stored blocks to replay
+	}
+	if resume != nil && base > 1 {
+		// The state at base-1 is the state the retained blocks build on. The
+		// epoch that the FIRST retained block belongs to was decided by exactly
+		// this state (the checkpoint sits one block before an epoch boundary -
+		// see consensus.Pruner), so recording it here is what lets a resumed
+		// validator judge height base without the state of an earlier epoch.
+		// Without this the node would replay correctly and then refuse to vote,
+		// with ErrNoCommittee for the epoch it just resumed into.
+		c.state = resume.State
+		c.head = resume.Head
+		c.baseHeight = resume.Height
+		c.baseState = resume.State
+		// Epoch 0's committee described a chain this directory no longer has;
+		// the memo is derived state, so clear it rather than leave a seat set
+		// that no retained block was judged by.
+		c.committees = make(map[uint64][]genesis.Validator)
+		c.memoCommitteeLocked(resume.State, resume.Height)
+	}
 	if !ok {
 		owned = true
 		return c, nil
 	}
-	for h := uint64(1); h <= height; h++ {
+	for h := base; h <= height; h++ {
 		raw, err := s.Read(h)
 		if err != nil {
 			return nil, err
@@ -604,10 +739,7 @@ func (c *Chain) creditEmissionLocked(st *state.State, height uint64) {
 // It mutates only the clone it returns, never c.state; the caller must hold
 // c.mu (reading is enough, which is how Build uses it).
 func (c *Chain) advanceLocked(height uint64, txs []types.Tx) (*state.State, error) {
-	next := c.state.Clone()
-	next.SetHeight(height) // execution context only: the claim rule derives its epoch from it
-	c.creditEmissionLocked(next, height)
-	return next.ApplyBlock(txs)
+	return c.transition(c.state, height, txs)
 }
 
 // Probe reports the state a block at head+1 carrying txs would produce, without
@@ -1169,31 +1301,17 @@ func (c *Chain) Append(b *types.Block) error {
 // store deliberately never holds (store heights start at 1): it is
 // re-synthesised from the genesis configuration exactly as Open built it.
 func (c *Chain) BlockAt(height uint64) (*types.Block, error) {
-	// The chain lock covers the HEAD snapshot only (audit R-2). It used to be
-	// held across the store's disk read and the decode as well, so every
-	// reader already inside a serialised read delayed Append, and a /history
-	// scan multiplied that by its window. A historical block never changes
-	// once appended, so the read needs no chain state beyond the head it was
-	// judged against; the store guards its own index.
+	// The chain lock covers the HEAD snapshot only (audit R-2). It is not held
+	// across the store's disk read and the decode, so every reader already
+	// inside a serialised read does not delay Append, and a /history scan does
+	// not multiply that by its window. A historical block never changes once
+	// appended, so the read needs no chain state beyond the head it was judged
+	// against; the store guards its own index. blockAt is the lock-free body,
+	// shared with PruneHistory (which already holds the write lock).
 	c.mu.RLock()
 	head := c.head
 	c.mu.RUnlock()
-	headHeight := head.Header.Height
-	if height > headHeight {
-		return nil, fmt.Errorf("%w: %d", store.ErrNotFound, height)
-	}
-	if height == headHeight {
-		return head, nil
-	}
-	if height == 0 {
-		st := genesisState(c.gen)
-		return genesisBlock(c.gen, st), nil
-	}
-	raw, err := c.store.Read(height)
-	if err != nil {
-		return nil, err
-	}
-	return types.DecodeBlock(raw)
+	return c.blockAt(head, height)
 }
 
 // PutLock durably records a validator's lock: that it precommitted

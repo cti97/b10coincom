@@ -146,6 +146,19 @@ type ValidatorConfig struct {
 	// Key is this validator's Ed25519 private key. Required in genesis-file
 	// mode; ignored (derived instead) in fixture mode.
 	Key ed25519.PrivateKey
+	// Checkpoint, when non-nil, is the RAW BYTES of a `bcoin checkpoint
+	// export` file to install into Dir before this node first opens it (M7).
+	// It is installed only after it verifies against this chain's genesis, and
+	// chain.OpenResume refuses it when Dir already holds history, so importing
+	// can never overwrite a chain.
+	Checkpoint []byte
+	// RetainBlocks, when non-zero, bounds this node's history to that many
+	// blocks (M7). Zero - the default - keeps everything, so every earlier
+	// acceptance run is byte-identical.
+	RetainBlocks uint64
+	// PruneLog, when set, receives one line per pruning pass and per refusal.
+	// Nil keeps a library caller quiet; the CLI wires stderr.
+	PruneLog func(format string, args ...any)
 	// Index is this node's seat in the fixture committee (fixture mode
 	// only; in genesis-file mode the seat is derived from the key and a
 	// nonzero value here is refused as a contradiction). In genesis-file
@@ -246,6 +259,11 @@ type Validator struct {
 	drvTP *driverTP
 	cfgC  consensus.Config
 	drv   *consensus.Driver
+	// pruner bounds this node's history (M7); nil unless RetainBlocks was set.
+	// pruneErr is the last refusal it reported, so a test (or a diagnostic)
+	// can see WHY a node that was asked to prune still holds everything.
+	pruner   *consensus.Pruner
+	pruneErr error
 	// dedup is the router's seen-set (audit N-7): the wave loop Forget()s
 	// below the committed height so a long-lived node does not accumulate
 	// keys for every height it ever decided.
@@ -530,7 +548,36 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		return nil, err
 	}
 
-	ch, err := chain.Open(g, cfg.Dir)
+	// M7: retention is validated BEFORE anything is opened, so a value below
+	// the floor is a startup refusal rather than a prune that fails later.
+	if err := consensus.ValidateRetain(cfg.RetainBlocks, g.Params.EpochBlocks); err != nil {
+		return nil, err
+	}
+	// A checkpoint handed to the CLI is VERIFIED FIRST and installed second:
+	// a file that does not prove a quorum commitment of the state it carries
+	// must never reach the data directory, where a later start would try to
+	// resume from it.
+	if len(cfg.Checkpoint) > 0 {
+		cp, err := consensus.DecodeCheckpoint(cfg.Checkpoint)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := consensus.VerifyCheckpoint(g, cp); err != nil {
+			return nil, err
+		}
+		if err := consensus.InstallCheckpoint(cfg.Dir, cp); err != nil {
+			return nil, err
+		}
+	}
+	// A PRUNED directory carries its own checkpoint (M7). ResumeForDir returns
+	// nil for an ordinary chain, so this changes nothing unless the node was
+	// actually pruned; chain.OpenResume then enforces that the checkpoint sits
+	// exactly on the retained history's base.
+	resume, err := consensus.ResumeForDir(g, cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	ch, err := chain.OpenResume(g, cfg.Dir, resume)
 	if err != nil {
 		return nil, err
 	}
@@ -700,21 +747,32 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// precommit votes, so the chain it holds is pullable by a catching-up
 	// peer (Design Decision 8). Without it, Answer refuses every range.
 	drv.CommitWitness = sy.RecordCommit
+	var pruner *consensus.Pruner
+	if cfg.RetainBlocks > 0 {
+		pruner, err = consensus.NewPruner(cfg.Dir, cfg.RetainBlocks)
+		if err != nil {
+			_ = tp.Close()
+			_ = ch.Close()
+			return nil, err
+		}
+		pruner.Log = cfg.PruneLog
+	}
 
 	v := &Validator{
-		cfg:   cfg,
-		g:     g,
-		ch:    ch,
-		priv:  priv,
-		pub:   pub,
-		pool:  pool,
-		sy:    sy,
-		rt:    rt,
-		ttp:   tp,
-		drvTP: dtp,
-		cfgC:  ccfg,
-		drv:   drv,
-		dedup: dedup,
+		cfg:    cfg,
+		g:      g,
+		ch:     ch,
+		priv:   priv,
+		pub:    pub,
+		pool:   pool,
+		sy:     sy,
+		rt:     rt,
+		ttp:    tp,
+		drvTP:  dtp,
+		cfgC:   ccfg,
+		drv:    drv,
+		dedup:  dedup,
+		pruner: pruner,
 		// The learned-address book starts empty; nothing is dialled from a hint
 		// until a peer advertises it through an attested connection.
 		hints: peerHints{
@@ -741,6 +799,12 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// the transport's dispatch goroutine (audit C-4): serving one costs disk
 	// reads and quorum-many verifies per height, and that work on the
 	// dispatch goroutine would hold every consensus frame behind it.
+	// M7: bound the data directory when asked, on the commit path. The pruner
+	// is installed on the driver only when one was configured, so a node that
+	// was not asked to prune has no hook at all.
+	if v.pruner != nil {
+		drv.HistoryPruner = v.maybePrune
+	}
 	rt.AsyncServe = v.enqueueSync
 	tp.OnMessage(v.route)
 	// The router's height observer: the wave loop pulls from what this sees.
@@ -1579,6 +1643,41 @@ func (v *Validator) syncWorker() {
 // queue. A nonzero count is the observable that the serving bound bit.
 func (v *Validator) SyncRequestsDropped() uint64 { return v.syncDropped.Load() }
 
+// maybePrune is the driver's HistoryPruner hook (M7). A refusal is RECORDED,
+// never fatal: a node that cannot produce a checkpoint for its horizon keeps
+// its history and keeps producing blocks, and this field is how an operator (or
+// a test) learns why the directory is not shrinking.
+func (v *Validator) maybePrune(ch *chain.Chain) {
+	if v.pruner == nil {
+		return
+	}
+	if _, err := v.pruner.MaybePrune(ch); err != nil {
+		v.mu.Lock()
+		v.pruneErr = err
+		v.mu.Unlock()
+		if v.cfg.PruneLog != nil {
+			v.cfg.PruneLog("prune: %v", err)
+		}
+		return
+	}
+	v.mu.Lock()
+	v.pruneErr = nil
+	v.mu.Unlock()
+}
+
+// PruneError reports the last prune refusal, or nil. It exists for the
+// acceptance run and the tests: a node asked to prune that still holds
+// everything must be able to say why.
+func (v *Validator) PruneError() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.pruneErr
+}
+
+// Pruner exposes the configured pruner (nil when history is unbounded) so a
+// caller can read its Retain without reaching into unexported state.
+func (v *Validator) Pruner() *consensus.Pruner { return v.pruner }
+
 // rebuildDriver replaces the driver with one judging the chain's CURRENT head.
 // The old engine's volatile round state is discarded the way a restart's is;
 // its persisted locks (if any) are per-height and restored by the fresh
@@ -1591,6 +1690,9 @@ func (v *Validator) rebuildDriver() error {
 		return err
 	}
 	d.CommitWitness = v.sy.RecordCommit
+	if v.pruner != nil {
+		d.HistoryPruner = v.maybePrune
+	}
 	v.drv = d
 	// Re-arm the N-8 notice: this failure episode is over, so a future one is
 	// reported again. mu is held by this method's caller-visible contract.
