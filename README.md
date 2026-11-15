@@ -941,6 +941,24 @@ a per-write deadline alone never caught because each individual write
 "succeeded". A peer that drains as it goes empties its queue constantly and
 is never cut off.
 
+**The node adds a third bound on the relay link it dials**, and it is an
+application-frame bound, not a socket timer: TCP keepalive only asks whether
+the far end's *kernel* is alive, so a relay that holds the socket while its
+writer is parked answers every probe and looks healthy. Each relay link
+records the age of the last frame it received, and once that link has
+delivered at least one frame a watchdog closes it — with a log line naming the
+relay address and the measured silence — after **60 seconds** without a frame
+(`DefaultRelaySilenceTimeout`, 4 × the relay's 15-second keepalive; it is
+derived rather than exposed as a flag, so the two constant families cannot
+drift apart unnoticed). Four periods stay above the churn a two-period
+(30-second) bound would cause and inside the node's 120-second idle read
+deadline, so the relay-specific line is the one an operator sees instead of a
+silent generic teardown. A link that has **never** delivered a frame is not
+judged: a lone validator behind a relay has nobody to hear from, and the idle
+deadline remains that link's backstop. The teardown forces a fresh socket,
+which is what made the difference in the three-host stall at height 5,794:
+restarting the relay committed within seconds because it did exactly that.
+
 **The memory arithmetic, derived rather than asserted.** One connection can
 hold, at one instant, at most: its write-queue **payload** budget
 (`write-queue-bytes`); its write-queue **entry ring**, at most

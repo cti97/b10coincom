@@ -200,6 +200,49 @@ const (
 	// the relay's own per-frame bound and sits far above any honest
 	// validator's cadence (ticks every 50 ms, waves every 500 ms).
 	DefaultIdleReadTimeout = 2 * time.Minute
+	// relayKeepAlive is internal/relay's DefaultKeepAlive (15 s), the TCP
+	// keepalive period the relay puts on every accepted connection. It is
+	// copied rather than imported because the transport must not depend on
+	// the relay implementation (the relay is one user of this layer, not the
+	// layer's owner); TestRelaySilenceBoundIsFourKeepalivePeriods pins the two
+	// constants together so the copy cannot drift unnoticed.
+	//
+	// What the relay's keepalive DOES and does NOT prove is the reason a
+	// node-side bound is needed at all: it is a KERNEL probe. A relay that
+	// holds the socket open but has stopped forwarding (a full send buffer
+	// toward this node, a writer parked, a process that is alive but wedged)
+	// answers every probe with a bare ACK, so the kernel never fails the
+	// connection. Liveness of the peer is an application-frame question, and
+	// only the application can time it.
+	relayKeepAlive = 15 * time.Second
+	// DefaultRelaySilenceTimeout is the per-RELAY-LINK silence bound: the
+	// longest a relay connection may deliver NO frame before the node
+	// presumes the link wedged, logs the measured silence, and closes the
+	// socket so its maintainer redials a fresh one.
+	//
+	// WHY 4 x KEEPALIVE (60 s).
+	//   - One period (15 s) is the relay's own probe cadence, not a wedge
+	//     signal: a single missed probe is ordinary on a WAN and is answered
+	//     by the kernel without any application traffic.
+	//   - Two periods (30 s) is exactly the churn interval the liveness brief
+	//     rules out, and it is also the relay's own write timeout: a bound at
+	//     the relay's own reaping time would race a healthy relay instead of
+	//     backstopping a wedged one.
+	//   - Four periods (60 s) gives three whole probe cycles of margin while
+	//     staying INSIDE DefaultIdleReadTimeout (120 s), so the relay-specific
+	//     line - with the address and the measured silence - is the diagnosis
+	//     an operator sees, not the generic idle-deadline teardown, which
+	//     never said which link went quiet or for how long.
+	//
+	// IT CANNOT FIRE ON A HEALTHY QUIET CHAIN. The node broadcasts a signed
+	// HELLO to every peer every 500 ms (devnet.WaveEvery), and every other
+	// member does the same, so an established relay link delivers a frame
+	// every half second even when no block is being committed: 60 s is ~120
+	// missed HELLOs. A link that has NEVER delivered a frame is deliberately
+	// not judged by this bound (see relayWatchdog): a lone validator whose
+	// relay has no other members behind it is quiet but not wedged, and
+	// churning that link would be the false positive the bound must avoid.
+	DefaultRelaySilenceTimeout = 4 * relayKeepAlive
 	// DefaultWriteTimeout is the per-frame WRITE DEADLINE (audit N-3): the
 	// longest one WriteFrame may block on a peer that has stopped reading
 	// before the connection is ended. Pre-fix the writer had no deadline, so
@@ -329,6 +372,14 @@ type Options struct {
 	// IdleReadTimeout is the longest a live connection may deliver no
 	// complete frame before it is closed. Default DefaultIdleReadTimeout.
 	IdleReadTimeout time.Duration
+	// RelaySilenceTimeout is the longest a RELAY link may deliver no frame
+	// before the node presumes it wedged, logs the address and the measured
+	// silence, and closes it so the maintainer redials. It applies to
+	// relay-mode connections only (a direct peer is a different trust and a
+	// different diagnostic), and only after the link has delivered at least
+	// one frame: a link that has never spoken is not evidence of a wedge.
+	// Default DefaultRelaySilenceTimeout (4 x the relay's 15 s keepalive).
+	RelaySilenceTimeout time.Duration
 	// WriteTimeout is the longest one frame's write may block before the
 	// connection is ended. Default DefaultWriteTimeout.
 	WriteTimeout time.Duration
@@ -452,6 +503,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.IdleReadTimeout <= 0 {
 		o.IdleReadTimeout = DefaultIdleReadTimeout
+	}
+	if o.RelaySilenceTimeout <= 0 {
+		o.RelaySilenceTimeout = DefaultRelaySilenceTimeout
 	}
 	if o.WriteTimeout <= 0 {
 		o.WriteTimeout = DefaultWriteTimeout
@@ -743,6 +797,16 @@ type conn struct {
 	gated       atomic.Uint64
 	rateLimited atomic.Uint64
 	relayPaced  atomic.Uint64
+	// lastFrame is the link's liveness clock: the value of
+	// TcpTransport.sinceStart() at the last complete frame read from this
+	// connection, or -1 before the first one. It is written by the reader
+	// goroutine and read by that connection's relayWatchdog, so it is an
+	// atomic rather than a plain field (a per-link timestamp touched from two
+	// goroutines is exactly what -race must see synchronised). Only a relay
+	// connection has a watchdog; the field is maintained for every connection
+	// so the reader has no branch and the instrument is uniform, but a direct
+	// connection's value is never read by anything.
+	lastFrame atomic.Int64
 }
 
 // finish tears the connection down exactly once: unblock the maintainer, make
@@ -821,6 +885,15 @@ type outbound struct {
 // TcpTransport moves opaque bytes over real TCP.
 type TcpTransport struct {
 	opts Options
+	// clock and started form the MONOTONIC link clock every per-connection
+	// timestamp is expressed against. The clock is a field so a test can
+	// drive link age by a constructed instant instead of sleeping (the same
+	// rule rateLimiter follows), and it is read-only after New: no goroutine
+	// writes it. A time.Time carries its monotonic reading, so
+	// clock().Sub(started) is immune to wall-clock steps - a link must not be
+	// judged wedged because the host's NTP corrected its clock.
+	clock   func() time.Time
+	started time.Time
 	// backoff is shared by every maintainer: one rng, one delay curve, seeded
 	// from Options.Rand. Next takes its lock, so the maintainers' interleaved
 	// draws are safe though not individually ordered - jitter needs
@@ -918,10 +991,30 @@ func New(opts Options) (*TcpTransport, error) {
 	return &TcpTransport{
 		opts:      o,
 		backoff:   NewBackoff(o.BackoffBase, o.BackoffMax, o.Rand),
+		clock:     time.Now,
+		started:   time.Now(),
 		conns:     make(map[transport.PeerID]*conn),
 		outbounds: make(map[string]*outbound),
 		quit:      make(chan struct{}),
 	}, nil
+}
+
+// sinceStart is the transport's monotonic link clock: the time elapsed since
+// New. It is the reference every conn.lastFrame is stored against, so link age
+// is a subtraction of two durations on one clock - never the difference between
+// a wall-clock timestamp and now, which a clock step could turn into a false
+// "silent for hours" and a needless teardown.
+func (t *TcpTransport) sinceStart() time.Duration {
+	return t.clock().Sub(t.started)
+}
+
+// noteFrame stamps c with the link clock's current reading. The reader calls it
+// for every complete frame (including one refused for size or policy: liveness
+// is a socket fact, not an admission decision), and relayWatchdog reads it. The
+// atomic is the synchronisation - the reader goroutine writes, the watchdog
+// goroutine reads - which is why this is not a plain time.Time field.
+func (t *TcpTransport) noteFrame(c *conn) {
+	c.lastFrame.Store(int64(t.sinceStart()))
 }
 
 // Listen accepts inbound connections on addr. It returns error only for a
@@ -1887,6 +1980,11 @@ func (t *TcpTransport) install(nc net.Conn, addr string, dialled, relay, gated b
 		needsAdmit: gated && t.opts.Admit != nil,
 		rl:         newRateLimiter(t.opts.RateLimitPerSec, t.opts.RateLimitBurst),
 	}
+	// No frame has been read from this socket yet. -1 (rather than 0) matters:
+	// 0 is a legitimate sinceStart() value, and the watchdog must be able to
+	// tell "delivered a frame at install" from "never delivered one" - the
+	// difference between an idle link and a link that has proven it can speak.
+	c.lastFrame.Store(-1)
 	if relay {
 		// The frame bucket is bypassed on this connection (one socket carries
 		// every member's traffic), so the BYTE budget is what bounds it (audit
@@ -2043,6 +2141,87 @@ func (t *TcpTransport) start(c *conn) {
 	c.ready.Store(true)
 	go t.writer(c)
 	go t.reader(c)
+	if c.relayMode {
+		// A relay link is the one connection whose far end is a FORWARDER,
+		// not a peer: the socket can stay open and healthy while the frames
+		// this node is waiting for are never written (see relayWatchdog).
+		go t.relayWatchdog(c)
+	}
+}
+
+// relayWatchdog is the per-relay-link liveness bound: the one component that
+// turns a silent relay link into a teardown and a line.
+//
+// THE DEFECT IT CLOSES (three-host run, height 5794). Three validators behind
+// one relay stopped committing with every seat at the same height and round,
+// all peers admitted, and each node tallying only its OWN vote. The relay's
+// accounting and `ss` showed three sockets and refused=0, but one had
+// Send-Q=7368: the relay had written bytes toward a validator that were never
+// read. Restarting the relay made the chain commit within seconds, because it
+// forced a fresh socket. At the node the link was indistinguishable from an
+// idle one: the socket was open, TCP keepalive probes were answered by the
+// kernel, and the generic idle read deadline would not speak for two minutes.
+//
+// WHAT IT DOES. Every relay connection carries conn.lastFrame, stamped by the
+// reader on every complete frame. Once every interval (bound/8, clamped to
+// [5ms, 5s], so detection lands inside one check of the bound) the watchdog
+// computes the link's silence. A link that has NEVER delivered a frame is
+// skipped: a lone validator whose relay has no other member behind it is quiet
+// but not wedged, and a fresh link has not had the chance to speak yet - the
+// generic IdleReadTimeout is that link's backstop, exactly as before. A link
+// that HAS delivered and then goes silent past the bound is presumed wedged:
+// the line names the address and the measured silence, and finish() closes the
+// socket, which wakes the reader/writer and lets the maintainer redial.
+//
+// WHY THE TEARDOWN IS THE FIX AND NOT A PUNISHMENT. The alternative - a
+// shorter per-read deadline on every relay link - would tear down healthy
+// links: a relay link is shared by every member, so it is legitimately idle
+// for long stretches between waves on a quiet chain, and a deadline short
+// enough to matter for a wedge is short enough to cut a healthy link. A
+// watchdog that measures SILENCE AGAINST PROVEN ACTIVITY, and acts only when
+// the bound is exceeded, distinguishes the two without touching the healthy
+// path. The line is not decoration: the incident cost two days because nothing
+// anywhere said the link had gone quiet.
+//
+// THE RESIDUAL, stated rather than hidden: if the reader is parked inside the
+// dispatch callback (not in a socket read) the watchdog still closes the
+// socket and the maintainer still redials, but the parked goroutine is not
+// unblocked by a socket close and can still hold the single dispatch lock. The
+// incident's own recovery - restarting the relay forced a fresh socket and
+// commits resumed - is the evidence that the link, not the callback, was the
+// wedge this time. A dispatch-side park would need a separate bound; nothing
+// here pretends to provide it.
+func (t *TcpTransport) relayWatchdog(c *conn) {
+	interval := t.opts.RelaySilenceTimeout / 8
+	if interval < 5*time.Millisecond {
+		interval = 5 * time.Millisecond
+	}
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.dead:
+			return
+		case <-t.quit:
+			return
+		case <-ticker.C:
+			last := c.lastFrame.Load()
+			if last < 0 {
+				continue // never delivered a frame: not evidence of a wedge
+			}
+			silence := t.sinceStart() - time.Duration(last)
+			if silence < t.opts.RelaySilenceTimeout {
+				continue
+			}
+			log.Printf("b10coin: relay %s: no frame received for %s (relay-link silence bound %s), so the relay link is presumed wedged - the socket is open and the kernel keeps it alive, but nothing has arrived on it - and it is being closed so the maintainer dials a fresh one",
+				c.addr, silence.Round(time.Millisecond), t.opts.RelaySilenceTimeout)
+			t.finish(c)
+			return
+		}
+	}
 }
 
 // newcomerWins decides which of two connections to the same peer keeps the
@@ -2145,6 +2324,11 @@ func (t *TcpTransport) reader(c *conn) {
 			var otl *wire.FrameTooLarge
 			if errors.As(err, &otl) {
 				if t.skipOversized(c, otl) {
+					// A frame that was refused for size still proves the link
+					// is delivering bytes; a stream of them is a misconfigured
+					// peer, not a silent one, and must not be misdiagnosed as
+					// the wedge the watchdog exists for.
+					t.noteFrame(c)
 					continue
 				}
 				break
@@ -2156,6 +2340,12 @@ func (t *TcpTransport) reader(c *conn) {
 			// through its maintainer; the consensus layer tolerates the loss.
 			break
 		}
+		// A COMPLETE frame arrived: this is the link's liveness beat, and it
+		// is recorded before pacing, admission or dispatch can delay or drop
+		// the frame. The relay watchdog asks only "has this socket delivered
+		// anything", which is a socket fact; a frame this node later refuses
+		// for policy is still proof the link is not wedged.
+		t.noteFrame(c)
 		if c.relayMode {
 			if !t.paceRelay(c, len(payload)) {
 				break // the connection died while pacing
