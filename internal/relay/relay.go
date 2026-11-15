@@ -532,8 +532,41 @@ func groupOf(ip netip.Addr) string {
 // unattended process on a €4 VPS needs to be diagnosable over its operator's
 // SSH session.
 type Stats struct {
-	// Conns is the number of currently registered connections.
+	// Conns is the number of currently REGISTERED connections - the length of
+	// the registry, which is what the fan-out set is drawn from. It is a
+	// BOOKKEEPING count: it says what the relay believes it holds, never
+	// whether a socket is still there. Read it beside Live, which is the
+	// socket-lifecycle count, and Handshaking, which is the accepted sockets
+	// that are not registered yet (audit F1's population). A `conns` read as
+	// "sockets" is how the 2026-11-15 incident was misdiagnosed for two days:
+	// the line said conns=3 on a host whose `ss` showed none.
 	Conns int
+	// Handshaking is the number of accepted sockets still presenting the
+	// access token: counted against BOTH caps (audit F1) but absent from
+	// Conns, so a line that omits it hides part of what the relay holds.
+	Handshaking int
+	// Accepted counts sockets the accept loop has taken from the listener, and
+	// Closed counts sockets this process has closed. They are maintained at
+	// the SOCKET's lifecycle, not at the registry's - a close is counted by
+	// the call that actually closes the socket - which is what makes them
+	// comparable with the registry counts instead of a restatement of them.
+	Accepted uint64
+	Closed   uint64
+	// Live is Accepted minus Closed: the sockets this process has NOT closed.
+	// Conns+Handshaking is what the caps believe they hold, so the two must be
+	// equal whenever the books are straight; ConnBookkeepingIssue is that
+	// comparison and is what the stats tick logs. A negative Live is also a
+	// finding: it means a socket was closed twice, which would under-count a
+	// source group and let more than --max-conns-per-ip in.
+	Live int64
+	// LongestSilence is how long the quietest REGISTERED connection has gone
+	// without delivering a complete frame. It is measured from the reader's
+	// own progress (conn.lastFrame), so it is an OBSERVATION, not a
+	// derivation from the counters: a connection whose reader is wedged -
+	// the incident's signature - shows an age far past --read-timeout, which
+	// no healthy connection can reach because the reader's own deadline ends
+	// it at exactly that bound. Zero while the registry is empty.
+	LongestSilence time.Duration
 	// Forwarded counts frames enqueued for onward delivery.
 	Forwarded uint64
 	// Dropped counts frames lost to a full (or fair-share-exhausted) write
@@ -1001,6 +1034,16 @@ type conn struct {
 	// its only consumer; push never blocks, which is the property that keeps
 	// a slow peer from stalling the relay for everyone else.
 	q *sendQ
+	// lastFrame is the unix-nano instant of the last COMPLETE frame this
+	// connection's reader delivered, stored at admit and refreshed after every
+	// frame. It is the relay's one OBSERVED liveness fact per connection: the
+	// reader's socket deadline guarantees a live reader cannot leave it older
+	// than ReadTimeout (a frame in progress is bounded by the same deadline),
+	// so an age beyond that means the reader is no longer reading. The stats
+	// tick reports the oldest one and says so loudly, which is the check the
+	// 2026-11-15 incident needed: the registry said 3 connections while the
+	// host held none, and nothing in the counters could tell.
+	lastFrame atomic.Int64
 	// srcGroup is the canonical source PREFIX this connection came from
 	// (connGroup: IPv6 /64, IPv4 /24, or the host for an unparseable
 	// address), grouped for the accept-time cap AND used as the fair-share
@@ -1032,7 +1075,7 @@ func (r *Relay) finish(c *conn) {
 		delete(r.conns, c)
 		r.decGroupLocked(c.srcGroup) // the accept-time cap sees the freed slot again
 		close(c.dead)
-		_ = c.nc.Close()
+		r.closeSocket(c.nc)
 		r.mu.Unlock()
 	})
 }
@@ -1077,6 +1120,14 @@ type Relay struct {
 	// readerPanics counts per-connection readers that recovered from a panic
 	// (audit S-9). One panic costs one connection, never the process.
 	readerPanics atomic.Uint64
+	// accepted counts sockets the accept loop has taken from the listener;
+	// closedSockets counts sockets this process has closed (see closeSocket,
+	// which counts only the call that actually closed one). The two are
+	// maintained at the SOCKET's lifecycle rather than at the registry's, so
+	// their difference can be compared with the registry's slot count instead
+	// of restating it - ConnBookkeepingIssue is that comparison.
+	accepted      atomic.Uint64
+	closedSockets atomic.Uint64
 
 	// refusalMu guards the gate-refusal line's rate limiter, and is separate
 	// from r.mu so a refusal never contends with the registry lock. The
@@ -1147,18 +1198,118 @@ func (r *Relay) Addr() net.Addr {
 	return r.lsn.Addr()
 }
 
-// Stats returns a point-in-time reading of the relay's counters.
+// Stats returns a point-in-time reading of the relay's counters: the registry
+// and handshake populations under the registry lock, the per-connection
+// freshness observation, and the atomics the hot path maintains.
 func (r *Relay) Stats() Stats {
 	r.mu.Lock()
 	conns := len(r.conns)
-	r.mu.Unlock()
-	return Stats{
-		Conns:        conns,
-		Forwarded:    r.forwarded.Load(),
-		Dropped:      r.dropped.Load(),
-		RefusedConns: r.refused.Load(),
-		Unauthorized: r.unauthorized.Load(),
+	handshaking := len(r.handshaking)
+	var oldest int64 // the smallest lastFrame: the quietest registered connection
+	for c := range r.conns {
+		if ts := c.lastFrame.Load(); ts != 0 && (oldest == 0 || ts < oldest) {
+			oldest = ts
+		}
 	}
+	r.mu.Unlock()
+	var silence time.Duration
+	if oldest != 0 {
+		silence = time.Since(time.Unix(0, oldest))
+	}
+	accepted := r.accepted.Load()
+	closed := r.closedSockets.Load()
+	return Stats{
+		Conns:          conns,
+		Handshaking:    handshaking,
+		Accepted:       accepted,
+		Closed:         closed,
+		Live:           int64(accepted) - int64(closed),
+		LongestSilence: silence,
+		Forwarded:      r.forwarded.Load(),
+		Dropped:        r.dropped.Load(),
+		RefusedConns:   r.refused.Load(),
+		Unauthorized:   r.unauthorized.Load(),
+	}
+}
+
+// closeSocket closes one accepted socket and counts the close - but only the
+// call that actually closed it. A second Close on the same socket returns an
+// error (net.ErrClosed) and is not counted, which is what keeps the count
+// honest on the paths where two goroutines can reach the same socket: Close
+// closes every handshaking socket while its own handshake goroutine is still
+// running, and that goroutine closes it again on the way out.
+//
+// Every socket the relay closes goes through here (accept refusal, each gate
+// exit, a refused admit, finish, and Close's handshake sweep), so Accepted
+// minus Closed is the number of sockets this process still holds. That is the
+// number the stats line must show beside the registry's slot count: the
+// incident's line reported the SLOT count (conns=3) as if it were the socket
+// count, and no counter could contradict it.
+func (r *Relay) closeSocket(nc net.Conn) {
+	if err := nc.Close(); err == nil {
+		r.closedSockets.Add(1)
+	}
+}
+
+// ConnBookkeepingIssue compares what the relay BELIEVES it holds with what it
+// has actually done with sockets, and reports the disagreement in one line.
+// It is the check the stats tick runs (cmd/b10coin-relay's logStats), and it
+// answers the question the 2026-11-15 incident could not: is `conns` a socket
+// count or a registry count that has outlived its sockets?
+//
+// Two comparisons, both cheap and both on data the relay already maintains:
+//
+//   - the CAPS' POPULATION against the SOCKET LIFECYCLE: the caps count
+//     len(conns)+len(handshaking) slots, and Accepted-Closed counts the sockets
+//     the process has not closed. Every accepted socket is in exactly one of
+//     the two populations or has been closed exactly once, so the two must be
+//     equal. A leaked slot (a socket closed without its release), a double
+//     release (an under-count, which would let more than --max-conns-per-ip
+//     in), and a connection whose goroutines are gone all land here.
+//
+//   - the READ DEADLINE against OBSERVED TRAFFIC: every reader arms a
+//     per-frame deadline of ReadTimeout, so a registered connection cannot go
+//     longer than that without a complete frame - the reader would have ended
+//     it. A registered connection older than twice that is a reader that is no
+//     longer reading, which is exactly "the registry holds a socket that is
+//     not there". Twice, not once, because a frame IN PROGRESS may legally
+//     consume the whole ReadTimeout before completing.
+//
+// A disagreement that a re-reading two milliseconds later no longer sees is
+// not reported: a socket counted at accept but not yet reserved, or a finish
+// between its two counters, is a nanosecond-wide window in the accept loop or
+// the teardown, and a real leak survives a re-read. So the normal path costs
+// one Stats read, and the check never sleeps unless something already looks
+// wrong.
+func (r *Relay) ConnBookkeepingIssue() (string, bool) {
+	check := func(st Stats) (string, bool) {
+		if slots := st.Conns + st.Handshaking; int64(slots) != st.Live {
+			return fmt.Sprintf("the caps count %d slots (conns=%d handshaking=%d) but the socket lifecycle counts %d live (accepted=%d closed=%d): %s",
+				slots, st.Conns, st.Handshaking, st.Live, st.Accepted, st.Closed,
+				slotsLeakWords(slots, st.Live)), true
+		}
+		if limit := 2 * r.opts.ReadTimeout; limit > 0 && st.LongestSilence > limit {
+			return fmt.Sprintf("a registered connection has delivered no frame for %s, past twice --read-timeout (%s): its reader's own deadline should have ended it, so the registry is holding a connection that is not reading",
+				st.LongestSilence.Round(time.Second), r.opts.ReadTimeout), true
+		}
+		return "", false
+	}
+	if _, bad := check(r.Stats()); !bad {
+		return "", false
+	}
+	time.Sleep(2 * time.Millisecond)
+	return check(r.Stats())
+}
+
+// slotsLeakWords names the DIRECTION of a slot/socket disagreement, because
+// the two directions are different bugs: too few slots is a double release
+// (the caps stop binding), and too many is a slot whose socket is already
+// closed (the incident's over-count).
+func slotsLeakWords(slots int, live int64) string {
+	if int64(slots) > live {
+		return fmt.Sprintf("%d slot(s) more than sockets - a slot outlived the socket it was taken for", int64(slots)-live)
+	}
+	return fmt.Sprintf("%d socket(s) more than slots - a slot was released twice, so the caps under-count", live-int64(slots))
 }
 
 // ReaderPanics reports how many per-connection readers recovered from a panic
@@ -1197,6 +1348,10 @@ func (r *Relay) acceptLoop(l net.Listener) {
 		// spawned once the reservation is held. A socket in handshake is the
 		// resource, so it counts: the cap is the cap on sockets, not on
 		// sockets that have already said something.
+		// The socket exists from here, whether or not the caps want it, so it
+		// is counted here: a refused dial is a socket this process opened and
+		// closed, and the lifecycle count must see both halves.
+		r.accepted.Add(1)
 		group := connGroup(nc.RemoteAddr())
 		r.mu.Lock()
 		if err := r.acceptCapLocked(group); err != nil {
@@ -1204,7 +1359,7 @@ func (r *Relay) acceptLoop(l net.Listener) {
 			if !errors.Is(err, ErrClosed) {
 				r.refused.Add(1)
 			}
-			_ = nc.Close()
+			r.closeSocket(nc)
 			continue
 		}
 		r.handshaking[nc] = group
@@ -1310,7 +1465,7 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 			// look like it was turning valid tokens away whenever a peer
 			// disconnected mid-handshake.
 			r.releaseHandshake(nc)
-			_ = nc.Close()
+			r.closeSocket(nc)
 			return
 		}
 		// The challenge (audit PX-3): 32 fresh random bytes, then this
@@ -1323,7 +1478,7 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 		if _, err := rand.Read(challenge); err != nil {
 			r.unauthorized.Add(1)
 			r.releaseHandshake(nc)
-			_ = nc.Close()
+			r.closeSocket(nc)
 			return
 		}
 		if la := nc.LocalAddr(); la != nil {
@@ -1331,13 +1486,13 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 		}
 		if err := writeGateFrame(nc, challenge, r.opts.WriteTimeout); err != nil {
 			r.releaseHandshake(nc) // dying socket, not a refused token (audit D-5)
-			_ = nc.Close()
+			r.closeSocket(nc)
 			return
 		}
 		if err := nc.SetReadDeadline(time.Now().Add(r.opts.AccessTimeout)); err != nil {
 			r.unauthorized.Add(1)
 			r.releaseHandshake(nc)
-			_ = nc.Close()
+			r.closeSocket(nc)
 			return
 		}
 		// The answer is one fixed-width MAC (audit PX-3): the read bound is
@@ -1353,7 +1508,7 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 			r.logGateRefusal(nc.RemoteAddr(), frame, err)
 			r.unauthorized.Add(1)
 			r.releaseHandshake(nc)
-			_ = nc.Close()
+			r.closeSocket(nc)
 			return
 		}
 		// The proof matched. Confirm it BEFORE clearing the deadline, so a node
@@ -1366,19 +1521,19 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 		confirmation := wire.RelayGateConfirmation(r.opts.AccessToken, challenge, frame)
 		if err := writeGateFrame(nc, confirmation, r.opts.WriteTimeout); err != nil {
 			r.releaseHandshake(nc)
-			_ = nc.Close()
+			r.closeSocket(nc)
 			return
 		}
 		// Both gate frames are done; clear the deadlines so the reader and
 		// writer arm their own per-frame ones.
 		if err := nc.SetReadDeadline(time.Time{}); err != nil {
 			r.releaseHandshake(nc)
-			_ = nc.Close()
+			r.closeSocket(nc)
 			return
 		}
 		if err := nc.SetWriteDeadline(time.Time{}); err != nil {
 			r.releaseHandshake(nc)
-			_ = nc.Close()
+			r.closeSocket(nc)
 			return
 		}
 	}
@@ -1389,7 +1544,7 @@ func (r *Relay) handshake(nc net.Conn, group string) {
 		if !errors.Is(err, ErrClosed) {
 			r.refused.Add(1)
 		}
-		_ = nc.Close()
+		r.closeSocket(nc)
 	}
 }
 
@@ -1497,6 +1652,9 @@ func (r *Relay) admit(nc net.Conn, group string) error {
 		dead:     make(chan struct{}),
 		srcGroup: group,
 	}
+	// A connection is FRESH at admit: the reader's first deadline starts now,
+	// so "no frame yet" must not read as "silent since the epoch".
+	c.lastFrame.Store(time.Now().UnixNano())
 	r.conns[c] = struct{}{}
 	r.wg.Add(2)
 	go r.reader(c)
@@ -1575,6 +1733,10 @@ func (r *Relay) reader(c *conn) {
 			// A validator redials through its own outbound backoff.
 			break
 		}
+		// The one observation the reader publishes: this connection delivered
+		// a COMPLETE frame now. Stored before the fan-out so a slow fan-out
+		// never makes a reading connection look silent.
+		c.lastFrame.Store(time.Now().UnixNano())
 		r.forward(c, payload)
 	}
 }
@@ -1758,7 +1920,7 @@ func (r *Relay) Close() {
 			_ = lsn.Close()
 		}
 		for _, nc := range handshaking {
-			_ = nc.Close()
+			r.closeSocket(nc)
 		}
 		for _, c := range conns {
 			r.finish(c)
