@@ -178,3 +178,84 @@ so whether that drift is load, peer churn or something structural is unmeasured.
 - **Record the numbers**: 15 blocks/s across a WAN relay with three Pi-class
   nodes is a figure the README's Pi section should carry, and nothing measures it
   in CI.
+
+---
+
+## 10. Restart test (2026-11-15, same chain at height 824,350)
+
+The soak never restarted a node, which §9 recorded as its main gap. It was then
+restarted deliberately.
+
+### The clean restart
+
+```
+stopped    height 820,083   data 557 MB across 821 segments
+restarted  08:04:32
+loaded     08:04:41        height 820,131   <- 9 s to replay 820k blocks
+now        height 820,205 -> 820,513 in 20 s = 15 blocks/s
+
+relay      conns=3  forwarded=12,256,721  dropped=0  refused=0
+           unauthorized=140,539  (unchanged - the restart cost zero refusals)
+```
+
+**Recovery was nine seconds**, the node rejoined at the same height, and it was
+voting at full rate within twenty more. `conns=3` throughout and `unauthorized`
+unmoved means the other two seats never noticed the gap.
+
+Two numbers worth recording: **557 MB of log replays in ~9 s** (about 91 MB/s,
+~91,000 blocks/s of replay throughput, so the on-disk format is not a restart
+bottleneck), and **zero refusals on reconnect** - the gate re-admits a returning
+node on the first attempt, not just a first-time one.
+
+### The round-resume defect did NOT reproduce, and it is narrower than recorded
+
+**No `resuming height N at round R` line appeared.** The node came back at round 0
+of the current height.
+
+The Pis had shown `resuming height 1 at round 429`, and the difference is what
+matters: **they had been stalling**, accumulating rounds by timeout; this node was
+**committing** when stopped, so its persisted round was small and the resume was
+cheap.
+
+So the defect from §6 is not "a restart strands a node". It is:
+
+> **A node that was stalled when it stopped resumes at its accumulated round. A
+> node that was healthy resumes cheaply. The durable round record persists
+> STALLS, not only state.**
+
+That is worse than the earlier note suggests, because the trigger is not
+"restart" - it is **"restart a node that had already been failing"**, which is
+exactly the situation in which an operator would most want a restart to help.
+Clearing the data directory is still the only way out.
+
+### What this test did not cover
+
+**The restart was clean** - `SIGTERM`, so the node flushed and closed its log
+properly. A `kill -9` or a power cut is the harder case and is what a Pi actually
+experiences; it would exercise log-truncation recovery across the `.seg` files.
+**Untested.** Do not read this section as evidence that an unclean stop is safe.
+
+## 11. `certs.log` is the dominant disk cost, and it is unbounded
+
+Measured at height 824,350:
+
+```
+558 MB  total data directory
+381 MB  certs.log       <- 68%, more than twice the block log
+178 MB  825 x .seg      <- the block log, segmented and rotated
+547 B   rounds.log
+7.7 K   locks.log
+```
+
+**The certificate log is larger than the block log**, and unlike the block log it
+is a single append-only file with **no rotation and no compaction**. At roughly
+465 bytes per height that is about **1.6 GB per million blocks** from
+`certs.log` alone.
+
+At this run's rate (824,350 blocks in about 18 hours, ~1.1M blocks/day) that is
+**~1.8 GB per day of certificates**. A Raspberry Pi on a 32 GB card would fill it
+in under three weeks, and the file that fills it is not the one anyone thinks to
+watch.
+
+`du -sh /var/lib/b10coin/certs.log` is the number an operator should actually
+monitor. Bounding it the way the block log is already bounded is bounded work.
