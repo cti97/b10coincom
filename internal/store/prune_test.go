@@ -387,3 +387,59 @@ func TestPruneCertsRemovesTheLegacyLogWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestPruneCertsNeverDeletesTheActiveSegment pins audit I-2 BY CONSTRUCTION:
+// even in the shape a future certRecordsPerSegment change could produce - the
+// ACTIVE segment's highest record below the horizon, so the segment is
+// removable by the "max < first" rule - the prune must leave alone the file
+// this process is still appending to.
+//
+// Before the fix the active segment was unlinked (an os.Remove on an open
+// handle: a portability hazard on Windows, and on every platform a segment
+// whose records then had to be recreated empty), and the file under that name
+// was a NEW inode afterwards. The by-construction skip is what makes that path
+// unreachable rather than merely unlikely.
+func TestPruneCertsNeverDeletesTheActiveSegment(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	// Certificates 1..3 all live in segment 0, which is also the ACTIVE one.
+	for h := uint64(1); h <= 3; h++ {
+		if err := s.PutCert(h, []byte{byte('0' + h)}); err != nil {
+			t.Fatalf("PutCert(%d): %v", h, err)
+		}
+	}
+	path := filepath.Join(dir, certSegmentName(s.certSeg))
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("the active certificate segment %s: %v", path, err)
+	}
+	// A horizon above every certificate this node holds: the active segment's
+	// highest record (3) is below it (4), so the pre-fix rule selected it.
+	if _, err := s.PruneCerts(4); err != nil {
+		t.Fatalf("PruneCerts(4): %v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("the ACTIVE certificate segment was deleted by the prune: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("PruneCerts replaced the ACTIVE certificate segment (an open-handle delete plus an empty recreate); the active segment must be skipped by construction, as the block pruner skips its own")
+	}
+	// The append target still works and the record is readable: the segment is
+	// the boundary segment now, keeping its dead prefix, not a fresh file.
+	if err := s.PutCert(5, []byte("five")); err != nil {
+		t.Fatalf("PutCert(5) after pruning the active segment's records: %v", err)
+	}
+	if got, ok := s.CertAt(5); !ok || string(got) != "five" {
+		t.Fatalf("CertAt(5) after the prune = %q, %v", got, ok)
+	}
+	// ... while a below-horizon certificate is ABSENT: the index answers, not
+	// the bytes still sitting in the boundary segment's dead prefix.
+	if got, ok := s.CertAt(3); ok {
+		t.Fatalf("CertAt(3) served a pruned certificate (%q)", got)
+	}
+}
