@@ -1328,9 +1328,11 @@ func TestOpenRefusesADifferentGenesisUpFront(t *testing.T) {
 }
 
 // Audit S-14 evidence: a stray/duplicated segment does NOT silently renumber
-// the chain. The store numbers heights by record count, but replay refuses a
-// stored block whose own header does not claim its position, so the extra
-// copy fails Open instead of shifting every later height.
+// the chain. Since M7 the STORE refuses it first: a segment's name states its
+// absolute position, so a duplicate (or a hole) is a framing error at scan time
+// rather than something replay has to notice through the stored header. Both
+// refusals keep the invariant the finding is about - the extra copy fails Open
+// instead of shifting every later height - so either error is accepted here.
 func TestOpenRefusesADuplicatedSegment(t *testing.T) {
 	dir := t.TempDir()
 	g := genesis.Devnet()
@@ -1365,8 +1367,8 @@ func TestOpenRefusesADuplicatedSegment(t *testing.T) {
 	if c2, err := Open(g, dir); err == nil {
 		_ = c2.Close()
 		t.Fatal("a duplicated segment silently renumbered the chain")
-	} else if !errors.Is(err, ErrGenesisReplay) {
-		t.Fatalf("a duplicated segment reported as %v, want ErrGenesisReplay", err)
+	} else if !errors.Is(err, store.ErrCorruptRecord) && !errors.Is(err, ErrGenesisReplay) {
+		t.Fatalf("a duplicated segment reported as %v, want store.ErrCorruptRecord (the store's name check) or ErrGenesisReplay", err)
 	}
 }
 

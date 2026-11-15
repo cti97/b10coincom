@@ -61,6 +61,8 @@ func main() {
 		err = cmdUnstake(os.Args[2:])
 	case "withdraw":
 		err = cmdWithdraw(os.Args[2:])
+	case "checkpoint":
+		err = cmdCheckpoint(os.Args[2:])
 	case "version":
 		err = cmdVersion(os.Args[2:])
 	case "help", "-h", "--help":
@@ -128,6 +130,10 @@ Usage:
                                                         Unbond all or part of the bond; a partial exit must leave MIN_STAKE or nothing
   b10coin withdraw --node URL --key PATH [--yes | --dry-run]
                                                         Release matured unbonding records to the spendable balance
+  b10coin checkpoint export --dir PATH --at H [--out FILE]
+                                                        Write the verifiable recovery artefact for height H: the
+                                                        block, the state committed there and the quorum certificate
+                                                        that proves a committee agreed on it (M7)
   b10coin version [--short]                             Print the build identity (version + VCS revision);
                                                         --short prints only the semantic version, for scripts
 
@@ -1239,6 +1245,10 @@ func cmdNode(args []string) error {
 	index := fs.Int("index", 0, "FIXTURE committee seat (development mode; the seat of --key is derived from --genesis otherwise)")
 	keyPath := fs.String("key", "", "this validator's key file (b10coin keygen); REQUIRED with --genesis")
 	genesisPath := fs.String("genesis", "", "shared committee file listing the validators' public keys (required for any node a shared network can reach)")
+	// M7: bounded history. Opt-in and default-off, so no earlier run changes.
+	epochBlocks := fs.Uint64("epoch-blocks", 0, "FIXTURE mode only: override the fixture genesis's epoch length before it is hashed (development and scenarios; refused with --genesis, where the shared committee file owns it)")
+	retainBlocks := fs.Uint64("retain-blocks", 0, "bound the data directory to the last N blocks (0 = keep everything, the default). Only a checkpoint can make pruned history recoverable, and only a consensus validator records the quorum certificate a checkpoint is built from")
+	checkpointPath := fs.String("checkpoint", "", "start this node from a checkpoint file written by `b10coin checkpoint export` (the data directory must be empty: importing over a chain is refused)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1265,6 +1275,20 @@ func cmdNode(args []string) error {
 		if *advertise != "" {
 			return fmt.Errorf("--advertise names what PEER_EXCHANGE should advertise, which only a networked node runs: give --listen together with it, or drop it")
 		}
+		if *epochBlocks != 0 {
+			return fmt.Errorf("--epoch-blocks overrides the FIXTURE genesis, which this single-node producer (no --validators/--index) does not use: give --validators N --index I for a fixture committee, or drop the flag")
+		}
+		if *retainBlocks > 0 {
+			// Not laziness: pruning is only allowed when the horizon's quorum
+			// certificate can be exported into a checkpoint, and this producer
+			// runs no consensus, so no certificate exists. Pruning here would
+			// produce exactly the node plan §7 forbids - healthy-looking and
+			// unable to recover.
+			return fmt.Errorf("--retain-blocks bounds history with checkpoints, and a checkpoint is a quorum certificate this single-node producer never records (it runs no consensus). Run a consensus validator (--genesis/--key or --validators/--index) with --retain-blocks, or drop the flag to keep everything")
+		}
+		if *checkpointPath != "" {
+			return fmt.Errorf("--checkpoint adopts a state a committee signed; this single-node producer has no committee and cannot judge one. Give --genesis/--key (or --validators/--index) together with it")
+		}
 		if err := checkProducerBlockTime(*blockTime); err != nil {
 			return err
 		}
@@ -1290,13 +1314,21 @@ func cmdNode(args []string) error {
 				*relayTokenPath, len(relayToken), wire.MinRelayAccessTokenBytes)
 		}
 	}
+	var checkpointBytes []byte
+	if *checkpointPath != "" {
+		data, err := os.ReadFile(*checkpointPath)
+		if err != nil {
+			return fmt.Errorf("reading checkpoint %q: %w", *checkpointPath, err)
+		}
+		checkpointBytes = data
+	}
 	if *advertise != "" && *listen == "" {
 		// A node with no listener cannot receive the dial an advertisement asks
 		// for; accepting the flag would advertise an endpoint that refuses every
 		// peer. The devnet layer refuses it too (it is the library entry point).
 		return fmt.Errorf("--advertise names the address peers should dial, but this node has no --listen to receive them: give --listen ADDR (e.g. 0.0.0.0:7001) together with it")
 	}
-	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints)
+	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints, checkpointBytes, *retainBlocks, *epochBlocks)
 }
 
 // runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
@@ -1437,6 +1469,13 @@ func relayNoTokenWarning(relays []string, token []byte) string {
 		strings.Join(relays, ","))
 }
 
+// pruneLog is where the M7 pruner reports. It goes to stderr, where systemd
+// captures it beside the other operational lines, and it is one line per pass
+// or refusal rather than per block.
+func pruneLog(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
 // runNetworkedNode is the M4 consensus path of the `node` command: one
 // validator of a consensus committee over the real transport, running the same
 // consensus stack the in-process TCP integration test drives. The single-node
@@ -1459,7 +1498,7 @@ func relayNoTokenWarning(relays []string, token []byte) string {
 //
 // --block-time is refused with networking: a committee's cadence is its
 // round-timeout ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool) error {
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool, checkpoint []byte, retainBlocks, epochBlocks uint64) error {
 	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -1571,9 +1610,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers,
 	var v *devnet.Validator
 	var err error
 	if g != nil {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
 	} else {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
 	}
 	if err != nil {
 		return err

@@ -585,7 +585,7 @@ func TestTornCertificateTailIsTruncatedAndEarlierRecordsSurvive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	logPath := filepath.Join(dir, certLogName)
+	logPath := filepath.Join(dir, certSegmentName(s.certSeg))
 	intact, err := os.Stat(logPath)
 	if err != nil {
 		t.Fatal(err)

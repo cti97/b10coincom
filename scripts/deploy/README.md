@@ -584,6 +584,8 @@ token".
 | `--http` (default `127.0.0.1:8645`) | RPC status endpoint, loopback-only by default. Read it via SSH (§7) rather than opening it to your LAN |
 | `--listen`, `--peers` | optional **direct** peer connections (same-LAN or port-forwarded setups). With the relay star they stay off; a dial list is already complete via `--relay` |
 | `--advertise IP:PORT` | with `--listen`, the address peers should dial. Required for a **port-forwarded** node: `--listen` binds `0.0.0.0:7001` (a wildcard names no endpoint), and without `--advertise` the node advertises nothing and logs one line saying so (§5) |
+| `--retain-blocks N` | bound the data directory to the last `N` blocks (§5.2). **Default 0: keep everything.** The shipped unit passes `B10COIN_RETAIN_BLOCKS`, whose default is `0`, so nothing changes until you set it |
+| `--checkpoint PATH` | start this node from a checkpoint written by `b10coin checkpoint export` (§5.2). Only for an **empty** `--dir`; a pruned node reads its own `checkpoint.json` without the flag |
 
 **The seat is derived, not configured.** A node's seat is the position of its
 public key inside the shared committee file, so there is no `--index` here
@@ -755,6 +757,93 @@ dial. Such a node must also pass `--advertise PUBLIC_IP:7001` — the address th
 router forwards to — or bind the concrete public address directly. Binding a
 forwarded port is not enough by itself, and without `--advertise` the node now
 logs one line at the first advertisement saying exactly that.
+
+### 5.2 Bounding the data directory (M7)
+
+A validator's data directory grew forever before M7. Measured at height 824,350
+after ~18 hours on three hosts: **558 MB, ~710 B/block, ~1.7 GB/day** - and 68%
+of it was one append-only certificate file (`certs.log`, 485 B/block). A 32 GB
+Pi card fills in under three weeks at that rate, and a full card is how a
+validator stops without anyone noticing until it is a day behind.
+
+Set the block count you want to keep:
+
+```sh
+# /etc/default/b10coin on each Pi, or the unit's Environment= line
+B10COIN_RETAIN_BLOCKS=200000
+```
+
+Then restart the node. With the shipped epoch length (`epoch_blocks` 1000) that
+is 200 epochs of history. The flag is in **blocks, not hours**, because a height
+is exact: "24 hours" is a different number of blocks on every chain, and the
+operator can convert (`blocks_per_second x 86,400`).
+
+What actually happens, and what to expect in the log:
+
+* Nothing is pruned until the head is more than `4 x epoch_blocks` past the
+  window, and pruning happens **only at an epoch boundary**. You will see one
+  line per pass, at most once per epoch:
+  `pruned history below height 1183: 1 block segments, 1 certificate segments
+  (… bytes total); checkpoint at height 1182`.
+* The horizon is one block BEFORE the boundary, because the state there decides
+  the first retained epoch's committee. That state is what the checkpoint
+  carries.
+* **A pruned node keeps a dead prefix on disk** equal to at most one segment of
+  each kind (the segment the horizon falls inside is never rewritten — a rewrite
+  and a marker update cannot be made atomic together, so M7 moves the marker
+  only). That is the "small margin": at the measured rates, roughly 226 KB of
+  blocks and 500 KB of certificates. It is reclaimed whole when the next prune
+  passes that segment.
+* The steady state is a **sawtooth**, not a flat line: the directory grows
+  through one segment and drops when that segment goes below the horizon. The
+  bound is two segments plus the retention window, however long the chain runs.
+
+**If the node cannot write a checkpoint, it refuses to prune.** A node with no
+certificate for its horizon (a producer, or a validator that has not adopted
+that height) keeps its history and logs the refusal, naming the reason. That is
+deliberate: a node that looks healthy and cannot recover is worse than a full
+disk, because a full disk is visible (`docs/plan-2026-11-15-m7-bounded-history.md`
+§7).
+
+**Recovery, and the backup that matters.** A pruned node restarts from
+`/var/lib/b10coin/checkpoint.json` plus its retained blocks, with no operator
+action. That same file is how you move a seat to a new machine - and it is the
+only file in the data directory worth copying:
+
+```sh
+# on the OLD Pi, with the node STOPPED (it holds the directory lock):
+sudo systemctl stop b10coin
+sudo -u b10coin /opt/b10coin/b10coin checkpoint export \
+    --dir /var/lib/b10coin --at <height> --out /tmp/cp.json \
+    --genesis /var/lib/b10coin/committee.json
+
+# on the NEW Pi, into an EMPTY directory:
+sudo install -o b10coin -m 0600 /tmp/cp.json /var/lib/b10coin/checkpoint.json
+# then start the unit with B10COIN_CHECKPOINT=/var/lib/b10coin/checkpoint.json
+# (or run the node once with --checkpoint /var/lib/b10coin/checkpoint.json)
+```
+
+The importer verifies the checkpoint before it is adopted: a quorum of the
+**genesis** committee must have signed the block, and the carried state must
+hash to the root that block commits. A file from another chain, or one with a
+state swapped in, is refused and nothing is written into the data directory.
+After adopting it the node is at the checkpoint's height and catches up over
+BLOCK_SYNC like any other node that fell behind.
+
+`--at <height>` must be a height the directory can still prove: the pruning
+HORIZON (always available - the pruner keeps its certificate and the chain keeps
+its block and state), any retained height, or the head if that height's
+certificate has been recorded. Exporting a retained height replays the window
+from the horizon to it, so it takes as long as the window is large - which is
+why the horizon is checkpointed at every pass rather than exported on demand.
+
+The end-to-end scenario lives in `scripts/deploy/scenario-m7-prune.sh`: four
+fixture validators, one wiped, one restarted with `--retain-blocks`, a
+checkpoint exported from it, and a node started from that checkpoint alone. It
+asserts that the joiner reaches the **same height and the same state root**, and
+prints the disk size of the pruned node before and after. It runs in minutes
+because it uses the fixture-only `--epoch-blocks` (a real chain's epoch comes
+from the committee file and must not be overridden).
 
 ## 6. The systemd units (what runs after the first contact test)
 

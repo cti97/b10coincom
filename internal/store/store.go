@@ -48,9 +48,11 @@
 //
 // The round log (roundLogName) records the consensus round a validator had
 // reached at a height (audit C-3), under the lock log's fixed-width framing;
-// the certificate log (certLogName, audit C-7) indexes one opaque certificate
-// per committed height and reads records back on demand rather than holding
-// them in memory.
+// the certificate log (audit C-7) indexes one opaque certificate per committed
+// height and reads records back on demand rather than holding them in memory.
+// Since M7 it is SEGMENTED into certRecordsPerSegment-record files
+// (certSegmentName) so the pruner can drop whole segments below a horizon; a
+// pre-M7 certs.log is still indexed read-only for compatibility.
 package store
 
 import (
@@ -64,6 +66,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -81,9 +85,60 @@ const maxOpenReaders = 8
 // renumber the chain.
 const lockLogName = "locks.log"
 
-// certLogName holds the commit-certificate log (audit C-7). Like the lock log
-// its name avoids the ".seg" suffix for the same reason.
+// certLogName is the LEGACY commit-certificate log (audit C-7): one
+// append-only file holding every height's certificate. A directory written
+// before M7 may still hold one, and it stays readable here (see scanCerts) -
+// but this build never writes it again.
+//
+// M7 segments it because a single append-only file cannot be pruned: the
+// certificate log was 381 MB of a 558 MB data directory (68%, ~485 B/block)
+// after the 18-hour three-host run (docs/plan-2026-11-15-m7-bounded-history.md
+// §1), and no amount of retention can bound a file that everything is appended
+// to forever. A certificate segment (certSegmentName) holds a fixed number of
+// records, so the pruner can drop whole segments below a horizon and rewrite
+// the one straddling it.
 const certLogName = "certs.log"
+
+// certRecordsPerSegment is how many certificate records share one segment
+// file. It matches BlocksPerSegment deliberately: with one certificate per
+// committed height, a cert segment covers exactly the height range of a block
+// segment, so a horizon that is a block-segment boundary is a cert-segment
+// boundary too and the common prune deletes whole files on both sides.
+const certRecordsPerSegment = 1000
+
+// certSegmentName maps a certificate segment index to its file name. The
+// ".cseg" suffix is deliberate: scan() discovers BLOCK segments by the
+// ".seg" extension, so a certificate segment must not look like one (the
+// legacy certLogName avoided the suffix for the same reason).
+func certSegmentName(idx uint64) string {
+	return fmt.Sprintf("certs-%08d.cseg", idx)
+}
+
+// certLoc is where one certificate record lives: the segment index and the
+// record's offset within it. It is kept to sixteen bytes because it is the one
+// per-height structure this package holds for the whole chain - the S-12
+// budget is about NOT keeping a payload per height, and an index entry that
+// grew a bool would spend the same budget on padding.
+//
+// The pre-M7 single log has no segment index of its own, and legacyCertSeg is
+// the sentinel that names it: no real segment can reach that value (it would
+// need 1.8e19 records), so one comparison distinguishes the two files without
+// a third field.
+type certLoc struct {
+	seg uint64
+	off int64
+}
+
+// legacyCertSeg is certLoc.seg for a record in the pre-M7 certs.log.
+const legacyCertSeg = ^uint64(0)
+
+// certFileName is the file certLoc names.
+func certFileName(loc certLoc) string {
+	if loc.seg == legacyCertSeg {
+		return certLogName
+	}
+	return certSegmentName(loc.seg)
+}
 
 // roundLogName holds the consensus-round log (audit C-3). Like the lock and
 // certificate logs its name avoids the ".seg" suffix for the same reason.
@@ -211,8 +266,16 @@ type Store struct {
 	dir   string
 	file  *os.File // append handle on the segment receiving writes
 	last  uint64   // highest height present, corrupt ones included
-	have  bool
-	index map[uint64]int64 // height -> record offset within its segment
+	first uint64   // lowest height this directory still holds (1: never pruned)
+	// firstOffset is where height `first`'s RECORD starts within its segment
+	// (base.height, M7). The pruner never rewrites a segment - it moves the
+	// marker and deletes whole segments below it - so this offset is where the
+	// surviving history begins inside a segment that may still carry pruned
+	// records ahead of it. certFirst is the certificate log's horizon.
+	firstOffset int64
+	certFirst   uint64
+	have        bool
+	index       map[uint64]int64 // height -> record offset within its segment
 	// indexMu guards index, last and have (audit R-2). Append writes them
 	// under the chain's write lock; Read used to look the offset up under the
 	// chain's READ lock, which the chain no longer holds across a disk read,
@@ -252,14 +315,30 @@ type Store struct {
 	rounds       map[uint64]uint32
 	roundRecords int
 
-	// certFile is the append-and-read handle on the commit-certificate log
-	// (audit C-7); certIndex maps a height to the offset of its record in
-	// that file. The certificate BYTES are not held in memory: one record
-	// per committed height would grow without bound over a long run, and the
-	// log exists precisely so a restarted node can serve history it no
-	// longer remembers. CertAt reads one record back through this handle.
-	certFile  *os.File
-	certIndex map[uint64]int64
+	// certFile is the append handle on the ACTIVE certificate segment
+	// (M7 segmentation, audit C-7): the highest-numbered segment, where the
+	// next record goes. Reads go through the shared per-file read-handle
+	// cache instead (see CertAt), so this handle is write-only.
+	//
+	// certSeg is that segment's index and certSegRecords counts the records
+	// it PHYSICALLY holds, which is what triggers rotation;
+	// certSegRecords is also kept per segment from the scan, so a restart
+	// resumes appending to a partially filled segment instead of starting a
+	// new one per process.
+	//
+	// certIndex maps a height to its record's location. The certificate
+	// BYTES are not held in memory: one record per committed height would
+	// grow without bound over a long run, and the log exists precisely so a
+	// restarted node can serve history it no longer remembers. CertAt reads
+	// the one record back.
+	certFile        *os.File
+	certSeg         uint64
+	certSegRecords  map[uint64]int
+	certSegMax      map[uint64]uint64
+	certIndex       map[uint64]certLoc
+	legacyCertMax   uint64 // highest height the legacy certs.log holds, 0 if none
+	legacyCertRecs  int    // records the legacy certs.log physically holds
+	legacyCertExist bool
 
 	// readMu guards the per-segment read-handle cache below (audit S-7).
 	// Store.Read is reached CONCURRENTLY by RPC readers under the chain's read
@@ -294,13 +373,18 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:       dir,
-		index:     make(map[uint64]int64),
-		locks:     make(map[uint64]LockRecord),
-		rounds:    make(map[uint64]uint32),
-		certIndex: make(map[uint64]int64),
-		readers:   make(map[string]*os.File),
-		lock:      lock,
+		dir:            dir,
+		first:          1,
+		firstOffset:    int64(SegmentHeaderLen),
+		certFirst:      1,
+		index:          make(map[uint64]int64),
+		locks:          make(map[uint64]LockRecord),
+		rounds:         make(map[uint64]uint32),
+		certIndex:      make(map[uint64]certLoc),
+		certSegRecords: make(map[uint64]int),
+		certSegMax:     make(map[uint64]uint64),
+		readers:        make(map[string]*os.File),
+		lock:           lock,
 	}
 	if err := s.scan(); err != nil {
 		lock.release()
@@ -324,9 +408,13 @@ func Open(dir string) (*Store, error) {
 		lock.release()
 		return nil, err
 	}
-	// O_RDWR, unlike the append-only handles above: serving an adopted
-	// height's certificate reads the record back with ReadAt.
-	cf, err := os.OpenFile(filepath.Join(dir, certLogName), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
+	// The certificate log is SEGMENTED (M7 step 1). Open resumes appending to
+	// the highest-numbered segment the scan found (or creates segment 0), so
+	// a restart never opens a fresh segment just because the process changed.
+	// A pre-M7 certs.log is not written to any more; scanCerts indexes it
+	// read-only, and the pruner removes it once every height it holds is
+	// below the horizon.
+	cf, err := os.OpenFile(filepath.Join(dir, certSegmentName(s.certSeg)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		_ = f.Close()
 		_ = lf.Close()
@@ -374,11 +462,16 @@ func Open(dir string) (*Store, error) {
 	return s, nil
 }
 
+// segmentPath is the segment an append lands in: the last one when the store
+// holds blocks, and the segment that would hold the next height when it holds
+// none. The latter is NOT always segmentName(0) any more (M7): a directory
+// pruned down to empty has a first height above 1 (base.height), and appending
+// to segment 0 there would write below the recorded base.
 func (s *Store) segmentPath() string {
 	if s.have {
 		return filepath.Join(s.dir, segmentName(s.last))
 	}
-	return filepath.Join(s.dir, segmentName(0))
+	return filepath.Join(s.dir, segmentName(s.first))
 }
 
 // syncDir best-effort fsyncs a directory so a newly created or renamed entry
@@ -461,13 +554,47 @@ func (s *Store) scan() error {
 	if err != nil {
 		return err
 	}
+	// The pruner's first-height marker (M7) comes FIRST: block segments are
+	// numbered by record count, so a directory whose first segments were
+	// deleted would silently renumber every surviving block unless the scan
+	// knows where numbering starts. It also tells a crash-interrupted prune how
+	// many records at the head of the boundary segment are already pruned and
+	// must be SKIPPED rather than renumbered.
+	marker, err := readBaseMarker(s.dir)
+	if err != nil {
+		return err
+	}
+	first := marker.blockFirst
+	s.first = first
+	s.firstOffset = marker.blockOffset
+	s.certFirst = marker.certFirst
+	s.last = first - 1
 	var segs []string
 	for _, e := range entries {
 		if !e.IsDir() && filepath.Ext(e.Name()) == ".seg" {
+			if _, err := segmentIndexFromName(e.Name()); err != nil {
+				return err
+			}
 			segs = append(segs, e.Name())
 		}
 	}
 	slices.Sort(segs)
+	// Leading segments ENTIRELY below the base are what a crash between writing
+	// the marker and removing them leaves behind. They are not part of the
+	// chain any more, and numbering cannot start inside one that no longer
+	// holds a retained height - so drop them before the sequence check runs.
+	// Only LEADING ones: a segment below the base with a retained segment
+	// before it would be a hole, and the name check below refuses that.
+	for len(segs) > 0 {
+		idx, err := segmentIndexFromName(segs[0])
+		if err != nil {
+			return err
+		}
+		if segmentMaxHeight(idx) >= first {
+			break
+		}
+		segs = segs[1:]
+	}
 
 	for si, name := range segs {
 		if err := s.scanSegment(name, si == len(segs)-1); err != nil {
@@ -719,7 +846,31 @@ func (s *Store) scanSegment(name string, final bool) error {
 	default:
 		return fmt.Errorf("%w%s", err, formatHint(path))
 	}
-	off := int64(SegmentHeaderLen)
+	// Where numbering resumes. A never-pruned directory starts a segment at its
+	// header; the FIRST segment of a pruned one starts at the offset the horizon
+	// marker records, so the pruned records ahead of it - still on disk, never
+	// rewritten - are simply not part of the chain any more.
+	start := int64(SegmentHeaderLen)
+	if !s.have && s.firstOffset > start {
+		start = s.firstOffset
+	}
+	if start > size {
+		return fmt.Errorf("%w: the horizon marker starts block %d at offset %d, past the end of %s (%d bytes); the marker or the segment is damaged", ErrCorruptRecord, s.first, start, name, size)
+	}
+
+	// The segment's NAME is a fact about its absolute position: a hole in the
+	// sequence (a segment removed by hand, or a rename the pruner did not do)
+	// would otherwise renumber everything after it, and a renumbered chain
+	// replays to the roots its rewritten headers claim. Refuse the hole here,
+	// where the file name makes it visible, rather than at replay time where
+	// it presents as a divergence.
+	if idx, err := segmentIndexFromName(name); err != nil {
+		return err
+	} else if want := (s.last + 1) / BlocksPerSegment; idx != want {
+		return fmt.Errorf("%w: block segment %s is number %d, but the chain reaches it at segment %d: a segment is missing from the directory", ErrCorruptRecord, name, idx, want)
+	}
+
+	off := start
 	// buf is reused across records; it grows to the largest record and no more.
 	var buf []byte
 	for off < size {
@@ -772,7 +923,10 @@ func (s *Store) truncateTail(path string, size int64) error {
 
 // Append writes payload as the block at height. Heights must be sequential.
 func (s *Store) Append(height uint64, payload []byte) error {
-	want := uint64(1)
+	// The first height this directory can accept is its recorded horizon, not
+	// necessarily 1: a store adopted from a checkpoint at H (M7) starts at H+1
+	// with no blocks yet, and asking for 1 would refuse the very first append.
+	want := s.first
 	if s.have {
 		want = s.last + 1
 	}
@@ -1132,20 +1286,24 @@ func (s *Store) scanRounds() error {
 	return nil
 }
 
-// scanCerts indexes the commit-certificate log (audit C-7): a height to the
-// offset of its record. The payloads are NOT kept in memory - see the Store
-// doc - so this pass rebuilds an index, not an archive.
+// scanCerts indexes the commit-certificate log (audit C-7, segmented by M7):
+// a height to the location of its record. The payloads are NOT kept in memory
+// - see the Store doc - so this pass rebuilds an index, not an archive.
 //
-// It STREAMS the log (audit S-12), the way scanSegment streams the block
-// segments: one fixed-width header read per record, the offset indexed, the
-// payload skipped byte for byte. The old pass called os.ReadFile, so Open
-// allocated the whole log - every certificate payload of every committed height
-// - in ONE make before it had indexed anything. That is the one log whose size
-// is not bounded by a prune (there is no PruneCerts: serving an old height's
-// certificate is why the file exists), so it is the one log where that cost
-// compounds for the life of the chain: ~2.1 KB per height at ~15 precommits is
-// ~2.1 GB at a million heights, which is an OOM kill at Open on the machines
-// the README targets, after which the node cannot restart at all.
+// It STREAMS every file (audit S-12), the way scanSegment streams the block
+// segments: one fixed-width header read per record, the location indexed, the
+// payload skipped byte for byte. The pre-S-12 pass called os.ReadFile, so Open
+// allocated every certificate payload of every committed height in ONE make
+// before it had indexed anything. That is the one log whose size grows for the
+// life of a chain - ~2.1 KB per height at ~15 precommits is ~2.1 GB at a
+// million heights, which is an OOM kill at Open on the machines the README
+// targets, after which the node cannot restart at all.
+//
+// M7 SEGMENTS it. A certificate segment holds certRecordsPerSegment records,
+// named by index (certSegmentName); a pre-M7 certs.log is still indexed, as a
+// READ-ONLY legacy file, so upgrading a validator does not lose the history it
+// promised to serve. Nothing here rewrites the legacy file: the pruner drops
+// it whole once every height it holds is below the horizon.
 //
 // The cost of skipping the payload is that this pass cannot verify the
 // trailer checksum over it. That is a deliberate trade and it is safe: the
@@ -1163,10 +1321,81 @@ func (s *Store) scanRounds() error {
 // complete record still stops the scan and fails Open, because the bytes after
 // a record whose length cannot be trusted cannot be framed at all.
 func (s *Store) scanCerts() error {
-	path := filepath.Join(s.dir, certLogName)
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	// The legacy log first, so a segment record for the same height (written by
+	// this build) wins the index: segments are the live archive, the legacy file
+	// is history this build never appends to.
+	if err := s.scanCertFile(certLogName, certLoc{seg: legacyCertSeg}, true); err != nil {
+		return err
+	}
+	type segFile struct {
+		idx  uint64
+		name string
+	}
+	var segs []segFile
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if idx, ok := parseCertSegmentName(e.Name()); ok {
+			segs = append(segs, segFile{idx: idx, name: e.Name()})
+		}
+	}
+	slices.SortFunc(segs, func(a, b segFile) int {
+		switch {
+		case a.idx < b.idx:
+			return -1
+		case a.idx > b.idx:
+			return 1
+		default:
+			return 0
+		}
+	})
+	for i, seg := range segs {
+		// Only the LAST segment can carry the torn tail a crash leaves: every
+		// earlier one was sealed when the next was opened.
+		if err := s.scanCertFile(seg.name, certLoc{seg: seg.idx}, i == len(segs)-1); err != nil {
+			return err
+		}
+	}
+	// Resume appending to the highest segment present; segment 0 when this
+	// directory has none (a fresh directory, or one whose only archive is the
+	// legacy log - new records begin a new segmented archive).
+	if len(segs) == 0 {
+		s.certSeg = 0
+	} else {
+		s.certSeg = segs[len(segs)-1].idx
+	}
+	return nil
+}
+
+// parseCertSegmentName recognises a certificate segment file name and returns
+// its index. The ".cseg" extension keeps a certificate segment from being
+// mistaken for a block segment by scan().
+func parseCertSegmentName(name string) (uint64, bool) {
+	if !strings.HasPrefix(name, "certs-") || !strings.HasSuffix(name, ".cseg") {
+		return 0, false
+	}
+	mid := strings.TrimSuffix(strings.TrimPrefix(name, "certs-"), ".cseg")
+	idx, err := strconv.ParseUint(mid, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return idx, true
+}
+
+// scanCertFile indexes one certificate file: the legacy log or one segment.
+// A missing file is not an error (the legacy log may simply not exist, and a
+// fresh directory has no segments). final permits the torn-tail truncation
+// that only a crash shape justifies.
+func (s *Store) scanCertFile(name string, loc certLoc, final bool) error {
+	path := filepath.Join(s.dir, name)
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil // no certificate was ever recorded
+		return nil
 	}
 	if err != nil {
 		return err
@@ -1176,11 +1405,15 @@ func (s *Store) scanCerts() error {
 	if err != nil {
 		return err
 	}
+	legacy := loc.seg == legacyCertSeg
+	if legacy {
+		s.legacyCertExist = true
+	}
 	size := fi.Size()
-	// The segment header, as in the two logs above. A pre-header certificate
-	// log is refused as an unrecognised format rather than truncated: the
-	// archive is not a safety promise, but a truncated log would silently
-	// renumber the heights it indexes, which is worse than refusing to read it.
+	// The segment header, as in the two logs above. A segment written before
+	// the header existed is a format this build cannot read; a certificate log
+	// is not a safety promise, but reading it as if it were the current layout
+	// would index heights that do not exist, so it is refused, never truncated.
 	headLen := min(size, int64(SegmentHeaderLen))
 	var head [SegmentHeaderLen]byte
 	if headLen > 0 {
@@ -1191,6 +1424,9 @@ func (s *Store) scanCerts() error {
 	switch err := classifySegmentHeader(head[:headLen]); {
 	case err == nil:
 	case errors.Is(err, errTornRecord):
+		if !final {
+			return fmt.Errorf("%w: segment header is incomplete in %s", ErrCorruptRecord, name)
+		}
 		_ = f.Close()
 		return s.truncateTail(path, 0)
 	default:
@@ -1201,26 +1437,52 @@ func (s *Store) scanCerts() error {
 	for off < size {
 		n, recEnd, err := readRecordAt(f, size, off, -1)
 		if err != nil {
-			if errors.Is(err, errTornRecord) {
+			if final && errors.Is(err, errTornRecord) {
 				// Close before truncating: Windows refuses os.Truncate while a
 				// handle is open. The deferred Close then no-ops.
 				_ = f.Close()
 				return s.truncateTail(path, off)
 			}
-			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, certLogName, err)
+			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, name, err)
 		}
 		if n < certHeightLen {
-			return fmt.Errorf("%w: certificate record at offset %d of %s carries %d bytes, too few for its height", ErrCorruptRecord, off, certLogName, n)
+			return fmt.Errorf("%w: certificate record at offset %d of %s carries %d bytes, too few for its height", ErrCorruptRecord, off, name, n)
 		}
 		// The height key is the only payload byte this pass needs: everything
 		// after it is opaque to the store, and CertAt reads it back on demand.
 		if _, err := f.ReadAt(key[:], off+RecordHeaderLen); err != nil {
-			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, certLogName, err)
+			return fmt.Errorf("%w: certificate record at offset %d of %s: %v", ErrCorruptRecord, off, name, err)
+		}
+		h := binary.BigEndian.Uint64(key[:])
+		// The physical record count and the segment's height range are tracked
+		// for EVERY record, including the ones below the horizon: rotation
+		// counts the bytes actually in the file, and the pruner must be able to
+		// tell that a segment is entirely below the horizon even when none of
+		// its records is indexed any more.
+		if !legacy {
+			s.certSegRecords[loc.seg]++
+			if h > s.certSegMax[loc.seg] {
+				s.certSegMax[loc.seg] = h
+			}
+		}
+		// A height below the certificate horizon is ABSENT, even though its
+		// record may still be on disk: the pruner never rewrites a segment, so
+		// the boundary segment keeps its pruned prefix and this is where it is
+		// ignored (M7).
+		if h < s.certFirst {
+			off = recEnd
+			continue
 		}
 		// Newest wins: a height is certified once, and the store's PutCert
 		// refuses to append a second record for it, so only a hand-written
 		// file can present two.
-		s.certIndex[binary.BigEndian.Uint64(key[:])] = off
+		s.certIndex[h] = certLoc{seg: loc.seg, off: off}
+		if legacy {
+			s.legacyCertRecs++
+			if h > s.legacyCertMax {
+				s.legacyCertMax = h
+			}
+		}
 		off = recEnd
 	}
 	return nil
@@ -1236,9 +1498,19 @@ const certHeightLen = 8
 // recorded for that height is kept: a committed height never changes its
 // block, so the first certificate this node proved and persisted for it is the
 // one that stands, and re-recording would only grow the log.
+//
+// Records go to the ACTIVE certificate segment (M7), rotating to a new one
+// after certRecordsPerSegment records. Rotation opens the next segment and
+// writes its header before the first record lands in it, and makes the new
+// directory entry durable, exactly as a block segment rollover does.
 func (s *Store) PutCert(height uint64, payload []byte) error {
 	if _, have := s.certIndex[height]; have {
 		return nil
+	}
+	if s.certSegRecords[s.certSeg] >= certRecordsPerSegment {
+		if err := s.rollCertSegment(); err != nil {
+			return err
+		}
 	}
 	rec := make([]byte, 0, certHeightLen+len(payload))
 	var key [certHeightLen]byte
@@ -1255,54 +1527,107 @@ func (s *Store) PutCert(height uint64, payload []byte) error {
 		_ = s.certFile.Truncate(off)
 		return err
 	}
-	s.certIndex[height] = off
+	s.certIndex[height] = certLoc{seg: s.certSeg, off: off}
+	s.certSegRecords[s.certSeg]++
+	// The segment's height range is what PruneCerts decides deletion on, and it
+	// must be maintained by the WRITER too, not only by the scan: a long-running
+	// node that never reopens would otherwise never see a segment as prunable,
+	// and its certificate archive would grow without bound despite the pruner.
+	if height > s.certSegMax[s.certSeg] {
+		s.certSegMax[s.certSeg] = height
+	}
+	return nil
+}
+
+// rollCertSegment opens the next certificate segment and makes it the append
+// target. The new handle is installed before the old one is closed, for the
+// reason Append's block rollover gives: a failed Close must not leave the store
+// naming a closed handle, or every later PutCert would fail forever.
+func (s *Store) rollCertSegment() error {
+	next := s.certSeg + 1
+	f, err := os.OpenFile(filepath.Join(s.dir, certSegmentName(next)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if err := ensureSegmentHeader(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	old := s.certFile
+	s.certFile = f
+	s.certSeg = next
+	// Make the new segment's directory entry durable before a record is
+	// written into it (audit S-15), exactly as the block rollover does.
+	syncDir(s.dir)
+	if old != nil {
+		if err := old.Close(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 // CertAt returns a copy of the certificate payload recorded for height, and
 // whether one exists. It reads the one record, so the cert log costs memory
-// only for the record being served, however long the chain runs.
+// only for the record being served, however long the chain runs. The read goes
+// through the shared read-handle cache: a certificate may live in any
+// segment, and opening the file per call would cost a descriptor per read.
 func (s *Store) CertAt(height uint64) ([]byte, bool) {
-	off, ok := s.certIndex[height]
+	loc, ok := s.certIndex[height]
 	if !ok {
 		return nil, false
 	}
-	// The record was framed by scanCerts/PutCert, but the file lives on disk, so
-	// re-validate rather than trusting the offset (audit S-12). Frame it against
-	// the file's CURRENT size FIRST: the length prefix is a number the file
-	// states, and a stale offset or an edited log can leave it claiming a
-	// payload the file does not hold. Allocating on that number's word is how a
-	// 54-byte file asks for 64 MiB. A record that does not frame is an absence,
-	// never a panic and never a short read.
-	fi, err := s.certFile.Stat()
+	pay, ok := s.readCertAt(certFileName(loc), loc.off)
+	if !ok {
+		return nil, false
+	}
+	// The record at this offset must be the record for this height. Two records
+	// swapped in place keep every checksum valid - the framing moves with the
+	// bytes - so the height key is the only thing that can tell, and serving
+	// another height's certificate under this one would be an answer that is
+	// wrong rather than absent.
+	if len(pay) < certHeightLen || binary.BigEndian.Uint64(pay[:certHeightLen]) != height {
+		return nil, false
+	}
+	out := make([]byte, len(pay)-certHeightLen)
+	copy(out, pay[certHeightLen:])
+	return out, true
+}
+
+// readCertAt reads and fully verifies the framed record at off in the named
+// certificate file, returning its payload. Every failure is an absence, never
+// a panic and never a short read: the offset came from this store's own index,
+// but the file lives on disk and can be rewritten underneath an open store, so
+// the framing is re-validated before the offset arithmetic is trusted.
+func (s *Store) readCertAt(name string, off int64) ([]byte, bool) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	f, err := s.readerLocked(name)
 	if err != nil {
 		return nil, false
 	}
-	n, _, err := readRecordAt(s.certFile, fi.Size(), off, -1)
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, false
+	}
+	size := fi.Size()
+	// Frame it against the file's CURRENT size first: the length prefix is a
+	// number the file states, and a stale offset or an edited log can leave it
+	// claiming a payload the file does not hold. Allocating on that number's
+	// word is how a 54-byte file asks for 64 MiB.
+	n, _, err := readRecordAt(f, size, off, -1)
 	if err != nil || n < certHeightLen || uint64(n) > uint64(math.MaxInt) {
 		return nil, false
 	}
-	// One read of the whole framed record, now that its width is known to fit.
 	rec := make([]byte, RecordHeaderLen+int(n)+RecordTrailerLen)
-	if _, err := s.certFile.ReadAt(rec, off); err != nil {
+	if _, err := f.ReadAt(rec, off); err != nil {
 		return nil, false
 	}
 	payEnd := RecordHeaderLen + int(n)
 	if crc32.Checksum(rec[:payEnd], crcTable) != binary.BigEndian.Uint32(rec[payEnd:]) {
 		return nil, false
 	}
-	pay := rec[RecordHeaderLen:payEnd]
-	// The record at this offset must be the record for this height. Two records
-	// swapped in place keep every checksum valid - the framing moves with the
-	// bytes - so the height key is the only thing that can tell, and serving
-	// another height's certificate under this one would be an answer that is
-	// wrong rather than absent.
-	if binary.BigEndian.Uint64(pay[:certHeightLen]) != height {
-		return nil, false
-	}
-	out := make([]byte, n-certHeightLen)
-	copy(out, pay[certHeightLen:])
-	return out, true
+	return rec[RecordHeaderLen:payEnd], true
 }
 
 // encodeLockRecord renders a lock as its fixed-size payload: 8 bytes of

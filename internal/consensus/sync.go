@@ -140,6 +140,12 @@ var (
 	// count is refused, never silently truncated, so a requester always
 	// knows whether the error is its own window or the peer's height.
 	ErrRangeTooBig = errors.New("consensus: BLOCK_SYNC range exceeds MaxBlocksPerResponse")
+	// ErrRangePruned reports a range that starts at or below the height this
+	// node PRUNED its history to (M7). The blocks are not missing by accident:
+	// they were deliberately dropped, and no retry will find them here. It is a
+	// distinct error so the node can SAY SO instead of refusing with the
+	// generic "no certificate" that sends the peer looking for a corrupt log.
+	ErrRangePruned = errors.New("consensus: BLOCK_SYNC range starts below this node's pruned history")
 	// ErrRangeAhead reports a range that starts above the local height - on
 	// the ANSWER side, a requester asking for a future block is confused or
 	// hostile; on the PULL side, a caller naming a height above head+1 can
@@ -238,6 +244,19 @@ type Syncer struct {
 	// always learned that a peer has run out: the caller's next wave resumes
 	// from the new head.
 	MaxResponseBytes int
+
+	// Log, when set, receives the operator-facing refusals that would otherwise
+	// be SILENT - today the one case where this node cannot serve a range
+	// because it PRUNED it away (M7). It is throttled inside the syncer: a
+	// lagging peer retries every wave, so the line is printed occasionally
+	// rather than once per request. Plan §6 requires a pruned node to say
+	// plainly that it cannot serve, because silence here is the same class of
+	// defect as the relay gate's silent refusal.
+	Log func(format string, args ...any)
+	// pruneSayMu guards the throttle state below.
+	pruneSayMu    sync.Mutex
+	pruneSaidAt   time.Time
+	pruneSaidOnce bool
 
 	// Peer is the validator this syncer pulls from, set by the
 	// transport-facing layer when it knows which peer it is behind (a HELLO
@@ -437,6 +456,30 @@ func nonceSeed() uint64 {
 		return uint64(time.Now().UnixNano())
 	}
 	return binary.BigEndian.Uint64(b[:])
+}
+
+// sayPrunedRequest prints the "I cannot serve that" line for a range below the
+// pruning horizon, at most once per pruneSayInterval. It is throttled because a
+// lagging peer asks again every wave, and an unthrottled line every 500 ms is
+// noise an operator learns to ignore - the failure mode this line exists to
+// prevent.
+func (s *Syncer) sayPrunedRequest(from, to, base uint64) {
+	if s.Log == nil {
+		return
+	}
+	const pruneSayInterval = 10 * time.Minute
+	s.pruneSayMu.Lock()
+	now := s.now()
+	say := !s.pruneSaidOnce || now.Sub(s.pruneSaidAt) >= pruneSayInterval
+	if say {
+		s.pruneSaidOnce = true
+		s.pruneSaidAt = now
+	}
+	s.pruneSayMu.Unlock()
+	if say {
+		s.Log("BLOCK_SYNC: a peer asked for heights %d..%d, which this node pruned (it keeps history from height %d). A node behind the horizon must resync from a peer that still holds those heights, or from a checkpoint at or above %d.",
+			from, min(to, base), base+1, base)
+	}
 }
 
 // nextNonce returns the next request nonce. Nonces are unique within one
@@ -765,6 +808,21 @@ func (s *Syncer) verifyCertificate(blk *types.Block, round uint32, votes []*Vote
 		// all. A refused certificate, never a fallback to genesis.
 		return fmt.Errorf("%w: no committee for height %d: %w", ErrBadSyncCommit, blk.Header.Height, err)
 	}
+	return verifyCertificateVotes(vals, blk, round, votes)
+}
+
+// verifyCertificateVotes is THE quorum gate's body, extracted (M7) so the
+// checkpoint verifier re-tallies a checkpoint's certificate through EXACTLY the
+// same rules the syncer applies to an adopted block: VoteSet.Add proves each
+// vote's signature, its sender's committee membership, its placement at
+// (height, round), and the one-vote-per-validator rule; HasQuorum demands the
+// same two-thirds-of-total-power a live commit musters.
+//
+// It takes the committee rather than looking it up, because the checkpoint
+// verifier's committee is the GENESIS committee (the trust anchor) while the
+// syncer's is the block's epoch committee. Both paths agree on everything else
+// by construction: there is one tally rule.
+func verifyCertificateVotes(vals []genesis.Validator, blk *types.Block, round uint32, votes []*Vote) error {
 	// certVoteSet builds a bare Config (no timeouts), so Config.Validate is not
 	// run over it and Config.Quorum would silently use a WRAPPED total if this
 	// committee's powers summed past 2^64 (audit C-17). The production node
@@ -980,6 +1038,16 @@ func (s *Syncer) Answer(req *wire.BlockSyncReq) (*wire.BlockSyncResp, error) {
 	height := s.chain.Height()
 	if req.From > height {
 		return nil, ErrRangeAhead
+	}
+	// THE PRUNED-RANGE REFUSAL (M7). A node that bounded its history cannot
+	// answer for heights it deleted, and it must say that rather than fail the
+	// request as a missing certificate: silence here is the relay gate's defect
+	// in another place (plan §6). `base` is the last height the node pruned, so
+	// everything at or below it is absent by design.
+	if base := s.chain.Base(); base > 0 && req.From <= base {
+		s.sayPrunedRequest(req.From, req.To, base)
+		return nil, fmt.Errorf("%w: this node keeps history from height %d (heights at or below %d were pruned), so it cannot serve %d..%d; pull those heights from a peer that still holds them, or start this node from a checkpoint at or above %d",
+			ErrRangePruned, base+1, base, req.From, min(req.To, base), base)
 	}
 	end := req.To
 	if end > height {
