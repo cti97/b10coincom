@@ -91,24 +91,15 @@ func TestAWipedValidatorOneHeightBehindCatchesUp(t *testing.T) {
 	// height 2, so no live vote will ever reach the wiped seat's height-1
 	// rounds: block 1 can only arrive through a certificate-gated pull.
 	waitAdopted(t, vs[2], 1, 30*time.Second)
-	if got := vs[2].Height(); got != 1 {
-		t.Fatalf("the wiped seat stands at height %d after adopting, want 1", got)
+	// The head may already be PAST 1 (the committee resumes within the same
+	// second), so the claim is "the gap closed", not "it stopped at 1".
+	if got := vs[2].Height(); got < 1 {
+		t.Fatalf("the wiped seat stands at height %d after adopting, want at least 1", got)
 	}
-	ref, err := vs[0].Chain().BlockAt(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := vs[2].Chain().BlockAt(1)
-	if err != nil {
-		t.Fatalf("the adopted block 1: %v", err)
-	}
-	gid, rid := got.ID(), ref.ID()
-	if gid != rid {
-		t.Fatalf("the wiped seat adopted block %x at height 1, but the committee holds %x", gid[:8], rid[:8])
-	}
-	if root, want := vs[2].Chain().State().Root(), vs[0].Chain().State().Root(); root != want {
-		t.Fatalf("the wiped seat's state root after adopting = %x, want %x", root[:8], want[:8])
-	}
+	// Block 1 itself is the committee's, byte for byte. Its header commits the
+	// state root, so per-height agreement here IS the root agreement the
+	// report asks for; the walk is repeated below at the height the run
+	// reaches.
 	assertIdenticalHistory(t, vs, 1)
 
 	// 2. THE RE-ENTRY. Block 2 needs all three seats, so the committee moving
@@ -157,8 +148,8 @@ func TestAWipedValidatorOneHeightBehindThroughARelay(t *testing.T) {
 	}
 
 	waitAdopted(t, vs[2], 1, 30*time.Second)
-	if got := vs[2].Height(); got != 1 {
-		t.Fatalf("the wiped seat stands at height %d after adopting through the relay, want 1", got)
+	if got := vs[2].Height(); got < 1 {
+		t.Fatalf("the wiped seat stands at height %d after adopting through the relay, want at least 1", got)
 	}
 	assertIdenticalHistory(t, vs, 1)
 	waitAllReach(t, vs, 2, 120*time.Second)
@@ -197,8 +188,8 @@ func TestAWipedValidatorCatchesUpAfterItsPeersRanTheLadder(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitAdopted(t, vs[2], 1, 30*time.Second)
-	if got := vs[2].Height(); got != 1 {
-		t.Fatalf("the wiped seat stands at height %d after adopting, want 1", got)
+	if got := vs[2].Height(); got < 1 {
+		t.Fatalf("the wiped seat stands at height %d after adopting, want at least 1", got)
 	}
 	assertIdenticalHistory(t, vs, 1)
 }
