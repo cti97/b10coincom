@@ -726,6 +726,48 @@ func TestNodeGenesisModeFlagContract(t *testing.T) {
 	}
 }
 
+// M8's trust flag is ONE decision with three parts, and the CLI refuses every
+// half of it before anything is opened: a trust flag with no file trusts
+// nothing, an age with no trust bounds nothing, and an age of zero is the
+// permanent fork-pin the bound exists to prevent. Each refusal is asserted
+// here rather than left to the verifier, because an operator who gets a
+// plausible-looking start has already been told the wrong thing.
+func TestCheckpointTrustFlagContract(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "trust with no checkpoint file",
+			args: []string{"--dir", filepath.Join(dir, "a"), "--genesis", filepath.Join(dir, "c.json"), "--key", filepath.Join(dir, "k"), "--checkpoint-trust"},
+			want: "--checkpoint",
+		},
+		{
+			name: "an age bound with no trust flag",
+			args: []string{"--dir", filepath.Join(dir, "b"), "--genesis", filepath.Join(dir, "c.json"), "--key", filepath.Join(dir, "k"), "--checkpoint-max-age", "2"},
+			want: "--checkpoint-trust",
+		},
+		{
+			name: "a zero age bound",
+			args: []string{"--dir", filepath.Join(dir, "c"), "--genesis", filepath.Join(dir, "c.json"), "--key", filepath.Join(dir, "k"), "--checkpoint", filepath.Join(dir, "cp.json"), "--checkpoint-trust", "--checkpoint-max-age", "0"},
+			want: "0",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := cmdNode(tc.args)
+			if err == nil {
+				t.Fatalf("%s was accepted", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%s gave %v, want it to name %q", tc.name, err, tc.want)
+			}
+		})
+	}
+}
+
 // `b10coin version` must print the build identity — the semantic version plus
 // the toolchain's VCS stamp — and `--short` must print exactly the semantic
 // version, because scripts/build-release.sh names every artifact with it.
