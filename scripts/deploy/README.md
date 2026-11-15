@@ -830,17 +830,20 @@ state swapped in, is refused and nothing is written into the data directory.
 After adopting it the node is at the checkpoint's height and catches up over
 BLOCK_SYNC like any other node that fell behind.
 
-`--at <height>` must be a height whose certificate the old directory still
-holds. If you need the CURRENT head, note that exporting replays the retained
-window (it must reconstruct the state at that height), so it takes as long as
-the window is large - the reason the horizon is pruned to, and checkpointed, at
-every pass rather than exported on demand.
+`--at <height>` must be a height the directory can still prove: the pruning
+HORIZON (always available - the pruner keeps its certificate and the chain keeps
+its block and state), any retained height, or the head if that height's
+certificate has been recorded. Exporting a retained height replays the window
+from the horizon to it, so it takes as long as the window is large - which is
+why the horizon is checkpointed at every pass rather than exported on demand.
 
-The end-to-end scenario lives in `scripts/deploy/scenario-m7-prune.sh`: three
-validators, one restarted with `--retain-blocks`, a checkpoint exported from it,
-and a fourth node started from that checkpoint alone. It asserts that the
-joiner reaches the **same height and the same state root**, and prints the disk
-size of the pruned node before and after.
+The end-to-end scenario lives in `scripts/deploy/scenario-m7-prune.sh`: four
+fixture validators, one wiped, one restarted with `--retain-blocks`, a
+checkpoint exported from it, and a node started from that checkpoint alone. It
+asserts that the joiner reaches the **same height and the same state root**, and
+prints the disk size of the pruned node before and after. It runs in minutes
+because it uses the fixture-only `--epoch-blocks` (a real chain's epoch comes
+from the committee file and must not be overridden).
 
 ## 6. The systemd units (what runs after the first contact test)
 

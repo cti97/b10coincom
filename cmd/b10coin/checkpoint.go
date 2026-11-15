@@ -39,6 +39,7 @@ func cmdCheckpoint(args []string) error {
 	out := fs.String("out", "", "file to write (default: stdout)")
 	genesisPath := fs.String("genesis", "", "committee file the chain was started with (default: the devnet genesis)")
 	validators := fs.Int("validators", 0, "fixture committee size, for a chain started with --validators N")
+	epochBlocks := fs.Uint64("epoch-blocks", 0, "fixture epoch length, for a chain started with --epoch-blocks N (0 = the fixture default)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -55,6 +56,8 @@ func cmdCheckpoint(args []string) error {
 	switch {
 	case *genesisPath != "" && *validators != 0:
 		return fmt.Errorf("--genesis names the committee file and --validators names the fixture committee; give exactly one (or neither, for the devnet genesis)")
+	case *epochBlocks != 0 && *validators == 0:
+		return fmt.Errorf("--epoch-blocks overrides the FIXTURE genesis; give --validators N with it (a genesis file owns its own epoch, and the devnet genesis is fixed)")
 	case *genesisPath != "":
 		g, err = genesis.LoadCommitteeJSON(*genesisPath)
 		if err != nil {
@@ -65,6 +68,12 @@ func cmdCheckpoint(args []string) error {
 			return fmt.Errorf("--validators %d is above the fixture ceiling of 255", *validators)
 		}
 		g = simnet.Committee(*validators)
+		if *epochBlocks != 0 {
+			if *epochBlocks < 2 {
+				return fmt.Errorf("--epoch-blocks %d is below the floor of 2", *epochBlocks)
+			}
+			g.Params.EpochBlocks = *epochBlocks
+		}
 	default:
 		g = genesis.Devnet()
 	}

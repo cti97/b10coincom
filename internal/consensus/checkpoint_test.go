@@ -223,6 +223,62 @@ func TestCheckpointVotesFromAStrangerKeyAreRefused(t *testing.T) {
 	}
 }
 
+// TestAPrunedNodeCanReExportItsOwnHorizon is the "days later" case: the export
+// that moves a seat to a new machine happens from the pruned directory, long
+// after the prune, when the epoch that decided the horizon's committee is no
+// longer derivable (its deciding state was pruned). The export must still work:
+// the committee comparison is a rotation DIAGNOSTIC, while the trust check is
+// the certificate re-tallied under the genesis committee - and the horizon's
+// certificate is deliberately kept by the pruner for exactly this.
+func TestAPrunedNodeCanReExportItsOwnHorizon(t *testing.T) {
+	const (
+		epoch  = 4
+		retain = 4 * epoch
+		total  = 40
+	)
+	a, g, dir := certChain(t, total, epoch)
+	p := prunerFor(t, dir, retain)
+	if _, err := p.MaybePrune(a); err != nil {
+		t.Fatal(err)
+	}
+	horizon := a.Base()
+	if horizon == 0 {
+		t.Fatal("nothing was pruned")
+	}
+	cp, err := ReadCheckpointFile(filepath.Join(dir, CheckpointFileName))
+	if err != nil {
+		t.Fatalf("the pruner wrote no checkpoint: %v", err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Reopen the PRUNED directory: the epoch that decided the horizon's
+	// committee is gone, so CommitteeAt(horizon) must fail - and the export must
+	// not care.
+	resume, err := ResumeForDir(g, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := chain.OpenResume(g, dir, resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Close() }()
+	if _, err := b.CommitteeAt(horizon); err == nil {
+		t.Fatalf("fixture: the epoch at height %d is still derivable; this test is not exercising the pruned path", horizon)
+	}
+	again, err := ExportCheckpoint(b, horizon)
+	if err != nil {
+		t.Fatalf("re-exporting the horizon from a pruned directory: %v", err)
+	}
+	if again.Height != cp.Height {
+		t.Fatalf("the re-exported checkpoint is at %d, the pruned one at %d", again.Height, cp.Height)
+	}
+	if _, err := VerifyCheckpoint(g, again); err != nil {
+		t.Fatalf("the re-exported checkpoint does not verify: %v", err)
+	}
+}
+
 // TestExportCheckpointRefusesWithoutACertificate is plan §7's line in code:
 // retention without a provable checkpoint is worse than a full disk. A chain
 // with no recorded certificate for the horizon must refuse to produce one.

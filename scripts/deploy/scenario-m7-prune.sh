@@ -58,13 +58,16 @@ fi
 
 # ---------------------------------------------------------------- parameters
 N=${N:-4}
-EPOCH=${EPOCH:-1000}                      # the fixture committee's epoch length
+# A SHORT fixture epoch. The shipped fixture epoch is 1000 blocks, so the first
+# prune could not happen before ~5000 blocks - over an hour at the fixture
+# committee's pace (~1 block/s on loopback). --epoch-blocks is the fixture-only
+# override the node grew for exactly this scenario; on a real chain the epoch is
+# the shared committee document's.
+EPOCH=${EPOCH:-20}
 RETAIN=${RETAIN:-$((4 * EPOCH))}          # the pruner's floor: four epochs
-# The first prune needs head - retain >= one epoch, i.e. a head above
-# retain + epoch = 5000 blocks on the shipped parameters. At the fixture
-# committee's pace that is roughly 15-25 minutes; that is the scenario's cost,
-# not a bug in it.
-TARGET_HEIGHT=${TARGET_HEIGHT:-5000}
+# The first prune needs head - retain >= one epoch, so a head above
+# retain + epoch = 100 blocks here. 400 leaves room for several passes.
+TARGET_HEIGHT=${TARGET_HEIGHT:-400}
 BASE_HTTP=${BASE_HTTP:-18600}
 BASE_P2P=${BASE_P2P:-17600}
 WAIT=${WAIT:-600}                         # seconds any single wait may take
@@ -95,11 +98,15 @@ fi
 
 # ---------------------------------------------------------------- helpers
 # status_field PORT FIELD: one /status value, or empty when the node is not up.
+# It ALWAYS returns 0: a node that is not answering is an empty value, not an
+# error, and `set -e` would otherwise abort the script the moment a node is
+# stopped - which is every restart in this scenario.
 status_field() {
     local port=$1 field=$2
     curl -fsS --max-time 2 "http://127.0.0.1:${port}/status" 2>/dev/null \
         | grep -o "\"${field}\":[[:space:]]*\"\?[A-Za-z0-9_-]*\"\?" \
-        | head -1 | sed 's/.*:[[:space:]]*//; s/"//g'
+        | head -1 | sed 's/.*:[[:space:]]*//; s/"//g' || true
+    return 0
 }
 
 # node_peers INDEX: every other validator's P2P address.
@@ -122,25 +129,39 @@ start_node() {
         --listen "127.0.0.1:$((BASE_P2P + idx))" \
         --peers "$(node_peers "$idx")" \
         --allow-local-peer-hints \
-        --validators "$N" --index "$idx" \
+        --validators "$N" --index "$idx" --epoch-blocks "$EPOCH" \
         "$@" >>"$log" 2>&1 &
     PIDS+=("$!")
     echo "$!" >"$ROOT/v$idx.pid"
 }
 
 # stop_node INDEX: stop the process started for that validator.
+#
+# "Did it stop" is asked by REAPING it, not by polling kill -0: a child bash has
+# not waited for yet is a zombie, and kill -0 succeeds for a zombie. A consensus
+# node also drains an in-flight BLOCK_SYNC pull before it exits, so the grace is
+# generous and a hard kill is the last resort (the store is crash-safe, but a
+# killed writer costs a torn-tail repair on the next start for no reason).
 stop_node() {
-    local idx=$1 pidfile="$ROOT/v$1.pid" pid
+    local idx=$1 pidfile="$ROOT/v$1.pid" pid watcher
     [ -f "$pidfile" ] || return 0
     pid=$(cat "$pidfile")
     kill "$pid" 2>/dev/null || true
-    # Wait for the process to exit, so the directory lock is released before a
-    # restart or an offline export.
-    for _ in $(seq 1 100); do
-        kill -0 "$pid" 2>/dev/null || { rm -f "$pidfile"; return 0; }
+    # A watcher that hard-kills after 30 s, and that is told to STAND DOWN by a
+    # flag file once the node has exited - so it is never killed itself, and
+    # bash prints no job-control noise over the scenario's output.
+    local flag="$ROOT/stop.$pid.flag"
+    rm -f "$flag"
+    ( for _ in $(seq 1 300); do
+        [ -f "$flag" ] && exit 0
         sleep 0.1
-    done
-    die "validator $idx did not stop"
+      done
+      kill -9 "$pid" 2>/dev/null ) &
+    watcher=$!
+    wait "$pid" 2>/dev/null || true
+    : >"$flag"
+    wait "$watcher" 2>/dev/null || true
+    rm -f "$pidfile" "$flag"
 }
 
 # wait_height INDEX MIN: wait until that validator reports height >= MIN.
@@ -204,7 +225,7 @@ horizon=$(echo "$prune_line" | sed 's/.*checkpoint at height //; s/[^0-9].*//')
 say "exporting a checkpoint at height $horizon from validator 0"
 stop_node 0
 "$BIN" checkpoint export --dir "$ROOT/v0" --at "$horizon" \
-    --validators "$N" --out "$ROOT/cp.json" 2>"$ROOT/export.log" \
+    --validators "$N" --epoch-blocks "$EPOCH" --out "$ROOT/cp.json" 2>"$ROOT/export.log" \
     || die "checkpoint export failed: $(cat "$ROOT/export.log")"
 [ -s "$ROOT/cp.json" ] || die "checkpoint export wrote nothing"
 v0_bytes=$(dir_bytes "$ROOT/v0")

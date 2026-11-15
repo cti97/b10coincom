@@ -104,6 +104,13 @@ type Chain struct {
 	// builds on, not from genesis.
 	baseHeight uint64
 	baseState  *state.State
+	// baseHead is the BLOCK at baseHeight. The store does not hold it (it was
+	// pruned or was never stored), but the chain resumed from it, so it is the
+	// one historical block this process must be able to hand back: it is the
+	// block a checkpoint at the horizon carries, and re-exporting that
+	// checkpoint - to move a seat to a new machine, days after the prune - must
+	// not need a block the prune deleted.
+	baseHead *types.Block
 
 	// pruneMu serialises the two operations that READ baseHeight/baseState
 	// against the one that MOVES them (PruneHistory). StateAt replays blocks
@@ -455,6 +462,7 @@ func OpenResume(g *genesis.Genesis, dir string, resume *ResumeState) (*Chain, er
 		c.head = resume.Head
 		c.baseHeight = resume.Height
 		c.baseState = resume.State
+		c.baseHead = resume.Head
 		// Epoch 0's committee described a chain this directory no longer has;
 		// the memo is derived state, so clear it rather than leave a seat set
 		// that no retained block was judged by.

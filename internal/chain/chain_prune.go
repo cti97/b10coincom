@@ -68,6 +68,23 @@ func (c *Chain) Base() uint64 {
 	return c.baseHeight
 }
 
+// BaseSnapshot returns the block and state at the base height: the pruned
+// horizon this chain resumed or pruned to. ok is false for a chain that still
+// holds its whole history (base 0), where the ordinary accessors answer.
+//
+// It is what makes a checkpoint re-exportable from a pruned directory: the
+// horizon's block is not in the store any more, but the chain is running on top
+// of it. The returned state is the LIVE base state - callers must treat it as
+// immutable, exactly as State()'s contract says.
+func (c *Chain) BaseSnapshot() (*types.Block, *state.State, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.baseHeight == 0 || c.baseHead == nil || c.baseState == nil {
+		return nil, nil, false
+	}
+	return c.baseHead, c.baseState, true
+}
+
 // StateAt returns the committed state at height h: the live state when h is the
 // head, and otherwise a replay of the retained blocks from the directory's base
 // up to h.
@@ -218,6 +235,7 @@ func (c *Chain) PruneHistory(upTo uint64, st *state.State) (store.PruneStats, er
 
 	c.baseHeight = upTo
 	c.baseState = st.Clone()
+	c.baseHead = blk
 	// Epoch committees whose whole epoch is below the horizon can never be asked
 	// for again (no retained block belongs to them), and keeping one entry per
 	// epoch forever is the unbounded memory the committee memo was always going

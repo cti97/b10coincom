@@ -359,6 +359,7 @@ whose keys sign, and that is the security boundary:**
 | `--allow-local-peer-hints` | *off* | accept `PEER_EXCHANGE` hints that name a **loopback, private or link-local** address. Off by default, and it must stay off on any node reachable from the public internet: it is the one switch that turns a peer's advertised string into a dial at an address on the operator's own network. Turn it **on** for a private-range deployment — a lab VLAN, a Docker bridge, a home network on `10/8` or `192.168/16` — where every address a member can advertise is private, so without it every hint is refused and peer exchange links nobody. (Audit M-2: the capability existed but had no CLI flag, so a private-range chain had no way to opt in.) |
 | `--validators N` | *unset* | fixture committee size — development only, see the security note above |
 | `--index I` | *unset* | fixture seat number — development only |
+| `--epoch-blocks N` | `0` (the fixture's own) | **fixture mode only**: override the derived committee's epoch length before the genesis is hashed. It exists for the M7 pruning scenario, whose first prune would otherwise need ~5000 blocks (an hour at the fixture pace); refused with `--genesis`, where the shared committee file owns the epoch, and refused below 2. Two nodes that disagreed on it would hash different chains — which is why the fixture mode is development-only in the first place |
 | `--retain-blocks N` | `0` (**keep everything**) | bound the data directory to the last `N` blocks (M7). Off by default, so a node started without it behaves exactly as it did before. Refused below `4 × epoch_blocks` blocks, and only a **consensus** validator may use it: pruning is allowed only when the horizon's quorum certificate can be written into a checkpoint, and a single-node producer records none. Prunes only at epoch boundaries, so the state at the horizon is exactly reproducible; what is never pruned is `rounds.log`, `locks.log`, `genesis.hash`, the head block and its certificate, the horizon committee, the base marker and the checkpoint itself (`internal/retention`) |
 | `--checkpoint PATH` | *unset* | start this node from a checkpoint written by `b10coin checkpoint export`. The file is **verified before it is installed**: its precommit votes must reach a quorum of the **genesis** committee for the block it carries, and its state must hash to that block's committed root. It is only accepted into an **empty** data directory — importing over a chain is refused, never silently merged. Without the flag a pruned directory still starts: it reads its own `checkpoint.json` |
 
@@ -503,6 +504,13 @@ The output is JSON, indented so an operator can read it before trusting it.
 Nothing in the file is authenticated by its own bytes: the votes and the state
 root are the evidence, which is why the file may be copied, inspected and
 re-served by anything.
+
+A PRUNED directory can still export its own horizon. The pruner keeps that
+height's certificate (it is the proof of the checkpoint) and the chain keeps the
+horizon's block and state in memory because it resumed from them, so
+`--at <base>` works even when the epoch that decided that committee is no longer
+derivable. Heights strictly between the horizon and the head are exportable too
+(they are retained); heights below the horizon are gone.
 
 ### `b10coin claim`
 

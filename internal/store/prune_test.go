@@ -127,8 +127,8 @@ func TestAPartialPruneSkipsTheBoundaryPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !containsRecordFor(raw, upTo+1) {
-		t.Fatal("the boundary prefix is not on disk; this test's premise (no rewrite) no longer holds")
+	if len(raw) <= SegmentHeaderLen {
+		t.Fatal("the boundary segment is empty; this test's premise (a prefix left in place) no longer holds")
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -386,15 +386,4 @@ func TestPruneCertsRemovesTheLegacyLogWhole(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// containsRecordFor reports whether raw contains a framed record whose payload
-// begins with the given block height key... which block payloads do NOT carry
-// (they are opaque and may be shorter than a height). It is therefore a
-// deliberately weak check: it only asserts that the file is LONGER than the
-// header plus the retained records would need, i.e. that a prefix is still
-// there. The strong statement is the store's own: Read(upTo+1) works and
-// Read(upTo) is absent, which the test already asserts.
-func containsRecordFor(raw []byte, height uint64) bool {
-	return len(raw) > SegmentHeaderLen
 }

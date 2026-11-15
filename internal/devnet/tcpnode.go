@@ -157,6 +157,15 @@ type ValidatorConfig struct {
 	// blocks (M7). Zero - the default - keeps everything, so every earlier
 	// acceptance run is byte-identical.
 	RetainBlocks uint64
+	// EpochBlocks, when non-zero, overrides the FIXTURE genesis's epoch length
+	// before it is hashed. It exists because the shipped fixture epoch is 1000
+	// blocks: at the fixture committee's pace a M7 pruning scenario would need
+	// ~5000 blocks, i.e. over an hour, before the first prune is possible. A
+	// short epoch makes the same scenario minutes long, and the override is
+	// refused with a genesis file - on a real chain the epoch is a property of
+	// the shared document, and a flag that could move it would let two nodes
+	// hash different chains from one file.
+	EpochBlocks uint64
 	// PruneLog, when set, receives one line per pruning pass and per refusal.
 	// Nil keeps a library caller quiet; the CLI wires stderr.
 	PruneLog func(format string, args ...any)
@@ -456,6 +465,9 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		if cfg.Index != 0 || cfg.Validators != 0 {
 			return nil, fmt.Errorf("devnet: the committee comes from the genesis file; --index and --validators are fixture-mode flags and must not be set alongside it")
 		}
+		if cfg.EpochBlocks != 0 {
+			return nil, fmt.Errorf("devnet: --epoch-blocks overrides the FIXTURE genesis and means nothing alongside --genesis: the shared committee file owns the epoch length, and two nodes that disagreed about it would hash different chains")
+		}
 		if cfg.Key == nil {
 			return nil, fmt.Errorf("devnet: a genesis-file committee needs this validator's key: give a key file's private key (see b10coin keygen)")
 		}
@@ -473,6 +485,15 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	case cfg.Validators >= 1 && cfg.Validators <= 255 && cfg.Index >= 0 && cfg.Index < cfg.Validators:
 		// Fixture mode, as before M4 A-1: derived committee, derived keys.
 		g = simnet.Committee(cfg.Validators)
+		// M7's fixture-only epoch override. Applied BEFORE the genesis is
+		// hashed (the chain ID and every root derive from it), and refused
+		// alongside a real committee file, where the epoch is the document's.
+		if cfg.EpochBlocks != 0 {
+			if cfg.EpochBlocks < 2 {
+				return nil, fmt.Errorf("devnet: a fixture epoch of %d blocks is below the floor of 2: one-block epochs are a test fixture of the state machine, not a chain to run a node on", cfg.EpochBlocks)
+			}
+			g.Params.EpochBlocks = cfg.EpochBlocks
+		}
 	default:
 		return nil, fmt.Errorf("devnet: fixture committee size must be 1..255 and the seat in range, got size %d seat %d", cfg.Validators, cfg.Index)
 	}

@@ -1246,6 +1246,7 @@ func cmdNode(args []string) error {
 	keyPath := fs.String("key", "", "this validator's key file (b10coin keygen); REQUIRED with --genesis")
 	genesisPath := fs.String("genesis", "", "shared committee file listing the validators' public keys (required for any node a shared network can reach)")
 	// M7: bounded history. Opt-in and default-off, so no earlier run changes.
+	epochBlocks := fs.Uint64("epoch-blocks", 0, "FIXTURE mode only: override the fixture genesis's epoch length before it is hashed (development and scenarios; refused with --genesis, where the shared committee file owns it)")
 	retainBlocks := fs.Uint64("retain-blocks", 0, "bound the data directory to the last N blocks (0 = keep everything, the default). Only a checkpoint can make pruned history recoverable, and only a consensus validator records the quorum certificate a checkpoint is built from")
 	checkpointPath := fs.String("checkpoint", "", "start this node from a checkpoint file written by `b10coin checkpoint export` (the data directory must be empty: importing over a chain is refused)")
 	if err := fs.Parse(args); err != nil {
@@ -1273,6 +1274,9 @@ func cmdNode(args []string) error {
 		}
 		if *advertise != "" {
 			return fmt.Errorf("--advertise names what PEER_EXCHANGE should advertise, which only a networked node runs: give --listen together with it, or drop it")
+		}
+		if *epochBlocks != 0 {
+			return fmt.Errorf("--epoch-blocks overrides the FIXTURE genesis, which this single-node producer (no --validators/--index) does not use: give --validators N --index I for a fixture committee, or drop the flag")
 		}
 		if *retainBlocks > 0 {
 			// Not laziness: pruning is only allowed when the horizon's quorum
@@ -1324,7 +1328,7 @@ func cmdNode(args []string) error {
 		// peer. The devnet layer refuses it too (it is the library entry point).
 		return fmt.Errorf("--advertise names the address peers should dial, but this node has no --listen to receive them: give --listen ADDR (e.g. 0.0.0.0:7001) together with it")
 	}
-	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints, checkpointBytes, *retainBlocks)
+	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints, checkpointBytes, *retainBlocks, *epochBlocks)
 }
 
 // runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
@@ -1494,7 +1498,7 @@ func pruneLog(format string, args ...any) {
 //
 // --block-time is refused with networking: a committee's cadence is its
 // round-timeout ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool, checkpoint []byte, retainBlocks uint64) error {
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool, checkpoint []byte, retainBlocks, epochBlocks uint64) error {
 	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -1606,9 +1610,9 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers,
 	var v *devnet.Validator
 	var err error
 	if g != nil {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, RetainBlocks: retainBlocks, PruneLog: pruneLog})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
 	} else {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, RetainBlocks: retainBlocks, PruneLog: pruneLog})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
 	}
 	if err != nil {
 		return err

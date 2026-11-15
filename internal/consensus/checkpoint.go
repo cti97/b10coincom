@@ -129,12 +129,16 @@ func exportCheckpointAt(c *chain.Chain, at uint64) (*Checkpoint, *state.State, e
 	// exporting a checkpoint whose horizon sits under a rotated committee would
 	// produce a file this build's importer must refuse - better to refuse at the
 	// source, naming rotation.
-	vals, err := c.CommitteeAt(at)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: the committee at height %d cannot be derived: %v", ErrBadCheckpoint, at, err)
-	}
-	if diff := committeeDiff(g.Validators, vals); diff != "" {
-		return nil, nil, fmt.Errorf("%w: the committee at height %d is not the genesis committee (%s). A checkpoint is verified against the GENESIS committee while the committee is genesis-fixed; rotation-aware checkpoints are the next milestone's problem (docs/plan-2026-11-15-m7-bounded-history.md §4 and §7), and this build refuses to write a checkpoint its own importer could not verify", ErrBadCheckpoint, at, diff)
+	// The committee comparison is a DIAGNOSTIC of rotation, not the trust
+	// check: the trust check is the certificate below, which must verify under
+	// the GENESIS committee. So a committee that cannot be derived here - a
+	// PRUNED node re-exporting its own horizon, whose epoch was decided by a
+	// state the prune removed - does not block the export. A rotated committee
+	// still fails, because the genesis keys did not sign its certificate.
+	if vals, err := c.CommitteeAt(at); err == nil {
+		if diff := committeeDiff(g.Validators, vals); diff != "" {
+			return nil, nil, fmt.Errorf("%w: the committee at height %d is not the genesis committee (%s). A checkpoint is verified against the GENESIS committee while the committee is genesis-fixed; rotation-aware checkpoints are the next milestone's problem (docs/plan-2026-11-15-m7-bounded-history.md §4 and §7), and this build refuses to write a checkpoint its own importer could not verify", ErrBadCheckpoint, at, diff)
+		}
 	}
 	payload, ok := c.CertAt(at)
 	if !ok {
@@ -144,18 +148,30 @@ func exportCheckpointAt(c *chain.Chain, at uint64) (*Checkpoint, *state.State, e
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: the stored certificate for height %d does not decode: %v", ErrBadCheckpoint, at, err)
 	}
-	blk, err := c.BlockAt(at)
-	if err != nil {
-		return nil, nil, err
+	// The horizon's own block is not in the store once the prune has run, but
+	// the chain is running on top of it: BaseSnapshot hands it back so a
+	// checkpoint can be re-exported from a pruned directory (the seat-move
+	// procedure in scripts/deploy/README.md).
+	var blk *types.Block
+	var st *state.State
+	if hb, hs, ok := c.BaseSnapshot(); ok && at == c.Base() {
+		blk, st = hb, hs
+	} else {
+		blk, err = c.BlockAt(at)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	// Verify what we are about to write: an exporter that emits a checkpoint
 	// its own verifier rejects is writing a file that fails on the next machine.
 	if err := VerifyCommitCertificate(g.Validators, blk, round, encoded); err != nil {
 		return nil, nil, fmt.Errorf("the stored certificate for height %d does not verify against the genesis committee: %w", at, err)
 	}
-	st, err := c.StateAt(at)
-	if err != nil {
-		return nil, nil, err
+	if st == nil {
+		st, err = c.StateAt(at)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	if root := st.Root(); root != blk.Header.StateRoot {
 		return nil, nil, fmt.Errorf("%w: the state at height %d hashes to %x, but that block commits %x", ErrBadCheckpoint, at, root[:8], blk.Header.StateRoot[:8])
