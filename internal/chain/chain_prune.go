@@ -226,16 +226,17 @@ func (c *Chain) PruneHistory(upTo uint64, st *state.State) (store.PruneStats, er
 	if err != nil {
 		return bs, err
 	}
-	cs, err := c.store.PruneCerts(upTo)
-	if err != nil {
-		return bs, err
-	}
-	bs.CertSegs = cs.CertSegs
-	bs.CertBytes = cs.CertBytes
-	bs.LegacyCerts = cs.LegacyCerts
-	bs.LegacyBytes = cs.LegacyBytes
-	bs.FirstHeight = cs.FirstHeight
-
+	// THE IN-MEMORY BASE MOVES WITH THE ON-DISK BLOCK BASE, NOT WITH THE
+	// CERTIFICATE PASS (audit L-1). PruneBlocks has already persisted the new
+	// horizon and deleted the sub-horizon block segments, so from this
+	// statement on the store holds no block at or below upTo. Advancing
+	// baseHeight here - before PruneCerts, which can fail on an I/O error -
+	// is what keeps StateAt's `h < base` guard true for exactly the heights
+	// the store can still read: the pre-fix order advanced it only after
+	// PruneCerts succeeded, so a certificate error left the on-disk base
+	// advanced and the in-memory one stale, and StateAt(h) for h in
+	// (oldBase, upTo] passed the guard, read a DELETED block and reported
+	// store.ErrNotFound for the life of the process.
 	c.baseHeight = upTo
 	c.baseState = st.Clone()
 	c.baseHead = blk
@@ -243,11 +244,32 @@ func (c *Chain) PruneHistory(upTo uint64, st *state.State) (store.PruneStats, er
 	// for again (no retained block belongs to them), and keeping one entry per
 	// epoch forever is the unbounded memory the committee memo was always going
 	// to become. Drop them; the entry the first retained epoch needs was
-	// recorded by OpenResume/Apply and is above the horizon.
+	// recorded by OpenResume/Apply and is above the horizon. This moves with
+	// the base for the same reason: below-horizon committees are gone whether
+	// or not the certificate pass completes.
 	for e := range c.committees {
 		if e+1 <= upTo/blocks {
 			delete(c.committees, e)
 		}
 	}
+
+	cs, err := c.store.PruneCerts(upTo)
+	if err != nil {
+		// SURPLUS, NOT INCONSISTENCY. The chain is already consistent above:
+		// the blocks are gone, the base is the new horizon, and every reader
+		// agrees about which heights are absent. What the failed pass leaves
+		// behind is certificate segments below the horizon that were not
+		// reclaimed - and reclaiming them late is exactly what PruneCerts'
+		// idempotence is for (it deletes any segment whose highest record is
+		// below the horizon, so the next pass takes them with no special
+		// handling). The error is returned so the operator sees the I/O
+		// failure; the running process is not degraded until restart.
+		return bs, err
+	}
+	bs.CertSegs = cs.CertSegs
+	bs.CertBytes = cs.CertBytes
+	bs.LegacyCerts = cs.LegacyCerts
+	bs.LegacyBytes = cs.LegacyBytes
+	bs.FirstHeight = cs.FirstHeight
 	return bs, nil
 }

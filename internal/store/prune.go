@@ -411,10 +411,24 @@ func (s *Store) PruneBlocks(upTo uint64) (PruneStats, error) {
 // to. It compares inodes rather than names, so a caller cannot be fooled by a
 // path that happens to look the same.
 func (s *Store) fileIsActiveSegment(path string) (bool, error) {
-	if s.file == nil {
+	return sameOpenFile(s.file, path)
+}
+
+// certFileIsActiveSegment is the certificate log's version of
+// fileIsActiveSegment: does path name the segment s.certFile appends to?
+func (s *Store) certFileIsActiveSegment(path string) (bool, error) {
+	return sameOpenFile(s.certFile, path)
+}
+
+// sameOpenFile reports whether path names the file f is open on, compared by
+// inode so a caller cannot be fooled by a path that happens to look the same.
+// A nil f is not open on anything, and false (with no error) is then the
+// honest answer rather than an error a caller would have to special-case.
+func sameOpenFile(f *os.File, path string) (bool, error) {
+	if f == nil {
 		return false, nil
 	}
-	fi, err := s.file.Stat()
+	fi, err := f.Stat()
 	if err != nil {
 		return false, err
 	}
@@ -480,8 +494,24 @@ func (s *Store) PruneCerts(upTo uint64) (PruneStats, error) {
 	// nothing but pruned records and therefore have no index entry at all, and
 	// it would never be reclaimed. The boundary segment stays, with its dead
 	// prefix.
+	//
+	// THE ACTIVE SEGMENT IS NEVER SELECTED (audit I-2), by the same inode
+	// comparison the block path uses: it is an OPEN HANDLE, and unlinking a
+	// file this process still appends to is a portability hazard (Windows
+	// refuses it) rather than a reclaim. Skipping it BY CONSTRUCTION - on the
+	// handle, not on the segment's highest record versus the horizon - is what
+	// makes the open-handle delete path unreachable even under a future change
+	// to certRecordsPerSegment: whatever shape a directory's segments have,
+	// the one this process is appending to cannot be chosen however the
+	// horizon moves. The cost is the boundary segment's dead prefix, exactly
+	// as on the block side: the active segment keeps its below-horizon records
+	// on disk (their index entries are dropped below), and the NEXT prune -
+	// when this segment is sealed and no longer open - reclaims it whole.
 	var segs []uint64
 	for idx, max := range s.certSegMax {
+		if active, aerr := s.certFileIsActiveSegment(filepath.Join(s.dir, certSegmentName(idx))); aerr == nil && active {
+			continue
+		}
 		if max < first {
 			segs = append(segs, idx)
 		}
@@ -519,9 +549,13 @@ func (s *Store) PruneCerts(upTo uint64) (PruneStats, error) {
 	}
 	s.certFirst = first
 
-	// The active segment may just have been deleted (a node whose newest
-	// certificate is at the horizon still needs an append target for its next
-	// commit). Recreate it empty, with a header, at the same index.
+	// The ACTIVE segment is never deleted above (audit I-2), so this is no
+	// longer the pruner's repair; it remains the repair for an append target
+	// that is MISSING FROM DISK - a directory damaged or edited outside this
+	// process, or one an older build's prune unlinked while the handle stayed
+	// open. Without it, appends would go to an unlinked inode and the next
+	// commit's certificate would be lost silently. Recreate it empty, with a
+	// header, at the same index.
 	if _, ok := s.certSegRecords[s.certSeg]; !ok && s.certFile != nil {
 		path := filepath.Join(s.dir, certSegmentName(s.certSeg))
 		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
