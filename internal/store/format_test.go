@@ -52,7 +52,7 @@ func TestEveryLogBeginsWithTheSegmentHeader(t *testing.T) {
 	}
 
 	want := append([]byte(SegmentMagic), 0, 0, 0, SegmentFormatVersion)
-	for _, name := range []string{"00000000.seg", lockLogName, roundLogName, certLogName} {
+	for _, name := range []string{"00000000.seg", lockLogName, roundLogName, certSegmentName(0)} {
 		raw, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)

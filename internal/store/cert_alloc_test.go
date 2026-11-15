@@ -165,11 +165,12 @@ func TestCertAtDoesNotAllocateWhatTheHeaderClaims(t *testing.T) {
 	if err := s.PutCert(1, []byte("certificate-one")); err != nil {
 		t.Fatal(err)
 	}
-	logPath := filepath.Join(dir, certLogName)
-	off, ok := s.certIndex[1]
+	logPath := filepath.Join(dir, certSegmentName(s.certSeg))
+	loc, ok := s.certIndex[1]
 	if !ok {
 		t.Fatal("PutCert did not index height 1")
 	}
+	off := loc.off
 	// A complete, VALID header - its length checksum is correct - naming 64 MiB
 	// of payload in a file of about a hundred bytes.
 	f, err := os.OpenFile(logPath, os.O_RDWR, 0o644)
@@ -222,8 +223,9 @@ func TestCertAtRefusesARecordForAnotherHeight(t *testing.T) {
 	if err := s.PutCert(2, two); err != nil {
 		t.Fatal(err)
 	}
-	logPath := filepath.Join(dir, certLogName)
-	off1, off2 := s.certIndex[1], s.certIndex[2]
+	logPath := filepath.Join(dir, certSegmentName(s.certSeg))
+	loc1, loc2 := s.certIndex[1], s.certIndex[2]
+	off1, off2 := loc1.off, loc2.off
 	if off2-off1 != int64(RecordHeaderLen+len(one)+certHeightLen+RecordTrailerLen) {
 		t.Fatalf("fixture records are not the same width: offsets %d and %d", off1, off2)
 	}
@@ -329,8 +331,8 @@ func TestAPayloadCorruptCertificateIsRefusedAtReadNotAtOpen(t *testing.T) {
 	if err := s.PutCert(2, second); err != nil {
 		t.Fatal(err)
 	}
-	logPath := filepath.Join(dir, certLogName)
-	off2 := s.certIndex[2]
+	logPath := filepath.Join(dir, certSegmentName(s.certIndex[2].seg))
+	off2 := s.certIndex[2].off
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
