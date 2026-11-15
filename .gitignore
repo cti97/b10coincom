@@ -46,3 +46,15 @@ coverage.out
 # The walkthrough's default WORK directory (docs/2026-11-01-m6-walkthrough.md):
 # keys, chain data and a pid file, all regenerable, none of it tracked.
 /walkthrough/
+
+# iCloud conflict copies. They have appeared ELEVEN times in this tree and broken
+# the build or CI each time. The pattern must cover every numeric suffix: the
+# earlier rule matched " 2." only, so a " 3.go" was neither ignored nor noticed
+# and was committed by a `git add -A`, failing staticcheck in CI with undefined
+# symbols from a half-merged file.
+* [0-9].go
+* [0-9].md
+* [0-9].sh
+* [0-9].py
+* [0-9].json
+* [0-9].txt
