@@ -153,6 +153,21 @@ type ValidatorConfig struct {
 	// chain.OpenResume refuses it when Dir already holds history, so importing
 	// can never overwrite a chain.
 	Checkpoint []byte
+	// CheckpointTrust admits a checkpoint whose committee is NOT the genesis
+	// committee (M8). It is a TRUST DOWNGRADE: such a file is verified only for
+	// internal consistency - its own committee signed its own block whose
+	// header commits its own state - which anyone can fabricate. It exists for
+	// a node whose chain has rotated and which therefore cannot verify the
+	// file against genesis. Only ever set from an explicit --checkpoint-trust.
+	CheckpointTrust bool
+	// CheckpointMaxAgeEpochs bounds a CheckpointTrust import, in epochs. Zero is
+	// refused by the verifier: an unbounded trusted checkpoint is a permanent
+	// fork-pin.
+	CheckpointMaxAgeEpochs uint64
+	// CheckpointLog, when set, receives the trusted-import warning. It is a seam
+	// so the CLI can put the warning on stderr where systemd captures it, and so
+	// a test can observe that the downgrade was announced rather than silent.
+	CheckpointLog func(format string, args ...any)
 	// RetainBlocks, when non-zero, bounds this node's history to that many
 	// blocks (M7). Zero - the default - keeps everything, so every earlier
 	// acceptance run is byte-identical.
@@ -579,25 +594,46 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	// a file that does not prove a quorum commitment of the state it carries
 	// must never reach the data directory, where a later start would try to
 	// resume from it.
+	//
+	// TWO VERIFIERS, and the difference is the whole of M8. By default the file
+	// must prove a quorum of the GENESIS committee (consensus.VerifyCheckpoint,
+	// M7 unchanged). With CheckpointTrust the file may instead carry a rotated
+	// committee and is verified only against ITSELF, plus a hard age bound; the
+	// operator asked for that downgrade explicitly, and the warning below says
+	// so on stderr rather than leaving it in a doc.
+	var resume *chain.ResumeState
 	if len(cfg.Checkpoint) > 0 {
 		cp, err := consensus.DecodeCheckpoint(cfg.Checkpoint)
 		if err != nil {
 			return nil, err
 		}
-		if _, err := consensus.VerifyCheckpoint(g, cp); err != nil {
-			return nil, err
+		if cfg.CheckpointTrust {
+			resume, err = consensus.VerifyTrustedCheckpoint(g, cp, consensus.TrustPolicy{MaxAgeEpochs: cfg.CheckpointMaxAgeEpochs})
+			if err != nil {
+				return nil, err
+			}
+			if cfg.CheckpointLog != nil {
+				cfg.CheckpointLog("%s", consensus.TrustStatement(cp))
+			}
+		} else {
+			resume, err = consensus.VerifyCheckpoint(g, cp)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if err := consensus.InstallCheckpoint(cfg.Dir, cp); err != nil {
 			return nil, err
 		}
-	}
-	// A PRUNED directory carries its own checkpoint (M7). ResumeForDir returns
-	// nil for an ordinary chain, so this changes nothing unless the node was
-	// actually pruned; chain.OpenResume then enforces that the checkpoint sits
-	// exactly on the retained history's base.
-	resume, err := consensus.ResumeForDir(g, cfg.Dir)
-	if err != nil {
-		return nil, err
+	} else {
+		// A PRUNED directory carries its own checkpoint (M7). ResumeForDir
+		// returns nil for an ordinary chain, so this changes nothing unless the
+		// node was actually pruned; chain.OpenResume then enforces that the
+		// checkpoint sits exactly on the retained history's base.
+		own, err := consensus.ResumeForDir(g, cfg.Dir)
+		if err != nil {
+			return nil, err
+		}
+		resume = own
 	}
 	ch, err := chain.OpenResume(g, cfg.Dir, resume)
 	if err != nil {
