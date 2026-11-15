@@ -57,14 +57,21 @@ safety bug. These are load-bearing and must survive every pruning pass:
 | Record | Why |
 |---|---|
 | `genesis.hash` | chain identity; a mismatch must be fatal, not a silent re-sync |
-| the durable round record (`rounds.log`) | **double-vote protection** — a validator that forgets the highest round it signed can sign twice at the same height, which is a safety violation, not a liveness one |
+| the lock record (`locks.log`) | **double-vote protection** — a validator that precommits two different blocks at one height has broken safety, and `locks.log` is the promise it made, surviving the restart that would otherwise forget it. Its scan policy is strict (a corrupt lock log fails Open) because it is the record that must never be lost |
+| the durable round record (`rounds.log`) | **restart position (liveness)** — a validator that loses the highest round it entered re-runs the round ladder from round 0 for a height it already advanced past. That is a liveness regression, not a safety one: `locks.log` still refuses a conflicting vote, so no double-vote follows from losing it. It is permanent anyway, because re-running the ladder is exactly the multi-minute stall the restart tests exist to prevent |
 | the head block and its certificate | the node must know what it last committed |
 | the committee/validator set at the pruning horizon | without it, a replayed state cannot be checked |
 
-**The round record is the sharp edge.** M7 must assert, in a test, that pruning
-never removes or truncates it. A pruner that "cleans the data directory" and
-takes `rounds.log` with it is a consensus-safety bug that presents as a disk
-fix.
+**The lock record is the sharp edge, and the round record is not.** M7 must
+assert, in a test, that pruning never removes or truncates `locks.log`; and
+`rounds.log` is permanent too, for the liveness reason above. A pruner that
+"cleans the data directory" and takes `locks.log` with it is a consensus-safety
+bug that presents as a disk fix; one that takes `rounds.log` is a liveness bug
+in the same costume. Audit I-3 (2026-11-15) found this table naming `rounds.log`
+as the double-vote record — the code has always had it the other way round
+(`retention.LockLog` is "the double-vote promise", `retention.RoundLog` the
+restart position), and both were permanent under either reading. Corrected
+here so a reviewer checks the sharpest edge in the right file.
 
 ## 4. The recovery design
 
@@ -118,7 +125,7 @@ else and is worth landing on its own.
 
 **Step 2 — separate the prunable from the permanent.** One place that answers
 "what may be deleted", with the §3 table encoded as code and a test that asserts
-`rounds.log` and `genesis.hash` are never in the prunable set. No pruning logic
+`rounds.log`, `locks.log` and `genesis.hash` are never in the prunable set. No pruning logic
 yet.
 
 **Step 3 — the pruner.** `--retain-blocks N` (heights, not hours: a height is
@@ -148,8 +155,8 @@ exactly this kind of scenario; extend it with a pruned node plus a fresh joiner.
       **and the same state root** as a node that never lost history.
 - [ ] A node **down beyond the retention window** rejoins via a checkpoint and
       agrees on the head.
-- [ ] **No safety regression**: `rounds.log` and `genesis.hash` survive every
-      pruning pass, asserted by test; and a pruned validator does not double-vote
+- [ ] **No safety regression**: `locks.log`, `rounds.log` and `genesis.hash`
+      survive every pruning pass, asserted by test; and a pruned validator does not double-vote
       across a restart (the existing round-record tests must still pass with
       pruning enabled).
 - [ ] A pruned node either **serves** peers behind the horizon or **says plainly
