@@ -219,8 +219,22 @@ Bandwidth is kilobytes per second.
 Observability: the relay logs a stats line every 60 seconds and on SIGUSR1
 (Unix; on Windows the timer alone), because "no error and no output" is also
 what a relay silently dropping frames looks like (audit N-9). The line
-reports conns, forwarded, dropped, refused and unauthorized counts; a rising
-dropped or refused is the signal to read, not a healthy silence.
+reports conns, handshaking, live, forwarded, dropped, refused and unauthorized
+counts; a rising dropped or refused is the signal to read, not a healthy
+silence.
+
+  THE THREE CONNECTION NUMBERS ARE NOT THE SAME NUMBER, and reading one as
+  another is how the 2026-11-15 incident was misdiagnosed for two days. conns
+  is the REGISTRY's length - connections the relay believes it has, which is
+  what forwarding uses. handshaking is accepted sockets still presenting their
+  access token, which the caps count but the registry does not. live is
+  accepted minus closed: the sockets this process has NOT closed, which is the
+  only one of the three that comes from the socket lifecycle. conns+handshaking
+  must equal live; when it does not, or when a registered connection has been
+  silent past twice --read-timeout (its reader's own deadline should have
+  ended it), the relay prints "CONNECTION BOOKKEEPING DISAGREES: ..." right
+  after the stats line, naming which way the books are off. A conns with no live
+  beside it is a claim, not an observation.
 `
 
 // defaultStatsInterval is how often the relay writes its counters line while
@@ -231,25 +245,51 @@ const defaultStatsInterval = 60 * time.Second
 // relayStatsLine renders one Stats reading as the single line both the timer
 // and the signal path print. It is a function so the test pins the exact
 // fields - Dropped and RefusedConns are the counters that reveal the relay
-// censoring (N-2's history), and a line that omit them is worse than silence.
+// censoring (N-2's history), and a line that omits them is worse than silence.
+//
+// The first three fields are the ones the 2026-11-15 incident needed and did
+// not have. `conns` alone is a DESIRED-state number: it is the registry's
+// length, and it cannot contradict itself. `live` is the OBSERVED one -
+// accepted minus closed, the sockets this process has not closed - and
+// `handshaking` is the accepted sockets that are not registered yet. The line
+// the operator read said `conns=3` on a host with no established socket; a
+// `live=0` beside it would have ended the misdiagnosis in one glance, and the
+// ConnBookkeepingIssue warning below says it in words when the two disagree.
 func relayStatsLine(s relay.Stats) string {
-	return fmt.Sprintf("b10coin-relay stats: conns=%d forwarded=%d dropped=%d refused=%d unauthorized=%d",
-		s.Conns, s.Forwarded, s.Dropped, s.RefusedConns, s.Unauthorized)
+	return fmt.Sprintf("b10coin-relay stats: conns=%d handshaking=%d live=%d forwarded=%d dropped=%d refused=%d unauthorized=%d",
+		s.Conns, s.Handshaking, s.Live, s.Forwarded, s.Dropped, s.RefusedConns, s.Unauthorized)
 }
 
 // logStats writes one counters line every interval and one for every value on
-// sig, until ctx is cancelled. It never touches the relay's hot path.
+// sig, until ctx is cancelled - and, when the relay's own books disagree, one
+// warning line after it. It never touches the relay's hot path: the check is
+// two counter reads and one comparison, and it only costs more than that when
+// it has already found a disagreement.
 func logStats(ctx context.Context, sig <-chan os.Signal, r *relay.Relay, w io.Writer, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	emit := func() {
+		st := r.Stats()
+		fmt.Fprintln(w, relayStatsLine(st))
+		if msg, bad := r.ConnBookkeepingIssue(); bad {
+			// The one line this relay can print that contradicts its own
+			// counters. `conns` on its own cannot: it is the registry
+			// reporting on itself. This compares the registry with the
+			// socket lifecycle and with observed traffic, so it is the line
+			// that would have named the 2026-11-15 incident instead of
+			// leaving an operator to reconcile `conns=3` with `ss` showing
+			// nothing.
+			fmt.Fprintf(w, "b10coin-relay: CONNECTION BOOKKEEPING DISAGREES: %s\n", msg)
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			fmt.Fprintln(w, relayStatsLine(r.Stats()))
+			emit()
 		case <-sig:
-			fmt.Fprintln(w, relayStatsLine(r.Stats()))
+			emit()
 		}
 	}
 }

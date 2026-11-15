@@ -319,10 +319,16 @@ func TestLogStatsSurfacesTheCountersOnTheTimerAndTheSignal(t *testing.T) {
 		}
 	}
 	timerLine := readLine("the timer path")
-	for _, want := range []string{"conns=", "forwarded=", "dropped=", "refused=", "unauthorized="} {
+	for _, want := range []string{"conns=", "handshaking=", "live=", "forwarded=", "dropped=", "refused=", "unauthorized="} {
 		if !strings.Contains(timerLine, want) {
 			t.Fatalf("the stats line omits %q, so a relay silently dropping frames would still look healthy: %q", want, timerLine)
 		}
+	}
+	// A healthy relay must NOT print the bookkeeping warning: a check that
+	// cries wolf on an idle process would be switched off by its operator, and
+	// then it would catch nothing on the day it mattered.
+	if strings.Contains(timerLine, "CONNECTION BOOKKEEPING DISAGREES") {
+		t.Fatalf("an idle relay's timer tick reported a bookkeeping issue: %q", timerLine)
 	}
 	// The signal path writes one line per signal, immediately.
 	sig <- os.Interrupt
@@ -334,11 +340,21 @@ func TestLogStatsSurfacesTheCountersOnTheTimerAndTheSignal(t *testing.T) {
 }
 
 // TestRelayStatsLineReportsEveryCounter pins the exact fields of the line, so
-// a future edit cannot quietly drop the two counters N-9 exists for.
+// a future edit cannot quietly drop the two counters N-9 exists for - or the
+// three the 2026-11-15 incident needed, which are the ones that turn the line
+// from the registry's claim about itself into a reading an operator can check
+// against the host: conns (registry slots), handshaking (accepted sockets not
+// registered) and live (accepted minus closed, the sockets this process has
+// not closed).
 func TestRelayStatsLineReportsEveryCounter(t *testing.T) {
-	got := relayStatsLine(relay.Stats{Conns: 3, Forwarded: 11, Dropped: 2, RefusedConns: 5, Unauthorized: 7})
-	want := "b10coin-relay stats: conns=3 forwarded=11 dropped=2 refused=5 unauthorized=7"
+	got := relayStatsLine(relay.Stats{Conns: 3, Handshaking: 1, Live: 4, Forwarded: 11, Dropped: 2, RefusedConns: 5, Unauthorized: 7})
+	want := "b10coin-relay stats: conns=3 handshaking=1 live=4 forwarded=11 dropped=2 refused=5 unauthorized=7"
 	if got != want {
 		t.Fatalf("relayStatsLine = %q, want %q", got, want)
+	}
+	// The three connection numbers are separate on purpose: a line that folded
+	// them into one could again report the registry's count as a socket count.
+	if !strings.Contains(got, "conns=3 handshaking=1 live=4") {
+		t.Fatalf("relayStatsLine = %q, want conns, handshaking and live as three distinct fields", got)
 	}
 }
