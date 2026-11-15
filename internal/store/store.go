@@ -331,6 +331,18 @@ type Store struct {
 	// grow without bound over a long run, and the log exists precisely so a
 	// restarted node can serve history it no longer remembers. CertAt reads
 	// the one record back.
+	//
+	// LOCKING CONTRACT (audit I-1): PruneCerts WRITES this map under indexMu;
+	// the serve path (CertAt -> readCertAt) READS it with NO indexMu, and is
+	// race-free only because Chain.CertAt holds c.mu.RLock() across the whole
+	// call INCLUDING the disk read, while Chain.PruneHistory/PutCert hold
+	// c.mu.Lock(). Do not give CertAt BlockAt's lock-release pattern (audit
+	// R-2) without first guarding this map: the block index may be read
+	// outside the chain lock because indexMu guards it, and this one may not
+	// - a prune writing it while a serve reads it is a fatal "concurrent map
+	// read and map write", not a stale read. The cost of the contract is the
+	// one I-1 names: serving a historical certificate holds the commit path
+	// for the read's duration, which serving a block does not.
 	certFile        *os.File
 	certSeg         uint64
 	certSegRecords  map[uint64]int
