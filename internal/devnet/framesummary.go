@@ -66,3 +66,34 @@ func (v *Validator) FrameSummary() string {
 	}
 	return b.String()
 }
+
+// FrameVerdict is the second half of the same answer: where the frames went
+// AFTER they were received. The per-kind counters say "received"; this says
+// whether the node's own router accepted them (routed), refused them before
+// verification (refused: a non-member key or a height outside the live
+// window), dropped a duplicate, or could not classify the bytes (unknown) -
+// and then what the ENGINE did with the ones it got (a vote for another height,
+// a vote too early or too late in the round, a proposal for another round, a
+// proposal from the wrong proposer).
+//
+// THE FOUR-WAY SPLIT THIS CLOSES. A stalled line saying "tallies=1" has four
+// possible causes and they need four different fixes:
+//
+//   - sent=0 (the engine or send path never emitted): frames summary, zero sent;
+//   - sent>0, received=0 (the relay or the network): frames summary;
+//   - received>0, routed=0 (the router refused): THIS line, refused/dup/unknown;
+//   - routed>0, tallies=1 (the engine dropped it as foreign/early/late): THIS
+//     line, engine[...].
+//
+// It reads only counters the node already keeps, and it runs only when the
+// once-per-height stall watcher fires.
+func (v *Validator) FrameVerdict() string {
+	if v.drv == nil || v.rt == nil {
+		return "routed n/a (no driver)"
+	}
+	d := v.drv.DiagCounters()
+	return fmt.Sprintf("routed=%d refused=%d dup=%d unknown=%d engine[otherheight=%d early=%d late=%d foreignprop=%d wrongprop=%d dupprop=%d dupvote=%d]",
+		v.framesIn.Load(), v.rt.RefusedBeforeVerify(), v.rt.DuplicatesDropped(), v.rt.UnknownDropped(),
+		d.OtherHeightVotes, d.EarlyVotes, d.LateVotes, d.ForeignProposals,
+		d.WrongProposerProposals, d.DuplicateProposals, d.DuplicateVotes)
+}

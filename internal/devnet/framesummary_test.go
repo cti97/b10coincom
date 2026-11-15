@@ -51,6 +51,12 @@ func TestTheStallLineCarriesTheFrameCounters(t *testing.T) {
 	if !strings.Contains(line, "proposal 0/0") || !strings.Contains(line, "prevote 0/0") {
 		t.Fatalf("the stall line's frame counters do not name the consensus buckets: %s", line)
 	}
+	// And the second half: where the received frames went after the socket.
+	for _, want := range []string{"routed=", "refused=", "dup=", "engine[otherheight=", "late="} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("the stall line does not carry the router/engine verdict (%q): %s", want, line)
+		}
+	}
 	// And the unreachable-quorum sibling, which is the other "nothing commits"
 	// shape an operator meets.
 	unreach := v.stallUnreachableLine(0, 3, stallBoard{total: 4, quorum: 3, power: 2})
