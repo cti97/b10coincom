@@ -515,6 +515,7 @@ func TestAWipedNodeRecoversFromACheckpointToTheSameHeadAndRoot(t *testing.T) {
 	if got := b.Head().ID(); got != wantHeadID {
 		t.Fatalf("node B's head block is %x, want %x", got[:8], wantHeadID[:8])
 	}
+	t.Logf("RECOVERY: wiped node at height %d, root %x (pruned node %d, root %x)", b.Height(), b.State().Root(), wantHeight, wantRoot)
 	if err := b.Close(); err != nil {
 		t.Fatal(err)
 	}
