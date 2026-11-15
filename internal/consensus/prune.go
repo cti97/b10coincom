@@ -131,7 +131,7 @@ func (p *Pruner) MaybePrune(c *chain.Chain) (store.PruneStats, error) {
 		return zero, nil // nothing new to prune
 	}
 
-	cp, st, err := exportCheckpointAt(c, horizon)
+	cp, st, err := exportCheckpointAt(c, horizon, false)
 	if err != nil {
 		// NO CHECKPOINT, NO PRUNE. This is the refusal that keeps a node from
 		// looking healthy while being unable to recover.
