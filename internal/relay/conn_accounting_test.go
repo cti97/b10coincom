@@ -118,6 +118,23 @@ func TestRelayConnectDisconnectCyclesReleaseEverySlot(t *testing.T) {
 			},
 		},
 		{
+			name: "stalled header reaped by the read deadline",
+			opts: Options{MaxFrameBytes: 4096, MaxConns: 64, MaxConnsPerIP: 64, WriteQueueBytes: 1 << 16, ReadTimeout: 120 * time.Millisecond},
+			run: func(t *testing.T, r *Relay, _ []byte) {
+				c := dial(t, r.Addr().String())
+				// A 4-byte header declaring 100 payload bytes, then silence:
+				// the per-frame read deadline is the only thing that ends it.
+				if err := c.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					t.Fatalf("set write deadline: %v", err)
+				}
+				if _, err := c.Write([]byte{0, 0, 0, 100}); err != nil {
+					t.Fatalf("write a stalled frame header: %v", err)
+				}
+				waitClosed(t, c, "a stalled header after its read deadline expired")
+				c.Close()
+			},
+		},
+		{
 			name: "gated: full handshake then reset",
 			opts: Options{MaxFrameBytes: 4096, MaxConns: 64, MaxConnsPerIP: 64, WriteQueueBytes: 1 << 16, AccessToken: testLeakToken},
 			run: func(t *testing.T, r *Relay, token []byte) {
