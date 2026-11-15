@@ -1529,6 +1529,13 @@ func (s *Store) PutCert(height uint64, payload []byte) error {
 	}
 	s.certIndex[height] = certLoc{seg: s.certSeg, off: off}
 	s.certSegRecords[s.certSeg]++
+	// The segment's height range is what PruneCerts decides deletion on, and it
+	// must be maintained by the WRITER too, not only by the scan: a long-running
+	// node that never reopens would otherwise never see a segment as prunable,
+	// and its certificate archive would grow without bound despite the pruner.
+	if height > s.certSegMax[s.certSeg] {
+		s.certSegMax[s.certSeg] = height
+	}
 	return nil
 }
 

@@ -251,10 +251,6 @@ func shortKey(k string) string {
 // committeeDiff reports how got differs from want, or "" when they are the same
 // committee: same keys, same powers, same seat count. Order is not significant.
 func committeeDiff(want, got []genesis.Validator) string {
-	type seat struct {
-		key   string
-		power uint64
-	}
 	index := func(vals []genesis.Validator) map[string]uint64 {
 		m := make(map[string]uint64, len(vals))
 		for _, v := range vals {

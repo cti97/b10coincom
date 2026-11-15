@@ -57,6 +57,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -724,6 +725,13 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 
 	pool := mempool.New(networkedMempoolCapacity, g.Hash(), ch.AdmissionHead)
 	sy := consensus.NewSyncer(ch, tp, priv)
+	// The pruned-range notice goes to the operator's log, where systemd keeps
+	// it: a node that cannot serve below its horizon must SAY so (M7, plan §6),
+	// and the syncer throttles the line itself.
+	sy.Log = cfg.PruneLog
+	if sy.Log == nil {
+		sy.Log = func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
+	}
 	rt := consensus.NewMessageRouter(sy)
 	rt.SendReply = tp.Send
 	// The seen-set for VERIFIED consensus messages (audit N-7). The router

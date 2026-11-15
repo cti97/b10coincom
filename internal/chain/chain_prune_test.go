@@ -274,4 +274,17 @@ func TestOpenResumeRefusesAMismatchedCheckpoint(t *testing.T) {
 	if _, err := Open(g, dir); !errors.Is(err, ErrHistoryPruned) {
 		t.Fatalf("opening without a checkpoint gave %v, want ErrHistoryPruned", err)
 	}
+	// 4. The IMPORT shape: an empty directory, so there are no retained blocks
+	// whose replay could notice a wrong base state. The chain's own root check
+	// is the only thing between the operator and a state no quorum committed.
+	empty := t.TempDir()
+	if c2, err := OpenResume(g, empty, &ResumeState{Height: 7, Head: blk7, State: other}); err == nil {
+		_ = c2.Close()
+		t.Fatal("OpenResume adopted a state that does not hash to its block's root into an EMPTY directory")
+	} else if !errors.Is(err, ErrCheckpointMismatch) {
+		t.Fatalf("an empty-directory import with a wrong state gave %v, want ErrCheckpointMismatch", err)
+	}
+	if base, err := store.BaseOf(empty); err != nil || base != 1 {
+		t.Fatalf("a refused import recorded base %d (%v); nothing may be written", base, err)
+	}
 }

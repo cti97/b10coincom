@@ -3,6 +3,7 @@ package consensus
 import (
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -327,14 +328,12 @@ func TestThePrunerReachesASteadyState(t *testing.T) {
 	p := prunerFor(t, dir, retain)
 
 	var sizes []int64
-	var stats []uint64
 	for i := 0; i < phases; i++ {
 		head := appendWithCerts(t, c, phase)
 		st, err := p.MaybePrune(c)
 		if err != nil {
 			t.Fatalf("phase %d (head %d): MaybePrune: %v", i+1, head, err)
 		}
-		stats = append(stats, st.Blocks)
 		size, err := dirSize(dir)
 		if err != nil {
 			t.Fatal(err)
@@ -398,7 +397,7 @@ func TestAWipedNodeRecoversFromACheckpointToTheSameHeadAndRoot(t *testing.T) {
 
 	// Every block and certificate A still holds for the retained range: what a
 	// peer would serve.
-	blocks := make([]*typesBlockAlias, 0)
+	blocks := make([]*types.Block, 0)
 	for h := horizon + 1; h <= wantHeight; h++ {
 		b, err := a.BlockAt(h)
 		if err != nil {
@@ -492,6 +491,62 @@ func TestAWipedNodeRecoversFromACheckpointToTheSameHeadAndRoot(t *testing.T) {
 	}
 }
 
+// TestAPrunedNodeSaysPlainlyItCannotServeBelowItsHorizon is plan §6's last
+// acceptance line: a pruned node must either serve a peer behind its horizon or
+// SAY that it cannot. Silence here would be the relay gate's defect in another
+// place, so the refusal is a typed error AND a logged line - and the line is
+// throttled, because a lagging peer asks again every wave.
+func TestAPrunedNodeSaysPlainlyItCannotServeBelowItsHorizon(t *testing.T) {
+	const (
+		epoch  = 4
+		retain = 4 * epoch
+		total  = 120
+	)
+	a, _, dir := certChain(t, total, epoch)
+	p := prunerFor(t, dir, retain)
+	if _, err := p.MaybePrune(a); err != nil {
+		t.Fatalf("pruning: %v", err)
+	}
+	base := a.Base()
+	if base == 0 {
+		t.Fatal("nothing was pruned")
+	}
+	sy := NewSyncer(a, nil, testCommitteeKey(0))
+	var said []string
+	sy.Log = func(format string, args ...any) {
+		said = append(said, fmt.Sprintf(format, args...))
+	}
+	// A range entirely below the horizon: unservable by construction.
+	req := syncSignReq(t, testCommitteeKey(0), 1, 2)
+	if _, err := sy.Answer(req); !errors.Is(err, ErrRangePruned) {
+		t.Fatalf("a range below the horizon gave %v, want ErrRangePruned", err)
+	}
+	if len(said) != 1 {
+		t.Fatalf("the pruned-range refusal logged %d lines, want exactly 1", len(said))
+	}
+	if !strings.Contains(said[0], "pruned") || !strings.Contains(said[0], "checkpoint") {
+		t.Fatalf("the refusal line reads %q; it must say the history was pruned and name the checkpoint remedy", said[0])
+	}
+	// A second refusal within the throttle window stays quiet.
+	req2 := syncSignReq(t, testCommitteeKey(0), 3, 4)
+	if _, err := sy.Answer(req2); !errors.Is(err, ErrRangePruned) {
+		t.Fatalf("second pruned range gave %v, want ErrRangePruned", err)
+	}
+	if len(said) != 1 {
+		t.Fatalf("the throttled refusal logged %d lines in total, want 1", len(said))
+	}
+	// A range ABOVE the horizon is still served, so the refusal is not "never
+	// serve after pruning".
+	good := syncSignReq(t, testCommitteeKey(0), base+1, base+2)
+	resp, err := sy.Answer(good)
+	if err != nil {
+		t.Fatalf("a range above the horizon was refused: %v", err)
+	}
+	if len(resp.Units) != 2 {
+		t.Fatalf("served %d units above the horizon, want 2", len(resp.Units))
+	}
+}
+
 // mustStateAt is StateAt that fails the test on error, for assertions inside
 // long tests.
 func mustStateAt(t *testing.T, c *chain.Chain, h uint64) *state.State {
@@ -502,10 +557,6 @@ func mustStateAt(t *testing.T, c *chain.Chain, h uint64) *state.State {
 	}
 	return st
 }
-
-// typesBlockAlias keeps the block slice's type readable without threading a
-// types import through the test body.
-type typesBlockAlias = types.Block
 
 // hexOf renders bytes as the checkpoint's hex fields do.
 func hexOf(b []byte) string { return hex.EncodeToString(b) }

@@ -125,6 +125,12 @@ func TestPutCertRotatesAtTheSegmentSize(t *testing.T) {
 	if s.certSeg != 1 {
 		t.Fatalf("active segment after rotation is %d, want 1", s.certSeg)
 	}
+	// The WRITER must maintain the segment's height range, not only the scan: a
+	// node that never reopens would otherwise never see a certificate segment as
+	// prunable, and pruning would bound nothing for the life of the process.
+	if got := s.certSegMax[1]; got != next {
+		t.Fatalf("writer-maintained segment 1 height range is %d, want its record %d", got, next)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}

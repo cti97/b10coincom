@@ -277,14 +277,6 @@ func segmentMaxHeight(idx uint64) uint64 {
 	return (idx+1)*BlocksPerSegment - 1
 }
 
-// segmentFirstHeight is the lowest height a segment index can hold.
-func segmentFirstHeight(idx uint64) uint64 {
-	if idx == 0 {
-		return 1
-	}
-	return idx * BlocksPerSegment
-}
-
 // closeReaderLocked drops a cached read handle for name, if any. The caller
 // must hold readMu.
 func (s *Store) closeReaderLocked(name string) {
