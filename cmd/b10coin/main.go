@@ -1269,6 +1269,16 @@ func cmdNode(args []string) error {
 	checkpointPath := fs.String("checkpoint", "", "start this node from a checkpoint file written by `b10coin checkpoint export` (the data directory must be empty: importing over a chain is refused)")
 	checkpointTrust := fs.Bool("checkpoint-trust", false, "TRUST DOWNGRADE, for a rotated chain only: accept --checkpoint FILE even when its committee is not the genesis committee, by checking only that THE FILE AGREES WITH ITSELF (its own committee signed its own block, whose header commits its own state). Anyone can fabricate such a file with their own keys, so this proves internal consistency, NOT that it is the real chain. Bounded by --checkpoint-max-age. Never pass it for a file whose provenance you have not authenticated out of band")
 	checkpointMaxAge := fs.Uint64("checkpoint-max-age", consensus.DefaultCheckpointMaxAgeEpochs, "EPOCHS: a --checkpoint-trust import is refused once the file is older than this. 0 is refused - an unbounded trusted checkpoint pins this node to a past fork forever")
+	// The round ladder's two wall-clock knobs. The base is how long a round
+	// WAITS before the ladder starts - not a block interval - so widening it
+	// costs no throughput and buys immunity to the transient (one lost or
+	// retransmitted vote) that starts a round divergence on a three-seat
+	// committee, where a quorum is 3 of 3 and a divergence is a stall
+	// (docs/bug-2026-11-16-round-divergence-ratchet.md). The step is how fast
+	// the deadline grows per round, i.e. how fast a divergence closes; raise
+	// it only on a path where every round needs the extra time.
+	timeoutBase := fs.Duration("timeout-base", 0, "consensus round-0 timeout (default 2s). This is how long a round waits for its votes before the timeout ladder starts, NOT a block interval - a healthy round commits on arrival, so widening it costs no throughput and only tolerates a slower network. Raise it on a WAN whose RTT+jitter+RTO approaches the default")
+	timeoutStep := fs.Duration("timeout-step", 0, "timeout ladder step added per further round (default 100ms). Larger steps close a round divergence faster at high rounds but make every round after the first wait longer; leave at the default unless the operator has measured a reason")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1311,6 +1321,12 @@ func cmdNode(args []string) error {
 		}
 		if *checkpointTrust {
 			return fmt.Errorf("--checkpoint-trust names a trust decision about an imported checkpoint, and this single-node producer imports none; give --checkpoint FILE --genesis/--key (or --validators/--index), or drop the flag")
+		}
+		if *timeoutBase != 0 || *timeoutStep != 0 {
+			// These tune the consensus round ladder, which only a committee
+			// node runs; a producer that silently accepted them would be a
+			// flag that lies about the run it configured.
+			return fmt.Errorf("--timeout-base/--timeout-step tune the consensus round ladder, which this single-node producer (no --validators/--index) does not run: give --validators N --index I for a fixture committee, or drop them")
 		}
 		if err := checkProducerBlockTime(*blockTime); err != nil {
 			return err
@@ -1371,7 +1387,7 @@ func cmdNode(args []string) error {
 		// peer. The devnet layer refuses it too (it is the library entry point).
 		return fmt.Errorf("--advertise names the address peers should dial, but this node has no --listen to receive them: give --listen ADDR (e.g. 0.0.0.0:7001) together with it")
 	}
-	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints, checkpointBytes, *checkpointTrust, *checkpointMaxAge, *retainBlocks, *epochBlocks)
+	return runNetworkedNode(fs, *dir, *addr, *listen, *advertise, *peers, *relay, *keyPath, *genesisPath, *validators, *index, relayToken, *allowLocalHints, checkpointBytes, *checkpointTrust, *checkpointMaxAge, *retainBlocks, *epochBlocks, *timeoutBase, *timeoutStep)
 }
 
 // runProducerNode is the M1 single-node path, unchanged by M4 and unchanged
@@ -1549,7 +1565,7 @@ func checkpointLog(format string, args ...any) {
 //
 // --block-time is refused with networking: a committee's cadence is its
 // round-timeout ladder, and the flag only drives the single-node producer.
-func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool, checkpoint []byte, checkpointTrust bool, checkpointMaxAge, retainBlocks, epochBlocks uint64) error {
+func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers, relay, keyPath, genesisPath string, committee, seat int, relayToken []byte, allowLocalHints bool, checkpoint []byte, checkpointTrust bool, checkpointMaxAge, retainBlocks, epochBlocks uint64, timeoutBase, timeoutStep time.Duration) error {
 	vSet, iSet, genSet, keySet, blockTimeSet := false, false, false, false, false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -1658,12 +1674,28 @@ func runNetworkedNode(fs *flag.FlagSet, dir, httpAddr, listen, advertise, peers,
 		return fmt.Errorf("a committee of %d needs reachable peers: give --peers, --relay, or --listen for the others to dial", committeeSize)
 	}
 
+	// The ladder's flags are durations on the CLI and wall milliseconds in the
+	// devnet config; a sub-millisecond value rounds UP so it can never become
+	// the zero that means "use the default". Negative values are refused
+	// rather than clamped: a silently corrected timeout is a run the operator
+	// did not configure.
+	if timeoutBase < 0 || timeoutStep < 0 {
+		return fmt.Errorf("--timeout-base and --timeout-step must not be negative (got %s and %s)", timeoutBase, timeoutStep)
+	}
+	timeoutBaseMS, timeoutStepMS := int64(0), int64(0)
+	if timeoutBase > 0 {
+		timeoutBaseMS = int64((timeoutBase + time.Millisecond - 1) / time.Millisecond)
+	}
+	if timeoutStep > 0 {
+		timeoutStepMS = int64((timeoutStep + time.Millisecond - 1) / time.Millisecond)
+	}
+
 	var v *devnet.Validator
 	var err error
 	if g != nil {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, CheckpointTrust: checkpointTrust, CheckpointMaxAgeEpochs: checkpointMaxAge, CheckpointLog: checkpointLog, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Genesis: g, Key: priv, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, CheckpointTrust: checkpointTrust, CheckpointMaxAgeEpochs: checkpointMaxAge, CheckpointLog: checkpointLog, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog, TimeoutBaseMS: timeoutBaseMS, TimeoutStepMS: timeoutStepMS})
 	} else {
-		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, CheckpointTrust: checkpointTrust, CheckpointMaxAgeEpochs: checkpointMaxAge, CheckpointLog: checkpointLog, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog})
+		v, err = devnet.StartValidator(devnet.ValidatorConfig{Dir: dir, Index: seat, Validators: committee, Listen: listen, Advertise: advertise, Relay: relayDial, RelayAccessToken: relayToken, AllowLocalPeerHints: allowLocalHints, Checkpoint: checkpoint, CheckpointTrust: checkpointTrust, CheckpointMaxAgeEpochs: checkpointMaxAge, CheckpointLog: checkpointLog, RetainBlocks: retainBlocks, EpochBlocks: epochBlocks, PruneLog: pruneLog, TimeoutBaseMS: timeoutBaseMS, TimeoutStepMS: timeoutStepMS})
 	}
 	if err != nil {
 		return err

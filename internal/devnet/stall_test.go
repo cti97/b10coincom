@@ -42,6 +42,16 @@ func quietValidators(t *testing.T, total int) []*Validator {
 			Validators: total,
 			TickEvery:  time.Hour,
 			WaveEvery:  time.Hour,
+			// The stall-log tests were written against the ladder the project
+			// shipped until 2026-11-16 (200 ms base, 100 ms step): their
+			// comments measure stall age in ROUNDS at that cadence ("five
+			// seconds bought more than eight rounds"). Pinning the values here
+			// keeps those measurements true against the live default, which is
+			// now 2 s (docs/bug-2026-11-16-round-divergence-ratchet.md). The
+			// DEFAULT itself is pinned separately by
+			// TestTheRoundLadderDefaultsToTheShippedBaseAndStep.
+			TimeoutBaseMS: 200,
+			TimeoutStepMS: 100,
 		})
 		if err != nil {
 			t.Fatalf("starting quiet validator %d: %v", i, err)

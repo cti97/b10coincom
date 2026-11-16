@@ -260,9 +260,12 @@ const (
 	// (tcp.DefaultRelayBytesPerSec, 512 KiB/s - the rate at which a node's
 	// relay reader actually services the socket, and therefore the rate at
 	// which the relay's writer can put bytes on the wire). 64 KiB at 512
-	// KiB/s is 125 ms, inside one base round timeout of the shipped ladder
-	// (200 ms: internal/devnet's consensusTimeoutBaseMS); 128 KiB would be
-	// 250 ms and past it. It is also ~1.6 s of the whole committee's consensus
+	// KiB/s is 125 ms - inside ONE base round timeout of the shipped ladder,
+	// which is 2 s since the round-divergence mitigation
+	// (docs/bug-2026-11-16-round-divergence-ratchet.md), and was 200 ms
+	// before it. The reservation is therefore even safer than when it was
+	// sized: it removes a fifth of a round at worst, where it used to remove
+	// more than half. It is also ~1.6 s of the whole committee's consensus
 	// traffic at 10 seats (10 nodes x ~650 bytes per height x 6 heights/s is
 	// ~40 KiB/s), and it holds ~330 vote-sized frames, so a burst of votes is
 	// absorbed rather than refused. A quarter of the budget is the ceiling on

@@ -76,10 +76,21 @@ import (
 )
 
 const (
-	// Round timeouts in WALL milliseconds - the same defaults every simnet
-	// scenario drives, now over sockets. A healthy commit completes in one
-	// round; escalation is the timeout ladder.
-	consensusTimeoutBaseMS = int64(200)
+	// Round timeouts in WALL milliseconds. The base is the wait the committee
+	// grants one round before the ladder starts; escalation is the ladder.
+	//
+	// THE BASE IS NOT A BLOCK INTERVAL. A round commits the moment its votes
+	// arrive, so a larger base costs no throughput; it only bounds how long a
+	// round WAITS. The shipped value rose from 200 ms to 2 s because a missed
+	// 200 ms deadline is what starts the round-divergence ratchet on a real
+	// WAN (docs/bug-2026-11-16-round-divergence-ratchet.md): the live path
+	// measured 8-35 ms RTT with ~20 ms jitter, and one TCP retransmit costs an
+	// RTO of ~230 ms - already past the old deadline. 2 s is ~10x that worst
+	// case. The step stays at 100 ms on purpose: it dominates the deadline at
+	// high rounds (round 100 is ~12 s either way), so the ladder's catch-up
+	// slope - the reason the step exists - is unchanged, while far fewer
+	// divergences start at all.
+	consensusTimeoutBaseMS = int64(2000)
 	consensusTimeoutStepMS = int64(100)
 
 	// defaultTickEvery is the driver's tick cadence: well inside one round's
@@ -114,6 +125,20 @@ const (
 	// (audit C-6).
 	peerDemoteWaves = 4
 )
+
+// timeoutsMS is the resolution rule for the consensus round ladder's two
+// wall-clock values: a caller's positive setting wins, zero (or anything below
+// it) takes the shipped default. It is a function so a test can pin the rule
+// without starting a node and waiting for a socket to prove it.
+func timeoutsMS(base, step int64) (int64, int64) {
+	if base <= 0 {
+		base = consensusTimeoutBaseMS
+	}
+	if step <= 0 {
+		step = consensusTimeoutStepMS
+	}
+	return base, step
+}
 
 // ValidatorConfig configures one networked validator. It has two modes:
 //
@@ -241,6 +266,17 @@ type ValidatorConfig struct {
 	TickEvery time.Duration
 	// WaveEvery is the HELLO/catch-up cadence (zero: defaultWaveEvery).
 	WaveEvery time.Duration
+	// TimeoutBaseMS is this node's consensus round-0 timeout in wall
+	// milliseconds (zero: consensusTimeoutBaseMS). It bounds how long a round
+	// waits before the ladder starts; it is NOT a block interval, so widening
+	// it costs no throughput. The CLI exposes it as --timeout-base for an
+	// operator on a slower path than the shipped 2 s.
+	TimeoutBaseMS int64
+	// TimeoutStepMS is the ladder's per-round step in wall milliseconds
+	// (zero: consensusTimeoutStepMS). It sets how fast the deadline grows and
+	// therefore the rate at which a round divergence closes; raising it makes
+	// each ladder step longer to wait out.
+	TimeoutStepMS int64
 }
 
 // peerAttestation is what one peer's HELLO leaves behind (audit C-6): the
@@ -545,6 +581,7 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	if cfg.WaveEvery <= 0 {
 		cfg.WaveEvery = defaultWaveEvery
 	}
+	cfg.TimeoutBaseMS, cfg.TimeoutStepMS = timeoutsMS(cfg.TimeoutBaseMS, cfg.TimeoutStepMS)
 
 	priv := cfg.Key
 	if priv == nil {
@@ -577,8 +614,8 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	capNum, capDen := consensus.PowerCapFor(n)
 	ccfg := consensus.Config{
 		Committee:   g.Validators,
-		TimeoutBase: consensusTimeoutBaseMS,
-		TimeoutStep: consensusTimeoutStepMS,
+		TimeoutBase: cfg.TimeoutBaseMS,
+		TimeoutStep: cfg.TimeoutStepMS,
 		PowerCapNum: capNum, PowerCapDen: capDen,
 	}
 	if err := ccfg.Validate(); err != nil {
