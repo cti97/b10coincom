@@ -199,6 +199,60 @@ b10coin node --dir seat0 --http 127.0.0.1:8651 --validators 3 --index 0 \
 # ... seat1/8652, seat2/8653
 ```
 
+## 10. 2026-11-16 18:20 — the deadlock behind the "silent link" (this is the cause)
+
+The v0.1.7 run reproduced the stop with the new 2 s base, and the frame counters
+finally crossed: `proposal 7/3`, `prevote 11/10`, two of three prevotes for the
+same block, one block committed, then silence again. A `SIGQUIT` goroutine dump
+of the live Mac node at that moment shows a **deadlock in the node's transport**:
+
+```
+goroutine 19  [sync.Mutex.Lock, 6 minutes]
+  transport/tcp.dispatch            tcp.go:2544
+  transport/tcp.reader              (OnMessage callback)
+  consensus.(*Driver).OnMessage → flush → maybePrune
+  devnet.(*Validator).maybePrune    tcpnode.go:1765   ← wants v.mu
+
+goroutine 52  [sync.Mutex.Lock, 6 minutes]
+  devnet.(*Validator).tickLoop      tcpnode.go:1180   ← wants v.mu
+
+goroutine 114, 30, 12, 149, 123, 126, 183  [sync.Mutex.Lock]
+  transport/tcp.dispatch → dispatchMu  ← every reader parked behind goroutine 19
+```
+
+- The dispatch callback (a reader delivering a frame) holds the transport's
+  single `dispatchMu` and blocks on the validator mutex `v.mu` inside
+  `maybePrune`. Every other connection's reader then parks on `dispatchMu`, so
+  **no frame is read from any socket** — exactly the "no frame received for
+  64 s" line, with the relay still forwarding normally.
+- `tickLoop`, which owns the driver's tick, is also waiting on `v.mu`, so the
+  consensus clock stops too.
+- Eight reader goroutines exist but only **one writer**: each relay-link
+  watchdog teardown (64 s of silence) leaves its reader parked in `dispatch`,
+  the maintainer dials a fresh connection, and the process accumulates zombies
+  until nothing can make progress. That is why every restart buys only a few
+  minutes and why the local clean-network repro (no reconnects) never sees it.
+
+**Consequence for the mitigation:** the 2 s base is necessary but not
+sufficient. A link that goes deaf for 64 s always kills a 3-of-3 committee,
+whatever the timeout is. The fix is in `internal/devnet` / `internal/transport`:
+
+1. Never take `v.mu` from inside the dispatch callback. `maybePrune` (and any
+   other validator-mutex work) must be handed to the tick/prune goroutine, not
+   run on the reader's stack.
+2. The transport's `dispatchMu` must not be held across a callback that can
+   block on another subsystem's lock. Either drop the lock before calling
+   `onMessage` (the engine is single-threaded *by construction*, so serialise
+   at the engine, not at the transport), or make the callback lock-free.
+3. Bound the number of live connections per peer and make a closed connection's
+   reader exit even while parked in dispatch (a per-connection generation
+   check before delivering).
+
+Until that lands, a single-node restart recovers the chain temporarily (fresh
+process, no zombies) — the live v0.1.7 run did commit one block after a clean
+start — but any reconnect returns it to the deadlocked shape within minutes.
+
+
 Healthy: ~22 blocks/s, all three within one height of each other. Killing one
 seat for two minutes and restarting it re-converges in ~12 s; bouncing the relay
 under a live committee recovers immediately. The live failure is not reproducible
