@@ -575,7 +575,43 @@ type Stats struct {
 	// monopolising the queue it is being held to. The bound held (nobody
 	// else stalled) but the relay is now the one censoring, which is
 	// liveness pressure a validator set feels.
+	//
+	// Dropped is the TOTAL. The six fields below split it by the reason the
+	// frame was dropped, so "the relay dropped it" can be read as WHICH bound
+	// bit before anyone reasons about a fix. They always sum to Dropped (a
+	// dropped frame has exactly one reason); a divergence between the six and
+	// Dropped is itself a finding - a path that is not attributed.
+	// This is the instrumentation the 2026-11-15 stall needed: the queue's
+	// rejection path was a boolean, so an operator could see frames vanish but
+	// not which limit did it.
 	Dropped uint64
+	// DroppedShare counts refusals of the sender account's fair share.
+	DroppedShare uint64
+	// DroppedBytes counts refusals by the queue's byte budget (including a
+	// frame larger than the whole budget, which can never fit anywhere).
+	DroppedBytes uint64
+	// DroppedFrames counts refusals by the entry-ring frame bound.
+	DroppedFrames uint64
+	// DroppedLane counts refusals of a BULK frame by the audit N-1 size
+	// reservation: the frame would have crossed into bytes only
+	// consensus-sized frames may occupy. This is the counter that says the
+	// reservation is what shed a frame - and a consensus-sized frame can never
+	// be charged here.
+	DroppedLane uint64
+	// DroppedOther counts a drop no known bound claimed. It is unreachable by
+	// construction, so a nonzero value means a refusal path was added without
+	// being attributed - the exact silence this field exists to prevent.
+	DroppedOther uint64
+	// DroppedOnClose counts frames that were ADMITTED to a connection's write
+	// queue and then abandoned when that connection ended. Before this, they
+	// were counted Forwarded at enqueue and discarded by finish with no other
+	// counter, so the relay over-reported delivery: the 2026-11-15 stall read
+	// "forwarded climbing, dropped=0" while consensus frames that had been
+	// queued for a torn-down link were gone. Forwarded now equals delivered
+	// plus Dropped (the frame in the writer's hand at teardown is charged
+	// here too); a nonzero value is a receiver that did not drain its link,
+	// not a healthy relay.
+	DroppedOnClose uint64
 	// RefusedConns counts dials closed at accept, for either refusing rule:
 	// over MaxConns, or past MaxConnsPerIP from one source.
 	RefusedConns uint64
@@ -591,6 +627,74 @@ type Stats struct {
 type sentFrame struct {
 	sender *conn
 	b      []byte
+}
+
+// rejectReason names WHY push refused a frame. A refusal is a dropped frame -
+// forward never retries - so every refusal must be attributable: a boolean at
+// the door is what let the 2026-11-15 stall be reported as "forwarded climbing,
+// dropped=0" while frames vanished. Exactly one reason applies to a refused
+// frame, and the four counters on Stats are these reasons.
+type rejectReason uint8
+
+const (
+	rejectNone rejectReason = iota
+	// rejectByteBudget: the frame would put the queue past its total byte
+	// budget (or is itself larger than the whole budget, so no queue state
+	// could ever admit it).
+	rejectByteBudget
+	// rejectFrameCount: the entry ring is full (maxFrames live entries).
+	rejectFrameCount
+	// rejectSenderShare: the frame would take the SENDER ACCOUNT past its
+	// allowance (shareFor). With three or more contending accounts this is the
+	// bound a greedy sender meets first; a consensus-sized frame below the
+	// share can never be charged here.
+	rejectSenderShare
+	// rejectReservedLane: a BULK frame (larger than smallFrameBytes) would
+	// cross into the bytes the audit N-1 reservation keeps for
+	// consensus-sized frames. By construction this can never refuse a frame
+	// of smallFrameBytes or less.
+	rejectReservedLane
+	// rejectConnClosed: the frame was ADMITTED to a queue and then abandoned
+	// when its connection ended (finish). It is the one drop that used to be
+	// silent: Forwarded had already counted the frame at enqueue, so the relay
+	// reported it as forwarded while it was discarded. A frame is never
+	// "forwarded" and lost - it is forwarded and delivered, or it is dropped.
+	rejectConnClosed
+	// rejectOther: a refusal no known bound claimed. Unreachable by
+	// construction; counted rather than folded into another reason, so an
+	// unattributed path shows up as itself instead of inflating a bound that
+	// did not cause it.
+	rejectOther
+)
+
+// String is the log spelling of a rejection reason.
+func (r rejectReason) String() string {
+	switch r {
+	case rejectByteBudget:
+		return "byte budget"
+	case rejectFrameCount:
+		return "frame-count limit"
+	case rejectSenderShare:
+		return "per-sender share"
+	case rejectReservedLane:
+		return "consensus reservation (bulk frame)"
+	case rejectConnClosed:
+		return "connection closed with the frame queued"
+	case rejectOther:
+		return "UNATTRIBUTED (a drop path is not accounted)"
+	default:
+		return "unknown"
+	}
+}
+
+// pushRejection describes one refused frame for the drop line. It is filled
+// only when push refuses; the zero value is not a refusal.
+type pushRejection struct {
+	reason rejectReason
+	size   int // the refused frame's payload bytes
+	queued int // the queue's bytes at the refusal
+	limit  int // the queue's byte budget
+	allow  int // the refusing sender account's allowance at the refusal
 }
 
 // shareAccount is the fair-share identity a sender's queued bytes are charged
@@ -813,6 +917,15 @@ func (s *sendQ) shareFor(senders int) int {
 // partitioned, not shared. Only a refusal that the share or the ring caused,
 // with another account holding bytes, turns the sticky share on.
 func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
+	ok, _ := s.tryPush(sender, b, senders)
+	return ok
+}
+
+// tryPush is push with its refusal attributed: on false it returns the ONE
+// bound that refused the frame, so forward can count and log the drop instead
+// of discarding the why. push stays a boolean for the queue-level callers that
+// only care whether the frame got in.
+func (s *sendQ) tryPush(sender *conn, b []byte, senders int) (bool, pushRejection) {
 	acct := shareAccountOf(sender)
 	share := s.shareFor(senders)
 	small := s.small(len(b))
@@ -838,11 +951,10 @@ func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 	// whole budget, so the reservation can never refuse one.
 	overBudget := s.bytes+len(b) > s.limit
 	laneRefused := !small && !overBudget && s.bytes+len(b) > s.bulkLimit
-	ok := len(b) <= s.limit &&
-		!overBudget &&
-		!laneRefused &&
-		s.n < s.maxFrames &&
-		s.from[acct]+len(b) <= allow
+	tooBig := len(b) > s.limit
+	full := s.n >= s.maxFrames
+	overShare := s.from[acct]+len(b) > allow
+	ok := !tooBig && !overBudget && !laneRefused && !full && !overShare
 	if ok {
 		now := time.Now()
 		if s.n == 0 {
@@ -872,8 +984,37 @@ func (s *sendQ) push(sender *conn, b []byte, senders int) bool {
 		// being partitioned rather than shared (testrun N-1).
 		s.contended = true
 	}
+	rej := pushRejection{
+		reason: rejectNone,
+		size:   len(b),
+		queued: s.bytes,
+		limit:  s.limit,
+		allow:  allow,
+	}
+	if !ok {
+		// One reason, in the order the frame meets the bounds. The lane is
+		// reported before the total budget because a bulk frame that crosses
+		// the lane AND leaves the budget is still the reservation's decision:
+		// the reserved bytes are not bulk's to spend.
+		switch {
+		case laneRefused:
+			rej.reason = rejectReservedLane
+		case tooBig || overBudget:
+			rej.reason = rejectByteBudget
+		case full:
+			rej.reason = rejectFrameCount
+		case overShare:
+			rej.reason = rejectSenderShare
+		default:
+			// Unreachable while ok is the conjunction above, but named rather
+			// than left as a silent zero: a future edit that refuses a frame
+			// for a new reason without extending this switch shows up in
+			// DroppedOther instead of hiding inside a bound that did not fire.
+			rej.reason = rejectOther
+		}
+	}
 	s.mu.Unlock()
-	return ok
+	return ok, rej
 }
 
 // smallPos returns the ring OFFSET (from head) of the oldest consensus-sized
@@ -958,6 +1099,28 @@ func (s *sendQ) pop() (sentFrame, bool) {
 		s.oldest = time.Time{} // empty: the next push starts a new epoch
 	}
 	return f, true
+}
+
+// abandon empties the queue and reports what it held. finish calls it when a
+// connection ends, so every frame still queued is COUNTED as dropped instead
+// of vanishing: a frame the relay admitted and then could not deliver is not a
+// forwarded frame, and a relay that reports one as forwarded over-states the
+// only thing its counters exist to show. The writer may have a frame in its
+// hand (already popped, not yet written); that one is charged by the writer
+// when the write fails, so the two halves add up to what was undelivered.
+func (s *sendQ) abandon() (frames, bytes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	frames, bytes = s.n, s.bytes
+	for i := 0; i < s.n; i++ {
+		s.ents[(s.head+i)%s.maxFrames] = sentFrame{}
+	}
+	s.head, s.n, s.bytes, s.smallN = 0, 0, 0, 0
+	if len(s.from) != 0 {
+		s.from = make(map[shareAccount]int)
+	}
+	s.oldest = time.Time{}
+	return frames, bytes
 }
 
 // writeDeadline returns the absolute instant by which the queue must have
@@ -1074,10 +1237,29 @@ func (r *Relay) finish(c *conn) {
 		r.mu.Lock()
 		delete(r.conns, c)
 		r.decGroupLocked(c.srcGroup) // the accept-time cap sees the freed slot again
+		frames, bytes := c.q.abandon()
 		close(c.dead)
 		r.closeSocket(c.nc)
 		r.mu.Unlock()
+		if frames > 0 {
+			r.recordAbandoned(c, frames, bytes)
+		}
 	})
+}
+
+// recordAbandoned accounts the frames finish discarded: each is a Dropped
+// frame (they were counted Forwarded at enqueue, and never reached the wire).
+// One line per teardown rather than one per frame: a receiver that stops
+// draining loses its whole backlog at once, and that event is the diagnosis.
+func (r *Relay) recordAbandoned(c *conn, frames, bytes int) {
+	r.dropped.Add(uint64(frames))
+	r.droppedClose.Add(uint64(frames))
+	where := "a hand-built connection"
+	if c.nc != nil {
+		where = c.nc.RemoteAddr().String()
+	}
+	r.dropLine(fmt.Sprintf("b10coin: relay: DROPPED %d queued frame(s) (%d bytes) for %s: the connection closed with them still queued, so they were never written",
+		frames, bytes, where))
 }
 
 // Relay is the middlebox: a listener, a registry, and per-connection
@@ -1115,6 +1297,12 @@ type Relay struct {
 
 	forwarded    atomic.Uint64
 	dropped      atomic.Uint64
+	droppedShare atomic.Uint64
+	droppedBytes atomic.Uint64
+	droppedFrame atomic.Uint64
+	droppedLane  atomic.Uint64
+	droppedClose atomic.Uint64
+	droppedOther atomic.Uint64
 	refused      atomic.Uint64
 	unauthorized atomic.Uint64
 	// readerPanics counts per-connection readers that recovered from a panic
@@ -1137,6 +1325,16 @@ type Relay struct {
 	refusalMu         sync.Mutex
 	refusalLast       time.Time
 	refusalSuppressed int
+
+	// dropMu guards the drop line's rate limiter, separate from r.mu and from
+	// refusalMu: a drop is produced under the registry lock (forward holds it
+	// across the fan-out), so logging from there must not re-enter anything.
+	// The line is rate-limited because a wedged receiver makes every frame a
+	// drop - the one time the message is most useful is also the one time an
+	// unthrottled line would flood the journal.
+	dropMu         sync.Mutex
+	dropLast       time.Time
+	dropSuppressed int
 }
 
 // New returns a relay with all bounds defaulted. Nothing runs and nothing is
@@ -1227,6 +1425,12 @@ func (r *Relay) Stats() Stats {
 		LongestSilence: silence,
 		Forwarded:      r.forwarded.Load(),
 		Dropped:        r.dropped.Load(),
+		DroppedShare:   r.droppedShare.Load(),
+		DroppedBytes:   r.droppedBytes.Load(),
+		DroppedFrames:  r.droppedFrame.Load(),
+		DroppedLane:    r.droppedLane.Load(),
+		DroppedOnClose: r.droppedClose.Load(),
+		DroppedOther:   r.droppedOther.Load(),
 		RefusedConns:   r.refused.Load(),
 		Unauthorized:   r.unauthorized.Load(),
 	}
@@ -1792,12 +1996,70 @@ func (r *Relay) forward(sender *conn, payload []byte) {
 			continue
 		default:
 		}
-		if c.q.push(sender, payload, sendersFor(c, accounts)) {
+		ok, rej := c.q.tryPush(sender, payload, sendersFor(c, accounts))
+		if ok {
 			r.forwarded.Add(1)
-		} else {
-			r.dropped.Add(1)
+			continue
 		}
+		r.recordDrop(c, rej)
 	}
+}
+
+// recordDrop accounts one frame that push REFUSED: it is a dropped frame, not
+// a forwarded one, and it is charged to the bound that refused it. Before this,
+// a refusal was a bare boolean and the relay could not say which limit shed a
+// frame; "forwarded climbs, dropped=0" was the shape of a silent loss.
+//
+// The line is deliberately about the QUEUE, not the payload: reason, the
+// frame's payload length, the queue's byte/entry state and the sender
+// account's allowance. The relay still parses nothing - a length is the same
+// observation the byte budget already makes.
+func (r *Relay) recordDrop(target *conn, rej pushRejection) {
+	r.dropped.Add(1)
+	switch rej.reason {
+	case rejectSenderShare:
+		r.droppedShare.Add(1)
+	case rejectByteBudget:
+		r.droppedBytes.Add(1)
+	case rejectFrameCount:
+		r.droppedFrame.Add(1)
+	case rejectReservedLane:
+		r.droppedLane.Add(1)
+	case rejectConnClosed:
+		r.droppedClose.Add(1)
+	case rejectOther:
+		r.droppedOther.Add(1)
+	}
+
+	where := "a hand-built connection"
+	if target.nc != nil {
+		where = target.nc.RemoteAddr().String()
+	}
+	r.dropLine(fmt.Sprintf("b10coin: relay: DROPPED a %d-byte frame for %s: refused by the %s (queue %d/%d bytes, allowance %d)",
+		rej.size, where, rej.reason, rej.queued, rej.limit, rej.allow))
+}
+
+// dropLine writes one drop/teardown line, at most one per second: the moment
+// the message is most useful (a receiver that stopped draining, or a churn of
+// reset dials) is also the moment an unthrottled line would flood the journal.
+// The COUNTERS are never throttled - only the line - so the suppressed count
+// stays exact and the summary says how many lines were folded into this one.
+func (r *Relay) dropLine(msg string) {
+	r.dropMu.Lock()
+	now := time.Now()
+	if !r.dropLast.IsZero() && now.Sub(r.dropLast) < time.Second {
+		r.dropSuppressed++
+		r.dropMu.Unlock()
+		return
+	}
+	suppressed := r.dropSuppressed
+	r.dropSuppressed = 0
+	r.dropLast = now
+	r.dropMu.Unlock()
+	if suppressed > 0 {
+		msg += fmt.Sprintf(" (%d more drop lines suppressed in the last second)", suppressed)
+	}
+	log.Print(msg)
 }
 
 // sendersFor reports how many distinct sender accounts can contend for the
@@ -1881,7 +2143,16 @@ func (r *Relay) writer(c *conn) {
 					// Socket failure, or the write deadline expiring on a peer
 					// that has stopped reading - the same ending either way:
 					// nothing is parsed, nothing is retried, the slot is
-					// released.
+					// released. The frame in hand is not in the queue (pop took
+					// it), so it is accounted HERE: a frame that was admitted
+					// and not written is a Dropped frame, never a silent one.
+					r.recordDrop(c, pushRejection{
+						reason: rejectConnClosed,
+						size:   len(f.b),
+						queued: 0,
+						limit:  c.q.limit,
+						allow:  0,
+					})
 					r.finish(c)
 					return
 				}

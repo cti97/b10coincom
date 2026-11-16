@@ -255,9 +255,18 @@ const defaultStatsInterval = 60 * time.Second
 // the operator read said `conns=3` on a host with no established socket; a
 // `live=0` beside it would have ended the misdiagnosis in one glance, and the
 // ConnBookkeepingIssue warning below says it in words when the two disagree.
+//
+// dropped is split by the bound that refused the frame (share, bytes, frames,
+// the N-1 reservation) and by the one path that cannot refuse at the door -
+// dropped_on_close, frames already queued when their connection ended. A
+// single dropped number said a frame was lost but not why; these say which
+// bound did it. dropped_on_close was the 2026-11-15 silence: those frames were
+// counted forwarded at enqueue and discarded at teardown.
 func relayStatsLine(s relay.Stats) string {
-	return fmt.Sprintf("b10coin-relay stats: conns=%d handshaking=%d live=%d forwarded=%d dropped=%d refused=%d unauthorized=%d",
-		s.Conns, s.Handshaking, s.Live, s.Forwarded, s.Dropped, s.RefusedConns, s.Unauthorized)
+	return fmt.Sprintf("b10coin-relay stats: conns=%d handshaking=%d live=%d forwarded=%d dropped=%d dropped_share=%d dropped_bytes=%d dropped_frames=%d dropped_lane=%d dropped_other=%d dropped_on_close=%d refused=%d unauthorized=%d",
+		s.Conns, s.Handshaking, s.Live, s.Forwarded, s.Dropped,
+		s.DroppedShare, s.DroppedBytes, s.DroppedFrames, s.DroppedLane, s.DroppedOther, s.DroppedOnClose,
+		s.RefusedConns, s.Unauthorized)
 }
 
 // logStats writes one counters line every interval and one for every value on
