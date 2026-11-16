@@ -2385,7 +2385,14 @@ func (t *TcpTransport) reader(c *conn) {
 			}
 			c.admitted.Store(true)
 		}
-		t.dispatch(transport.Message{From: c.remote, Data: payload})
+		if !t.dispatch(c, transport.Message{From: c.remote, Data: payload}) {
+			// The connection was finished while this reader waited for the
+			// dispatch lock (watchdog teardown, write deadline, peer reset).
+			// Stop: a frame from an abandoned link must not reach the engine,
+			// and leaving the goroutine parked is how the 2026-11-16 stall
+			// accumulated zombie readers on every redial.
+			break
+		}
 	}
 }
 
@@ -2531,21 +2538,43 @@ func (t *TcpTransport) skipOversized(c *conn, otl *wire.FrameTooLarge) bool {
 	return true
 }
 
-// dispatch hands one message to the OnMessage callback. At most one callback
-// runs at a time (the lock is held across the call, not just the fetch):
-// consensus's engine is single-threaded, and concurrent delivery from two
-// readers would corrupt it - a bug -race would only find in Task 6.
+// dispatch hands one message to the OnMessage callback, and reports whether the
+// connection was still alive when its turn came. At most one callback runs at a
+// time (the lock is held across the call, not just the fetch): consensus's
+// engine is single-threaded, and concurrent delivery from two readers would
+// corrupt it.
 //
-// The cost of that choice is honest: a callback that blocks stalls delivery
-// for the WHOLE transport, exactly once per received frame. That is the
-// documented price of a single-threaded engine; the SENDING side is what the
-// bounded queues protect, and that is the property this task is judged on.
-func (t *TcpTransport) dispatch(m transport.Message) {
+// THE COST IS A DEADLOCK IF THE CALLBACK BLOCKS, AND THAT IS NOT HYPOTHETICAL
+// (2026-11-16): a callback that took the validator mutex inside a commit's
+// prune hook parked every reader behind this lock, and the process stopped
+// reading ANY socket while the relay kept forwarding. The fix has two halves:
+// the callback path must not take another subsystem's lock (the prune work now
+// runs on its own goroutine — internal/devnet's pruneLoop), and a reader whose
+// connection has been finished while it waited here must stop instead of
+// delivering a frame from a link the node has already abandoned (which is what
+// turned each watchdog redial into a permanently parked reader).
+func (t *TcpTransport) dispatch(c *conn, m transport.Message) bool {
+	// The connection may already be over: no point queueing behind the lock
+	// for a link nobody will read again.
+	select {
+	case <-c.dead:
+		return false
+	default:
+	}
 	t.dispatchMu.Lock()
 	defer t.dispatchMu.Unlock()
+	// It may have died WHILE we waited for the lock. Delivering now would hand
+	// the engine a frame from a finished connection, and would keep a zombie
+	// reader alive for as long as the lock holder takes.
+	select {
+	case <-c.dead:
+		return false
+	default:
+	}
 	if t.onMessage != nil {
 		t.onMessage(m)
 	}
+	return true
 }
 
 // writer is the per-connection write goroutine: drain the queue onto the

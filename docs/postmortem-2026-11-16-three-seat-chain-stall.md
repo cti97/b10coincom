@@ -6,7 +6,7 @@
 | **Detected** | 2026-11-16 ~16:56 EET (height frozen at 5797; noticed at 16:56–17:00) |
 | **Duration** | ~1 h 30 min to root cause; ~2 h to a working mitigation release; the deadlock itself is **not yet fixed** |
 | **Impact** | Fixture testnet only: no funds, no user data, no fork, no divergence of committed state. All three nodes agreed on the same head hash throughout. The live experiment (and the v0.1.7 validation) was blocked |
-| **Status** | Root cause identified (transport/dispatch deadlock). Mitigation shipped in **v0.1.7** (round-timeout widening, PR #38). Deadlock fix **outstanding** (§7) |
+| **Status** | Root cause identified (transport/dispatch deadlock). Mitigation shipped in **v0.1.7** (round-timeout widening, PR #38). Deadlock fix: dispatch-side nesting and reader leak fixed (§7); connection cap, lock-holder endpoint and the automated reconnect test remain |
 
 ## 1. Executive summary
 
@@ -240,12 +240,12 @@ sufficient.
 | # | Item | Area | Status |
 |---|---|---|---|
 | 1 | Round-0 timeout 2 s + tunable flags | consensus | **Shipped v0.1.7** |
-| 2 | Move `maybePrune` off the dispatch path | transport/devnet | Open |
-| 3 | Stop holding `dispatchMu` across `onMessage` | transport | Open |
-| 4 | Reader exit-on-close + connection generation | transport | Open |
-| 5 | Bound live connections per peer | transport | Open |
+| 2 | Move `maybePrune` off the dispatch path | transport/devnet | **Fixed**: the hook only signals; `pruneLoop` runs the work (`pruneWake`) |
+| 3 | Stop holding `dispatchMu` across `onMessage` | transport | **Partly**: the callback path no longer takes `v.mu`; the lock is still held across the call, so a future blocking callback would re-arm the deadlock |
+| 4 | Reader exit-on-close + connection generation | transport | **Fixed**: `dispatch` returns false when the connection is finished (checked before and after the lock) and the reader stops; pinned by `TestDispatchRefusesAFrameFromAFinishedConnection` |
+| 5 | Bound live connections per peer | transport | Open (no longer load-bearing for the deadlock, still wanted) |
 | 6 | Debug endpoint: connection state + lock holder | transport/devnet | Open |
-| 7 | Reconnect-storm regression test | tests | Open |
+| 7 | Reconnect-storm regression test | tests | **Partly**: unit tests pin both fix halves; a manual four-bounce local run now ends 1-reader/1-writer with zero blocked goroutines (was 8/1). Automate the storm next |
 | 8 | Document the coordinated-restart rule in the deploy README | docs | Open (in bug doc §7) |
 
 ## 9. Lessons
