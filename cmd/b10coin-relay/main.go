@@ -255,9 +255,21 @@ const defaultStatsInterval = 60 * time.Second
 // the operator read said `conns=3` on a host with no established socket; a
 // `live=0` beside it would have ended the misdiagnosis in one glance, and the
 // ConnBookkeepingIssue warning below says it in words when the two disagree.
+//
+// dropped is split by the bound that refused the frame (share, bytes, frames,
+// the N-1 reservation) and by the two teardown paths that abandon frames
+// already queued: dropped_on_close (the link ended) and dropped_reap (the write
+// deadline ended it because the receiver stopped draining). A single dropped
+// number said a frame was lost but not why; these say which bound or path did
+// it. dropped_on_close was the 2026-11-15 silence: those frames were counted
+// forwarded at enqueue and discarded at teardown; dropped_reap is the live
+// stall's own path (a peer's queue sat at 60-66 KB against a 30 s timeout in
+// 572 of 1,019 samples), and it must be countable for exactly the same reason.
 func relayStatsLine(s relay.Stats) string {
-	return fmt.Sprintf("b10coin-relay stats: conns=%d handshaking=%d live=%d forwarded=%d dropped=%d refused=%d unauthorized=%d",
-		s.Conns, s.Handshaking, s.Live, s.Forwarded, s.Dropped, s.RefusedConns, s.Unauthorized)
+	return fmt.Sprintf("b10coin-relay stats: conns=%d handshaking=%d live=%d forwarded=%d dropped=%d dropped_share=%d dropped_bytes=%d dropped_frames=%d dropped_lane=%d dropped_other=%d dropped_on_close=%d dropped_reap=%d refused=%d unauthorized=%d",
+		s.Conns, s.Handshaking, s.Live, s.Forwarded, s.Dropped,
+		s.DroppedShare, s.DroppedBytes, s.DroppedFrames, s.DroppedLane, s.DroppedOther, s.DroppedOnClose, s.DroppedReap,
+		s.RefusedConns, s.Unauthorized)
 }
 
 // logStats writes one counters line every interval and one for every value on

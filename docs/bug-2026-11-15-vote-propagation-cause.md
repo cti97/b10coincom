@@ -267,3 +267,48 @@ during the stall; `conns` alone cannot show a redial between samples.
 - The real pairwise RTTs and their asymmetry during the stall.
 - Whether the round ladder was climbing. A single sampled line cannot tell a
   parked round from one instant of a ladder.
+
+---
+
+## 10. 2026-11-16: the relay's silent discard at teardown (found and fixed)
+
+The relay's per-connection `sendQ` was instrumented with one counter per refusal
+reason (per-sender share, byte budget, frame-count ring, the N-1 reservation).
+That DISPROVED the hypothesis this round started from: `sendQ.push` never
+returned false without `forward` counting a dropped frame, and no consensus-sized
+frame was preferentially refused. Measured at the bulk ceiling (queue 1,966,080
+of 2,097,152 bytes; bulk limit 2,031,616): 12 of 12 HELLOs and 12 of 12
+consensus frames were admitted, and the only refusals were bulk frames.
+
+The counters did expose the real silent path, in `finish`: a frame ADMITTED to a
+queue was counted `Forwarded` at enqueue and then discarded when its connection
+was torn down (`Forwarded` counts enqueued frames); nothing counted those
+frames as lost. Reproduced end-to-end: 1,500 consensus-sized frames offered, the
+receiver paused past the write bound, 368 delivered, 1,132 discarded - and
+`dropped=0` while `forwarded` read 1,500.
+
+The fix counts them: `finish` drains the queue through `sendQ.abandon`, and every
+discarded frame (plus the frame in the writer's hand when its write fails) is a
+`Dropped` frame, logged with the byte count. The invariant is now `Forwarded =
+delivered + Dropped` for the frames the relay admitted, which is what makes a
+"forwarded climbing, dropped=0" line mean something.
+
+Two teardown paths abandon frames, and both are counted. The ordinary close
+(peer gone, read deadline, shutdown) attributes to `DroppedOnClose`. The
+write-deadline REAP - the writer ending a receiver that stayed stalled past
+`WriteTimeout`, which is the path the live stall exercised (queues of 60-66 KB
+against a 30 s timeout in 572 of 1,019 samples) - attributes to `DroppedReap`
+and logs once per reap. The frame the writer had already popped when the
+deadline expired, or when the deadline could not be armed, is invisible to
+`abandon`; the writer charges that frame itself as `rejectReap` /
+`rejectConnClosed`, so the one frame in hand cannot slip out uncounted. The
+stats line publishes every per-reason counter, including `dropped_reap`.
+Tests fail on `origin/main`: `TestRelayFinishCountsTheFramesItDiscards`,
+`TestRelayAReceiverPauseLeavesNoUncountedFrame` and the constructed exit pins
+(`TestTheWriteDeadlineReapCountsTheBacklogItDiscards`,
+`TestTheWriterCountsThePoppedFrameWhenTheDeadlineCannotBeArmed`,
+`TestTheWriterCountsThePoppedFrameWhenTheWriteDeadlineExpires`).
+
+What is still NOT claimed: this is not proof that the live three-host stall was
+a teardown. It is proof that the relay could report a frame forwarded and never
+deliver or count it, which is exactly the shape the incident's counters showed.
