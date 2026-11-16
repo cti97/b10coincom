@@ -319,7 +319,7 @@ func TestLogStatsSurfacesTheCountersOnTheTimerAndTheSignal(t *testing.T) {
 		}
 	}
 	timerLine := readLine("the timer path")
-	for _, want := range []string{"conns=", "handshaking=", "live=", "forwarded=", "dropped=", "dropped_share=", "dropped_bytes=", "dropped_frames=", "dropped_lane=", "dropped_other=", "dropped_on_close=", "refused=", "unauthorized="} {
+	for _, want := range []string{"conns=", "handshaking=", "live=", "forwarded=", "dropped=", "dropped_share=", "dropped_bytes=", "dropped_frames=", "dropped_lane=", "dropped_other=", "dropped_on_close=", "dropped_reap=", "refused=", "unauthorized="} {
 		if !strings.Contains(timerLine, want) {
 			t.Fatalf("the stats line omits %q, so a relay silently dropping frames would still look healthy: %q", want, timerLine)
 		}
@@ -348,8 +348,8 @@ func TestLogStatsSurfacesTheCountersOnTheTimerAndTheSignal(t *testing.T) {
 // not closed).
 func TestRelayStatsLineReportsEveryCounter(t *testing.T) {
 	got := relayStatsLine(relay.Stats{Conns: 3, Handshaking: 1, Live: 4, Forwarded: 11, Dropped: 2,
-		DroppedShare: 1, DroppedBytes: 0, DroppedFrames: 0, DroppedLane: 0, DroppedOther: 0, DroppedOnClose: 1, RefusedConns: 5, Unauthorized: 7})
-	want := "b10coin-relay stats: conns=3 handshaking=1 live=4 forwarded=11 dropped=2 dropped_share=1 dropped_bytes=0 dropped_frames=0 dropped_lane=0 dropped_other=0 dropped_on_close=1 refused=5 unauthorized=7"
+		DroppedShare: 1, DroppedBytes: 0, DroppedFrames: 0, DroppedLane: 0, DroppedOther: 0, DroppedOnClose: 0, DroppedReap: 1, RefusedConns: 5, Unauthorized: 7})
+	want := "b10coin-relay stats: conns=3 handshaking=1 live=4 forwarded=11 dropped=2 dropped_share=1 dropped_bytes=0 dropped_frames=0 dropped_lane=0 dropped_other=0 dropped_on_close=0 dropped_reap=1 refused=5 unauthorized=7"
 	if got != want {
 		t.Fatalf("relayStatsLine = %q, want %q", got, want)
 	}

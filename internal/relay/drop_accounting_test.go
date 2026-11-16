@@ -19,6 +19,7 @@ package relay
 // frame is never the one they refuse.
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -151,7 +152,7 @@ func TestRelayEveryPushRefusalIsCounted(t *testing.T) {
 			r.forward(senders[1], frame)
 		}
 		st := r.Stats()
-		sum := st.DroppedBytes + st.DroppedShare + st.DroppedFrames + st.DroppedLane + st.DroppedOnClose + st.DroppedOther
+		sum := st.DroppedBytes + st.DroppedShare + st.DroppedFrames + st.DroppedLane + st.DroppedOnClose + st.DroppedReap + st.DroppedOther
 		if st.Dropped == 0 || sum != st.Dropped {
 			t.Fatalf("reason counters sum to %d, Dropped is %d: a refusal path is unattributed", sum, st.Dropped)
 		}
@@ -184,6 +185,161 @@ func TestRelayFinishCountsTheFramesItDiscards(t *testing.T) {
 	}
 	if recv.q.queued() != 0 {
 		t.Fatalf("the queue still holds %d frames after finish", recv.q.queued())
+	}
+}
+
+// deadlineFailConn is a connection whose socket is fine but whose write deadline
+// cannot be armed. It makes the writer's SetWriteDeadline exit reachable with no
+// race: that is the exit where a popped frame is in the writer's hand, invisible
+// to sendQ.abandon, so only the writer can charge it.
+type deadlineFailConn struct{ *gateConn }
+
+func (deadlineFailConn) SetWriteDeadline(time.Time) error {
+	return errors.New("set write deadline: socket is gone")
+}
+
+// timeoutErr is a net.Error whose Timeout is true, the shape a write deadline
+// expiring on a stalled receiver produces.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+// timeoutWriteConn fails every write with the deadline's own error, so the
+// writer takes the reap exit with a frame in its hand.
+type timeoutWriteConn struct{ *gateConn }
+
+func (timeoutWriteConn) Write([]byte) (int, error) { return 0, timeoutErr{} }
+
+// writerConn builds a relay with one receiver whose queue holds n frames (all
+// admitted through forward, so Forwarded counts them), and the receiver's writer
+// not yet started. The socket is the caller's, so each test chooses which exit
+// the writer meets.
+func writerConn(t *testing.T, n, frameBytes int, nc net.Conn) (*Relay, *conn) {
+	t.Helper()
+	r := New(Options{
+		MaxFrameBytes: 4096, MaxConns: 8, MaxConnsPerIP: 8,
+		WriteQueueBytes: 1 << 20, WriteQueueFrames: 64,
+		WriteTimeout: 200 * time.Millisecond,
+	})
+	c := &conn{nc: nc, q: newSendQ(1<<20, 4096, 64), dead: make(chan struct{}), srcGroup: "192.0.2.0/24"}
+	sender := &conn{q: newSendQ(1<<20, 4096, 64), dead: make(chan struct{}), srcGroup: "198.51.100.0/24"}
+	r.mu.Lock()
+	r.conns[c] = struct{}{}
+	r.conns[sender] = struct{}{}
+	r.perGroup[c.srcGroup]++
+	r.perGroup[sender.srcGroup]++
+	r.mu.Unlock()
+	for i := 0; i < n; i++ {
+		r.forward(sender, make([]byte, frameBytes))
+	}
+	if got := c.q.queued(); got != n {
+		t.Fatalf("construction: %d of %d frames queued", got, n)
+	}
+	return r, c
+}
+
+func waitDead(t *testing.T, c *conn, why string) {
+	t.Helper()
+	select {
+	case <-c.dead:
+	case <-time.After(5 * time.Second):
+		t.Fatal(why)
+	}
+}
+
+// TestTheWriteDeadlineReapCountsTheBacklogItDiscards pins path 2 on its own: the
+// receiver's backlog is CONSTRUCTED as stalled (aged past WriteTimeout and no
+// frame admitted within that window), so the writer's very first decision is the
+// reap. Every frame the reaper abandons must be Dropped and attributed to the
+// reap - on origin/main finish only closed the socket, so the whole queue
+// vanished while Forwarded already counted it.
+func TestTheWriteDeadlineReapCountsTheBacklogItDiscards(t *testing.T) {
+	const queued, frameBytes = 7, 64
+	nc := &gateConn{closed: make(chan struct{}), gate: make(chan struct{}), entered: make(chan struct{}), payloadSize: frameBytes}
+	r, c := writerConn(t, queued, frameBytes, nc)
+	c.q.mu.Lock()
+	c.q.oldest = time.Now().Add(-10 * r.opts.WriteTimeout)
+	c.q.lastPush = time.Now().Add(-10 * r.opts.WriteTimeout)
+	c.q.mu.Unlock()
+	if !c.q.receiverStalled(r.opts.WriteTimeout) {
+		t.Fatal("the constructed state does not read as a receiver stall")
+	}
+	r.wg.Add(1)
+	go r.writer(c)
+	waitDead(t, c, "the writer did not reap a queue that had been stalled past WriteTimeout")
+	// dead is closed by the teardown BEFORE the counters are updated (the
+	// accounting runs outside the registry lock), so the assertion is on the
+	// settled end state, not the instant dead closed.
+	waitFor(t, func() bool { return r.Stats().DroppedReap == queued }, "the reap to account the backlog it discarded")
+	st := r.Stats()
+	if st.Forwarded != queued {
+		t.Fatalf("Forwarded is %d, want the %d enqueued frames", st.Forwarded, queued)
+	}
+	if st.Dropped != queued {
+		t.Fatalf("the reap discarded %d queued frames but Dropped is %d: they were forwarded and lost silently", queued, st.Dropped)
+	}
+	if st.DroppedReap != queued {
+		t.Fatalf("the reap's frames were not attributed to it: DroppedReap=%d, want %d", st.DroppedReap, queued)
+	}
+	if st.DroppedOnClose != 0 {
+		t.Fatalf("a reap was charged to an ordinary close: DroppedOnClose=%d", st.DroppedOnClose)
+	}
+	if c.q.queued() != 0 {
+		t.Fatalf("the queue still holds %d frames after the reap", c.q.queued())
+	}
+}
+
+// TestTheWriterCountsThePoppedFrameWhenTheDeadlineCannotBeArmed pins the exit
+// that has no queue to abandon: the writer popped a frame, then could not arm the
+// write deadline, and the frame is in its hand. sendQ.abandon cannot see it, so
+// only the writer's own charge keeps it from being the one frame this exit loses
+// silently.
+func TestTheWriterCountsThePoppedFrameWhenTheDeadlineCannotBeArmed(t *testing.T) {
+	const queued, frameBytes = 5, 64
+	nc := &deadlineFailConn{&gateConn{closed: make(chan struct{}), gate: make(chan struct{}), entered: make(chan struct{}), payloadSize: frameBytes}}
+	r, c := writerConn(t, queued, frameBytes, nc)
+	r.wg.Add(1)
+	go r.writer(c)
+	waitDead(t, c, "the writer did not tear down a connection whose write deadline could not be armed")
+	waitFor(t, func() bool { return r.Stats().DroppedOnClose == queued }, "the teardown to account the popped frame and its queue")
+	st := r.Stats()
+	if st.Forwarded != queued {
+		t.Fatalf("Forwarded is %d, want the %d enqueued frames", st.Forwarded, queued)
+	}
+	if st.Dropped != queued {
+		t.Fatalf("the teardown discarded %d frames but Dropped is %d: the popped frame was lost silently", queued, st.Dropped)
+	}
+	if st.DroppedOnClose != queued {
+		t.Fatalf("the popped frame and its queue were not attributed to the close: DroppedOnClose=%d, want %d", st.DroppedOnClose, queued)
+	}
+}
+
+// TestTheWriterCountsThePoppedFrameWhenTheWriteDeadlineExpires pins the other
+// in-hand exit: the write deadline expired on a stalled receiver. The popped
+// frame is charged to the reap and the rest of the queue is abandoned through
+// the same reap teardown, so this exit also counts everything it discards.
+func TestTheWriterCountsThePoppedFrameWhenTheWriteDeadlineExpires(t *testing.T) {
+	const queued, frameBytes = 5, 64
+	nc := &timeoutWriteConn{&gateConn{closed: make(chan struct{}), gate: make(chan struct{}), entered: make(chan struct{}), payloadSize: frameBytes}}
+	r, c := writerConn(t, queued, frameBytes, nc)
+	r.wg.Add(1)
+	go r.writer(c)
+	waitDead(t, c, "the writer did not tear down a connection whose write deadline expired")
+	waitFor(t, func() bool { return r.Stats().DroppedReap == queued }, "the reaping teardown to account the popped frame and its queue")
+	st := r.Stats()
+	if st.Forwarded != queued {
+		t.Fatalf("Forwarded is %d, want the %d enqueued frames", st.Forwarded, queued)
+	}
+	if st.Dropped != queued {
+		t.Fatalf("the reaping teardown discarded %d frames but Dropped is %d", queued, st.Dropped)
+	}
+	if st.DroppedReap != queued {
+		t.Fatalf("the expired write's frame and its queue were not attributed to the reap: DroppedReap=%d, want %d", st.DroppedReap, queued)
+	}
+	if st.DroppedOnClose != 0 {
+		t.Fatalf("a write-deadline teardown was charged to an ordinary close: DroppedOnClose=%d", st.DroppedOnClose)
 	}
 }
 
@@ -324,8 +480,22 @@ func TestRelayAReceiverPauseLeavesNoUncountedFrame(t *testing.T) {
 		time.Sleep(700 * time.Millisecond) // past the write bound: the link is reaped
 		got := drainFrames(recv, 1<<20, 2*time.Second)
 
-		// Wait for the relay's writer/reader to finish tearing the connection
-		// down and account it before reading the counters.
+		// End state, after both teardown paths have settled: the invariant is
+		// Forwarded = delivered + Dropped, whichever path won. Two outcomes
+		// are correct, and which one happens is a real race against the host's
+		// socket buffers - when they absorb the whole burst, the burst is
+		// delivered even though the pause was longer than WriteTimeout, and
+		// Dropped is rightly zero. So the assertions are on the END STATE, not
+		// on a mid-flight snapshot that assumes the reap must win:
+		//
+		//   - the reap won: delivered < forwarded, and every frame that did not
+		//     arrive is in Dropped, attributed to the reap (or to the close, if
+		//     the reader's deadline won the teardown first) - never left as a
+		//     forwarded frame that vanished;
+		//   - the drain won: delivered == forwarded and nothing was dropped.
+		//
+		// What is unacceptable in EITHER outcome is Forwarded > delivered +
+		// Dropped: that is a frame the relay admitted and lost.
 		deadline := time.Now().Add(2 * time.Second)
 		var st Stats
 		for {
@@ -338,17 +508,19 @@ func TestRelayAReceiverPauseLeavesNoUncountedFrame(t *testing.T) {
 		if st.Forwarded != frames {
 			t.Fatalf("relay forwarded %d frames, sender offered %d", st.Forwarded, frames)
 		}
-		if st.Dropped == 0 {
-			t.Fatalf("the relay discarded the reaped link's backlog but Dropped is 0: %d of %d frames were counted forwarded and lost silently", frames-got, frames)
-		}
 		if unaccounted := int(st.Forwarded) - got - int(st.Dropped); unaccounted != 0 {
 			t.Fatalf("%d frames are unaccounted (forwarded %d = delivered %d + dropped %d); delivered+dropped must equal forwarded",
 				unaccounted, st.Forwarded, got, st.Dropped)
 		}
-		if st.DroppedOnClose == 0 {
-			t.Fatal("the lost frames were not attributed to the connection closing")
+		if got < frames {
+			if st.Dropped == 0 {
+				t.Fatalf("the relay discarded the reaped link's backlog but Dropped is 0: %d of %d frames were counted forwarded and lost silently", frames-got, frames)
+			}
+			if st.DroppedOnClose == 0 && st.DroppedReap == 0 {
+				t.Fatalf("the lost frames were not attributed to a teardown: dropped=%d on-close=%d reap=%d", st.Dropped, st.DroppedOnClose, st.DroppedReap)
+			}
 		}
-		t.Logf("delivered %d of %d; relay dropped %d (on-close %d) - no frame silently lost",
-			got, frames, st.Dropped, st.DroppedOnClose)
+		t.Logf("delivered %d of %d; relay dropped %d (on-close %d, reap %d) - no frame silently lost",
+			got, frames, st.Dropped, st.DroppedOnClose, st.DroppedReap)
 	})
 }

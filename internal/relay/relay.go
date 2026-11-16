@@ -576,10 +576,10 @@ type Stats struct {
 	// else stalled) but the relay is now the one censoring, which is
 	// liveness pressure a validator set feels.
 	//
-	// Dropped is the TOTAL. The six fields below split it by the reason the
+	// Dropped is the TOTAL. The seven fields below split it by the reason the
 	// frame was dropped, so "the relay dropped it" can be read as WHICH bound
 	// bit before anyone reasons about a fix. They always sum to Dropped (a
-	// dropped frame has exactly one reason); a divergence between the six and
+	// dropped frame has exactly one reason); a divergence between the seven and
 	// Dropped is itself a finding - a path that is not attributed.
 	// This is the instrumentation the 2026-11-15 stall needed: the queue's
 	// rejection path was a boolean, so an operator could see frames vanish but
@@ -603,15 +603,27 @@ type Stats struct {
 	// being attributed - the exact silence this field exists to prevent.
 	DroppedOther uint64
 	// DroppedOnClose counts frames that were ADMITTED to a connection's write
-	// queue and then abandoned when that connection ended. Before this, they
-	// were counted Forwarded at enqueue and discarded by finish with no other
-	// counter, so the relay over-reported delivery: the 2026-11-15 stall read
-	// "forwarded climbing, dropped=0" while consensus frames that had been
-	// queued for a torn-down link were gone. Forwarded now equals delivered
-	// plus Dropped (the frame in the writer's hand at teardown is charged
-	// here too); a nonzero value is a receiver that did not drain its link,
-	// not a healthy relay.
+	// queue and then abandoned when that connection ended for an ordinary
+	// reason (the peer closed, the reader's deadline fired, the relay shut
+	// down). Before this, they were counted Forwarded at enqueue and discarded
+	// by finish with no other counter, so the relay over-reported delivery:
+	// the 2026-11-15 stall read "forwarded climbing, dropped=0" while
+	// consensus frames that had been queued for a torn-down link were gone.
+	// Forwarded now equals delivered plus the abandoned terms; a nonzero value
+	// is a receiver that did not drain its link, not a healthy relay.
 	DroppedOnClose uint64
+	// DroppedReap counts frames abandoned by the WRITE-DEADLINE reaper - the
+	// writer's own teardown, taken when the receiver stalled: the queue was
+	// non-empty for a whole WriteTimeout and nothing new had arrived for it.
+	// It is kept separate from DroppedOnClose because the reaper is a distinct
+	// decision (this receiver is not draining; nothing is still arriving),
+	// while a close is just the link ending. The frame in the writer's hand
+	// when its write deadline expires is charged here too. Both terms are
+	// subsets of Dropped and both mean what the 2026-11-15 incident needed:
+	// admitted and not delivered is dropped, never forwarded. This is the path
+	// the live stall exercised (queues of 60-66 KB against a 30 s write
+	// timeout in 572 of 1,019 samples), so it must never be silent.
+	DroppedReap uint64
 	// RefusedConns counts dials closed at accept, for either refusing rule:
 	// over MaxConns, or past MaxConnsPerIP from one source.
 	RefusedConns uint64
@@ -633,7 +645,7 @@ type sentFrame struct {
 // forward never retries - so every refusal must be attributable: a boolean at
 // the door is what let the 2026-11-15 stall be reported as "forwarded climbing,
 // dropped=0" while frames vanished. Exactly one reason applies to a refused
-// frame, and the four counters on Stats are these reasons.
+// frame, and the per-reason counters on Stats are these reasons.
 type rejectReason uint8
 
 const (
@@ -660,6 +672,12 @@ const (
 	// reported it as forwarded while it was discarded. A frame is never
 	// "forwarded" and lost - it is forwarded and delivered, or it is dropped.
 	rejectConnClosed
+	// rejectReap: the frame was in the WRITER'S HAND (already popped, so no
+	// longer in the queue) when its write deadline expired - the receiver
+	// stalled past WriteTimeout. It is counted here, never left to a teardown
+	// that can only see the queue: a popped frame is invisible to abandon, so
+	// this is the one frame a reaping exit could otherwise drop uncounted.
+	rejectReap
 	// rejectOther: a refusal no known bound claimed. Unreachable by
 	// construction; counted rather than folded into another reason, so an
 	// unattributed path shows up as itself instead of inflating a bound that
@@ -680,6 +698,8 @@ func (r rejectReason) String() string {
 		return "consensus reservation (bulk frame)"
 	case rejectConnClosed:
 		return "connection closed with the frame queued"
+	case rejectReap:
+		return "write deadline reaped the connection (the frame was in the writer's hand)"
 	case rejectOther:
 		return "UNATTRIBUTED (a drop path is not accounted)"
 	default:
@@ -1221,8 +1241,8 @@ type conn struct {
 	once sync.Once
 }
 
-// finish tears one connection down exactly once: drop the connection from the
-// registry and from its source group's count, close dead (unblocking the
+// teardown tears one connection down exactly once: drop the connection from
+// the registry and from its source group's count, close dead (unblocking the
 // writer), and close the socket (unblocking every goroutine parked on it).
 //
 // All of it is ONE critical section, exactly as the transport's finish already
@@ -1232,7 +1252,24 @@ type conn struct {
 // lock, leaving a window in which the registry still named a corpse; forward
 // then picked it as a target and counted a frame the dead writer could never
 // write, so Stats.Forwarded over-reported.
-func (r *Relay) finish(c *conn) {
+//
+// The accounting is the SAME on every exit that can abandon queued frames:
+// finish (the ordinary close) and finishReaped (the write-deadline reap) both
+// drain the queue through sendQ.abandon before the socket is closed. The frame
+// in the writer's hand is not in the queue (pop took it), so the writer charges
+// it itself before calling either - otherwise that one frame per teardown
+// would still be lost silently, which is exactly the hole this closes.
+func (r *Relay) finish(c *conn) { r.teardown(c, false) }
+
+// finishReaped is finish for the WRITE-DEADLINE REAP: the writer ended a
+// connection because its receiver stalled (receiverStalled), not because the
+// link was done. The abandoned frames are counted and attributed to the reap
+// rather than to an ordinary close, so the counters say which decision lost
+// them. The teardown itself is identical - one registry delete, one abandon,
+// one socket close - so no exit can bypass the accounting by taking this path.
+func (r *Relay) finishReaped(c *conn) { r.teardown(c, true) }
+
+func (r *Relay) teardown(c *conn, reaped bool) {
 	c.once.Do(func() {
 		r.mu.Lock()
 		delete(r.conns, c)
@@ -1242,24 +1279,30 @@ func (r *Relay) finish(c *conn) {
 		r.closeSocket(c.nc)
 		r.mu.Unlock()
 		if frames > 0 {
-			r.recordAbandoned(c, frames, bytes)
+			r.recordAbandoned(c, frames, bytes, reaped)
 		}
 	})
 }
 
-// recordAbandoned accounts the frames finish discarded: each is a Dropped
+// recordAbandoned accounts the frames a teardown discarded: each is a Dropped
 // frame (they were counted Forwarded at enqueue, and never reached the wire).
 // One line per teardown rather than one per frame: a receiver that stops
 // draining loses its whole backlog at once, and that event is the diagnosis.
-func (r *Relay) recordAbandoned(c *conn, frames, bytes int) {
+func (r *Relay) recordAbandoned(c *conn, frames, bytes int, reaped bool) {
 	r.dropped.Add(uint64(frames))
-	r.droppedClose.Add(uint64(frames))
 	where := "a hand-built connection"
 	if c.nc != nil {
 		where = c.nc.RemoteAddr().String()
 	}
-	r.dropLine(fmt.Sprintf("b10coin: relay: DROPPED %d queued frame(s) (%d bytes) for %s: the connection closed with them still queued, so they were never written",
-		frames, bytes, where))
+	why := "the connection closed with them still queued, so they were never written"
+	if reaped {
+		r.droppedReap.Add(uint64(frames))
+		why = "the write deadline reaped the connection (it did not drain within WriteTimeout), so they were never written"
+	} else {
+		r.droppedClose.Add(uint64(frames))
+	}
+	r.dropLine(fmt.Sprintf("b10coin: relay: DROPPED %d queued frame(s) (%d bytes) for %s: %s",
+		frames, bytes, where, why))
 }
 
 // Relay is the middlebox: a listener, a registry, and per-connection
@@ -1302,6 +1345,7 @@ type Relay struct {
 	droppedFrame atomic.Uint64
 	droppedLane  atomic.Uint64
 	droppedClose atomic.Uint64
+	droppedReap  atomic.Uint64
 	droppedOther atomic.Uint64
 	refused      atomic.Uint64
 	unauthorized atomic.Uint64
@@ -1430,6 +1474,7 @@ func (r *Relay) Stats() Stats {
 		DroppedFrames:  r.droppedFrame.Load(),
 		DroppedLane:    r.droppedLane.Load(),
 		DroppedOnClose: r.droppedClose.Load(),
+		DroppedReap:    r.droppedReap.Load(),
 		DroppedOther:   r.droppedOther.Load(),
 		RefusedConns:   r.refused.Load(),
 		Unauthorized:   r.unauthorized.Load(),
@@ -2027,6 +2072,8 @@ func (r *Relay) recordDrop(target *conn, rej pushRejection) {
 		r.droppedLane.Add(1)
 	case rejectConnClosed:
 		r.droppedClose.Add(1)
+	case rejectReap:
+		r.droppedReap.Add(1)
 	case rejectOther:
 		r.droppedOther.Add(1)
 	}
@@ -2037,6 +2084,21 @@ func (r *Relay) recordDrop(target *conn, rej pushRejection) {
 	}
 	r.dropLine(fmt.Sprintf("b10coin: relay: DROPPED a %d-byte frame for %s: refused by the %s (queue %d/%d bytes, allowance %d)",
 		rej.size, where, rej.reason, rej.queued, rej.limit, rej.allow))
+}
+
+// recordInHandDrop accounts the single frame the writer had already POPPED when
+// the connection ended under it. sendQ.abandon can only count what is still in
+// the queue, and pop removed this frame, so without this the one frame in the
+// writer's hand would be the frame every teardown loses silently. The queue
+// reading is taken here (not from the refusal path) so the line says what the
+// queue still held when the frame was charged.
+func (r *Relay) recordInHandDrop(target *conn, n int, reason rejectReason) {
+	r.recordDrop(target, pushRejection{
+		reason: reason,
+		size:   n,
+		queued: target.q.queued(),
+		limit:  target.q.limit,
+	})
 }
 
 // dropLine writes one drop/teardown line, at most one per second: the moment
@@ -2119,8 +2181,11 @@ func (r *Relay) writer(c *conn) {
 					// The backlog has failed to clear within WriteTimeout of
 					// its arrival AND nothing new has arrived within that
 					// window: the receiver is the one not keeping up, however
-					// steadily it trickled. End it.
-					r.finish(c)
+					// steadily it trickled. End it through the REAP teardown,
+					// which abandons the queue and counts every frame it holds
+					// (DroppedReap): this is the live stall's path, and it must
+					// never discard a backlog silently.
+					r.finishReaped(c)
 					return
 				}
 				f, ok := c.q.pop()
@@ -2136,24 +2201,34 @@ func (r *Relay) writer(c *conn) {
 					writeDeadline = time.Now().Add(r.opts.WriteTimeout)
 				}
 				if err := c.nc.SetWriteDeadline(writeDeadline); err != nil {
+					// The socket is already going away, but the frame in hand
+					// was POPPED, so abandon cannot see it: charge it here or
+					// this exit loses exactly one frame silently. Every exit
+					// that abandons frames counts them.
+					r.recordInHandDrop(c, len(f.b), rejectConnClosed)
 					r.finish(c)
 					return
 				}
 				if err := wire.WriteFrame(c.nc, f.b); err != nil {
 					// Socket failure, or the write deadline expiring on a peer
-					// that has stopped reading - the same ending either way:
-					// nothing is parsed, nothing is retried, the slot is
-					// released. The frame in hand is not in the queue (pop took
-					// it), so it is accounted HERE: a frame that was admitted
-					// and not written is a Dropped frame, never a silent one.
-					r.recordDrop(c, pushRejection{
-						reason: rejectConnClosed,
-						size:   len(f.b),
-						queued: 0,
-						limit:  c.q.limit,
-						allow:  0,
-					})
-					r.finish(c)
+					// that has stopped reading. The frame in hand is not in the
+					// queue (pop took it), so it is accounted HERE whatever the
+					// ending: a frame that was admitted and not written is a
+					// Dropped frame, never a silent one. A deadline expiry is
+					// the reaper's decision, so it is attributed to the reap
+					// (and the rest of the queue to the same reason); any other
+					// socket failure is an ordinary close.
+					reason := rejectConnClosed
+					reaped := false
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						reason, reaped = rejectReap, true
+					}
+					r.recordInHandDrop(c, len(f.b), reason)
+					if reaped {
+						r.finishReaped(c)
+					} else {
+						r.finish(c)
+					}
 					return
 				}
 			}
