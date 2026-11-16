@@ -583,10 +583,10 @@ func (v *Validator) stallUndeducibleLine(head uint64, round uint32, err error) s
 // carry one.
 func (v *Validator) stallUnreachableLine(head uint64, round uint32, b stallBoard) string {
 	short := b.quorum - b.power
-	return fmt.Sprintf("b10coin: no block for %d rounds at height %d (round %d, step %s) and the quorum is UNREACHABLE: this node can reach %d of %d power and the quorum is %d, so nothing at this height can commit - not even a block carrying the Unbond that would free a seat - and %d more power is needed; the committee for height %d DOES derive (%d seats), so the cause is not a missing derivation: it is seats with no node behind them (a bonded key whose validator is not running, or one this node cannot reach), and the %d seat(s) it hears nothing from are %s; peers=%s; this does not clear by waiting - the round ladder closes a gap in rounds, not a gap in voting power - so start a node behind one of those seats, or let the seat leave the committee at a boundary (README: nodeless seats and the 1/4 cap). Reported once per height",
+	return fmt.Sprintf("b10coin: no block for %d rounds at height %d (round %d, step %s) and the quorum is UNREACHABLE: this node can reach %d of %d power and the quorum is %d, so nothing at this height can commit - not even a block carrying the Unbond that would free a seat - and %d more power is needed; the committee for height %d DOES derive (%d seats), so the cause is not a missing derivation: it is seats with no node behind them (a bonded key whose validator is not running, or one this node cannot reach), and the %d seat(s) it hears nothing from are %s; peers=%s; %s; %s; this does not clear by waiting - the round ladder closes a gap in rounds, not a gap in voting power - so start a node behind one of those seats, or let the seat leave the committee at a boundary (README: nodeless seats and the 1/4 cap). Reported once per height",
 		v.stall.roundsAt(round), head, round, v.drv.DiagStep(),
 		b.power, b.total, b.quorum, short, head+1, b.size, len(b.silent),
-		stallSilent(b.silent), stallPeers(b.heard))
+		stallSilent(b.silent), stallPeers(b.heard), v.FrameSummary(), v.FrameVerdict())
 }
 
 // stallLine formats the one line a stalled validator emits when the quorum IS
@@ -623,12 +623,12 @@ func (v *Validator) stallLine(head uint64, round uint32, b stallBoard) string {
 		which += " (last round with a vote)"
 	}
 	var bld strings.Builder
-	fmt.Fprintf(&bld, "b10coin: no block for %d rounds at height %d (round %d, step %s): quorum reachable with %d of %d power (quorum %d), yet nothing commits; peers=%s; tallies %s: proposal=%s; %s; %s; selfprevote=%s; the round ladder is the only closer for a round divergence here, so a rolling restart can hold this for minutes - restart the committee together or expect the delay (README: rolling restart)",
+	fmt.Fprintf(&bld, "b10coin: no block for %d rounds at height %d (round %d, step %s): quorum reachable with %d of %d power (quorum %d), yet nothing commits; peers=%s; tallies %s: proposal=%s; %s; %s; selfprevote=%s; %s; %s; the round ladder is the only closer for a round divergence here, so a rolling restart can hold this for minutes - restart the committee together or expect the delay (README: rolling restart)",
 		v.stall.roundsAt(round), head, round, v.drv.DiagStep(),
 		b.power, b.total, b.quorum,
 		stallPeers(b.heard), which, proposal,
 		stallTally("prevote", r.Prevote, b.quorum), stallTally("precommit", r.Precommit, b.quorum),
-		self)
+		self, v.FrameSummary(), v.FrameVerdict())
 	return bld.String()
 }
 

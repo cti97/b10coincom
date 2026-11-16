@@ -797,6 +797,14 @@ type conn struct {
 	gated       atomic.Uint64
 	rateLimited atomic.Uint64
 	relayPaced  atomic.Uint64
+	// frames is the per-link, per-kind accounting (framecounts.go): what this
+	// connection SENT (accepted into its write queue), actually WROTE, and
+	// RECEIVED off the socket. It is an observation only - no byte it reads
+	// changes control flow - and it is the number the 2026-11-15 vote stall
+	// needed: "HELLOs arrive" and "votes do not" is the difference between
+	// this connection's hello bucket and its proposal/prevote/precommit
+	// buckets, in both directions.
+	frames frameCounts
 	// lastFrame is the link's liveness clock: the value of
 	// TcpTransport.sinceStart() at the last complete frame read from this
 	// connection, or -1 before the first one. It is written by the reader
@@ -846,6 +854,12 @@ func (c *conn) enqueue(data []byte) bool {
 	cp := append([]byte(nil), data...)
 	select {
 	case c.tq <- cp:
+		// SENT means "accepted into this connection's write queue": the last
+		// point the NODE chooses to keep the frame. A queue-full refusal takes
+		// the other branch and is counted in dropped, so every frame this
+		// connection was offered is in exactly one of the two counters. The
+		// classification reads one byte and decides nothing (framecounts.go).
+		c.frames.sent[ClassifyFrame(cp)].Add(1)
 		return true
 	default:
 		c.dropped.Add(1)
@@ -2346,6 +2360,12 @@ func (t *TcpTransport) reader(c *conn) {
 		// anything", which is a socket fact; a frame this node later refuses
 		// for policy is still proof the link is not wedged.
 		t.noteFrame(c)
+		// RECEIVED is counted HERE, before pacing, admission or dispatch can
+		// delay or drop the frame: "the frame arrived at this link" is the
+		// fact a stall needs, and a later placement would hide a router drop
+		// behind a zero. The router's own counters say why a received frame
+		// was refused.
+		c.frames.recv[ClassifyFrame(payload)].Add(1)
 		if c.relayMode {
 			if !t.paceRelay(c, len(payload)) {
 				break // the connection died while pacing
@@ -2563,6 +2583,11 @@ func (t *TcpTransport) writer(c *conn) {
 				t.finish(c)
 				return
 			}
+			// WRITTEN is the other side of SENT: this frame reached the socket
+			// (the kernel has it, no more). written <= sent always, and the gap
+			// is this link's own backlog - the difference between "the node
+			// committed the frame" and "the node put it on the wire".
+			c.frames.written[ClassifyFrame(b)].Add(1)
 		}
 	}
 }
