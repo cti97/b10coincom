@@ -325,6 +325,17 @@ type Validator struct {
 	// can see WHY a node that was asked to prune still holds everything.
 	pruner   *consensus.Pruner
 	pruneErr error
+	// pruneWake carries "a commit asked for a prune" from the driver's commit
+	// hook to the prune goroutine. It exists because that hook runs on the
+	// transport's DISPATCH goroutine, under the transport's dispatch lock: the
+	// prune itself takes the validator mutex, and taking it there deadlocked
+	// the node (2026-11-16) - the dispatch lock was held across a callback
+	// waiting on v.mu, so every socket reader parked and the process stopped
+	// reading frames while the relay kept forwarding. The hook therefore only
+	// signals; pruneLoop does the work. Capacity 1 coalesces repeated commits
+	// into one pending prune, which is exactly right: a prune that has not run
+	// yet does not need to be requested twice.
+	pruneWake chan struct{}
 	// dedup is the router's seen-set (audit N-7): the wave loop Forget()s
 	// below the committed height so a long-lived node does not accumulate
 	// keys for every height it ever decided.
@@ -895,6 +906,7 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 		peerH:      make(map[string]*peerAttestation),
 		syncQ:      make(chan transport.Message, syncQueueDepth),
 		stop:       make(chan struct{}),
+		pruneWake:  make(chan struct{}, 1),
 		advertise:  advertise,
 	}
 	// A BLOCK_SYNC request is answered by the bounded worker pool, never on
@@ -933,6 +945,13 @@ func StartValidator(cfg ValidatorConfig) (*Validator, error) {
 	v.wg.Add(2)
 	go v.tickLoop()
 	go v.waveLoop()
+	if v.pruner != nil {
+		// Only a node asked to prune pays for the goroutine, and the driver's
+		// commit hook signals it instead of running the prune on the dispatch
+		// goroutine (see maybePrune).
+		v.wg.Add(1)
+		go v.pruneLoop()
+	}
 	return v, nil
 }
 
@@ -1745,15 +1764,47 @@ func (v *Validator) syncWorker() {
 // queue. A nonzero count is the observable that the serving bound bit.
 func (v *Validator) SyncRequestsDropped() uint64 { return v.syncDropped.Load() }
 
-// maybePrune is the driver's HistoryPruner hook (M7). A refusal is RECORDED,
+// maybePrune is the driver's HistoryPruner hook (M7). It runs on the
+// transport's dispatch goroutine, under the transport's dispatch lock, so it
+// MUST NOT take any other lock (see pruneWake): it only signals the prune
+// goroutine. The prune's outcome is recorded there, and a refusal is recorded,
 // never fatal: a node that cannot produce a checkpoint for its horizon keeps
-// its history and keeps producing blocks, and this field is how an operator (or
+// its history and keeps producing blocks, and pruneErr is how an operator (or
 // a test) learns why the directory is not shrinking.
 func (v *Validator) maybePrune(ch *chain.Chain) {
 	if v.pruner == nil {
 		return
 	}
-	if _, err := v.pruner.MaybePrune(ch); err != nil {
+	select {
+	case v.pruneWake <- struct{}{}:
+	default: // a prune is already pending; one wake is enough
+	}
+}
+
+// pruneLoop runs the prune work off the dispatch goroutine. Every commit that
+// asks for a prune leaves one token at most, so a fast chain cannot queue
+// unbounded work here; a prune that takes longer than the next commit simply
+// runs again when the next token is left.
+func (v *Validator) pruneLoop() {
+	defer v.wg.Done()
+	for {
+		select {
+		case <-v.stop:
+			return
+		case <-v.pruneWake:
+			v.runPrune()
+		}
+	}
+}
+
+// runPrune performs one prune attempt and records its outcome under v.mu. It is
+// the body maybePrune used to run inline, moved here so it never executes under
+// the transport's dispatch lock.
+func (v *Validator) runPrune() {
+	if v.pruner == nil {
+		return
+	}
+	if _, err := v.pruner.MaybePrune(v.ch); err != nil {
 		v.mu.Lock()
 		v.pruneErr = err
 		v.mu.Unlock()

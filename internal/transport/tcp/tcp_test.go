@@ -2587,3 +2587,34 @@ func TestAnUnadmittedSquatterCannotHoldAPeersName(t *testing.T) {
 		t.Fatalf("Send over the healed link: %v", err)
 	}
 }
+
+// TestDispatchRefusesAFrameFromAFinishedConnection pins the 2026-11-16 fix at
+// the transport's edge: a reader that was waiting for the dispatch lock while
+// its connection was finished (watchdog teardown, write deadline, peer reset)
+// must stop rather than deliver, and must never park on the lock for a link
+// nobody will read again. Before the fix the frame reached OnMessage and the
+// reader stayed parked behind the dispatch mutex - one per reconnect - which is
+// how the live node accumulated eight readers on one writer and stopped
+// reading frames entirely.
+func TestDispatchRefusesAFrameFromAFinishedConnection(t *testing.T) {
+	tp, err := New(Options{LocalID: "t"})
+	if err != nil {
+		t.Fatalf("new transport: %v", err)
+	}
+	t.Cleanup(func() { _ = tp.Close() })
+
+	delivered := make(chan struct{}, 1)
+	tp.OnMessage(func(transport.Message) { delivered <- struct{}{} })
+
+	c := &conn{dead: make(chan struct{})}
+	close(c.dead)
+
+	if tp.dispatch(c, transport.Message{From: "peer", Data: []byte("frame")}) {
+		t.Fatal("dispatch reported a live connection after it was finished")
+	}
+	select {
+	case <-delivered:
+		t.Fatal("a frame from a finished connection reached OnMessage")
+	default:
+	}
+}
