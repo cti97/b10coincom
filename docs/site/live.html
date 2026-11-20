@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>b10coin — live chain</title>
+<style>
+  :root{
+    --bg:#0b0d10; --panel:#12161b; --line:#1f262e; --ink:#e7edf3;
+    --muted:#8b98a5; --dim:#5d6a76; --ok:#3ddc97; --warn:#ffb020; --bad:#ff5c5c;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:36px 22px 64px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:26px;letter-spacing:-.4px;margin:0;font-weight:650}
+  h1 span{color:var(--dim);font-weight:400}
+  .pill{font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+    padding:7px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+  .pill.live{color:var(--ok);border-color:#1d3b2f;background:#0f1a16}
+  .pill.stale{color:var(--warn);border-color:#3b3018;background:#1a1509}
+  .pill.dead{color:var(--bad);border-color:#3b1d1d;background:#1a0f0f}
+  .sub{color:var(--muted);margin:0 0 26px;font-size:14px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  @media(max-width:820px){.grid{grid-template-columns:repeat(2,1fr)}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px 16px}
+  .k{font:600 10.5px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+  .v{font:600 25px/1.25 var(--mono);margin-top:8px;letter-spacing:-.3px}
+  .v small{font-size:13px;color:var(--muted);font-weight:400}
+  .card.wide{grid-column:span 2}
+  @media(max-width:820px){.card.wide{grid-column:span 2}}
+  section{margin-top:26px}
+  h2{font:600 12px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+    color:var(--dim);margin:0 0 10px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{text-align:left;font:600 10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+    color:var(--dim);padding:9px 10px;border-bottom:1px solid var(--line)}
+  td{padding:10px;border-bottom:1px solid var(--line);color:var(--ink)}
+  tr:last-child td{border-bottom:none}
+  .mono{font-family:var(--mono);font-size:13px}
+  .hash{color:#9fd0ff;text-decoration:none}
+  .hash:hover{text-decoration:underline}
+  .muted{color:var(--muted)}
+  .right{text-align:right}
+  .rows{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  @media(max-width:820px){.rows{grid-template-columns:1fr}}
+  .row{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px dashed var(--line)}
+  .row:last-child{border-bottom:none}
+  .row .k{font-family:inherit;letter-spacing:0;text-transform:none;font-weight:500;color:var(--muted);font-size:13px}
+  .row .val{font-family:var(--mono);font-size:13px}
+  footer{margin-top:34px;color:var(--dim);font-size:12.5px;line-height:1.7}
+  .warn{margin-top:16px;padding:12px 14px;border:1px solid #3b3018;background:#1a1509;
+    border-radius:10px;color:#e8c98a;font-size:13px}
+  a{color:#9fd0ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>b10coin <span>· live chain</span></h1>
+    <span id="state" class="pill">connecting</span>
+  </header>
+  <p class="sub">Three-seat fixture testnet · one relay · <span id="chainid" class="mono">—</span></p>
+
+  <div class="grid">
+    <div class="card"><div class="k">Height</div><div class="v" id="height">—</div></div>
+    <div class="card"><div class="k">Block rate</div><div class="v" id="rate">— <small>blk/s</small></div></div>
+    <div class="card"><div class="k">Mempool</div><div class="v" id="mempool">—</div></div>
+    <div class="card"><div class="k">Updated</div><div class="v" id="age">—</div></div>
+    <div class="card wide"><div class="k">Head hash</div><div class="v mono" id="head" style="font-size:15px;word-break:break-all">—</div></div>
+    <div class="card wide"><div class="k">State root</div><div class="v mono" id="state_root" style="font-size:15px;word-break:break-all">—</div></div>
+  </div>
+
+  <section>
+    <h2>Recent blocks</h2>
+    <table>
+      <thead><tr><th>Height</th><th>Hash</th><th>Parent</th><th class="right">Txs</th><th class="right">Time</th></tr></thead>
+      <tbody id="blocks"><tr><td colspan="5" class="muted">—</td></tr></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Chain parameters</h2>
+    <div class="rows">
+      <div class="card" id="params1"></div>
+      <div class="card" id="params2"></div>
+      <div class="card" id="relay"></div>
+    </div>
+  </section>
+
+  <div class="warn">
+    Fixture committee: every validator key is derived from a public seed, so anyone
+    with the repository can sign as any seat. This chain carries no value — it is a
+    plumbing testnet. Consensus has a known residual: a round divergence can pause
+    block production for minutes before the timeout ladder closes it.
+  </div>
+
+  <footer>
+    Data comes from a live validator seat behind NAT, pushed to this host every ~15 s.
+    Relay counters are read from the relay's own journal once a minute.
+    Source: <a href="https://github.com/cti97/b10coincom">cti97/b10coincom</a>.
+  </footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString('en-US');
+const short = h => h ? h.slice(0,10) + '…' + h.slice(-6) : '—';
+let lastH = null, lastT = null, rate = null;
+
+function ago(ts){
+  if(!ts) return '—';
+  const s = Math.max(0, Math.round(Date.now()/1000 - ts));
+  if(s < 60) return s + 's ago';
+  if(s < 3600) return Math.round(s/60) + 'm ago';
+  return Math.round(s/3600) + 'h ago';
+}
+
+async function getJSON(name){
+  const r = await fetch(name + '?t=' + Date.now(), {cache:'no-store'});
+  if(!r.ok) throw new Error(name + ': HTTP ' + r.status);
+  return r.json();
+}
+
+function renderChain(c){
+  const now = Date.now()/1000;
+  $('chainid').textContent = c.chain_id || '—';
+  $('height').textContent = fmt(c.height);
+  $('mempool').textContent = fmt(c.mempool ?? 0);
+  $('head').textContent = c.head_hash || '—';
+  $('state_root').textContent = c.state_root || '—';
+
+  // Measured between height changes (the snapshot is pushed every 15 s, so a
+  // per-poll delta would read 0 most of the time); stale after two minutes.
+  if(lastH === null){ lastH = c.height; lastT = now; }
+  else if(c.height > lastH){
+    const dt = now - lastT;
+    if(dt > 0.5){
+      const inst = (c.height - lastH) / dt;
+      rate = rate === null ? inst : rate*0.7 + inst*0.3;
+    }
+    lastH = c.height; lastT = now;
+  }
+  const fresh = now - lastT < 120;
+  $('rate').innerHTML = (rate === null || !fresh ? '—' : rate.toFixed(1)) + ' <small>blk/s</small>';
+
+  const age = now - (c.updated || 0);
+  $('age').textContent = ago(c.updated);
+  const st = $('state');
+  if(age < 45){ st.className = 'pill live'; st.textContent = 'live'; }
+  else if(age < 300){ st.className = 'pill stale'; st.textContent = 'stale ' + ago(c.updated); }
+  else { st.className = 'pill dead'; st.textContent = 'no data ' + ago(c.updated); }
+
+  const tb = $('blocks');
+  if(Array.isArray(c.blocks) && c.blocks.length){
+    tb.innerHTML = c.blocks.map(b => `<tr>
+      <td class="mono">${fmt(b.height)}</td>
+      <td class="mono hash" title="${b.hash}">${short(b.hash)}</td>
+      <td class="mono muted" title="${b.parent}">${short(b.parent)}</td>
+      <td class="right mono">${b.tx_count ?? 0}</td>
+      <td class="right mono muted">${b.timestamp ? new Date(b.timestamp*1000).toISOString().slice(11,19)+'Z' : '—'}</td>
+    </tr>`).join('');
+  }
+
+  const rows = (pairs) => pairs.map(([k,v]) =>
+    `<div class="row"><span class="k">${k}</span><span class="val">${v}</span></div>`).join('');
+  $('params1').innerHTML = rows([
+    ['Committee size', c.committee_size ?? '—'],
+    ['Epoch length', fmt(c.epoch_blocks ?? 0) + ' blocks'],
+    ['Unbonding', (c.unbonding_epochs ?? '—') + ' epochs'],
+  ]);
+  $('params2').innerHTML = rows([
+    ['Min stake', fmt(c.min_stake_sparks ?? 0) + ' sparks'],
+    ['Claim amount', fmt(c.claim_amount_sparks ?? 0) + ' sparks'],
+    ['Genesis', c.genesis_hash ? short(c.genesis_hash) : '—'],
+  ]);
+}
+
+function renderRelay(r){
+  const rows = (pairs) => pairs.map(([k,v]) =>
+    `<div class="row"><span class="k">${k}</span><span class="val">${v}</span></div>`).join('');
+  $('relay').innerHTML = rows([
+    ['Relay connections', (r.conns ?? '—') + ' <span class="muted">(' + (r.live ?? '—') + ' live)</span>'],
+    ['Frames forwarded', fmt(r.forwarded ?? 0)],
+    ['Frames dropped', fmt(r.dropped ?? 0)],
+    ['— at close / reap', fmt(r.dropped_on_close ?? 0) + ' / ' + fmt(r.dropped_reap ?? 0)],
+    ['Gate refusals', fmt(r.unauthorized ?? 0)],
+  ]);
+}
+
+async function tick(){
+  try{
+    const c = await getJSON('chain.json');
+    renderChain(c);
+  }catch(e){
+    const st = $('state'); st.className = 'pill dead'; st.textContent = 'no data';
+    console.error(e);
+  }
+  try{ renderRelay(await getJSON('relay.json')); }catch(e){ /* relay panel stays */ }
+}
+
+tick();
+setInterval(tick, 8000);
+</script>
+</body>
+</html>
