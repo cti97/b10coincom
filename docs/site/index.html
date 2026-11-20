@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>b10coin — a chain for small computers</title>
+<meta name="description" content="b10coin is a from-scratch proof-of-stake-style cryptocurrency built to run a validator on Raspberry Pi class hardware. No proof of work, no premine, testnet only.">
+<style>
+  :root{
+    --bg:#0a0c0f; --panel:#11151a; --line:#1e252d; --ink:#e9eff5;
+    --muted:#8b98a5; --dim:#5b6875; --accent:#7cc4ff; --ok:#3ddc97;
+    --warn:#ffb020; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:
+      radial-gradient(1100px 520px at 78% -8%, #16222e 0%, transparent 62%),
+      radial-gradient(800px 420px at 8% 4%, #131a22 0%, transparent 58%),
+      var(--bg);
+    color:var(--ink); font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+  nav{display:flex;justify-content:space-between;align-items:center;padding:22px 0;font-size:14px}
+  nav .brand{font-weight:650;letter-spacing:-.2px}
+  nav .brand b{color:var(--accent)}
+  nav a{color:var(--muted);text-decoration:none;margin-left:22px}
+  nav a:hover{color:var(--ink)}
+  header.hero{padding:64px 0 40px}
+  .eyebrow{font:600 11px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+  h1{font-size:clamp(38px,6vw,64px);line-height:1.04;letter-spacing:-2.2px;margin:16px 0 0;font-weight:680}
+  h1 em{font-style:normal;color:var(--accent)}
+  .lede{max-width:680px;color:#c2ccd6;font-size:19px;margin:22px 0 0}
+  .cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}
+  .btn{display:inline-block;padding:12px 18px;border-radius:10px;text-decoration:none;
+    font-weight:600;font-size:14.5px;border:1px solid var(--line)}
+  .btn.primary{background:var(--ink);color:#0a0c0f;border-color:var(--ink)}
+  .btn.primary:hover{background:#fff}
+  .btn.ghost{color:var(--ink)}
+  .btn.ghost:hover{border-color:#31404e}
+
+  .strip{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);
+    border:1px solid var(--line);border-radius:14px;overflow:hidden;margin:46px 0 10px}
+  .strip div{background:var(--panel);padding:16px 18px}
+  .strip .k{font:600 10px/1 var(--mono);letter-spacing:.13em;text-transform:uppercase;color:var(--dim)}
+  .strip .v{font:600 22px/1.3 var(--mono);margin-top:7px}
+  .strip .v small{font-size:12px;color:var(--muted);font-weight:400}
+  .strip .pill{display:inline-block;margin-top:8px;font:600 10px/1 var(--mono);letter-spacing:.1em;
+    text-transform:uppercase;padding:6px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+  .pill.live{color:var(--ok);border-color:#1d3b2f;background:#0f1a16}
+
+  section{padding:56px 0;border-top:1px solid var(--line)}
+  section:first-of-type{border-top:none}
+  h2{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);
+    font-family:var(--mono);font-weight:600;margin:0 0 18px}
+  h3{font-size:22px;letter-spacing:-.4px;margin:0 0 10px;font-weight:640}
+  p{color:#b9c4cf;margin:0 0 14px;max-width:760px}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+  .card p:last-child{margin-bottom:0}
+  .card .tag{font:600 10px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;
+    color:var(--dim);display:block;margin-bottom:12px}
+  ul{margin:0;padding-left:18px;color:#b9c4cf}
+  li{margin:6px 0}
+  .steps{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  .step{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}
+  .step .n{font:600 11px/1 var(--mono);color:var(--accent);letter-spacing:.12em}
+  .step h4{font-size:16.5px;margin:10px 0 8px;letter-spacing:-.2px}
+  .step p{font-size:14px;margin:0;color:var(--muted)}
+
+  .arch{margin-top:8px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+  .arch svg{width:100%;height:auto;display:block}
+
+  .nums{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .num{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .num .v{font:600 24px/1.2 var(--mono);letter-spacing:-.5px}
+  .num .k{color:var(--muted);font-size:13px;margin-top:6px}
+
+  .status{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .badge{display:inline-block;font:600 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+    padding:6px 8px;border-radius:999px;margin-left:8px;vertical-align:2px}
+  .badge.done{color:var(--ok);border:1px solid #1d3b2f;background:#0f1a16}
+  .badge.wip{color:var(--warn);border:1px solid #3b3018;background:#1a1509}
+
+  .notice{background:#1a1509;border:1px solid #3b3018;border-radius:12px;padding:18px 20px;color:#e8c98a}
+  .notice strong{color:#ffd58a}
+
+  footer{padding:40px 0 60px;color:var(--dim);font-size:13.5px;border-top:1px solid var(--line)}
+  footer a{color:var(--accent);text-decoration:none}
+  code{font-family:var(--mono);font-size:.92em;background:#161b21;border:1px solid var(--line);
+    border-radius:5px;padding:1px 5px;color:#cfd9e3}
+
+  @media(max-width:900px){
+    .steps{grid-template-columns:1fr 1fr}
+    .strip{grid-template-columns:1fr 1fr}
+    .cols,.status{grid-template-columns:1fr}
+    .nums{grid-template-columns:1fr 1fr}
+  }
+  @media(max-width:560px){
+    .steps,.nums{grid-template-columns:1fr}
+    nav a{display:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav>
+    <span class="brand">b<b>10</b>coin</span>
+    <span>
+      <a href="#how">How it works</a>
+      <a href="#numbers">Numbers</a>
+      <a href="#status">Status</a>
+      <a href="live/">Live chain ↗</a>
+      <a href="https://github.com/cti97/b10coincom">GitHub ↗</a>
+    </span>
+  </nav>
+
+  <header class="hero">
+    <div class="eyebrow">proof-of-stake-style · from scratch · testnet</div>
+    <h1>A cryptocurrency that runs<br>on a <em>Raspberry Pi</em>.</h1>
+    <p class="lede">
+      b10coin is a from-scratch chain with Tendermint-style BFT consensus, a
+      keyless claim faucet, and staking-based committee rotation. No proof of
+      work, no premine, no token sale — the goal is a chain that is deeply
+      understood, not a market launch.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="live/">See the live chain</a>
+      <a class="btn ghost" href="https://github.com/cti97/b10coincom">Read the source</a>
+      <a class="btn ghost" href="#how">How it works</a>
+    </div>
+
+    <div class="strip" id="strip">
+      <div><div class="k">Height</div><div class="v" id="s-height">—</div></div>
+      <div><div class="k">Block rate</div><div class="v" id="s-rate">— <small>blk/s</small></div></div>
+      <div><div class="k">Committee</div><div class="v" id="s-committee">—</div></div>
+      <div><div class="k">Chain state</div><div class="v" id="s-state"><span class="pill">connecting</span></div></div>
+    </div>
+  </header>
+
+  <section>
+    <h2>What it is, and what it deliberately is not</h2>
+    <div class="cols">
+      <div class="card">
+        <span class="tag">The design</span>
+        <h3>Built for small computers</h3>
+        <p>
+          Validating and storing a chain costs disk and bandwidth — a Pi does that
+          fine. Producing blocks is where the cost lives, so b10coin moves the
+          difficulty out of consensus and into <strong>issuance and distribution</strong>:
+          a capped emission schedule and a keyless claim faucet.
+        </p>
+        <ul>
+          <li>Tendermint-style BFT: propose, prevote, precommit, commit</li>
+          <li>A dumb, token-gated relay so validators behind NAT can reach each other</li>
+          <li>Staking, epochs and committee rotation — one stake, one seat, capped power</li>
+          <li>Bounded history with verifiable checkpoints</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="tag">The trade-off, stated</span>
+        <h3>Permissionless, fairly distributed, no PoW — pick two</h3>
+        <p>
+          The design document makes the bargain explicit rather than hiding it.
+          b10coin begins <em>federated</em>: a genesis committee of held public keys,
+          with staking-based admission from there. Where proof of work survives — in
+          the faucet — it is a rate limiter on claims, never a consensus mechanism.
+        </p>
+        <ul>
+          <li>No smart contracts, no privacy layer, no scaling side-chain</li>
+          <li>No governance token, no sale, no mainnet</li>
+          <li>Testnet coins are valueless by construction</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <h2>How a block happens</h2>
+    <div class="steps">
+      <div class="step"><div class="n">01 · PROPOSE</div><h4>The round proposer builds</h4><p>One seat, chosen per height and round, assembles a block from its mempool and signs it.</p></div>
+      <div class="step"><div class="n">02 · PREVOTE</div><h4>Every validator judges</h4><p>The block is re-validated against the chain — parent, height, proposer seat, signatures, state root — before a prevote is cast.</p></div>
+      <div class="step"><div class="n">03 · PRECOMMIT</div><h4>A quorum locks</h4><p>Once prevotes reach quorum the validators lock and precommit. A lock is a promise; unlocking needs proof of a later round.</p></div>
+      <div class="step"><div class="n">04 · COMMIT</div><h4>State advances</h4><p>Precommits reaching quorum commit the block, advance the state root, and start the next height at round zero.</p></div>
+    </div>
+
+    <div class="arch" style="margin-top:16px">
+      <svg viewBox="0 0 1040 250" role="img" aria-label="Three validators dial out through one relay">
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0,0 L10,5 L0,10 z" fill="#3b4b5c"/>
+          </marker>
+        </defs>
+        <g font-family="ui-monospace,Menlo,monospace" font-size="12" fill="#8b98a5">
+          <rect x="20" y="30" width="210" height="56" rx="10" fill="#0f1419" stroke="#1e252d"/>
+          <text x="38" y="54" fill="#e9eff5" font-size="13">validator · seat 0</text>
+          <text x="38" y="72">Raspberry Pi · home A</text>
+
+          <rect x="20" y="104" width="210" height="56" rx="10" fill="#0f1419" stroke="#1e252d"/>
+          <text x="38" y="128" fill="#e9eff5" font-size="13">validator · seat 1</text>
+          <text x="38" y="146">Raspberry Pi · home B</text>
+
+          <rect x="20" y="178" width="210" height="56" rx="10" fill="#0f1419" stroke="#1e252d"/>
+          <text x="38" y="202" fill="#e9eff5" font-size="13">validator · seat 2</text>
+          <text x="38" y="220">laptop · home C</text>
+
+          <rect x="420" y="104" width="200" height="56" rx="10" fill="#111a22" stroke="#284253"/>
+          <text x="438" y="128" fill="#cfe6f7" font-size="13">relay (VPS)</text>
+          <text x="438" y="146">forwards bytes, parses nothing</text>
+
+          <rect x="810" y="30" width="210" height="56" rx="10" fill="#0f1419" stroke="#1e252d"/>
+          <text x="828" y="54" fill="#e9eff5" font-size="13">signed HELLO</text>
+          <text x="828" y="72">peer admission + heights</text>
+
+          <rect x="810" y="104" width="210" height="56" rx="10" fill="#0f1419" stroke="#1e252d"/>
+          <text x="828" y="128" fill="#e9eff5" font-size="13">votes</text>
+          <text x="828" y="146">proposal · prevote · precommit</text>
+
+          <rect x="810" y="178" width="210" height="56" rx="10" fill="#0f1419" stroke="#1e252d"/>
+          <text x="828" y="202" fill="#e9eff5" font-size="13">block sync</text>
+          <text x="828" y="220">catch-up after a gap</text>
+
+          <line x1="232" y1="58" x2="416" y2="122" stroke="#3b4b5c" stroke-width="1.4" marker-end="url(#a)"/>
+          <line x1="232" y1="132" x2="416" y2="132" stroke="#3b4b5c" stroke-width="1.4" marker-end="url(#a)"/>
+          <line x1="232" y1="206" x2="416" y2="142" stroke="#3b4b5c" stroke-width="1.4" marker-end="url(#a)"/>
+          <line x1="622" y1="122" x2="806" y2="58" stroke="#3b4b5c" stroke-width="1.4" marker-end="url(#a)"/>
+          <line x1="622" y1="132" x2="806" y2="132" stroke="#3b4b5c" stroke-width="1.4" marker-end="url(#a)"/>
+          <line x1="622" y1="142" x2="806" y2="206" stroke="#3b4b5c" stroke-width="1.4" marker-end="url(#a)"/>
+        </g>
+      </svg>
+    </div>
+  </section>
+
+  <section id="numbers">
+    <h2>The numbers</h2>
+    <div class="nums">
+      <div class="num"><div class="v">2 s</div><div class="k">target block interval</div></div>
+      <div class="num"><div class="v">21,000,000</div><div class="k">b10 supply cap</div></div>
+      <div class="num"><div class="v">0.5 b10</div><div class="k">block reward, halving every 21M blocks</div></div>
+      <div class="num"><div class="v">1,000</div><div class="k">blocks per epoch (committee rotation)</div></div>
+      <div class="num"><div class="v">1,000 b10</div><div class="k">minimum stake for a seat</div></div>
+      <div class="num"><div class="v">6</div><div class="k">build targets: darwin, linux, windows · amd64 &amp; arm64</div></div>
+    </div>
+    <p style="margin-top:18px;font-size:14px" class="muted">
+      Claims pay 1 b10 from protocol emission and cost an Argon2id proof — memory-hard,
+      so a Pi completes one in seconds and a GPU farm gains little. Transactions pay a
+      minimum fee of one spark; a bond of 1,000 b10 buys a seat, and no seat may hold more
+      than a quarter of committee power once the committee has four or more members.
+    </p>
+  </section>
+
+  <section id="status">
+    <h2>Where the project is</h2>
+    <div class="status">
+      <div class="card">
+        <span class="tag">Running now</span>
+        <h3>Live three-seat testnet</h3>
+        <p>
+          Three validators on three different home networks, one relay on a public VPS,
+          all behind NAT. The chain has been committing continuously since the
+          v0.1.8 transport fix — <strong id="s-height2">—</strong> blocks at the last check.
+        </p>
+        <p style="font-size:14px;color:var(--muted)">
+          Fixture committee: every key derives from a public seed, so this proves the
+          plumbing, not the security model. A separate committee-file mode uses held keys.
+        </p>
+      </div>
+      <div class="card">
+        <span class="tag">Milestones</span>
+        <h3>What is built</h3>
+        <ul style="font-size:14.5px">
+          <li>M0–M1 · chain, storage, single-node producer <span class="badge done">done</span></li>
+          <li>M2 · faucet with Argon2id claims <span class="badge done">done</span></li>
+          <li>M3 · BFT consensus engine <span class="badge done">done</span></li>
+          <li>M4 · real networking over a relay <span class="badge done">done</span></li>
+          <li>M5 · staking, epochs, rotation <span class="badge done">done</span></li>
+          <li>M6 · wallet, explorer RPC, walkthrough <span class="badge done">done</span></li>
+          <li>M7–M8 · bounded history, checkpoints <span class="badge done">done</span></li>
+          <li>Liveness hardening (round resync) <span class="badge wip">next</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="notice" style="margin-top:16px">
+      <strong>This is a testnet.</strong> Coins on it are valueless test currency. There is
+      no sale, no token offering and no mainnet. The fixture committee's private keys are
+      derived from a public seed published in the repository — anyone can sign as any seat.
+      Do not treat this chain as securing anything of value.
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap" style="padding:0">
+      b10coin · <a href="live/">live chain</a> ·
+      <a href="https://github.com/cti97/b10coincom">source &amp; design docs</a> ·
+      chain <code id="s-chain">—</code>
+      <br>
+      The design specification is the contract: what b10coin is, and what it
+      deliberately is not.
+    </div>
+  </footer>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString('en-US');
+let lastH = null, lastT = null, rate = null;
+
+function setState(kind, text){
+  $('s-state').innerHTML = '<span class="pill ' + kind + '">' + text + '</span>';
+}
+
+async function tick(){
+  try{
+    const r = await fetch('live/chain.json?t=' + Date.now(), {cache:'no-store'});
+    if(!r.ok) throw new Error(r.status);
+    const c = await r.json();
+    const now = Date.now()/1000;
+    $('s-height').textContent = fmt(c.height);
+    $('s-height2').textContent = fmt(c.height);
+    $('s-committee').textContent = (c.committee_size ?? '—') + ' seats';
+    $('s-chain').textContent = c.chain_id || '—';
+    // Rate is measured between HEIGHT CHANGES, not between polls: the snapshot
+    // is pushed every 15 s, so most polls see the same height and a per-poll
+    // delta would read 0. A rate older than two minutes is shown as "—" rather
+    // than frozen at a stale value.
+    if(lastH === null){ lastH = c.height; lastT = now; }
+    else if(c.height > lastH){
+      const dt = now - lastT;
+      if(dt > 0.5){
+        const inst = (c.height - lastH) / dt;
+        rate = rate === null ? inst : rate*0.6 + inst*0.4;
+      }
+      lastH = c.height; lastT = now;
+    }
+    const fresh = now - lastT < 120;
+    $('s-rate').innerHTML = (rate === null || !fresh ? '—' : rate.toFixed(1)) + ' <small>blk/s</small>';
+    const age = now - (c.updated || 0);
+    if(age < 45) setState('live', 'live');
+    else if(age < 300) setState('', 'stale');
+    else setState('', 'no data');
+  }catch(e){
+    setState('', 'no data');
+  }
+}
+tick();
+setInterval(tick, 10000);
+</script>
+</body>
+</html>
