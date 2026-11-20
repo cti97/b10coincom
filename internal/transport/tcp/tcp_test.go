@@ -2279,12 +2279,28 @@ func TestAFailedHandshakeReleasesOneSlotNotTwo(t *testing.T) {
 	for i := 0; i < attempts; i++ {
 		before := a.InboundAttempts()
 		abandonAfterID(t, a.Addr().String(), fmt.Sprintf("ghost%d", i))
-		waitFor(t, fmt.Sprintf("abandoned handshake %d to be accounted for", i+1), 5*time.Second, func() bool {
-			return a.InboundAttempts() > before
-		})
-		if got := a.InboundSlots(); got != baseline {
-			t.Fatalf("after abandoned handshake %d of %d: inboundSlots = %d, want %d (the counter moved by %d for one socket - one release is missing or doubled)",
-				i+1, attempts, got, baseline, got-baseline)
+		// Wait for BOTH facts, not for the attempt counter alone. An abandoned
+		// dial can be installed by adopt and killed a moment later by the read
+		// loop, and THAT goroutine releases the slot (finish). So a moved
+		// attempt counter does not by itself guarantee the release has run:
+		// under CI load the two are observably ordered either way, and the
+		// one-shot check this replaces read the count in between and failed
+		// with "inboundSlots = 3, want 2" (run 44732621937). The invariant is
+		// that the count RETURNS to the baseline; a leaked slot never returns
+		// and a double release settles one BELOW it, so the deadline still
+		// distinguishes both bugs from a slow one.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			attempted := a.InboundAttempts() > before
+			got := a.InboundSlots()
+			if attempted && got == baseline {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("after abandoned handshake %d of %d: inboundSlots = %d (attempt accounted: %v), want %d (the counter sits %d from the baseline for one socket - one release is missing or doubled)",
+					i+1, attempts, got, attempted, baseline, got-baseline)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
