@@ -157,6 +157,35 @@ The domain is fronted by Cloudflare, which terminates TLS. Requirements:
    grey, and it does not fix a `www` record pointing at somebody else's service
    (this domain's `www` pointed at an `onrender.com` chain from the registrar).
 
+### Resolution (2026-11-20)
+
+The record was switched to **Proxied**, and the site now answers HTTPS from
+Cloudflare's edge. Measured after the change:
+
+```
+curl -sI https://b10coin.com/     HTTP/2 200, server: cloudflare, cf-ray present
+openssl x509                      subject CN=b10coin.com
+                                  issuer  Google Trust Services WE1
+                                  validity 2026-11-05 → 2027-02-03 (90-day Universal SSL)
+dig +short A b10coin.com          188.114.9x.x (anycast, not the origin)
+https://www.b10coin.com/          HTTP/2 301 → https://b10coin.com/
+```
+
+Two things worth remembering from the diagnosis:
+
+- **The zone can be on Cloudflare while the host is not proxied.** Nameservers
+  `sunny/jake.ns.cloudflare.com` proved the zone was theirs; `dig` returning
+  `93.115.53.244` proved the record itself was grey-clouded, so HTTPS went
+  straight at the origin's closed :443 while `http://` worked. The zone's
+  nameservers say nothing about an individual record.
+- **Propagation is per-resolver.** After the flip, `1.1.1.1` served the anycast
+  address immediately while Google's resolver and this Mac's own cache still
+  returned the origin IP for the rest of the record's 300 s TTL — and macOS
+  keeps its own copy in mDNSResponder after the TTL, so `dig` and `curl` can
+  disagree until `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`.
+  Prove the edge with `curl --resolve b10coin.com:443:<anycast-ip> https://b10coin.com/`
+  before blaming the origin.
+
 Verification from anywhere:
 
 ```sh
@@ -227,6 +256,11 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: bitgod.xyz' http://127.0.0.1/
 curl -s https://b10coin.com/ | grep -o '<title>[^<]*</title>'
 curl -s https://b10coin.com/live/chain.json | python3 -c \
   'import json,sys,time; d=json.load(sys.stdin); print(d["height"], int(time.time())-d["updated"], "s old")'
+
+# edge: Cloudflare terminates TLS, the origin is reached over HTTP
+curl -sI https://b10coin.com/ | grep -iE '^HTTP|^server|^cf-ray'
+echo | openssl s_client -connect b10coin.com:443 -servername b10coin.com 2>/dev/null \
+  | openssl x509 -noout -subject -issuer
 ```
 
 ## 10. Known issues
@@ -236,8 +270,10 @@ curl -s https://b10coin.com/live/chain.json | python3 -c \
   liveness is the seat's liveness.
 - **15 s granularity.** The landing strip and the chain page are at most one
   push interval behind; the rate needs two pushes to appear.
-- **Origin is HTTP-only.** TLS is Cloudflare's; `Full (strict)` needs the origin
-  certificate described in §6.
+- **Origin is HTTP-only, by design.** TLS is Cloudflare's Universal SSL; the
+  certificate is 90-day and renews at the edge on its own. `Full (strict)` —
+  encrypted Cloudflare→origin — still needs the origin certificate described in
+  §6, and the `:80 → https` redirect may only be added after that switch.
 - **Cosmetic log noise.** `/favicon.ico` 404s (no icon is shipped), and the
   `bitgod.xyz` vhost tries `index.php` before `index.html` under the symlinked
   path before falling through to the HTML. Neither affects responses.
