@@ -5,6 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>b10coin — a chain for small computers</title>
 <meta name="description" content="b10coin is a from-scratch proof-of-stake-style cryptocurrency built to run a validator on Raspberry Pi class hardware. No proof of work, no premine, testnet only.">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#0a0c0f">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="b10coin">
+<meta property="og:title" content="b10coin — a chain for small computers">
+<meta property="og:description" content="A from-scratch proof-of-stake-style cryptocurrency that runs a validator on Raspberry Pi class hardware. No proof of work, no premine, testnet only.">
+<meta property="og:url" content="https://b10coin.com/">
+<meta property="og:image" content="https://b10coin.com/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://b10coin.com/assets/og-image.png">
+
 <style>
   :root{
     --bg:#0a0c0f; --panel:#11151a; --line:#1e252d; --ink:#e9eff5;
@@ -21,7 +36,8 @@
     -webkit-font-smoothing:antialiased}
   .wrap{max-width:1120px;margin:0 auto;padding:0 24px}
   nav{display:flex;justify-content:space-between;align-items:center;padding:22px 0;font-size:14px}
-  nav .brand{font-weight:650;letter-spacing:-.2px}
+  nav .brand{font-weight:650;letter-spacing:-.2px;display:inline-flex;align-items:center;gap:9px;margin-left:0;color:var(--ink)}
+  nav .brand .logo{width:26px;height:26px;display:block;flex:0 0 auto}
   nav .brand b{color:var(--accent)}
   nav a{color:var(--muted);text-decoration:none;margin-left:22px}
   nav a:hover{color:var(--ink)}
@@ -105,7 +121,7 @@
 <div class="wrap">
 
   <nav>
-    <span class="brand">b<b>10</b>coin</span>
+    <a class="brand" href="/"><img class="logo" src="/assets/logo-mark.svg" alt="" width="26" height="26"><span>b<b>10</b>coin</span></a>
     <span>
       <a href="#how">How it works</a>
       <a href="#numbers">Numbers</a>

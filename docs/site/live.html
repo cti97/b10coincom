@@ -4,6 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>b10coin — live chain</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#0a0c0f">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="b10coin">
+<meta property="og:title" content="b10coin — a chain for small computers">
+<meta property="og:description" content="A from-scratch proof-of-stake-style cryptocurrency that runs a validator on Raspberry Pi class hardware. No proof of work, no premine, testnet only.">
+<meta property="og:url" content="https://b10coin.com/">
+<meta property="og:image" content="https://b10coin.com/assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://b10coin.com/assets/og-image.png">
+
 <style>
   :root{
     --bg:#0b0d10; --panel:#12161b; --line:#1f262e; --ink:#e7edf3;
@@ -15,7 +30,8 @@
     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
   .wrap{max-width:1080px;margin:0 auto;padding:36px 22px 64px}
   header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
-  h1{font-size:26px;letter-spacing:-.4px;margin:0;font-weight:650}
+  h1{font-size:26px;letter-spacing:-.4px;margin:0;font-weight:650;display:flex;align-items:center;gap:10px}
+  h1 .logo{width:32px;height:32px;display:block;flex:0 0 auto}
   h1 span{color:var(--dim);font-weight:400}
   .pill{font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
     padding:7px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
@@ -59,7 +75,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>b10coin <span>· live chain</span></h1>
+    <h1><img class="logo" src="/assets/logo-mark.svg" alt="" width="34" height="34">b10coin <span>· live chain</span></h1>
     <span id="state" class="pill">connecting</span>
   </header>
   <p class="sub">Three-seat fixture testnet · one relay · <span id="chainid" class="mono">—</span></p>

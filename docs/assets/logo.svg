@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 272 80" role="img" aria-label="b10coin">
+  <defs>
+    <linearGradient id="bg" x1="10" y1="4" x2="54" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#c7e9ff"/>
+      <stop offset=".5" stop-color="#7cc4ff"/>
+      <stop offset="1" stop-color="#3a83d2"/>
+    </linearGradient>
+    <mask id="ten">
+      <rect width="64" height="64" fill="#fff"/>
+      <path d="M16.6 27.4 L21.8 21.8 V44.2" fill="none" stroke="#000" stroke-width="5.6"
+            stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="39.8" cy="32.3" r="8.9" fill="none" stroke="#000" stroke-width="5.6"/>
+    </mask>
+  </defs>
+  <!-- Lockup for dark backgrounds: mark + wordmark. The text uses the viewer's
+       UI font, so it inherits the same voice as the site. -->
+  <g transform="translate(4 12) scale(0.875)">
+    <path d="M32 3.4 56.4 17.4v28L32 60.6 7.6 45.4v-28Z" fill="url(#bg)" stroke="url(#bg)"
+          stroke-width="2.6" stroke-linejoin="round" mask="url(#ten)"/>
+  </g>
+  <text x="76" y="53" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+        font-size="38" font-weight="600" letter-spacing="-1.1" fill="#e9eff5">b10coin</text>
+</svg>
