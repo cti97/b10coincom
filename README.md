@@ -1,5 +1,9 @@
 # b10coin
 
+<p align="center">
+  <img src="docs/assets/logo.png" alt="b10coin" width="300">
+</p>
+
 b10coin is a from-scratch, proof-of-stake-style cryptocurrency built for small
 computers: the stated target is a validator node on Raspberry Pi class
 hardware. There is **no proof-of-work consensus** and **there is no premine**.

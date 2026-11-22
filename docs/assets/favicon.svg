@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="b10coin">
+  <defs>
+    <!-- Favicon build of the mark: same silhouette, flat colour instead of the
+         gradient, and both glyphs thickened so the "10" survives at 16 px. -->
+    <mask id="m">
+      <rect width="32" height="32" fill="#fff"/>
+      <rect x="8.3" y="10.4" width="3.6" height="12" rx=".7" fill="#000"/>
+      <circle cx="20.4" cy="16.4" r="4.7" fill="none" stroke="#000" stroke-width="3.1"/>
+    </mask>
+  </defs>
+  <path d="M16 1.5 28.1 8.4v15.2L16 30.5 3.9 23.6V8.4Z" fill="#7cc4ff" stroke="#7cc4ff"
+        stroke-width="1.6" stroke-linejoin="round" mask="url(#m)"/>
+</svg>
