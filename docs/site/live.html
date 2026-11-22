@@ -32,7 +32,10 @@
   header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
   h1{font-size:26px;letter-spacing:-.4px;margin:0;font-weight:650;display:flex;align-items:center;gap:10px}
   h1 .logo{width:32px;height:32px;display:block;flex:0 0 auto}
-  h1 span{color:var(--dim);font-weight:400}
+  h1 .home{display:flex;align-items:center;gap:10px;color:inherit;text-decoration:none;border-radius:8px;margin:-4px;padding:4px}
+  h1 .home:hover .name{color:var(--accent)}
+  h1 .home:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  h1 .where{color:var(--dim);font-weight:400}
   .pill{font:600 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;
     padding:7px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
   .pill.live{color:var(--ok);border-color:#1d3b2f;background:#0f1a16}
@@ -75,7 +78,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1><img class="logo" src="/assets/logo-mark.svg" alt="" width="34" height="34">b10coin <span>· live chain</span></h1>
+    <h1><a class="home" href="/" title="b10coin — back to the main page"><img class="logo" src="/assets/logo-mark.svg" alt="" width="32" height="32"><span class="name">b10coin</span></a> <span class="where">· live chain</span></h1>
     <span id="state" class="pill">connecting</span>
   </header>
   <p class="sub">Three-seat fixture testnet · one relay · <span id="chainid" class="mono">—</span></p>
