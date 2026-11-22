@@ -1841,7 +1841,7 @@ check).
 
 ## Status and roadmap
 
-Implemented — modules M0 through M6:
+Implemented — modules M0 through M8:
 
 - **M0** — repository skeleton, canonical encoding, crypto wrappers, CI.
 - **M1** — single-node chain: account state machine, block production,
@@ -1895,24 +1895,52 @@ Implemented — modules M0 through M6:
   which extracts the doc's single shell fence and runs it against a fresh node;
   CI runs it on every push. The state root did not move — M6 is CLI, HTTP pages
   and documentation.
+- **M7** — bounded history with verifiable recovery: `--retain-blocks` drops whole
+  block and certificate segments below an epoch-aligned horizon, `--checkpoint`
+  writes the quorum certificate at that horizon into a checkpoint, and an import
+  into an empty `--dir` recomputes every stored root before adopting it (see
+  *Bounded history and recovery (M7)* below).
+- **M8** — rotation-aware checkpoints as an explicit trust decision: a default
+  import refuses a checkpoint whose committee is not the genesis committee,
+  because a file that carries its own committee verifies against itself; the
+  rotation-aware import is opt-in and documented as the downgrade it is (see
+  *Rotated committees … (M8)* below).
 
-Pending:
+Live three-seat testnet — the M4/M5 acceptance on real hardware, and what it
+found:
 
-- **M4/M5 acceptance on real hardware** — three Raspberry Pis on separate home
-  networks plus a relay VPS, checked end-to-end by
-  `scripts/deploy/acceptance.sh`. The code and the recipe are in place, and two
-  Docker runs (containers on one Windows host, one bridge network,
-  linux/amd64 — [first](docs/testrun-2026-10-30-m5-docker.md),
-  [re-run](docs/testrun-2026-10-30-m5-docker-rerun.md)) did exercise the
-  transport across real processes. They found two permanent-freeze defects — a
-  validator that fell more than one 64-block sync window behind never caught
-  up, and a relay-only three-seat chain halted after a restart in **4 of 9**
-  cycles — both now fixed (the re-run's 8 restart cycles produced no halt).
-  But one Docker bridge is not a home network: **ARM64, separate NAT'd
-  networks, real packet loss and Pi-class timing remain unvalidated**, and M5's
-  rotation has still run only in the simulator and the CLI acceptance command,
-  never on a Pi. This three-Pi run is what validates the transport on real
-  hardware.
+- **2026-11-14** — first multi-host finality: two Raspberry Pis on separate home
+  networks plus a Mac on a third, all behind NAT, one relay
+  ([report](docs/testrun-2026-11-14-three-host-live.md)). ~15 blocks/s, relay
+  `dropped=0`.
+- **2026-11-16** — the chain stopped permanently at height 5797 with all three
+  seats agreeing. `kill -QUIT` showed the transport deadlock (dispatch mutex held
+  across `OnMessage → flush → maybePrune → v.mu`, readers parked behind it).
+  Full analysis in the
+  [bug doc](docs/bug-2026-11-16-round-divergence-ratchet.md) and
+  [post-mortem](docs/postmortem-2026-11-16-three-seat-chain-stall.md); fixed in
+  v0.1.8 (prune off the dispatch path, readers exit on a finished connection).
+- **2026-11-20 → 2026-11-22** — 43.4 h on v0.1.8: 2,083,972 blocks (~13.3
+  blocks/s including stalls), relay forwarding 110 M frames with 3,073 dropped,
+  and 18 transient round-divergence stalls that closed on their own
+  ([test run](docs/testrun-2026-11-21-transfers-and-staking.md) §6).
+- **Money paths exercised live** — `send`, `stake`, `unstake`, `withdraw` driven
+  through the CLI against the public relay, including refusals (below-minimum
+  bond, over-unbond, early withdraw, self-transfer, overspend) and the staking
+  invariants: fee 0 on exits, cooldown rounded up to an epoch boundary, records
+  at one release height merged
+  ([test run](docs/testrun-2026-11-21-transfers-and-staking.md)).
+
+Open, and not a documentation gap:
+
+- **Transient stalls are the known residual.** Three seats with 3-of-3 quorum
+  has no liveness margin: a round divergence costs minutes of the ladder tail and
+  happens roughly once per two hours on the live committee. The deadlock behind
+  the permanent 2026-11-16 stop is fixed; the divergence itself is a consensus
+  question (quorum shape, ladder tail) still open.
+- **No external audit, no real committee.** Every key in the fixture derives from
+  a public seed and the premine is spendable fixture money. The testnet is
+  plumbing evidence, never value.
 
 ## Documentation
 
