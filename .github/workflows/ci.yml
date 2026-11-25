@@ -322,7 +322,14 @@ jobs:
   # relay's TEST code that made `GOOS=windows go vet` fail while every build
   # stayed green — so a build-only matrix would have shipped the hole. Each
   # target cross-compiles from one runner; the pair (GOOS, GOARCH) is what
-  # the code must survive, not the runner it is compiled on.
+  # the code must survive, not the runner it is compiled on. That is why the
+  # darwin legs run on ubuntu-latest too: the project is pure Go (no cgo), so
+  # GOOS=darwin compiles and vets identically from Linux, while macOS hosted
+  # runners are GitHub's scarcest class. Three runs went red with the darwin
+  # jobs CANCELLED after 15 minutes in the queue - "The job was not acquired
+  # by Runner of type hosted even after multiple attempts" - without having
+  # executed a single step (runs 45431889395, 45464550204). A red that says
+  # nothing about the commit is worse than no check at all.
   cross:
     runs-on: ${{ matrix.os }}
     name: build + vet (${{ matrix.goos }}/${{ matrix.goarch }})
@@ -332,8 +339,8 @@ jobs:
         include:
           - { os: ubuntu-latest,  goos: linux,   goarch: amd64 }
           - { os: ubuntu-latest,  goos: linux,   goarch: arm64 }
-          - { os: macos-latest,   goos: darwin,  goarch: amd64 }
-          - { os: macos-latest,   goos: darwin,  goarch: arm64 }
+          - { os: ubuntu-latest,  goos: darwin,  goarch: amd64 }
+          - { os: ubuntu-latest,  goos: darwin,  goarch: arm64 }
           - { os: windows-latest, goos: windows, goarch: amd64 }
           - { os: windows-latest, goos: windows, goarch: arm64 }
     steps:
