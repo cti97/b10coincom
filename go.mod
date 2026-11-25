@@ -6,7 +6,7 @@ toolchain go1.27.4
 
 require (
 	golang.org/x/crypto v0.59.0
-	lukechampine.com/blake3 v1.4.1
+	lukechampine.com/blake3 v1.5.1
 )
 
 require (
