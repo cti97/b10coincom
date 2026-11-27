@@ -17,9 +17,20 @@
 
 set -eu
 
-HERE=$(cd "$(dirname "$0")" && pwd)
+HERE=$(cd "$(dirname "$0")" 2>/dev/null && pwd || pwd)
 SRC="$HERE/stall-watchdog.sh"
-[ -f "$SRC" ] || { echo "install-watchdog: $SRC not found (run from a checkout)" >&2; exit 1; }
+if [ ! -f "$SRC" ]; then
+  # Installed by `curl ... | sh` there is no checkout beside us: fetch the
+  # watchdog from the same tree this installer came from, so the one-liner
+  # works on a Pi that has the repository nowhere.
+  RAW="https://raw.githubusercontent.com/cti97/b10coincom/main/scripts/deploy/stall-watchdog.sh"
+  SRC=$(mktemp "${TMPDIR:-/tmp}/stall-watchdog.XXXXXX")
+  if ! curl -fsSL --proto '=https' --tlsv1.2 -o "$SRC" "$RAW"; then
+    echo "install-watchdog: cannot download $RAW and no checkout is present" >&2
+    exit 1
+  fi
+  head -1 "$SRC" | grep -q '^#!/bin/sh' || { echo "install-watchdog: $RAW is not the expected script" >&2; exit 1; }
+fi
 
 case "$(uname -s)" in
 Darwin)
