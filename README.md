@@ -1191,6 +1191,27 @@ rather than in round still catches up through BLOCK_SYNC). The measured
 numbers and the choice of the linear ladder over the slower sub-linear
 alternatives are recorded in `internal/consensus/driver.go`.
 
+**A majority attestation closes that gap in one step (v0.1.9).** Waiting for the
+ladder is the fallback, not the only closer. Every timeout also consults the
+signed rounds this validator has already seen: when members holding **strictly
+more than half the total power** have signed at a later round, no round this
+validator can reach holds a completable quorum, so waiting cannot help and the
+engine jumps — the whole gap, in one timeout. Anything weaker keeps the old
+bounded stride (16 rounds per timeout, and since each step's deadline grows
+with the round, catch-up was quadratic in the gap): a sub-majority coalition,
+or one buggy member, still cannot move a validator to a round the committee
+might not be in. A `MaxUint32` target is clamped to `MaxUint32-1`, because the
+wrap guard returns silently there and a jump to it would eject the validator
+from the height rather than resync it.
+
+The case that produced the change: on 2026-11-28 a seat restarted at round 0
+while two survivors ran on at round ~378 — 16 rounds per timeout, eight
+minutes, no catch-up, chain halted until the seat was restarted by hand. On
+0.1.9 that state resolves in one timeout. The three-seat fixture is the shape
+where this matters most: with quorum equal to the whole committee, one member's
+attestation already clears the jump bar, so the difference between "bounded
+stride" and "jump the gap" is the difference between an outage and a resync.
+
 **A rolling restart is the everyday way to meet that limit.** Restarting a
 committee's validators one at a time leaves their rounds apart, and only the
 ladder closes the gap. In the 2026-10-30 Docker re-run a four-seat chain with
@@ -1767,6 +1788,50 @@ and
 [`scripts/deploy/README.md`](scripts/deploy/README.md#6-the-systemd-units-what-runs-after-the-first-contact-test)
 has the operator's procedure.
 
+**A restart costs more than the seconds it takes to type.** Measured on
+2026-11-28: a Pi's systemd unit reports `active (running)` immediately, but the
+node spends roughly **three minutes** reopening its data directory and
+replaying the retained window before it prints `listening on … height …` and
+starts voting. The committee is short a seat for that entire period, and with
+3-of-3 quorum that is a guaranteed stall. So the order is: stop the Pis, start
+them, **wait for each to print its startup banner**, then restart the Mac seat
+(or whichever host the third seat is on) — not three commands fired at once.
+
+**Supervision, so an absent seat is not a permanent one.** A seat that simply
+is not running is the commonest way this chain stops, so every host should make
+its seat self-healing:
+
+- **macOS (the Mac seat):** a LaunchAgent, `~/Library/LaunchAgents/com.b10coin.node.plist`,
+  with `RunAtLoad` + `KeepAlive` + `ThrottleInterval 15`, running a **stable
+  symlink** (`~/b10coin-node/b10coin`) rather than a versioned path. A reboot,
+  a crash or a `kill -9` brings the seat back; a version upgrade is
+  `ln -sfn <new binary> ~/b10coin-node/b10coin` followed by
+  `launchctl kickstart -k gui/$(id -u)/com.b10coin.node`, and the plist never
+  changes.
+- **Pis:** the shipped unit is enabled at boot; check what it does on a crash
+  with `systemctl cat b10coin | grep -i restart`, and add `Restart=always` if
+  the unit is bare.
+- **Every host: the stall watchdog** (`scripts/deploy/stall-watchdog.sh`). It
+  watches the local node over `/status`; when the height has not moved for 15
+  minutes it stops the seat, moves `rounds.log` aside to
+  `rounds.log.stall-<epoch>`, and starts it again — `locks.log`, the
+  double-vote safety record, is never touched, and a dead or starting RPC is
+  left alone because that is the supervisor's job. Install it once:
+
+```sh
+# on a Pi, from nothing but the network
+curl -fsSL https://raw.githubusercontent.com/cti97/b10coincom/main/scripts/deploy/install-watchdog.sh | sudo sh
+# on macOS, from a checkout
+sh scripts/deploy/install-watchdog.sh
+```
+
+Its interesting property is that it needs no coordination: a stall is a global
+event, so every host's stall clock starts within seconds of the same moment and
+every host restarts within one watchdog interval of the same threshold — three
+independent local watchdogs produce one coordinated restart. What it cannot fix
+is a seat that is *not running at all* on another host; that is what the
+supervisors above are for.
+
 After the Pis are running, the acceptance run itself becomes one command:
 
 ```sh
@@ -1928,6 +1993,20 @@ found:
   blocks/s including stalls), relay forwarding 110 M frames with 3,073 dropped,
   and 18 transient round-divergence stalls that closed on their own
   ([test run](docs/testrun-2026-11-21-transfers-and-staking.md) §6).
+- **2026-11-27 → 2026-11-28 — the failures that produced v0.1.9's changes.** A
+  laptop restart removed the third seat for two hours (the seat was a manual
+  process), and when it returned the chain did **not** recover: the two
+  survivors had climbed to round ~378 while the returning seat sat at round 0,
+  and the bounded 16-round jump took eight minutes without closing the gap.
+  Stall frequency that day was roughly hourly (15 stalls), each costing the
+  ladder's tail. Two fixes came out of it: the round jump now goes the whole
+  gap on a majority attestation, and every host can run the stall watchdog.
+- **State of the live chain (2026-11-28, v0.1.9 on all three seats)** — height
+  **14.2 M** and committing at 15–17 blocks/s, relay `conns=3` with ~8.8 M
+  frames forwarded this run and 1,026 dropped, page snapshot 3–8 s fresh. The
+  residual is unchanged and stated plainly: a 3-of-3 committee has no liveness
+  margin, so a seat that is absent — rebooted, upgraded, suspended, or simply
+  not started — halts the chain until it returns.
 - **Money paths exercised live** — `send`, `stake`, `unstake`, `withdraw` driven
   through the CLI against the public relay, including refusals (below-minimum
   bond, over-unbond, early withdraw, self-transfer, overspend) and the staking
