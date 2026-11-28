@@ -60,6 +60,7 @@ var pageTemplates = template.Must(template.New("pages").Funcs(pageFuncs).ParseFS
 const (
 	faucetTemplateName   = "faucet.html"
 	explorerTemplateName = "explorer.html"
+	walletTemplateName   = "wallet.html"
 )
 
 // defaultNodeURL is cmd/b10coin's --node default. It is only the fallback for a

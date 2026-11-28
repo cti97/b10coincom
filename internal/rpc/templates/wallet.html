@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>b10coin wallet — {{.AddressShort}} — {{.ChainID}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; max-width: 62rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.55; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.9rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.35rem 0.6rem; border-bottom: 1px solid #8884; vertical-align: top; }
+  th { white-space: nowrap; font-weight: 600; }
+  code { background: #8881; padding: 0 0.2rem; word-break: break-all; }
+  .none { color: #8889; }
+  .big { font-size: 1.5rem; font-weight: 600; }
+  .limits { border-top: 1px solid #8884; margin-top: 2.2rem; padding-top: 0.5rem; }
+</style>
+</head>
+<body>
+<h1>b10coin wallet</h1>
+<p>One address, read from this node's committed state and its recent blocks. It signs nothing, submits nothing, and it holds no key: a page cannot spend, and this one does not pretend to.</p>
+
+<h2>{{.Address}}</h2>
+<table>
+  <tr><th>Balance</th><td class="big">{{b10 .Balance}} b10 <span class="none">({{.Balance}} sparks)</span></td></tr>
+  <tr><th>Nonce</th><td>{{.Nonce}}</td></tr>
+  <tr><th>Bonded</th><td>{{b10 .Bonded}} b10 <span class="none">({{.Bonded}} sparks)</span></td></tr>
+  <tr><th>Height read</th><td>{{.Height}}</td></tr>
+</table>
+
+<h2>Unbonding</h2>
+{{if .Unbonding}}
+<table>
+  <tr><th>Amount</th><th>Release height</th><th>Blocks to go</th></tr>
+  {{range .Unbonding}}
+  <tr><td>{{b10 .Amount}} b10</td><td>{{.ReleaseHeight}}</td><td>{{if .Mature}}matured{{else}}{{.BlocksToGo}}{{end}}</td></tr>
+  {{end}}
+</table>
+{{else}}
+<p class="none">No unbonding records: nothing is waiting to be released.</p>
+{{end}}
+
+<h2>Recent transactions</h2>
+<p class="none">Blocks {{.ScanFrom}}–{{.ScanTo}} of height {{.Head}}{{if .Truncated}}, truncated at {{.TxCap}} entries{{end}}.</p>
+{{if .Txs}}
+<table>
+  <tr><th>Height</th><th>Type</th><th>Direction</th><th>Amount</th><th>Counterparty</th><th>Fee</th></tr>
+  {{range .Txs}}
+  <tr>
+    <td>{{.Height}}</td>
+    <td>{{.Type}}</td>
+    <td>{{.Direction}}</td>
+    <td>{{if .HasAmount}}{{b10 .Amount}} b10{{else}}<span class="none">—</span>{{end}}</td>
+    <td>{{if .Counterparty}}<code>{{.Counterparty}}</code>{{else}}<span class="none">—</span>{{end}}</td>
+    <td>{{.Fee}} sparks</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p class="none">No transactions involving this address in the window above. A wallet only shows what a node can still read: history older than the scan window is not displayed.</p>
+{{end}}
+
+<div class="limits">
+  <p><strong>What this page cannot do.</strong> It cannot sign, spend, bond or claim: those need a key, and this server holds none. It cannot see further back than the scan window above, and it cannot show a balance it did not read from <em>this</em> node — a different node may hold a different head.</p>
+</div>
+</body>
+</html>
