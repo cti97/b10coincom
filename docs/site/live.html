@@ -162,8 +162,15 @@ function renderChain(c){
     }
     lastH = c.height; lastT = now;
   }
-  const fresh = now - lastT < 120;
-  $('rate').innerHTML = (rate === null || !fresh ? '—' : rate.toFixed(1)) + ' <small>blk/s</small>';
+  // The pusher measures a rate over its own 15 s window and publishes it, so a
+  // first render already has a number; the browser's own measurement, one poll
+  // apart, takes over as soon as it has seen two heights and is the finer of
+  // the two. `published` null means the pusher saw no progress for over a
+  // minute, which is a statement about the chain, not a missing measurement.
+  const published = typeof c.rate === 'number' && c.rate > 0 ? c.rate : null;
+  const fresh = (now - lastT) < 120 || (published !== null && (now - (c.updated || 0)) < 60);
+  const shown = rate !== null ? rate : published;
+  $('rate').innerHTML = (shown === null || !fresh ? '—' : shown.toFixed(1)) + ' <small>blk/s</small>';
 
   const age = now - (c.updated || 0);
   $('age').textContent = ago(c.updated);

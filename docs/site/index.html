@@ -350,8 +350,12 @@ async function tick(){
       }
       lastH = c.height; lastT = now;
     }
-    const fresh = now - lastT < 120;
-    $('s-rate').innerHTML = (rate === null || !fresh ? '—' : rate.toFixed(1)) + ' <small>blk/s</small>';
+    // Prefer the pusher's published rate until the browser has measured one of
+    // its own (see the live page for why both exist).
+    const published = typeof c.rate === 'number' && c.rate > 0 ? c.rate : null;
+    const fresh = (now - lastT) < 120 || (published !== null && (now - (c.updated || 0)) < 60);
+    const shown = rate !== null ? rate : published;
+    $('s-rate').innerHTML = (shown === null || !fresh ? '—' : shown.toFixed(1)) + ' <small>blk/s</small>';
     const age = now - (c.updated || 0);
     if(age < 45) setState('live', 'live');
     else if(age < 300) setState('', 'stale');
