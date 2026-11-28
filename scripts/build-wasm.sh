@@ -24,7 +24,9 @@ GOOS=js GOARCH=wasm go build -o "$out/b10coin-wasm.wasm" ./cmd/b10coin-wasm
 shim="$(go env GOROOT)/lib/wasm/wasm_exec.js"
 [ -f "$shim" ] || shim="$(go env GOROOT)/misc/wasm/wasm_exec.js"
 [ -f "$shim" ] || { echo "build-wasm: no wasm_exec.js under $(go env GOROOT)" >&2; exit 1; }
-cp "$shim" "$out/wasm_exec.js"
+# install, not cp: the shim inside GOROOT is read-only, and a plain cp refuses
+# to overwrite the copy a previous run left behind.
+install -m 0644 "$shim" "$out/wasm_exec.js"
 
 printf '%s\n' "built $out/b10coin-wasm.wasm and wasm_exec.js"
 ls -lh "$out/b10coin-wasm.wasm" "$out/wasm_exec.js"
