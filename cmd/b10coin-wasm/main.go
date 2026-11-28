@@ -39,7 +39,7 @@ import (
 // chain does not have.
 type request struct {
 	Op         string `json:"op"`
-	Seed       string `json:"seed,omitempty"`     // 32-byte Ed25519 seed, hex
+	Seed       string `json:"seed,omitempty"`        // 32-byte Ed25519 seed, hex
 	PrivateKey string `json:"private_key,omitempty"` // 64-byte form the CLI's key file holds
 	Genesis    string `json:"genesis_hash,omitempty"`
 	To         string `json:"to,omitempty"`
