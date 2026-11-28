@@ -589,7 +589,11 @@ func (e *Engine) jumpTarget() uint32 {
 	}
 
 	var cum uint64
-	for _, a := range rounds {
+	// Members at the SAME round are counted together before the decision: a
+	// "majority attested this round" question is about the power AT that
+	// round, and evaluating it after the first member of a group would see
+	// 1 of 3 where 2 of 3 had signed.
+	for i, a := range rounds {
 		var carry uint64
 		cum, carry = bits.Add64(cum, a.power, 0)
 		if carry != 0 {
@@ -599,11 +603,40 @@ func (e *Engine) jumpTarget() uint32 {
 			// the committee's own overflow guard takes.
 			return 0
 		}
+		if i+1 < len(rounds) && rounds[i+1].round == a.round {
+			continue // finish the group before judging it
+		}
 		if cum < bar {
 			continue
 		}
 		if a.round <= e.round {
 			return 0 // the bulk sits behind us: no evidence the committee is ahead
+		}
+		// A MAJORITY attestation may jump the whole gap in one step. When the
+		// members holding strictly more than half the total power have signed
+		// at a.round or beyond, the committee is demonstrably there: this is
+		// not a claim to be paced, it is where the chain lives. Stepping
+		// maxRoundEscalation at a time toward it multiplies recovery by
+		// distance/stride while EACH STEP'S DEADLINE GROWS WITH THE ROUND, so
+		// the cost is quadratic in the gap: on 2026-11-28 a 378-round
+		// divergence on three seats - one seat restarted at round 0 by the
+		// stall watchdog while two ran on - took ~8 minutes of 16-round jumps
+		// and never closed before the Mac was restarted again. Anything
+		// weaker than a majority keeps the bounded stride below: a
+		// sub-majority coalition (or one buggy member) can name any round,
+		// and the wrap guard makes an unbounded jump fatal.
+		//
+		// The comparison is cum > total-cum rather than cum*2 > total so a
+		// wrapped product cannot flip the answer.
+		if cum > e.cfg.TotalPower()-cum {
+			target := a.round
+			if target == math.MaxUint32 {
+				// OnTimeout's wrap guard returns silently at MaxUint32: a jump
+				// there would eject the validator from the height. One round
+				// short is still the whole gap for any real committee.
+				target = math.MaxUint32 - 1
+			}
+			return target
 		}
 		// The bounded stride: never leave the current round by more than
 		// maxRoundEscalation in one jump (see the function comment). The wrap

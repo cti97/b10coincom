@@ -123,10 +123,14 @@ type Driver struct {
 	diagRounds []DiagRound
 }
 
-// maxRoundEscalation is the STRIDE of one round-resync jump: jumpTarget
-// (engine.go) never leaves the engine's current round by more than this many
-// rounds on a single timeout, so one member's claim cannot park the engine at
-// a round it would take an unbounded number of timeouts to reach.
+// maxRoundEscalation is the STRIDE of a round-resync jump made on LESS THAN A
+// MAJORITY attestation: jumpTarget (engine.go) leaves the engine's current
+// round by at most this many rounds on a single timeout unless members holding
+// strictly more than half the total power have signed at the target, in which
+// case it jumps the whole gap (see the majority branch there). The stride is
+// what stops one member's claim - or a sub-majority coalition's - from parking
+// the engine at a round it would take an unbounded number of timeouts to
+// leave.
 //
 // It is NOT a cap on the timeout ladder, and it has not been one since the
 // round-divergence review. It used to be: Tick re-armed each round at
