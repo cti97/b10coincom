@@ -391,6 +391,7 @@ func (s *Server) Handler() http.Handler {
 	// beside the JSON API.
 	mux.HandleFunc("/faucet", s.handleFaucet)
 	mux.HandleFunc("/explorer", s.handleExplorer)
+	mux.HandleFunc("/wallet/", s.handleWalletPage)
 	mux.HandleFunc("/tx", s.handleTx)
 	return mux
 }
