@@ -296,7 +296,13 @@ func TestARotatedOutValidatorResyncsReannouncesAndIsCountedAgain(t *testing.T) {
 	if got := jn.Height(); got > peersNow {
 		peersNow = got // J is a follower; this keeps the assertion honest anyway
 	}
-	waitFor(t, "the rotated-out validator to follow past the committee's settled height", workWait(2, rt3Tick), func() bool {
+	// Four block-times of allowance, not two: this wait spans a BLOCK_SYNC
+	// round trip through a peer that is itself producing blocks, and on a
+	// loaded CI runner (six packages in parallel) two block-times measured in
+	// wall clock expires before the sync completes - run 46148337419 failed
+	// here at 38 s while the same test passes in 15-30 s on a quiet machine.
+	// The assertion is unchanged; only the deadline the test is allowed.
+	waitFor(t, "the rotated-out validator to follow past the committee's settled height", workWait(4, rt3Tick), func() bool {
 		_, committeeAdvanced := minMax(heightsOf(vs))
 		return jn.Height() > peersNow && committeeAdvanced > peersNow
 	})
